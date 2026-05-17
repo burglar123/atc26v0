@@ -17,6 +17,22 @@ from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.stspec_plan import (
+    StepPlan,
+    select_exec_seqs_for_plan,
+    stspec_protocol_alignment_error,
+)
+from nano_pearl.pearl_engine.pearl_protocol import (
+    PearlMessageType,
+    PearlLayoutKind,
+    decode_legacy_draft_message,
+    decode_legacy_verify_result,
+    encode_legacy_draft_message,
+    encode_legacy_verify_result,
+    ensure_legacy_fixed_layout,
+    ensure_supported_protocol,
+    validate_legacy_fixed_layout,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -318,11 +334,54 @@ class ModelRunnerBase:
             )
         self.active_execution_mode = execution_mode
 
-    def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
+    def _schedule_with_plan(self, runner_role: str):
+        return self.scheduler.schedule_with_plan(
+            runner_role=runner_role,
+            execution_mode=self.active_execution_mode,
+            decode_ready_mode=self.active_decode_ready_mode,
+            default_gamma=self.gamma,
+        )
+
+    def _trace_schedule(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        runner_role: str,
+        step_plan: StepPlan,
+    ):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
+        if step_plan.plan_id != iteration_id:
+            logger.warning(
+                f"StepPlan plan_id={step_plan.plan_id} does not match "
+                f"trace iteration_id={iteration_id}; keeping legacy trace id."
+            )
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
+        scheduled_seq_ids = [seq.seq_id for seq in seqs]
+        assert step_plan.scheduled_seq_ids == scheduled_seq_ids
+        plan_signature = step_plan.signature()
+        plan_digest = step_plan.digest()
+        actual_exec_seq_ids = (
+            list(step_plan.actual_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.actual_target_exec_seq_ids)
+        )
+        dryrun_exec_seq_ids = (
+            list(step_plan.dryrun_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.dryrun_target_exec_seq_ids)
+        )
+        filtered_out_seq_ids = [seq_id for seq_id in scheduled_seq_ids if seq_id not in set(actual_exec_seq_ids)]
+        actual_exec_fraction = (
+            float(len(actual_exec_seq_ids)) / float(len(scheduled_seq_ids))
+            if scheduled_seq_ids
+            else 1.0
+        )
+        protocol_alignment_error = stspec_protocol_alignment_error(
+            step_plan, runner_role, self.gamma
+        )
+        protocol_alignment_ok = protocol_alignment_error is None
         record = {
             "execution_mode": self.active_execution_mode,
             "decode_ready_mode": self.active_decode_ready_mode,
@@ -331,6 +390,65 @@ class ModelRunnerBase:
             "runner_role": runner_role,
             "scheduled_seq_ids": [seq.seq_id for seq in seqs],
             "request_ids": [seq.request_id for seq in seqs],
+            "plan_id": step_plan.plan_id,
+            "plan_signature": plan_signature,
+            "plan_signature_hash": plan_digest,
+            "plan_digest": plan_digest,
+            "plan_num_requests": len(step_plan.requests),
+            "plan_request_ids": list(step_plan.request_ids),
+            "plan_two_batch_shadow": step_plan.plan_two_batch_shadow,
+            "target_home_batch_id": step_plan.target_home_batch_id,
+            "draft_home_batch_id": step_plan.draft_home_batch_id,
+            "target_batch_seq_ids": list(step_plan.target_batch_seq_ids),
+            "draft_home_batch_seq_ids": list(step_plan.draft_home_batch_seq_ids),
+            "off_batch_seq_ids": list(step_plan.off_batch_seq_ids),
+            "two_batch_execution_enabled": step_plan.two_batch_execution_enabled,
+            "two_batch_execution_dryrun": step_plan.two_batch_execution_dryrun,
+            "two_batch_execution_mode": step_plan.two_batch_execution_mode,
+            "stspec_probe_enabled": step_plan.stspec_probe_enabled,
+            "stspec_probe_fail_fast": step_plan.stspec_probe_fail_fast,
+            "stspec_probe_local_only": step_plan.stspec_probe_local_only,
+            "real_probe_attempted": step_plan.real_probe_attempted,
+            "real_probe_applied": step_plan.real_probe_applied and protocol_alignment_ok,
+            "real_probe_blocked": bool(step_plan.real_probe_blocked or protocol_alignment_error),
+            "real_probe_block_reason": step_plan.real_probe_block_reason or protocol_alignment_error,
+            "actual_target_exec_seq_ids": list(step_plan.actual_target_exec_seq_ids),
+            "actual_draft_exec_seq_ids": list(step_plan.actual_draft_exec_seq_ids),
+            "dryrun_target_exec_seq_ids": list(step_plan.dryrun_target_exec_seq_ids),
+            "dryrun_draft_exec_seq_ids": list(step_plan.dryrun_draft_exec_seq_ids),
+            "actual_exec_seq_ids": actual_exec_seq_ids,
+            "dryrun_exec_seq_ids": dryrun_exec_seq_ids,
+            "filtered_out_seq_ids": filtered_out_seq_ids,
+            "filtered_out_seq_count": len(filtered_out_seq_ids),
+            "actual_exec_fraction": actual_exec_fraction,
+            "protocol_alignment_ok": protocol_alignment_ok,
+            "protocol_alignment_error": protocol_alignment_error,
+            "pearl_protocol_version": int(getattr(self.global_config, "pearl_protocol_version", 1)),
+            "pearl_protocol_layout": getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed"),
+            "pearl_protocol_envelope_enabled": bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True)),
+            "pearl_protocol_validate_enabled": bool(getattr(self.global_config, "pearl_protocol_validate", True)),
+            "pearl_protocol_trace_enabled": bool(getattr(self.global_config, "pearl_protocol_trace", True)),
+            "draft_message_seq_ids": None,
+            "draft_message_per_seq_lengths": None,
+            "draft_message_offsets": None,
+            "draft_message_total_tokens": None,
+            "verify_result_seq_ids": None,
+            "verify_result_per_seq_accepted_lengths": None,
+            "verify_result_offsets": None,
+            "verify_result_total_tokens": None,
+            "protocol_validation_ok": True,
+            "protocol_validation_error": None,
+            "protocol_message_type": None,
+            "protocol_layout_kind": None,
+            "plan_legacy_equivalent": step_plan.legacy_equivalent,
+            "plan_runner_role": step_plan.runner_role,
+            "plan_scheduled_seq_ids": list(step_plan.scheduled_seq_ids),
+            "plan_target_seq_ids": list(step_plan.target_seq_ids),
+            "plan_draft_home_seq_ids": list(step_plan.draft_home_seq_ids),
+            "plan_eager_seq_ids": list(step_plan.eager_seq_ids),
+            "effective_gamma_per_seq": dict(step_plan.effective_gamma_per_seq),
+            "home_batch_id_per_seq": dict(step_plan.home_batch_id_per_seq),
+            "is_eager_per_seq": dict(step_plan.is_eager_per_seq),
             "num_seqs_in_batch": len(seqs),
             "is_prefill": is_prefill,
             "draft_start_ts": None,
@@ -349,6 +467,109 @@ class ModelRunnerBase:
         }
         self.trace_records.append(record)
         return record
+
+
+    def _pearl_protocol_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True))
+
+    def _pearl_protocol_validate_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_validate", True))
+
+    def _pearl_protocol_trace_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_trace", True))
+
+    def _pearl_protocol_version(self) -> int:
+        return int(getattr(self.global_config, "pearl_protocol_version", 1))
+
+    def _pearl_protocol_layout(self) -> str:
+        return getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed")
+
+    def _check_pearl_protocol_config(self) -> None:
+        ensure_supported_protocol(self._pearl_protocol_version())
+        ensure_legacy_fixed_layout(self._pearl_protocol_layout())
+
+    def _trace_pearl_protocol_message(self, record: dict | None, message) -> None:
+        if record is None or not self._pearl_protocol_trace_enabled():
+            return
+        record["pearl_protocol_version"] = message.protocol_version
+        record["pearl_protocol_layout"] = message.layout_kind
+        record["protocol_message_type"] = message.message_type
+        record["protocol_layout_kind"] = message.layout_kind
+        if message.message_type == PearlMessageType.DRAFT_TOKENS.value:
+            record["draft_message_seq_ids"] = list(message.seq_ids)
+            record["draft_message_per_seq_lengths"] = list(message.per_seq_draft_lengths)
+            record["draft_message_offsets"] = list(message.draft_offsets)
+            record["draft_message_total_tokens"] = int(message.total_draft_tokens)
+        elif message.message_type == PearlMessageType.VERIFY_RESULT.value:
+            record["verify_result_seq_ids"] = list(message.seq_ids)
+            record["verify_result_per_seq_accepted_lengths"] = list(message.per_seq_accepted_lengths)
+            record["verify_result_offsets"] = list(message.accepted_offsets)
+            record["verify_result_total_tokens"] = int(message.total_accepted_tokens)
+
+    def _validate_and_trace_pearl_protocol(self, record: dict | None, message, expected_seq_ids: list[int]) -> None:
+        if not self._pearl_protocol_enabled():
+            return
+        try:
+            self._check_pearl_protocol_config()
+            if self._pearl_protocol_validate_enabled():
+                validate_legacy_fixed_layout(message, expected_seq_ids, self.gamma)
+        except Exception as exc:
+            if record is not None:
+                record["protocol_validation_ok"] = False
+                record["protocol_validation_error"] = str(exc)
+                record["protocol_message_type"] = getattr(message, "message_type", None)
+                record["protocol_layout_kind"] = getattr(message, "layout_kind", None)
+            raise
+        if record is not None:
+            record["protocol_validation_ok"] = True
+            record["protocol_validation_error"] = None
+        self._trace_pearl_protocol_message(record, message)
+
+    def _select_exec_seqs_for_plan(
+        self,
+        seqs: list[Sequence],
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> list[Sequence]:
+        exec_seqs = select_exec_seqs_for_plan(seqs, step_plan, runner_role)
+        actual_exec_seq_ids = [seq.seq_id for seq in exec_seqs]
+        trace_record["actual_exec_seq_ids"] = actual_exec_seq_ids
+        trace_record["filtered_out_seq_ids"] = [
+            seq.seq_id for seq in seqs if seq.seq_id not in set(actual_exec_seq_ids)
+        ]
+        trace_record["filtered_out_seq_count"] = len(trace_record["filtered_out_seq_ids"])
+        trace_record["actual_exec_fraction"] = (
+            float(len(actual_exec_seq_ids)) / float(len(seqs)) if seqs else 1.0
+        )
+        if not step_plan.real_probe_attempted:
+            assert exec_seqs == seqs
+        return exec_seqs
+
+    def _validate_stspec_probe_alignment(
+        self,
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> None:
+        error = stspec_protocol_alignment_error(step_plan, runner_role, self.gamma)
+        if error is None:
+            trace_record["protocol_alignment_ok"] = True
+            trace_record["protocol_alignment_error"] = None
+            if step_plan.real_probe_attempted:
+                trace_record["real_probe_applied"] = bool(trace_record.get("filtered_out_seq_ids"))
+                trace_record["real_probe_blocked"] = False
+            return
+
+        trace_record["protocol_alignment_ok"] = False
+        trace_record["protocol_alignment_error"] = error
+        trace_record["real_probe_applied"] = False
+        trace_record["real_probe_blocked"] = True
+        trace_record["real_probe_block_reason"] = error
+        # V4A is explicitly a feasibility probe. The current PEARL protocol packs
+        # draft/verify tensors by common sequence index, so a mismatch must stop
+        # before distributed communication can hang or corrupt request state.
+        raise RuntimeError(error)
 
     def _mark_trace_start(self, record: dict):
         if self.tp_params.local_rank != 0:
@@ -404,45 +625,51 @@ class ModelRunnerBase:
         self.shm.buf[4:n+4] = data
 
     def prefill(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, f"{self._runner_role()}_prefill")
+        runner_role = f"{self._runner_role()}_prefill"
+        seqs, is_prefill, step_plan = self._schedule_with_plan(runner_role)
+        trace_record = self._trace_schedule(seqs, is_prefill, runner_role, step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, runner_role, trace_record)
+        self._validate_stspec_probe_alignment(step_plan, runner_role, trace_record)
         assert is_prefill, "wrong match. current stage is decode."
-        input_ids, positions = self.prepare_prefill(seqs)
-        temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+        input_ids, positions = self.prepare_prefill(exec_seqs)
+        temperatures = self.prepare_sample(exec_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, True)
-        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
         torch.cuda.synchronize()
         token_ids = sample_tokens.tolist()
         reset_context(self.tp_params)
-        self.scheduler.postprocess(seqs, token_ids)
-        accepted_lens = {seq.seq_id: 1 for seq in seqs}
-        for seq in seqs:
+        self.scheduler.postprocess(exec_seqs, token_ids)
+        accepted_lens = {seq.seq_id: 1 for seq in exec_seqs}
+        for seq in exec_seqs:
             seq.record_accepted(1)
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, self._runner_role())
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+        runner_role = self._runner_role()
+        seqs, is_prefill, step_plan = self._schedule_with_plan(runner_role)
+        trace_record = self._trace_schedule(seqs, is_prefill, runner_role, step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, runner_role, trace_record)
+        self._validate_stspec_probe_alignment(step_plan, runner_role, trace_record)
+        input_ids, positions = self.prepare_prefill(exec_seqs) if is_prefill else self.prepare_decode(exec_seqs)
+        temperatures = self.prepare_sample(exec_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
         torch.cuda.synchronize()
         token_ids = sample_tokens.tolist()
         reset_context(self.tp_params)
-        self.scheduler.postprocess(seqs, token_ids)
-        accepted_lens = {seq.seq_id: 1 for seq in seqs}
-        for seq in seqs:
+        self.scheduler.postprocess(exec_seqs, token_ids)
+        accepted_lens = {seq.seq_id: 1 for seq in exec_seqs}
+        for seq in exec_seqs:
             seq.record_accepted(1)
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in exec_seqs]
+        num_tokens = sum(len(seq) for seq in exec_seqs) if is_prefill else -len(exec_seqs)
         return outputs, num_tokens
     
     def warmup_model(self):
@@ -751,27 +978,29 @@ class DraftModelRunner(ModelRunnerBase):
     def pearl_step(self):
         trace_record = None
         for _ in range(self.gamma):
-            seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "draft")
+            seqs, is_prefill, step_plan = self._schedule_with_plan("draft")
+            trace_record = self._trace_schedule(seqs, is_prefill, "draft", step_plan)
+            exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "draft", trace_record)
+            self._validate_stspec_probe_alignment(step_plan, "draft", trace_record)
             assert not is_prefill, "wrong match. current stage is prefill."
-            input_ids, positions = self.prepare_pearl_decode(seqs)
+            input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
             # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
             # We will support temperature in the future.
-            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
 
             # append the sample tokens to the seqs. Do not use postprocess to avoid early exiting when the draft tokens contain EOS.
-            for seq, token_id in zip(seqs, token_ids):
+            for seq, token_id in zip(exec_seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
-        accepted_lens, invalidated_lens = self.verify(seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -785,32 +1014,34 @@ class DraftModelRunner(ModelRunnerBase):
         """
         trace_record = None
         for _ in range(self.gamma):
-            seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft")
+            seqs, is_prefill, step_plan = self._schedule_with_plan("serialized_draft")
+            trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft", step_plan)
+            exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_draft", trace_record)
+            self._validate_stspec_probe_alignment(step_plan, "serialized_draft", trace_record)
             assert not is_prefill, "wrong match. current stage is prefill."
-            input_ids, positions = self.prepare_pearl_decode(seqs)
+            input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
-            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
 
-            for seq, token_id in zip(seqs, token_ids):
+            for seq, token_id in zip(exec_seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
-        accepted_lens, invalidated_lens = self.verify(seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, seqs: list[Sequence]):
+    def verify(self, seqs: list[Sequence], trace_record: dict | None = None, step_plan: StepPlan | None = None):
         if self.tp_params.local_rank == 0:
             to_be_verified_tokens = []
             next_round_input = []
@@ -820,6 +1051,23 @@ class DraftModelRunner(ModelRunnerBase):
                 else:
                     to_be_verified_tokens.extend(seq.token_ids[-2*self.gamma+1:-self.gamma+1])
                 next_round_input.extend(seq.token_ids[-self.gamma:])
+            if self._pearl_protocol_enabled():
+                draft_message = encode_legacy_draft_message(
+                    seqs=seqs,
+                    gamma=self.gamma,
+                    draft_token_ids=to_be_verified_tokens,
+                    next_round_input=next_round_input,
+                    plan_id=step_plan.plan_id if step_plan is not None else None,
+                    runner_role="draft",
+                    scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                    actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                    target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                    draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                    protocol_version=self._pearl_protocol_version(),
+                    layout_kind=self._pearl_protocol_layout(),
+                )
+                self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+                to_be_verified_tokens, next_round_input = decode_legacy_draft_message(draft_message)
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
         
@@ -828,6 +1076,25 @@ class DraftModelRunner(ModelRunnerBase):
         
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = encode_legacy_verify_result(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="draft",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = decode_legacy_verify_result(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
         for idx, seq in enumerate(seqs):
@@ -902,15 +1169,17 @@ class TargetModelRunner(ModelRunnerBase):
         return input_ids, positions, temp_seqs
 
     def pearl_step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "verify")
+        seqs, is_prefill, step_plan = self._schedule_with_plan("verify")
+        trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
+        self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -925,20 +1194,22 @@ class TargetModelRunner(ModelRunnerBase):
         # Global barrier pairs with DraftModelRunner.serialized_pearl_step().
         # Do not move this below target compute, or draft/verify will overlap.
         dist.barrier()
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")
+        seqs, is_prefill, step_plan = self._schedule_with_plan("serialized_verify")
+        trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify", step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
+        self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
+    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, trace_record: dict | None = None, step_plan: StepPlan | None = None):
         """Refer to the verification logic in the draft model verification function."""
         # verify_res will be sent to the sub-process in the target group.
         num_to_be_verified_tokens = sum([1 if seq.pre_verify else self.gamma for seq in seqs])
@@ -947,6 +1218,23 @@ class TargetModelRunner(ModelRunnerBase):
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
+        if self._pearl_protocol_enabled():
+            draft_message = encode_legacy_draft_message(
+                seqs=seqs,
+                gamma=self.gamma,
+                draft_token_ids=to_be_verified_tokens,
+                next_round_input=next_round_input,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+            to_be_verified_tokens, next_round_input = decode_legacy_draft_message(draft_message)
         
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
 
@@ -1005,6 +1293,25 @@ class TargetModelRunner(ModelRunnerBase):
 
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = encode_legacy_verify_result(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = decode_legacy_verify_result(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
 
@@ -1036,8 +1343,11 @@ class TargetModelRunner(ModelRunnerBase):
                     seq.pre_verify = True
                     if rollout[idx] > 1:
                         self.scheduler.rollback(seq, rollout[idx] - 1)
-                    seq.mark_finished()       
-        
+                    # A verification rejection ends the current speculative span,
+                    # not the request. Do not stamp request-level finish_ts until
+                    # the scheduler actually moves the sequence to finished.
+                    seq.mark_finished(record_finish_ts=False)
+
             if finish[idx]:
                 seq.mark_finished()
                 seq.num_acc_tokens.append(seq.cur_acc_tokens)
