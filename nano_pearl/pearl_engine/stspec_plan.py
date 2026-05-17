@@ -258,6 +258,7 @@ def stspec_protocol_alignment_error(
     step_plan: StepPlan,
     runner_role: str,
     gamma: int,
+    layout_kind: str = "legacy_fixed",
 ) -> str | None:
     """Return a V4A protocol blocker message, or None if alignment is safe.
 
@@ -283,6 +284,19 @@ def stspec_protocol_alignment_error(
         list(step_plan.actual_target_exec_seq_ids),
         list(step_plan.actual_draft_exec_seq_ids),
     )
+    if layout_kind == "variable_offsets":
+        return (
+            "variable_offsets protocol represented divergent seq sets, but cross-batch "
+            "draft payload routing is not implemented; "
+            f"plan_id={step_plan.plan_id}, runner_role={runner_role}, layout_kind=variable_offsets, "
+            f"draft_seq_ids={draft_ids}, target_seq_ids={target_ids}, "
+            f"actual_exec_seq_ids={actual_ids}, "
+            f"actual_draft_exec_seq_ids={draft_ids}, actual_target_exec_seq_ids={target_ids}, "
+            f"scheduled_seq_ids={step_plan.scheduled_seq_ids}, "
+            f"target_batch_seq_ids={step_plan.target_batch_seq_ids}, "
+            f"draft_home_batch_seq_ids={step_plan.draft_home_batch_seq_ids}, "
+            f"gamma={gamma}, next_required_feature=cross_batch_payload_routing"
+        )
     return (
         "ST-Spec real two-batch probe cannot proceed: draft exec seq ids != "
         "target verify seq ids under current legacy_fixed PEARL message layout; "
@@ -302,8 +316,9 @@ def validate_stspec_protocol_alignment(
     step_plan: StepPlan,
     runner_role: str,
     gamma: int,
+    layout_kind: str = "legacy_fixed",
 ) -> None:
-    error = stspec_protocol_alignment_error(step_plan, runner_role, gamma)
+    error = stspec_protocol_alignment_error(step_plan, runner_role, gamma, layout_kind)
     if error is not None:
         raise RuntimeError(error)
 

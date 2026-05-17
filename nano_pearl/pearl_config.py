@@ -110,8 +110,6 @@ class PEARLConfig:
                 "Invalid pearl_protocol_layout="
                 f"{self.pearl_protocol_layout!r}; expected legacy_fixed or variable_offsets."
             )
-        if self.pearl_protocol_layout == "variable_offsets":
-            raise NotImplementedError("variable_offsets PEARL protocol is reserved for V4C.")
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))

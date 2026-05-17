@@ -1,9 +1,9 @@
 """Explicit PEARL verification protocol envelopes.
 
-V4B keeps the NCCL tensor transport and verification semantics legacy-equivalent,
-but wraps the implicit ``gamma * len(seqs)`` layout in versioned metadata so later
-ST-Spec work can introduce variable layouts deliberately instead of relying on
-hidden positional assumptions.
+V4B introduced a versioned sidecar around the historical ``gamma * len(seqs)``
+transport. V4C adds a real ``variable_offsets`` envelope that can describe
+arbitrary/non-contiguous sequence sets and per-sequence payload lengths while
+keeping default runtime behavior on ``legacy_fixed`` unchanged.
 """
 
 from __future__ import annotations
@@ -133,10 +133,8 @@ def ensure_supported_protocol(protocol_version: int) -> None:
 
 def ensure_legacy_fixed_layout(layout_kind: str | PearlLayoutKind) -> None:
     layout = normalize_layout_kind(layout_kind)
-    if layout is PearlLayoutKind.VARIABLE_OFFSETS:
-        raise NotImplementedError("variable_offsets PEARL protocol is reserved for V4C.")
     if layout is not PearlLayoutKind.LEGACY_FIXED:
-        raise NotImplementedError(f"PEARL protocol layout {layout.value!r} is not implemented.")
+        raise NotImplementedError(f"PEARL protocol layout {layout.value!r} is not legacy_fixed.")
 
 
 def build_offsets(lengths: list[int]) -> list[int]:
@@ -150,14 +148,66 @@ def build_offsets(lengths: list[int]) -> list[int]:
     return offsets
 
 
-def validate_offsets(lengths: list[int], offsets: list[int], total: int) -> None:
-    expected = build_offsets([int(length) for length in lengths])
-    if list(offsets) != expected or int(total) != sum(int(length) for length in lengths):
-        raise RuntimeError(
-            "Invalid PEARL protocol offsets: "
-            f"per_seq_lengths={lengths}, offsets={offsets}, expected_offsets={expected}, "
-            f"total={total}, expected_total={sum(int(length) for length in lengths)}"
+def _layout_error(
+    message_type: str,
+    layout_kind: str,
+    seq_ids: list[int],
+    per_seq_lengths: list[int],
+    offsets: list[int],
+    total: int,
+    detail: str,
+) -> RuntimeError:
+    return RuntimeError(
+        f"{detail}: message_type={message_type}, layout_kind={layout_kind}, "
+        f"seq_ids={seq_ids}, per_seq_lengths={per_seq_lengths}, offsets={offsets}, total={total}"
+    )
+
+
+def validate_offsets(
+    lengths: list[int],
+    offsets: list[int],
+    total: int,
+    *,
+    message_type: str = "unknown",
+    layout_kind: str = "unknown",
+    seq_ids: list[int] | None = None,
+) -> None:
+    seq_ids = list(seq_ids or [])
+    lengths = [int(length) for length in lengths]
+    offsets = [int(offset) for offset in offsets]
+    if offsets and offsets[0] != 0:
+        raise _layout_error(message_type, layout_kind, seq_ids, lengths, offsets, total, "Invalid PEARL protocol offsets; first offset must be 0")
+    if any(offsets[idx] > offsets[idx + 1] for idx in range(len(offsets) - 1)):
+        raise _layout_error(message_type, layout_kind, seq_ids, lengths, offsets, total, "Invalid PEARL protocol offsets; offsets must be monotonic")
+    expected = build_offsets(lengths)
+    expected_total = sum(lengths)
+    if offsets != expected or int(total) != expected_total:
+        raise _layout_error(
+            message_type,
+            layout_kind,
+            seq_ids,
+            lengths,
+            offsets,
+            total,
+            f"Invalid PEARL protocol offsets; expected_offsets={expected}, expected_total={expected_total}",
         )
+
+
+def _validate_common_layout(message: PearlDraftMessage | PearlVerifyResultMessage, *, allow_duplicate_seq_ids: bool = False) -> None:
+    ensure_supported_protocol(message.protocol_version)
+    lengths = _message_lengths(message)
+    offsets = _message_offsets(message)
+    total = _message_total(message)
+    if len(message.seq_ids) != len(lengths):
+        raise _layout_error(message.message_type, message.layout_kind, message.seq_ids, lengths, offsets, total, "Invalid PEARL protocol layout; len(seq_ids) != len(per_seq_lengths)")
+    if message.request_ids and len(message.request_ids) != len(message.seq_ids):
+        raise _layout_error(message.message_type, message.layout_kind, message.seq_ids, lengths, offsets, total, "Invalid PEARL protocol layout; len(request_ids) != len(seq_ids)")
+    if not allow_duplicate_seq_ids and len(set(message.seq_ids)) != len(message.seq_ids):
+        raise _layout_error(message.message_type, message.layout_kind, message.seq_ids, lengths, offsets, total, "Invalid PEARL protocol layout; duplicate seq_ids are not allowed")
+    validate_offsets(lengths, offsets, total, message_type=message.message_type, layout_kind=message.layout_kind, seq_ids=message.seq_ids)
+    payload_length = _payload_length(message)
+    if payload_length != total:
+        raise _layout_error(message.message_type, message.layout_kind, message.seq_ids, lengths, offsets, total, f"Invalid PEARL protocol payload length; payload_length={payload_length}")
 
 
 def validate_seq_alignment(
@@ -181,32 +231,35 @@ def validate_legacy_fixed_layout(
     expected_seq_ids: Iterable[int],
     gamma: int,
 ) -> None:
-    ensure_supported_protocol(message.protocol_version)
     ensure_legacy_fixed_layout(message.layout_kind)
+    _validate_common_layout(message)
     validate_seq_alignment(message, expected_seq_ids)
-    lengths = _message_lengths(message)
-    offsets = _message_offsets(message)
-    total = _message_total(message)
-    validate_offsets(lengths, offsets, total)
-    payload_length = _payload_length(message)
-    if payload_length != total:
-        raise RuntimeError(
-            "Invalid PEARL protocol payload length: "
-            f"plan_id={message.plan_id}, message_type={message.message_type}, "
-            f"layout_kind={message.layout_kind}, expected_seq_ids={list(expected_seq_ids)}, "
-            f"message_seq_ids={message.seq_ids}, per_seq_lengths={lengths}, offsets={offsets}, "
-            f"total_payload_length={payload_length}, expected_total={total}, gamma={gamma}"
-        )
     if isinstance(message, PearlDraftMessage):
         expected_next_total = int(gamma) * len(message.seq_ids)
         if len(message.next_round_input) != expected_next_total:
-            raise RuntimeError(
-                "Invalid PEARL draft next_round_input length: "
-                f"plan_id={message.plan_id}, message_type={message.message_type}, "
-                f"layout_kind={message.layout_kind}, expected_seq_ids={list(expected_seq_ids)}, "
-                f"message_seq_ids={message.seq_ids}, per_seq_lengths={lengths}, offsets={offsets}, "
-                f"total_payload_length={len(message.next_round_input)}, gamma={gamma}"
-            )
+            raise _layout_error(message.message_type, message.layout_kind, message.seq_ids, _message_lengths(message), _message_offsets(message), _message_total(message), f"Invalid PEARL draft next_round_input length; next_round_length={len(message.next_round_input)}, expected_next_round_length={expected_next_total}")
+
+
+def validate_variable_offsets_layout(
+    message: PearlDraftMessage | PearlVerifyResultMessage,
+    expected_seq_ids: Iterable[int] | None = None,
+    *,
+    allow_duplicate_seq_ids: bool = False,
+) -> None:
+    if normalize_layout_kind(message.layout_kind) is not PearlLayoutKind.VARIABLE_OFFSETS:
+        raise NotImplementedError(f"PEARL protocol layout {message.layout_kind!r} is not variable_offsets.")
+    _validate_common_layout(message, allow_duplicate_seq_ids=allow_duplicate_seq_ids)
+    if expected_seq_ids is not None:
+        validate_seq_alignment(message, expected_seq_ids)
+    if isinstance(message, PearlDraftMessage):
+        validate_offsets(
+            [int(message.gamma)] * len(message.seq_ids),
+            message.next_round_offsets,
+            len(message.next_round_input),
+            message_type=message.message_type,
+            layout_kind=message.layout_kind,
+            seq_ids=message.seq_ids,
+        )
 
 
 def _message_lengths(message: PearlDraftMessage | PearlVerifyResultMessage) -> list[int]:
@@ -233,6 +286,26 @@ def _payload_length(message: PearlDraftMessage | PearlVerifyResultMessage) -> in
     return int(sum(int(length) for length in message.per_seq_accepted_lengths))
 
 
+def _seq_ids(seqs: list[Any]) -> list[int]:
+    return [int(seq.seq_id) for seq in seqs]
+
+
+def _request_ids(seqs: list[Any]) -> list[Any]:
+    return [seq.request_id for seq in seqs]
+
+
+def _draft_lengths(seqs: list[Any], gamma: int, per_seq_lengths: list[int] | None = None) -> list[int]:
+    if per_seq_lengths is not None:
+        return [int(length) for length in per_seq_lengths]
+    return [1 if getattr(seq, "pre_verify", False) else int(gamma) for seq in seqs]
+
+
+def _accepted_len_for_legacy(seq: Any, accepted: bool, rollout: int, gamma: int) -> int:
+    if getattr(seq, "pre_verify", False):
+        return 1 if accepted else 0
+    return int(gamma) if accepted else int(gamma) - int(rollout)
+
+
 def encode_legacy_draft_message(
     *,
     seqs: list[Any],
@@ -250,11 +323,8 @@ def encode_legacy_draft_message(
 ) -> PearlDraftMessage:
     ensure_supported_protocol(protocol_version)
     ensure_legacy_fixed_layout(layout_kind)
-    seq_ids = [int(seq.seq_id) for seq in seqs]
-    request_ids = [seq.request_id for seq in seqs]
-    per_seq_lengths = [1 if seq.pre_verify else int(gamma) for seq in seqs]
-    offsets = build_offsets(per_seq_lengths)
-    total = sum(per_seq_lengths)
+    seq_ids = _seq_ids(seqs)
+    per_seq_lengths = _draft_lengths(seqs, gamma)
     message = PearlDraftMessage(
         protocol_version=int(protocol_version),
         message_type=PearlMessageType.DRAFT_TOKENS.value,
@@ -262,10 +332,10 @@ def encode_legacy_draft_message(
         plan_id=plan_id,
         gamma=int(gamma),
         seq_ids=seq_ids,
-        request_ids=request_ids,
+        request_ids=_request_ids(seqs),
         per_seq_draft_lengths=per_seq_lengths,
-        draft_offsets=offsets,
-        total_draft_tokens=total,
+        draft_offsets=build_offsets(per_seq_lengths),
+        total_draft_tokens=sum(per_seq_lengths),
         draft_token_ids=list(draft_token_ids),
         next_round_input=list(next_round_input),
         next_round_offsets=build_offsets([int(gamma)] * len(seq_ids)),
@@ -281,6 +351,59 @@ def encode_legacy_draft_message(
 
 def decode_legacy_draft_message(message: PearlDraftMessage) -> tuple[list[int], list[int]]:
     validate_legacy_fixed_layout(message, message.seq_ids, message.gamma)
+    return list(message.draft_token_ids), list(message.next_round_input)
+
+
+def encode_variable_draft_message(
+    *,
+    seqs: list[Any],
+    gamma: int,
+    draft_token_ids: list[int],
+    next_round_input: list[int],
+    per_seq_draft_lengths: list[int] | None = None,
+    next_round_lengths: list[int] | None = None,
+    plan_id: int | None = None,
+    runner_role: str | None = None,
+    scheduled_seq_ids: list[int] | None = None,
+    actual_exec_seq_ids: list[int] | None = None,
+    target_batch_seq_ids: list[int] | None = None,
+    draft_home_batch_seq_ids: list[int] | None = None,
+    protocol_version: int = int(PearlProtocolVersion.LEGACY_EXPLICIT),
+    layout_kind: str | PearlLayoutKind = PearlLayoutKind.VARIABLE_OFFSETS,
+) -> PearlDraftMessage:
+    ensure_supported_protocol(protocol_version)
+    if normalize_layout_kind(layout_kind) is not PearlLayoutKind.VARIABLE_OFFSETS:
+        raise NotImplementedError(f"encode_variable_draft_message requires variable_offsets, got {layout_kind!r}.")
+    seq_ids = _seq_ids(seqs)
+    per_seq_lengths = _draft_lengths(seqs, gamma, per_seq_draft_lengths)
+    if next_round_lengths is None:
+        next_round_lengths = [int(gamma)] * len(seq_ids)
+    message = PearlDraftMessage(
+        protocol_version=int(protocol_version),
+        message_type=PearlMessageType.DRAFT_TOKENS.value,
+        layout_kind=PearlLayoutKind.VARIABLE_OFFSETS.value,
+        plan_id=plan_id,
+        gamma=int(gamma),
+        seq_ids=seq_ids,
+        request_ids=_request_ids(seqs),
+        per_seq_draft_lengths=per_seq_lengths,
+        draft_offsets=build_offsets(per_seq_lengths),
+        total_draft_tokens=sum(per_seq_lengths),
+        draft_token_ids=list(draft_token_ids),
+        next_round_input=list(next_round_input),
+        next_round_offsets=build_offsets([int(length) for length in next_round_lengths]),
+        scheduled_seq_ids=list(scheduled_seq_ids or seq_ids),
+        actual_exec_seq_ids=list(actual_exec_seq_ids or seq_ids),
+        target_batch_seq_ids=list(target_batch_seq_ids or []),
+        draft_home_batch_seq_ids=list(draft_home_batch_seq_ids or []),
+        runner_role=runner_role,
+    )
+    validate_variable_offsets_layout(message, seq_ids)
+    return message
+
+
+def decode_variable_draft_message(message: PearlDraftMessage) -> tuple[list[int], list[int]]:
+    validate_variable_offsets_layout(message, message.seq_ids)
     return list(message.draft_token_ids), list(message.next_round_input)
 
 
@@ -304,15 +427,13 @@ def encode_legacy_verify_result(
 ) -> PearlVerifyResultMessage:
     ensure_supported_protocol(protocol_version)
     ensure_legacy_fixed_layout(layout_kind)
-    seq_ids = [int(seq.seq_id) for seq in seqs]
-    request_ids = [seq.request_id for seq in seqs]
+    seq_ids = _seq_ids(seqs)
     if per_seq_accepted_lengths is None:
         per_seq_accepted_lengths = [
             _accepted_len_for_legacy(seq, bool(acc[idx]), int(rollout[idx]), int(gamma))
             for idx, seq in enumerate(seqs)
         ]
-    offsets = build_offsets([int(length) for length in per_seq_accepted_lengths])
-    total = sum(int(length) for length in per_seq_accepted_lengths)
+    per_seq_accepted_lengths = [int(length) for length in per_seq_accepted_lengths]
     message = PearlVerifyResultMessage(
         protocol_version=int(protocol_version),
         message_type=PearlMessageType.VERIFY_RESULT.value,
@@ -320,10 +441,10 @@ def encode_legacy_verify_result(
         plan_id=plan_id,
         gamma=int(gamma),
         seq_ids=seq_ids,
-        request_ids=request_ids,
-        per_seq_accepted_lengths=[int(length) for length in per_seq_accepted_lengths],
-        accepted_offsets=offsets,
-        total_accepted_tokens=total,
+        request_ids=_request_ids(seqs),
+        per_seq_accepted_lengths=per_seq_accepted_lengths,
+        accepted_offsets=build_offsets(per_seq_accepted_lengths),
+        total_accepted_tokens=sum(per_seq_accepted_lengths),
         acc=list(acc),
         rollout=[int(value) for value in rollout],
         revised_token_ids=[int(value) for value in revise_token],
@@ -349,15 +470,65 @@ def decode_legacy_verify_result(message: PearlVerifyResultMessage) -> tuple[list
     )
 
 
-def _accepted_len_for_legacy(seq: Any, accepted: bool, rollout: int, gamma: int) -> int:
-    if getattr(seq, "pre_verify", False):
-        return 1 if accepted else 0
-    return int(gamma) if accepted else int(gamma) - int(rollout)
+def encode_variable_verify_result(
+    *,
+    seqs: list[Any],
+    gamma: int,
+    acc: list[int | bool],
+    rollout: list[int],
+    revise_token: list[int],
+    finish: list[int | bool],
+    per_seq_accepted_lengths: list[int] | None = None,
+    plan_id: int | None = None,
+    runner_role: str | None = None,
+    scheduled_seq_ids: list[int] | None = None,
+    actual_exec_seq_ids: list[int] | None = None,
+    target_batch_seq_ids: list[int] | None = None,
+    draft_home_batch_seq_ids: list[int] | None = None,
+    protocol_version: int = int(PearlProtocolVersion.LEGACY_EXPLICIT),
+    layout_kind: str | PearlLayoutKind = PearlLayoutKind.VARIABLE_OFFSETS,
+) -> PearlVerifyResultMessage:
+    ensure_supported_protocol(protocol_version)
+    if normalize_layout_kind(layout_kind) is not PearlLayoutKind.VARIABLE_OFFSETS:
+        raise NotImplementedError(f"encode_variable_verify_result requires variable_offsets, got {layout_kind!r}.")
+    seq_ids = _seq_ids(seqs)
+    if per_seq_accepted_lengths is None:
+        per_seq_accepted_lengths = [
+            _accepted_len_for_legacy(seq, bool(acc[idx]), int(rollout[idx]), int(gamma))
+            for idx, seq in enumerate(seqs)
+        ]
+    per_seq_accepted_lengths = [int(length) for length in per_seq_accepted_lengths]
+    message = PearlVerifyResultMessage(
+        protocol_version=int(protocol_version),
+        message_type=PearlMessageType.VERIFY_RESULT.value,
+        layout_kind=PearlLayoutKind.VARIABLE_OFFSETS.value,
+        plan_id=plan_id,
+        gamma=int(gamma),
+        seq_ids=seq_ids,
+        request_ids=_request_ids(seqs),
+        per_seq_accepted_lengths=per_seq_accepted_lengths,
+        accepted_offsets=build_offsets(per_seq_accepted_lengths),
+        total_accepted_tokens=sum(per_seq_accepted_lengths),
+        acc=list(acc),
+        rollout=[int(value) for value in rollout],
+        revised_token_ids=[int(value) for value in revise_token],
+        finish_flags=list(finish),
+        payload_rows=[list(acc), [int(v) for v in rollout], [int(v) for v in revise_token], list(finish)],
+        scheduled_seq_ids=list(scheduled_seq_ids or seq_ids),
+        actual_exec_seq_ids=list(actual_exec_seq_ids or seq_ids),
+        target_batch_seq_ids=list(target_batch_seq_ids or []),
+        draft_home_batch_seq_ids=list(draft_home_batch_seq_ids or []),
+        runner_role=runner_role,
+    )
+    validate_variable_offsets_layout(message, seq_ids)
+    return message
 
 
-def encode_variable_draft_message(*args: Any, **kwargs: Any) -> PearlDraftMessage:
-    raise NotImplementedError("variable_offsets PEARL protocol is reserved for V4C.")
-
-
-def decode_variable_draft_message(*args: Any, **kwargs: Any) -> tuple[list[int], list[int]]:
-    raise NotImplementedError("variable_offsets PEARL protocol is reserved for V4C.")
+def decode_variable_verify_result(message: PearlVerifyResultMessage) -> tuple[list[Any], list[int], list[int], list[Any]]:
+    validate_variable_offsets_layout(message, message.seq_ids)
+    return (
+        list(message.acc),
+        list(message.rollout),
+        list(message.revised_token_ids),
+        list(message.finish_flags),
+    )

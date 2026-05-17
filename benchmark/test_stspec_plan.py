@@ -416,6 +416,16 @@ def run_stspec_v4a_probe_diagnostics(modules: SimpleNamespace) -> None:
     assert "target_batch_seq_ids=" in message
     assert "draft_home_batch_seq_ids=" in message
 
+    with pytest.raises(RuntimeError) as variable_exc_info:
+        modules.validate_stspec_protocol_alignment(
+            draft_plan, "draft", gamma=4, layout_kind="variable_offsets"
+        )
+    variable_message = str(variable_exc_info.value)
+    assert "cross-batch draft payload routing is not implemented" in variable_message
+    assert "layout_kind=variable_offsets" in variable_message
+    assert "next_required_feature=cross_batch_payload_routing" in variable_message
+    assert "legacy_fixed cannot represent" not in variable_message
+
 
 def test_stspec_v4a_probe_diagnostics() -> None:
     with cpu_safe_stspec_modules() as modules:

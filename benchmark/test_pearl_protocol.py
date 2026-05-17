@@ -115,12 +115,98 @@ def test_protocol_validation_rejects_bad_offsets() -> None:
         pearl_protocol.validate_legacy_fixed_layout(bad_message, [10, 11], gamma=4)
 
 
-def test_variable_offsets_reserved_for_v4c() -> None:
-    with pytest.raises(NotImplementedError, match="reserved for V4C"):
-        pearl_protocol.encode_variable_draft_message()
-    with pytest.raises(NotImplementedError, match="reserved for V4C"):
-        pearl_protocol.decode_variable_draft_message()
-    with pytest.raises(NotImplementedError, match="reserved for V4C"):
+
+def test_variable_offsets_build_offsets_with_zero_length() -> None:
+    assert pearl_protocol.build_offsets([1, 1, 1]) == [0, 1, 2]
+    assert pearl_protocol.build_offsets([4, 0, 2]) == [0, 4, 4]
+
+
+def test_encode_decode_variable_draft_message_uniform_and_heterogeneous() -> None:
+    seqs = make_seqs()
+    uniform = pearl_protocol.encode_variable_draft_message(
+        seqs=seqs,
+        gamma=4,
+        draft_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        next_round_input=[11, 12, 13, 14, 21, 22, 23, 24],
+        per_seq_draft_lengths=[4, 4],
+        plan_id=9,
+    )
+    assert uniform.layout_kind == "variable_offsets"
+    assert uniform.draft_offsets == [0, 4]
+    assert uniform.total_draft_tokens == 8
+    assert pearl_protocol.decode_variable_draft_message(uniform)[0] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    heterogeneous = pearl_protocol.encode_variable_draft_message(
+        seqs=seqs,
+        gamma=4,
+        draft_token_ids=[1, 2, 3, 4, 5],
+        next_round_input=[11, 12, 13, 14, 21, 22, 23, 24],
+        per_seq_draft_lengths=[1, 4],
+        plan_id=10,
+    )
+    assert heterogeneous.draft_offsets == [0, 1]
+    assert heterogeneous.per_seq_draft_lengths == [1, 4]
+    json.dumps(heterogeneous.to_trace_dict(), sort_keys=True)
+
+
+def test_encode_decode_variable_verify_result_and_zero_length() -> None:
+    seqs = make_seqs()
+    message = pearl_protocol.encode_variable_verify_result(
+        seqs=seqs,
+        gamma=4,
+        acc=[False, True],
+        rollout=[1, 0],
+        revise_token=[101, -1],
+        finish=[False, False],
+        per_seq_accepted_lengths=[0, 4],
+        plan_id=11,
+    )
+    assert message.layout_kind == "variable_offsets"
+    assert message.per_seq_accepted_lengths == [0, 4]
+    assert message.accepted_offsets == [0, 0]
+    assert message.total_accepted_tokens == 4
+    assert pearl_protocol.decode_variable_verify_result(message) == (
+        [False, True],
+        [1, 0],
+        [101, -1],
+        [False, False],
+    )
+    json.dumps(message.to_trace_dict(), sort_keys=True)
+
+
+def test_variable_offsets_validation_failures() -> None:
+    seqs = make_seqs()
+    message = pearl_protocol.encode_variable_draft_message(
+        seqs=seqs,
+        gamma=4,
+        draft_token_ids=[1, 2, 3, 4, 5],
+        next_round_input=[11, 12, 13, 14, 21, 22, 23, 24],
+        per_seq_draft_lengths=[1, 4],
+    )
+    bad_offsets = replace(message, draft_offsets=[0, 2])
+    with pytest.raises(RuntimeError, match="Invalid PEARL protocol offsets"):
+        pearl_protocol.validate_variable_offsets_layout(bad_offsets, [10, 11])
+
+    duplicate = replace(message, seq_ids=[10, 10])
+    with pytest.raises(RuntimeError, match="duplicate seq_ids"):
+        pearl_protocol.validate_variable_offsets_layout(duplicate, [10, 10])
+
+    bad_payload = replace(message, draft_token_ids=[1, 2])
+    with pytest.raises(RuntimeError, match="payload length"):
+        pearl_protocol.validate_variable_offsets_layout(bad_payload, [10, 11])
+
+
+def test_variable_offsets_no_longer_reserved() -> None:
+    seqs = make_seqs()
+    message = pearl_protocol.encode_variable_draft_message(
+        seqs=seqs,
+        gamma=4,
+        draft_token_ids=[1, 2, 3, 4, 5],
+        next_round_input=[11, 12, 13, 14, 21, 22, 23, 24],
+        per_seq_draft_lengths=[1, 4],
+    )
+    pearl_protocol.validate_variable_offsets_layout(message, [10, 11])
+    with pytest.raises(NotImplementedError, match="not legacy_fixed"):
         pearl_protocol.ensure_legacy_fixed_layout("variable_offsets")
 
 

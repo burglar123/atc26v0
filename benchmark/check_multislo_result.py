@@ -144,6 +144,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     raw_protocol_seq_alignment_errors = 0
     draft_message_total_tokens: List[float] = []
     verify_result_total_tokens: List[float] = []
+    variable_offsets_seen_count = 0
+    variable_offsets_validation_errors = 0
+    cross_batch_routing_error_count = 0
+    next_required_features = set()
+    raw_variable_draft_message_count = 0
+    raw_variable_verify_result_message_count = 0
+    variable_draft_total_tokens: List[float] = []
+    variable_verify_total_tokens: List[float] = []
 
     for row in rows:
         signature = row.get("plan_signature")
@@ -289,9 +297,37 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         verify_total = to_float(row.get("verify_result_total_tokens"))
         if verify_total is not None:
             verify_result_total_tokens.append(verify_total)
+        if row.get("variable_offsets_enabled") is True or row.get("pearl_protocol_layout") == "variable_offsets":
+            variable_offsets_seen_count += 1
+        variable_offsets_seen_count += int(row.get("variable_offsets_seen_count") or 0)
+        if row.get("variable_offsets_validation_error"):
+            variable_offsets_validation_errors += 1
+        variable_offsets_validation_errors += int(row.get("variable_offsets_validation_error_count") or 0)
+        if row.get("cross_batch_routing_error"):
+            cross_batch_routing_error_count += 1
+        cross_batch_routing_error_count += int(row.get("cross_batch_routing_error_count") or 0)
+        if row.get("next_required_feature"):
+            next_required_features.add(row.get("next_required_feature"))
+        for value in values_from_mapping(row.get("next_required_features")):
+            if value:
+                next_required_features.add(value)
+        if row.get("variable_draft_message_seq_ids") is not None:
+            raw_variable_draft_message_count += 1
+        raw_variable_draft_message_count += int(row.get("variable_draft_message_seen_count") or 0)
+        if row.get("variable_verify_result_seq_ids") is not None:
+            raw_variable_verify_result_message_count += 1
+        raw_variable_verify_result_message_count += int(row.get("variable_verify_result_seen_count") or 0)
+        variable_draft_total = to_float(row.get("variable_draft_message_total_tokens"))
+        if variable_draft_total is not None:
+            variable_draft_total_tokens.append(variable_draft_total)
+        variable_verify_total = to_float(row.get("variable_verify_result_total_tokens"))
+        if variable_verify_total is not None:
+            variable_verify_total_tokens.append(variable_verify_total)
 
     draft_total_min, draft_total_med, draft_total_max = quantiles(draft_message_total_tokens)
     verify_total_min, verify_total_med, verify_total_max = quantiles(verify_result_total_tokens)
+    variable_draft_min, variable_draft_med, variable_draft_max = quantiles(variable_draft_total_tokens)
+    variable_verify_min, variable_verify_med, variable_verify_max = quantiles(variable_verify_total_tokens)
 
     duplicate_plan_ids_by_role = {
         f"{role}:{plan_id}": count
@@ -343,6 +379,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "raw_protocol_seq_alignment_errors": raw_protocol_seq_alignment_errors,
         "draft_message_total_token_summary": (draft_total_min, draft_total_med, draft_total_max),
         "verify_result_total_token_summary": (verify_total_min, verify_total_med, verify_total_max),
+        "variable_offsets_seen_count": variable_offsets_seen_count,
+        "variable_offsets_validation_errors": variable_offsets_validation_errors,
+        "cross_batch_routing_error_count": cross_batch_routing_error_count,
+        "next_required_features": sorted(next_required_features, key=str),
+        "raw_variable_draft_message_count": raw_variable_draft_message_count,
+        "raw_variable_verify_result_message_count": raw_variable_verify_result_message_count,
+        "variable_draft_total_token_summary": (variable_draft_min, variable_draft_med, variable_draft_max),
+        "variable_verify_total_token_summary": (variable_verify_min, variable_verify_med, variable_verify_max),
     }
 
 
@@ -550,6 +594,22 @@ def summarize(path: Path) -> int:
     print(
         "verify result accepted tokens min/median/max: "
         f"{fmt(verify_min)} / {fmt(verify_med)} / {fmt(verify_max)}"
+    )
+    print(f"variable_offsets seen count: {plan_summary['variable_offsets_seen_count']}")
+    print(f"variable_offsets validation errors: {plan_summary['variable_offsets_validation_errors']}")
+    print(f"cross_batch_routing_error_count: {plan_summary['cross_batch_routing_error_count']}")
+    print(f"next_required_features: {plan_summary['next_required_features']}")
+    print(f"raw variable draft message count: {plan_summary['raw_variable_draft_message_count']}")
+    print(f"raw variable verify result message count: {plan_summary['raw_variable_verify_result_message_count']}")
+    variable_draft_min, variable_draft_med, variable_draft_max = plan_summary['variable_draft_total_token_summary']
+    variable_verify_min, variable_verify_med, variable_verify_max = plan_summary['variable_verify_total_token_summary']
+    print(
+        "variable draft total tokens min/median/max: "
+        f"{fmt(variable_draft_min)} / {fmt(variable_draft_med)} / {fmt(variable_draft_max)}"
+    )
+    print(
+        "variable verify total tokens min/median/max: "
+        f"{fmt(variable_verify_min)} / {fmt(variable_verify_med)} / {fmt(variable_verify_max)}"
     )
 
     anomalous = arrival_after_finish + elapsed_mismatch + tpot_mismatch

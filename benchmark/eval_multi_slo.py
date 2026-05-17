@@ -462,6 +462,12 @@ PLAN_REQUEST_FIELDS = [
     "draft_message_seen_count",
     "verify_result_seen_count",
     "protocol_seq_alignment_error_count",
+    "variable_offsets_seen_count",
+    "variable_offsets_validation_error_count",
+    "cross_batch_routing_error_count",
+    "next_required_features",
+    "variable_draft_message_seen_count",
+    "variable_verify_result_seen_count",
     "is_eager",
     "plan_roles",
 ]
@@ -663,6 +669,12 @@ def aggregate_low_level_traces(
         draft_message_seen_count = 0
         verify_result_seen_count = 0
         protocol_seq_alignment_error_count = 0
+        variable_offsets_seen_count = 0
+        variable_offsets_validation_error_count = 0
+        cross_batch_routing_error_count = 0
+        next_required_features: List[str] = []
+        variable_draft_message_seen_count = 0
+        variable_verify_result_seen_count = 0
 
         for entry in entries:
             e = entry["event"]
@@ -754,8 +766,19 @@ def aggregate_low_level_traces(
             append_unique(real_probe_block_reasons, e.get("real_probe_block_reason"))
             append_unique(protocol_alignment_errors, e.get("protocol_alignment_error"))
             append_unique(pearl_protocol_layouts, e.get("pearl_protocol_layout"))
+            if e.get("pearl_protocol_layout") == "variable_offsets" or e.get("variable_offsets_enabled") is True:
+                variable_offsets_seen_count += 1
             if e.get("protocol_validation_error"):
                 protocol_validation_error_count += 1
+            if e.get("variable_offsets_validation_error"):
+                variable_offsets_validation_error_count += 1
+            if e.get("cross_batch_routing_error"):
+                cross_batch_routing_error_count += 1
+            append_unique(next_required_features, e.get("next_required_feature"))
+            if e.get("variable_draft_message_seq_ids") is not None:
+                variable_draft_message_seen_count += 1
+            if e.get("variable_verify_result_seq_ids") is not None:
+                variable_verify_result_seen_count += 1
             if e.get("draft_message_seq_ids") is not None:
                 draft_message_seen_count += 1
             if e.get("verify_result_seq_ids") is not None:
@@ -907,6 +930,13 @@ def aggregate_low_level_traces(
         row["draft_message_seen_count"] = draft_message_seen_count
         row["verify_result_seen_count"] = verify_result_seen_count
         row["protocol_seq_alignment_error_count"] = protocol_seq_alignment_error_count
+        row["variable_offsets_seen_count"] = variable_offsets_seen_count
+        row["variable_offsets_validation_error_count"] = variable_offsets_validation_error_count
+        row["cross_batch_routing_error_count"] = cross_batch_routing_error_count
+        if next_required_features:
+            row["next_required_features"] = next_required_features
+        row["variable_draft_message_seen_count"] = variable_draft_message_seen_count
+        row["variable_verify_result_seen_count"] = variable_verify_result_seen_count
         if plan_roles:
             row["plan_roles"] = plan_roles
         if plan_scheduled_seq_ids:
@@ -1772,6 +1802,12 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "draft_message_seen_count": row.get("draft_message_seen_count"),
         "verify_result_seen_count": row.get("verify_result_seen_count"),
         "protocol_seq_alignment_error_count": row.get("protocol_seq_alignment_error_count"),
+        "variable_offsets_seen_count": row.get("variable_offsets_seen_count"),
+        "variable_offsets_validation_error_count": row.get("variable_offsets_validation_error_count"),
+        "cross_batch_routing_error_count": row.get("cross_batch_routing_error_count"),
+        "next_required_features": row.get("next_required_features"),
+        "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
+        "variable_verify_result_seen_count": row.get("variable_verify_result_seen_count"),
         "is_eager": row.get("is_eager"),
         "plan_roles": row.get("plan_roles"),
         "execution_mode": row.get("execution_mode", execution_mode),
