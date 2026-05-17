@@ -87,6 +87,8 @@ class PEARLConfig:
     execution_mode: str = "parallel_pearl"
     enable_stspec_two_batch_execution: bool = False
     stspec_two_batch_dryrun: bool = True
+    stspec_two_batch_probe: bool = False
+    stspec_two_batch_probe_fail_fast: bool = True
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -113,9 +115,16 @@ class PEARLConfig:
         logger.info(f"Execution_Mode={self.execution_mode}")
         logger.info(f"STSpec_Two_Batch_Execution={self.enable_stspec_two_batch_execution}")
         logger.info(f"STSpec_Two_Batch_Dryrun={self.stspec_two_batch_dryrun}")
-        if self.enable_stspec_two_batch_execution and not self.stspec_two_batch_dryrun:
+        logger.info(f"STSpec_Two_Batch_Probe={self.stspec_two_batch_probe}")
+        logger.info(f"STSpec_Two_Batch_Probe_Fail_Fast={self.stspec_two_batch_probe_fail_fast}")
+        if (
+            self.enable_stspec_two_batch_execution
+            and not self.stspec_two_batch_dryrun
+            and not self.stspec_two_batch_probe
+        ):
             raise NotImplementedError(
-                "Real ST-Spec two-batch execution is not implemented in V3C."
+                "Real ST-Spec two-batch execution is only available in explicit V4A "
+                "probe mode. Set stspec_two_batch_probe=True for the guarded probe."
             )
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8

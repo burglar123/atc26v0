@@ -127,6 +127,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     raw_invalid_target_draft = 0
     plan_ids: List[int] = []
     plan_id_role_counts: Dict[tuple[Any, Any], int] = {}
+    real_probe_attempted_rows = 0
+    real_probe_applied_rows = 0
+    real_probe_blocked_rows = 0
+    real_probe_block_reasons: set[Any] = set()
+    raw_actual_differs_from_scheduled = 0
+    raw_protocol_alignment_false = 0
+    raw_empty_actual_exec = 0
+    actual_exec_fraction_values: List[float] = []
 
     for row in rows:
         signature = row.get("plan_signature")
@@ -214,6 +222,34 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 raw_home_batch_id_values.add(value)
                 raw_home_batch_id_counts[value] += 1
 
+
+        if bool(row.get("real_probe_attempted") or signature.get("real_probe_attempted")):
+            real_probe_attempted_rows += 1
+        if bool(row.get("real_probe_applied") or signature.get("real_probe_applied")):
+            real_probe_applied_rows += 1
+        if bool(row.get("real_probe_blocked") or signature.get("real_probe_blocked")):
+            real_probe_blocked_rows += 1
+        for reason_value in values_from_mapping(row.get("real_probe_block_reasons")):
+            if reason_value:
+                real_probe_block_reasons.add(reason_value)
+        reason = row.get("real_probe_block_reason", signature.get("real_probe_block_reason"))
+        if reason:
+            real_probe_block_reasons.add(reason)
+
+        actual_exec_seq_ids = row.get("actual_exec_seq_ids", signature.get("actual_exec_seq_ids"))
+        scheduled_seq_ids = row.get("plan_scheduled_seq_ids") or row.get("scheduled_seq_ids") or signature.get("scheduled_seq_ids")
+        if isinstance(actual_exec_seq_ids, list) and isinstance(scheduled_seq_ids, list):
+            if actual_exec_seq_ids != scheduled_seq_ids:
+                raw_actual_differs_from_scheduled += 1
+            if not actual_exec_seq_ids:
+                raw_empty_actual_exec += 1
+        protocol_ok = row.get("protocol_alignment_ok", signature.get("protocol_alignment_ok"))
+        if protocol_ok is False:
+            raw_protocol_alignment_false += 1
+        fraction = to_float(row.get("actual_exec_fraction", signature.get("actual_exec_fraction")))
+        if fraction is not None:
+            actual_exec_fraction_values.append(fraction)
+
     duplicate_plan_ids_by_role = {
         f"{role}:{plan_id}": count
         for (role, plan_id), count in plan_id_role_counts.items()
@@ -243,6 +279,18 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "plan_id_min": min(plan_ids) if plan_ids else None,
         "plan_id_max": max(plan_ids) if plan_ids else None,
         "duplicate_plan_id_by_role": duplicate_plan_ids_by_role,
+        "real_probe_attempted_rows": real_probe_attempted_rows,
+        "real_probe_applied_rows": real_probe_applied_rows,
+        "real_probe_blocked_rows": real_probe_blocked_rows,
+        "unique_real_probe_block_reasons": sorted(real_probe_block_reasons, key=str),
+        "raw_actual_exec_differs_from_scheduled": raw_actual_differs_from_scheduled,
+        "raw_protocol_alignment_false": raw_protocol_alignment_false,
+        "raw_empty_actual_exec": raw_empty_actual_exec,
+        "avg_actual_exec_fraction": (
+            sum(actual_exec_fraction_values) / len(actual_exec_fraction_values)
+            if actual_exec_fraction_values
+            else None
+        ),
     }
 
 
@@ -413,6 +461,26 @@ def summarize(path: Path) -> int:
     print(
         "duplicate plan_id by role: "
         f"{plan_summary['duplicate_plan_id_by_role']}"
+    )
+    print(f"real_probe_attempted rows: {plan_summary['real_probe_attempted_rows']}")
+    print(f"real_probe_applied rows: {plan_summary['real_probe_applied_rows']}")
+    print(f"real_probe_blocked rows: {plan_summary['real_probe_blocked_rows']}")
+    print(
+        "unique real_probe_block_reason values: "
+        f"{plan_summary['unique_real_probe_block_reasons']}"
+    )
+    print(
+        "raw rows with actual_exec_seq_ids != scheduled_seq_ids: "
+        f"{plan_summary['raw_actual_exec_differs_from_scheduled']}"
+    )
+    print(
+        "raw rows with protocol_alignment_ok=false: "
+        f"{plan_summary['raw_protocol_alignment_false']}"
+    )
+    print(f"raw rows with empty actual_exec_seq_ids: {plan_summary['raw_empty_actual_exec']}")
+    print(
+        "average actual_exec_fraction: "
+        f"{fmt(plan_summary['avg_actual_exec_fraction'])}"
     )
 
     anomalous = arrival_after_finish + elapsed_mismatch + tpot_mismatch

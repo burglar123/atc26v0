@@ -41,6 +41,12 @@ class Scheduler:
         self.stspec_two_batch_dryrun = bool(
             getattr(config, "stspec_two_batch_dryrun", True)
         )
+        self.stspec_two_batch_probe = bool(
+            getattr(config, "stspec_two_batch_probe", False)
+        )
+        self.stspec_two_batch_probe_fail_fast = bool(
+            getattr(config, "stspec_two_batch_probe_fail_fast", True)
+        )
 
     def next_batch_id(self, runner_role: str) -> tuple[int, str]:
         iteration_id = self.iteration_id
@@ -106,9 +112,14 @@ class Scheduler:
         scheduler decision. The plan_id mirrors the next trace iteration id that
         _trace_schedule() will consume, preserving current iteration accounting.
         """
-        if self.enable_stspec_two_batch_execution and not self.stspec_two_batch_dryrun:
+        if (
+            self.enable_stspec_two_batch_execution
+            and not self.stspec_two_batch_dryrun
+            and not self.stspec_two_batch_probe
+        ):
             raise NotImplementedError(
-                "Real ST-Spec two-batch execution is not implemented in V3C."
+                "Real ST-Spec two-batch execution is only available in explicit V4A "
+                "probe mode; enable stspec_two_batch_probe for the guarded probe."
             )
         plan_id = self.iteration_id
         seqs, is_prefill = self.schedule()
@@ -132,6 +143,8 @@ class Scheduler:
             draft_home_batch_id=draft_home_batch_id,
             two_batch_execution_enabled=self.enable_stspec_two_batch_execution,
             two_batch_execution_dryrun=self.stspec_two_batch_dryrun,
+            stspec_two_batch_probe=self.stspec_two_batch_probe,
+            stspec_two_batch_probe_fail_fast=self.stspec_two_batch_probe_fail_fast,
         )
         return seqs, is_prefill, step_plan
 

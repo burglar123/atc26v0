@@ -133,6 +133,8 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "execution_mode": args.execution_mode,
         "enable_stspec_two_batch_execution": args.enable_stspec_two_batch_execution,
         "stspec_two_batch_dryrun": args.stspec_two_batch_dryrun,
+        "stspec_two_batch_probe": args.stspec_two_batch_probe,
+        "stspec_two_batch_probe_fail_fast": args.stspec_two_batch_probe_fail_fast,
     }
 
     # Try new named-path style with gamma.
@@ -436,6 +438,20 @@ PLAN_REQUEST_FIELDS = [
     "dryrun_draft_exec_hit_count",
     "dryrun_target_home_batch_ids",
     "dryrun_draft_home_batch_ids",
+    "stspec_probe_enabled",
+    "stspec_probe_fail_fast",
+    "stspec_probe_local_only",
+    "real_probe_attempted",
+    "real_probe_applied",
+    "real_probe_blocked",
+    "real_probe_block_reasons",
+    "filtered_out_seq_count",
+    "avg_actual_exec_fraction",
+    "protocol_alignment_ok",
+    "protocol_alignment_errors",
+    "scheduled_seq_ids",
+    "actual_exec_seq_ids",
+    "filtered_out_seq_ids",
     "is_eager",
     "plan_roles",
 ]
@@ -617,6 +633,20 @@ def aggregate_low_level_traces(
         dryrun_draft_exec_hit_count = 0
         dryrun_target_home_batch_ids: List[int] = []
         dryrun_draft_home_batch_ids: List[int] = []
+        stspec_probe_enabled_values: List[bool] = []
+        stspec_probe_fail_fast_values: List[bool] = []
+        stspec_probe_local_only_values: List[bool] = []
+        real_probe_attempted_values: List[bool] = []
+        real_probe_applied_values: List[bool] = []
+        real_probe_blocked_values: List[bool] = []
+        real_probe_block_reasons: List[str] = []
+        protocol_alignment_values: List[bool] = []
+        protocol_alignment_errors: List[str] = []
+        filtered_out_seq_count = 0
+        actual_exec_fractions: List[float] = []
+        scheduled_exec_seq_ids: List[Any] = []
+        actual_exec_seq_ids: List[Any] = []
+        filtered_out_seq_ids: List[Any] = []
 
         for entry in entries:
             e = entry["event"]
@@ -693,10 +723,31 @@ def aggregate_low_level_traces(
             for bool_key, dst in (
                 ("two_batch_execution_enabled", two_batch_execution_enabled_values),
                 ("two_batch_execution_dryrun", two_batch_execution_dryrun_values),
+                ("stspec_probe_enabled", stspec_probe_enabled_values),
+                ("stspec_probe_fail_fast", stspec_probe_fail_fast_values),
+                ("stspec_probe_local_only", stspec_probe_local_only_values),
+                ("real_probe_attempted", real_probe_attempted_values),
+                ("real_probe_applied", real_probe_applied_values),
+                ("real_probe_blocked", real_probe_blocked_values),
+                ("protocol_alignment_ok", protocol_alignment_values),
             ):
                 if e.get(bool_key) is not None:
                     dst.append(bool(e.get(bool_key)))
             append_unique(two_batch_execution_modes, e.get("two_batch_execution_mode"))
+            append_unique(real_probe_block_reasons, e.get("real_probe_block_reason"))
+            append_unique(protocol_alignment_errors, e.get("protocol_alignment_error"))
+            filtered_out_seq_count += int(e.get("filtered_out_seq_count") or 0)
+            fraction = to_float(e.get("actual_exec_fraction"))
+            if fraction is not None:
+                actual_exec_fractions.append(fraction)
+            for value, dst in (
+                (e.get("scheduled_seq_ids"), scheduled_exec_seq_ids),
+                (e.get("actual_exec_seq_ids"), actual_exec_seq_ids),
+                (e.get("filtered_out_seq_ids"), filtered_out_seq_ids),
+            ):
+                if isinstance(value, list):
+                    for item in value:
+                        append_unique(dst, item)
             for list_key, counter_name in (
                 ("actual_target_exec_seq_ids", "actual_target"),
                 ("actual_draft_exec_seq_ids", "actual_draft"),
@@ -797,6 +848,30 @@ def aggregate_low_level_traces(
             row["dryrun_target_home_batch_ids"] = dryrun_target_home_batch_ids
         if dryrun_draft_home_batch_ids:
             row["dryrun_draft_home_batch_ids"] = dryrun_draft_home_batch_ids
+        if stspec_probe_enabled_values:
+            row["stspec_probe_enabled"] = any(stspec_probe_enabled_values)
+        if stspec_probe_fail_fast_values:
+            row["stspec_probe_fail_fast"] = any(stspec_probe_fail_fast_values)
+        if stspec_probe_local_only_values:
+            row["stspec_probe_local_only"] = any(stspec_probe_local_only_values)
+        row["real_probe_attempted"] = any(real_probe_attempted_values)
+        row["real_probe_applied"] = any(real_probe_applied_values)
+        row["real_probe_blocked"] = any(real_probe_blocked_values)
+        if real_probe_block_reasons:
+            row["real_probe_block_reasons"] = real_probe_block_reasons
+        row["filtered_out_seq_count"] = filtered_out_seq_count
+        if actual_exec_fractions:
+            row["avg_actual_exec_fraction"] = sum(actual_exec_fractions) / len(actual_exec_fractions)
+        if protocol_alignment_values:
+            row["protocol_alignment_ok"] = all(protocol_alignment_values)
+        if protocol_alignment_errors:
+            row["protocol_alignment_errors"] = protocol_alignment_errors
+        if scheduled_exec_seq_ids:
+            row["scheduled_seq_ids"] = scheduled_exec_seq_ids
+        if actual_exec_seq_ids:
+            row["actual_exec_seq_ids"] = actual_exec_seq_ids
+        if filtered_out_seq_ids:
+            row["filtered_out_seq_ids"] = filtered_out_seq_ids
         if plan_roles:
             row["plan_roles"] = plan_roles
         if plan_scheduled_seq_ids:
@@ -1642,6 +1717,20 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "dryrun_draft_exec_hit_count": row.get("dryrun_draft_exec_hit_count"),
         "dryrun_target_home_batch_ids": row.get("dryrun_target_home_batch_ids"),
         "dryrun_draft_home_batch_ids": row.get("dryrun_draft_home_batch_ids"),
+        "stspec_probe_enabled": row.get("stspec_probe_enabled"),
+        "stspec_probe_fail_fast": row.get("stspec_probe_fail_fast"),
+        "stspec_probe_local_only": row.get("stspec_probe_local_only"),
+        "real_probe_attempted": row.get("real_probe_attempted"),
+        "real_probe_applied": row.get("real_probe_applied"),
+        "real_probe_blocked": row.get("real_probe_blocked"),
+        "real_probe_block_reasons": row.get("real_probe_block_reasons"),
+        "filtered_out_seq_count": row.get("filtered_out_seq_count"),
+        "avg_actual_exec_fraction": row.get("avg_actual_exec_fraction"),
+        "protocol_alignment_ok": row.get("protocol_alignment_ok"),
+        "protocol_alignment_errors": row.get("protocol_alignment_errors"),
+        "scheduled_seq_ids": row.get("scheduled_seq_ids"),
+        "actual_exec_seq_ids": row.get("actual_exec_seq_ids"),
+        "filtered_out_seq_ids": row.get("filtered_out_seq_ids"),
         "is_eager": row.get("is_eager"),
         "plan_roles": row.get("plan_roles"),
         "execution_mode": row.get("execution_mode", execution_mode),
@@ -1715,8 +1804,22 @@ def main() -> None:
         default=True,
         help=(
             "Keep ST-Spec two-batch execution in dry-run mode. "
-            "--no-stspec-two-batch-dryrun with execution enabled is unsupported in V3C."
+            "Use --no-stspec-two-batch-dryrun only with --stspec-two-batch-probe for V4A."
         ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-probe",
+        action="store_true",
+        help=(
+            "Enable the guarded V4A real two-batch feasibility probe. Requires "
+            "--enable-stspec-two-batch-execution and --no-stspec-two-batch-dryrun."
+        ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-probe-fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail fast with protocol diagnostics when the V4A probe is incompatible.",
     )
 
     parser.add_argument(

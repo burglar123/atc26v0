@@ -64,6 +64,9 @@ def cpu_safe_stspec_modules() -> Iterator[SimpleNamespace]:
             Sequence=sequence_mod.Sequence,
             stspec_plan=stspec_plan_mod,
             PlanRole=stspec_plan_mod.PlanRole,
+            StepPlan=stspec_plan_mod.StepPlan,
+            select_exec_seqs_for_plan=stspec_plan_mod.select_exec_seqs_for_plan,
+            validate_stspec_protocol_alignment=stspec_plan_mod.validate_stspec_protocol_alignment,
         )
     finally:
         for name in list(sys.modules):
@@ -280,10 +283,150 @@ def run_stspec_two_batch_dryrun_semantics(modules: SimpleNamespace) -> None:
     assert draft_plan.dryrun_draft_exec_seq_ids == draft_home_seq_ids
 
 
+def run_stspec_v4a_probe_diagnostics(modules: SimpleNamespace) -> None:
+    import pytest
+
+    dryrun_scheduler = make_scheduler(modules)
+    dryrun_scheduler.enable_stspec_two_batch_execution = True
+    dryrun_scheduler.stspec_two_batch_dryrun = True
+    dryrun_seqs = add_dummy_requests(dryrun_scheduler, modules)
+    dryrun_scheduler.schedule()
+    _, _, dryrun_plan = dryrun_scheduler.schedule_with_plan(
+        runner_role="draft",
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        default_gamma=4,
+    )
+    assert dryrun_plan.actual_exec_seq_ids == [seq.seq_id for seq in dryrun_seqs]
+    assert modules.select_exec_seqs_for_plan(dryrun_seqs, dryrun_plan, "draft") == dryrun_seqs
+
+    unsupported_scheduler = make_scheduler(modules)
+    unsupported_scheduler.enable_stspec_two_batch_execution = True
+    unsupported_scheduler.stspec_two_batch_dryrun = False
+    unsupported_scheduler.stspec_two_batch_probe = False
+    add_dummy_requests(unsupported_scheduler, modules)
+    unsupported_scheduler.schedule()
+    with pytest.raises(NotImplementedError):
+        unsupported_scheduler.schedule_with_plan(
+            runner_role="draft",
+            execution_mode="parallel_pearl",
+            decode_ready_mode=False,
+            default_gamma=4,
+        )
+
+    probe_scheduler = make_scheduler(modules)
+    probe_scheduler.enable_stspec_two_batch_execution = True
+    probe_scheduler.stspec_two_batch_dryrun = False
+    probe_scheduler.stspec_two_batch_probe = True
+    probe_scheduler.stspec_two_batch_probe_fail_fast = True
+    probe_seqs = add_dummy_requests(probe_scheduler, modules)
+    probe_scheduler.schedule()
+    _, is_prefill, draft_plan = probe_scheduler.schedule_with_plan(
+        runner_role="draft",
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        default_gamma=4,
+    )
+    assert is_prefill is False
+    scheduled_seq_ids = [seq.seq_id for seq in probe_seqs]
+    expected_draft_ids = [
+        seq.seq_id for seq in probe_seqs if seq.home_batch_id == draft_plan.draft_home_batch_id
+    ]
+    expected_target_ids = [
+        seq.seq_id for seq in probe_seqs if seq.home_batch_id == draft_plan.target_home_batch_id
+    ]
+    assert draft_plan.two_batch_execution_mode == "real_probe"
+    assert draft_plan.real_probe_attempted is True
+    assert draft_plan.actual_draft_exec_seq_ids == expected_draft_ids
+    assert draft_plan.actual_target_exec_seq_ids == expected_target_ids
+    assert draft_plan.actual_exec_seq_ids == expected_draft_ids
+
+    verify_plan = modules.stspec_plan.build_legacy_step_plan(
+        plan_id=draft_plan.plan_id,
+        seqs=probe_seqs,
+        is_prefill=False,
+        runner_role="verify",
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        default_gamma=4,
+        target_home_batch_id=draft_plan.target_home_batch_id,
+        draft_home_batch_id=draft_plan.draft_home_batch_id,
+        two_batch_execution_enabled=True,
+        two_batch_execution_dryrun=False,
+        stspec_two_batch_probe=True,
+    )
+    assert verify_plan.actual_exec_seq_ids == expected_target_ids
+    assert draft_plan.filtered_out_seq_ids == [
+        seq_id for seq_id in scheduled_seq_ids if seq_id not in set(expected_draft_ids)
+    ]
+
+    exec_seqs = modules.select_exec_seqs_for_plan(probe_seqs, draft_plan, "draft")
+    assert [seq.seq_id for seq in exec_seqs] == expected_draft_ids
+
+    reversed_probe_seqs = list(reversed(probe_seqs))
+    with pytest.raises(RuntimeError, match="do not match the StepPlan"):
+        modules.select_exec_seqs_for_plan(reversed_probe_seqs, draft_plan, "draft")
+
+    duplicate_plan = modules.StepPlan(
+        plan_id=999,
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        runner_role="draft",
+        is_prefill=False,
+        legacy_equivalent=False,
+        scheduled_seq_ids=scheduled_seq_ids,
+        actual_draft_exec_seq_ids=[scheduled_seq_ids[0], scheduled_seq_ids[0]],
+    )
+    with pytest.raises(RuntimeError, match="duplicate actual exec ids"):
+        modules.select_exec_seqs_for_plan(probe_seqs, duplicate_plan, "draft")
+
+    missing_plan = modules.StepPlan(
+        plan_id=1000,
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        runner_role="draft",
+        is_prefill=False,
+        legacy_equivalent=False,
+        scheduled_seq_ids=scheduled_seq_ids,
+        actual_draft_exec_seq_ids=[max(scheduled_seq_ids) + 999],
+    )
+    with pytest.raises(RuntimeError, match="outside scheduled ids"):
+        modules.select_exec_seqs_for_plan(probe_seqs, missing_plan, "draft")
+
+    empty_plan = modules.StepPlan(
+        plan_id=1001,
+        execution_mode="parallel_pearl",
+        decode_ready_mode=False,
+        runner_role="draft",
+        is_prefill=False,
+        legacy_equivalent=False,
+        scheduled_seq_ids=scheduled_seq_ids,
+        actual_draft_exec_seq_ids=[],
+    )
+    with pytest.raises(RuntimeError, match="empty actual exec set"):
+        modules.select_exec_seqs_for_plan(probe_seqs, empty_plan, "draft")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        modules.validate_stspec_protocol_alignment(draft_plan, "draft", gamma=4)
+    message = str(exc_info.value)
+    assert "draft exec seq ids != target verify seq ids" in message
+    assert f"plan_id={draft_plan.plan_id}" in message
+    assert "scheduled_seq_ids=" in message
+    assert "actual_exec_seq_ids=" in message
+    assert "target_batch_seq_ids=" in message
+    assert "draft_home_batch_seq_ids=" in message
+
+
+def test_stspec_v4a_probe_diagnostics() -> None:
+    with cpu_safe_stspec_modules() as modules:
+        run_stspec_v4a_probe_diagnostics(modules)
+
+
 def main() -> None:
     with cpu_safe_stspec_modules() as modules:
         run_stspec_plan_scaffold_diagnostics(modules)
         run_stspec_two_batch_dryrun_semantics(modules)
+        run_stspec_v4a_probe_diagnostics(modules)
     print("ST-Spec StepPlan scaffold diagnostics passed")
 
 
