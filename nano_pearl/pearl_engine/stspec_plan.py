@@ -285,7 +285,7 @@ def stspec_protocol_alignment_error(
     )
     return (
         "ST-Spec real two-batch probe cannot proceed: draft exec seq ids != "
-        "target verify seq ids under current PEARL message layout; "
+        "target verify seq ids under current legacy_fixed PEARL message layout; "
         f"plan_id={step_plan.plan_id}, runner_role={runner_role}, "
         f"scheduled_seq_ids={step_plan.scheduled_seq_ids}, "
         f"actual_exec_seq_ids={actual_ids}, "
@@ -293,7 +293,8 @@ def stspec_protocol_alignment_error(
         f"draft_home_batch_seq_ids={step_plan.draft_home_batch_seq_ids}, "
         f"actual_target_exec_seq_ids={target_ids}, "
         f"actual_draft_exec_seq_ids={draft_ids}, "
-        f"gamma={gamma}, execution_mode={step_plan.execution_mode}"
+        f"gamma={gamma}, execution_mode={step_plan.execution_mode}; "
+        "variable_offsets PEARL protocol support is required for divergent draft/verify seq sets"
     )
 
 

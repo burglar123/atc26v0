@@ -135,6 +135,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     raw_protocol_alignment_false = 0
     raw_empty_actual_exec = 0
     actual_exec_fraction_values: List[float] = []
+    protocol_layouts = set()
+    protocol_versions = set()
+    protocol_validation_error_count = 0
+    raw_protocol_validation_false = 0
+    raw_draft_message_count = 0
+    raw_verify_result_message_count = 0
+    raw_protocol_seq_alignment_errors = 0
+    draft_message_total_tokens: List[float] = []
+    verify_result_total_tokens: List[float] = []
 
     for row in rows:
         signature = row.get("plan_signature")
@@ -250,6 +259,40 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if fraction is not None:
             actual_exec_fraction_values.append(fraction)
 
+
+        layout = row.get("pearl_protocol_layout")
+        if layout is not None:
+            protocol_layouts.add(layout)
+        for value in values_from_mapping(row.get("pearl_protocol_layouts")):
+            if value is not None:
+                protocol_layouts.add(value)
+        version = row.get("pearl_protocol_version")
+        if version is not None:
+            protocol_versions.add(version)
+        if row.get("protocol_validation_error"):
+            protocol_validation_error_count += 1
+        protocol_validation_error_count += int(row.get("protocol_validation_error_count") or 0)
+        if row.get("protocol_validation_ok") is False:
+            raw_protocol_validation_false += 1
+        if row.get("draft_message_seq_ids") is not None:
+            raw_draft_message_count += 1
+        raw_draft_message_count += int(row.get("draft_message_seen_count") or 0)
+        if row.get("verify_result_seq_ids") is not None:
+            raw_verify_result_message_count += 1
+        raw_verify_result_message_count += int(row.get("verify_result_seen_count") or 0)
+        if "seq alignment" in str(row.get("protocol_validation_error") or "").lower():
+            raw_protocol_seq_alignment_errors += 1
+        raw_protocol_seq_alignment_errors += int(row.get("protocol_seq_alignment_error_count") or 0)
+        draft_total = to_float(row.get("draft_message_total_tokens"))
+        if draft_total is not None:
+            draft_message_total_tokens.append(draft_total)
+        verify_total = to_float(row.get("verify_result_total_tokens"))
+        if verify_total is not None:
+            verify_result_total_tokens.append(verify_total)
+
+    draft_total_min, draft_total_med, draft_total_max = quantiles(draft_message_total_tokens)
+    verify_total_min, verify_total_med, verify_total_max = quantiles(verify_result_total_tokens)
+
     duplicate_plan_ids_by_role = {
         f"{role}:{plan_id}": count
         for (role, plan_id), count in plan_id_role_counts.items()
@@ -291,6 +334,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             if actual_exec_fraction_values
             else None
         ),
+        "protocol_layouts_seen": sorted(protocol_layouts, key=str),
+        "unique_protocol_versions": sorted(protocol_versions, key=str),
+        "protocol_validation_error_count": protocol_validation_error_count,
+        "raw_protocol_validation_false": raw_protocol_validation_false,
+        "raw_draft_message_count": raw_draft_message_count,
+        "raw_verify_result_message_count": raw_verify_result_message_count,
+        "raw_protocol_seq_alignment_errors": raw_protocol_seq_alignment_errors,
+        "draft_message_total_token_summary": (draft_total_min, draft_total_med, draft_total_max),
+        "verify_result_total_token_summary": (verify_total_min, verify_total_med, verify_total_max),
     }
 
 
@@ -481,6 +533,23 @@ def summarize(path: Path) -> int:
     print(
         "average actual_exec_fraction: "
         f"{fmt(plan_summary['avg_actual_exec_fraction'])}"
+    )
+    print(f"protocol layouts seen: {plan_summary['protocol_layouts_seen']}")
+    print(f"unique protocol versions: {plan_summary['unique_protocol_versions']}")
+    print(f"protocol validation errors: {plan_summary['protocol_validation_error_count']}")
+    print(f"rows with protocol_validation_ok=false: {plan_summary['raw_protocol_validation_false']}")
+    print(f"raw draft message count: {plan_summary['raw_draft_message_count']}")
+    print(f"raw verify result message count: {plan_summary['raw_verify_result_message_count']}")
+    print(f"rows with protocol seq alignment errors: {plan_summary['raw_protocol_seq_alignment_errors']}")
+    draft_min, draft_med, draft_max = plan_summary['draft_message_total_token_summary']
+    verify_min, verify_med, verify_max = plan_summary['verify_result_total_token_summary']
+    print(
+        "draft message total tokens min/median/max: "
+        f"{fmt(draft_min)} / {fmt(draft_med)} / {fmt(draft_max)}"
+    )
+    print(
+        "verify result accepted tokens min/median/max: "
+        f"{fmt(verify_min)} / {fmt(verify_med)} / {fmt(verify_max)}"
     )
 
     anomalous = arrival_after_finish + elapsed_mismatch + tpot_mismatch

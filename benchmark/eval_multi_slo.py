@@ -135,6 +135,10 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "stspec_two_batch_dryrun": args.stspec_two_batch_dryrun,
         "stspec_two_batch_probe": args.stspec_two_batch_probe,
         "stspec_two_batch_probe_fail_fast": args.stspec_two_batch_probe_fail_fast,
+        "pearl_protocol_layout": args.pearl_protocol_layout,
+        "enable_pearl_protocol_envelope": not args.disable_pearl_protocol_envelope,
+        "pearl_protocol_validate": not args.disable_pearl_protocol_validate,
+        "pearl_protocol_trace": not args.disable_pearl_protocol_trace,
     }
 
     # Try new named-path style with gamma.
@@ -452,6 +456,12 @@ PLAN_REQUEST_FIELDS = [
     "scheduled_seq_ids",
     "actual_exec_seq_ids",
     "filtered_out_seq_ids",
+    "pearl_protocol_layouts",
+    "protocol_validation_ok",
+    "protocol_validation_error_count",
+    "draft_message_seen_count",
+    "verify_result_seen_count",
+    "protocol_seq_alignment_error_count",
     "is_eager",
     "plan_roles",
 ]
@@ -647,6 +657,12 @@ def aggregate_low_level_traces(
         scheduled_exec_seq_ids: List[Any] = []
         actual_exec_seq_ids: List[Any] = []
         filtered_out_seq_ids: List[Any] = []
+        pearl_protocol_layouts: List[str] = []
+        protocol_validation_values: List[bool] = []
+        protocol_validation_error_count = 0
+        draft_message_seen_count = 0
+        verify_result_seen_count = 0
+        protocol_seq_alignment_error_count = 0
 
         for entry in entries:
             e = entry["event"]
@@ -730,12 +746,23 @@ def aggregate_low_level_traces(
                 ("real_probe_applied", real_probe_applied_values),
                 ("real_probe_blocked", real_probe_blocked_values),
                 ("protocol_alignment_ok", protocol_alignment_values),
+                ("protocol_validation_ok", protocol_validation_values),
             ):
                 if e.get(bool_key) is not None:
                     dst.append(bool(e.get(bool_key)))
             append_unique(two_batch_execution_modes, e.get("two_batch_execution_mode"))
             append_unique(real_probe_block_reasons, e.get("real_probe_block_reason"))
             append_unique(protocol_alignment_errors, e.get("protocol_alignment_error"))
+            append_unique(pearl_protocol_layouts, e.get("pearl_protocol_layout"))
+            if e.get("protocol_validation_error"):
+                protocol_validation_error_count += 1
+            if e.get("draft_message_seq_ids") is not None:
+                draft_message_seen_count += 1
+            if e.get("verify_result_seq_ids") is not None:
+                verify_result_seen_count += 1
+            validation_error_text = str(e.get("protocol_validation_error") or "")
+            if "seq alignment" in validation_error_text.lower():
+                protocol_seq_alignment_error_count += 1
             filtered_out_seq_count += int(e.get("filtered_out_seq_count") or 0)
             fraction = to_float(e.get("actual_exec_fraction"))
             if fraction is not None:
@@ -872,6 +899,14 @@ def aggregate_low_level_traces(
             row["actual_exec_seq_ids"] = actual_exec_seq_ids
         if filtered_out_seq_ids:
             row["filtered_out_seq_ids"] = filtered_out_seq_ids
+        if pearl_protocol_layouts:
+            row["pearl_protocol_layouts"] = pearl_protocol_layouts
+        if protocol_validation_values:
+            row["protocol_validation_ok"] = all(protocol_validation_values)
+        row["protocol_validation_error_count"] = protocol_validation_error_count
+        row["draft_message_seen_count"] = draft_message_seen_count
+        row["verify_result_seen_count"] = verify_result_seen_count
+        row["protocol_seq_alignment_error_count"] = protocol_seq_alignment_error_count
         if plan_roles:
             row["plan_roles"] = plan_roles
         if plan_scheduled_seq_ids:
@@ -1731,6 +1766,12 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "scheduled_seq_ids": row.get("scheduled_seq_ids"),
         "actual_exec_seq_ids": row.get("actual_exec_seq_ids"),
         "filtered_out_seq_ids": row.get("filtered_out_seq_ids"),
+        "pearl_protocol_layouts": row.get("pearl_protocol_layouts"),
+        "protocol_validation_ok": row.get("protocol_validation_ok"),
+        "protocol_validation_error_count": row.get("protocol_validation_error_count"),
+        "draft_message_seen_count": row.get("draft_message_seen_count"),
+        "verify_result_seen_count": row.get("verify_result_seen_count"),
+        "protocol_seq_alignment_error_count": row.get("protocol_seq_alignment_error_count"),
         "is_eager": row.get("is_eager"),
         "plan_roles": row.get("plan_roles"),
         "execution_mode": row.get("execution_mode", execution_mode),
@@ -1820,6 +1861,28 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail fast with protocol diagnostics when the V4A probe is incompatible.",
+    )
+
+    parser.add_argument(
+        "--pearl-protocol-layout",
+        choices=["legacy_fixed", "variable_offsets"],
+        default="legacy_fixed",
+        help="Explicit PEARL protocol layout. variable_offsets is reserved for V4C.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-envelope",
+        action="store_true",
+        help="Disable the V4B sidecar protocol envelope while preserving legacy tensor transport.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-validate",
+        action="store_true",
+        help="Disable V4B PEARL protocol envelope validation.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-trace",
+        action="store_true",
+        help="Disable V4B PEARL protocol trace metadata export.",
     )
 
     parser.add_argument(

@@ -89,6 +89,11 @@ class PEARLConfig:
     stspec_two_batch_dryrun: bool = True
     stspec_two_batch_probe: bool = False
     stspec_two_batch_probe_fail_fast: bool = True
+    pearl_protocol_version: int = 1
+    pearl_protocol_layout: str = "legacy_fixed"
+    enable_pearl_protocol_envelope: bool = True
+    pearl_protocol_validate: bool = True
+    pearl_protocol_trace: bool = True
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -96,6 +101,17 @@ class PEARLConfig:
                 f"Invalid execution_mode={self.execution_mode!r}. "
                 f"Expected one of {sorted(self.ALLOWED_EXECUTION_MODES)}."
             )
+        if int(self.pearl_protocol_version) != 1:
+            raise NotImplementedError(
+                f"PEARL protocol_version={self.pearl_protocol_version!r} is unsupported; only version 1 is implemented."
+            )
+        if self.pearl_protocol_layout not in {"legacy_fixed", "variable_offsets"}:
+            raise ValueError(
+                "Invalid pearl_protocol_layout="
+                f"{self.pearl_protocol_layout!r}; expected legacy_fixed or variable_offsets."
+            )
+        if self.pearl_protocol_layout == "variable_offsets":
+            raise NotImplementedError("variable_offsets PEARL protocol is reserved for V4C.")
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))
@@ -117,6 +133,11 @@ class PEARLConfig:
         logger.info(f"STSpec_Two_Batch_Dryrun={self.stspec_two_batch_dryrun}")
         logger.info(f"STSpec_Two_Batch_Probe={self.stspec_two_batch_probe}")
         logger.info(f"STSpec_Two_Batch_Probe_Fail_Fast={self.stspec_two_batch_probe_fail_fast}")
+        logger.info(f"PEARL_Protocol_Version={self.pearl_protocol_version}")
+        logger.info(f"PEARL_Protocol_Layout={self.pearl_protocol_layout}")
+        logger.info(f"PEARL_Protocol_Envelope={self.enable_pearl_protocol_envelope}")
+        logger.info(f"PEARL_Protocol_Validate={self.pearl_protocol_validate}")
+        logger.info(f"PEARL_Protocol_Trace={self.pearl_protocol_trace}")
         if (
             self.enable_stspec_two_batch_execution
             and not self.stspec_two_batch_dryrun

@@ -22,6 +22,17 @@ from nano_pearl.pearl_engine.stspec_plan import (
     select_exec_seqs_for_plan,
     stspec_protocol_alignment_error,
 )
+from nano_pearl.pearl_engine.pearl_protocol import (
+    PearlMessageType,
+    PearlLayoutKind,
+    decode_legacy_draft_message,
+    decode_legacy_verify_result,
+    encode_legacy_draft_message,
+    encode_legacy_verify_result,
+    ensure_legacy_fixed_layout,
+    ensure_supported_protocol,
+    validate_legacy_fixed_layout,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -412,6 +423,23 @@ class ModelRunnerBase:
             "actual_exec_fraction": actual_exec_fraction,
             "protocol_alignment_ok": protocol_alignment_ok,
             "protocol_alignment_error": protocol_alignment_error,
+            "pearl_protocol_version": int(getattr(self.global_config, "pearl_protocol_version", 1)),
+            "pearl_protocol_layout": getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed"),
+            "pearl_protocol_envelope_enabled": bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True)),
+            "pearl_protocol_validate_enabled": bool(getattr(self.global_config, "pearl_protocol_validate", True)),
+            "pearl_protocol_trace_enabled": bool(getattr(self.global_config, "pearl_protocol_trace", True)),
+            "draft_message_seq_ids": None,
+            "draft_message_per_seq_lengths": None,
+            "draft_message_offsets": None,
+            "draft_message_total_tokens": None,
+            "verify_result_seq_ids": None,
+            "verify_result_per_seq_accepted_lengths": None,
+            "verify_result_offsets": None,
+            "verify_result_total_tokens": None,
+            "protocol_validation_ok": True,
+            "protocol_validation_error": None,
+            "protocol_message_type": None,
+            "protocol_layout_kind": None,
             "plan_legacy_equivalent": step_plan.legacy_equivalent,
             "plan_runner_role": step_plan.runner_role,
             "plan_scheduled_seq_ids": list(step_plan.scheduled_seq_ids),
@@ -439,6 +467,63 @@ class ModelRunnerBase:
         }
         self.trace_records.append(record)
         return record
+
+
+    def _pearl_protocol_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True))
+
+    def _pearl_protocol_validate_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_validate", True))
+
+    def _pearl_protocol_trace_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_trace", True))
+
+    def _pearl_protocol_version(self) -> int:
+        return int(getattr(self.global_config, "pearl_protocol_version", 1))
+
+    def _pearl_protocol_layout(self) -> str:
+        return getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed")
+
+    def _check_pearl_protocol_config(self) -> None:
+        ensure_supported_protocol(self._pearl_protocol_version())
+        ensure_legacy_fixed_layout(self._pearl_protocol_layout())
+
+    def _trace_pearl_protocol_message(self, record: dict | None, message) -> None:
+        if record is None or not self._pearl_protocol_trace_enabled():
+            return
+        record["pearl_protocol_version"] = message.protocol_version
+        record["pearl_protocol_layout"] = message.layout_kind
+        record["protocol_message_type"] = message.message_type
+        record["protocol_layout_kind"] = message.layout_kind
+        if message.message_type == PearlMessageType.DRAFT_TOKENS.value:
+            record["draft_message_seq_ids"] = list(message.seq_ids)
+            record["draft_message_per_seq_lengths"] = list(message.per_seq_draft_lengths)
+            record["draft_message_offsets"] = list(message.draft_offsets)
+            record["draft_message_total_tokens"] = int(message.total_draft_tokens)
+        elif message.message_type == PearlMessageType.VERIFY_RESULT.value:
+            record["verify_result_seq_ids"] = list(message.seq_ids)
+            record["verify_result_per_seq_accepted_lengths"] = list(message.per_seq_accepted_lengths)
+            record["verify_result_offsets"] = list(message.accepted_offsets)
+            record["verify_result_total_tokens"] = int(message.total_accepted_tokens)
+
+    def _validate_and_trace_pearl_protocol(self, record: dict | None, message, expected_seq_ids: list[int]) -> None:
+        if not self._pearl_protocol_enabled():
+            return
+        try:
+            self._check_pearl_protocol_config()
+            if self._pearl_protocol_validate_enabled():
+                validate_legacy_fixed_layout(message, expected_seq_ids, self.gamma)
+        except Exception as exc:
+            if record is not None:
+                record["protocol_validation_ok"] = False
+                record["protocol_validation_error"] = str(exc)
+                record["protocol_message_type"] = getattr(message, "message_type", None)
+                record["protocol_layout_kind"] = getattr(message, "layout_kind", None)
+            raise
+        if record is not None:
+            record["protocol_validation_ok"] = True
+            record["protocol_validation_error"] = None
+        self._trace_pearl_protocol_message(record, message)
 
     def _select_exec_seqs_for_plan(
         self,
@@ -915,7 +1000,7 @@ class DraftModelRunner(ModelRunnerBase):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
-        accepted_lens, invalidated_lens = self.verify(exec_seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -951,12 +1036,12 @@ class DraftModelRunner(ModelRunnerBase):
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
-        accepted_lens, invalidated_lens = self.verify(exec_seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, seqs: list[Sequence]):
+    def verify(self, seqs: list[Sequence], trace_record: dict | None = None, step_plan: StepPlan | None = None):
         if self.tp_params.local_rank == 0:
             to_be_verified_tokens = []
             next_round_input = []
@@ -966,6 +1051,23 @@ class DraftModelRunner(ModelRunnerBase):
                 else:
                     to_be_verified_tokens.extend(seq.token_ids[-2*self.gamma+1:-self.gamma+1])
                 next_round_input.extend(seq.token_ids[-self.gamma:])
+            if self._pearl_protocol_enabled():
+                draft_message = encode_legacy_draft_message(
+                    seqs=seqs,
+                    gamma=self.gamma,
+                    draft_token_ids=to_be_verified_tokens,
+                    next_round_input=next_round_input,
+                    plan_id=step_plan.plan_id if step_plan is not None else None,
+                    runner_role="draft",
+                    scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                    actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                    target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                    draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                    protocol_version=self._pearl_protocol_version(),
+                    layout_kind=self._pearl_protocol_layout(),
+                )
+                self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+                to_be_verified_tokens, next_round_input = decode_legacy_draft_message(draft_message)
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
         
@@ -974,6 +1076,25 @@ class DraftModelRunner(ModelRunnerBase):
         
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = encode_legacy_verify_result(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="draft",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = decode_legacy_verify_result(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
         for idx, seq in enumerate(seqs):
@@ -1058,7 +1179,7 @@ class TargetModelRunner(ModelRunnerBase):
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1083,12 +1204,12 @@ class TargetModelRunner(ModelRunnerBase):
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
+    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, trace_record: dict | None = None, step_plan: StepPlan | None = None):
         """Refer to the verification logic in the draft model verification function."""
         # verify_res will be sent to the sub-process in the target group.
         num_to_be_verified_tokens = sum([1 if seq.pre_verify else self.gamma for seq in seqs])
@@ -1097,6 +1218,23 @@ class TargetModelRunner(ModelRunnerBase):
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
+        if self._pearl_protocol_enabled():
+            draft_message = encode_legacy_draft_message(
+                seqs=seqs,
+                gamma=self.gamma,
+                draft_token_ids=to_be_verified_tokens,
+                next_round_input=next_round_input,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+            to_be_verified_tokens, next_round_input = decode_legacy_draft_message(draft_message)
         
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
 
@@ -1155,6 +1293,25 @@ class TargetModelRunner(ModelRunnerBase):
 
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = encode_legacy_verify_result(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = decode_legacy_verify_result(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
 
