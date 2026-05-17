@@ -131,6 +131,8 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "target_tensor_parallel_size": args.target_tp,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "execution_mode": args.execution_mode,
+        "enable_stspec_two_batch_execution": args.enable_stspec_two_batch_execution,
+        "stspec_two_batch_dryrun": args.stspec_two_batch_dryrun,
     }
 
     # Try new named-path style with gamma.
@@ -425,6 +427,15 @@ PLAN_REQUEST_FIELDS = [
     "plan_two_batch_shadow",
     "target_batch_hit_count",
     "draft_home_batch_hit_count",
+    "two_batch_execution_enabled",
+    "two_batch_execution_dryrun",
+    "two_batch_execution_modes",
+    "actual_target_exec_hit_count",
+    "actual_draft_exec_hit_count",
+    "dryrun_target_exec_hit_count",
+    "dryrun_draft_exec_hit_count",
+    "dryrun_target_home_batch_ids",
+    "dryrun_draft_home_batch_ids",
     "is_eager",
     "plan_roles",
 ]
@@ -597,6 +608,15 @@ def aggregate_low_level_traces(
         plan_two_batch_shadow_values: List[bool] = []
         target_batch_hit_count = 0
         draft_home_batch_hit_count = 0
+        two_batch_execution_enabled_values: List[bool] = []
+        two_batch_execution_dryrun_values: List[bool] = []
+        two_batch_execution_modes: List[str] = []
+        actual_target_exec_hit_count = 0
+        actual_draft_exec_hit_count = 0
+        dryrun_target_exec_hit_count = 0
+        dryrun_draft_exec_hit_count = 0
+        dryrun_target_home_batch_ids: List[int] = []
+        dryrun_draft_home_batch_ids: List[int] = []
 
         for entry in entries:
             e = entry["event"]
@@ -670,6 +690,32 @@ def aggregate_low_level_traces(
             ):
                 draft_home_batch_hit_count += 1
 
+            for bool_key, dst in (
+                ("two_batch_execution_enabled", two_batch_execution_enabled_values),
+                ("two_batch_execution_dryrun", two_batch_execution_dryrun_values),
+            ):
+                if e.get(bool_key) is not None:
+                    dst.append(bool(e.get(bool_key)))
+            append_unique(two_batch_execution_modes, e.get("two_batch_execution_mode"))
+            for list_key, counter_name in (
+                ("actual_target_exec_seq_ids", "actual_target"),
+                ("actual_draft_exec_seq_ids", "actual_draft"),
+                ("dryrun_target_exec_seq_ids", "dryrun_target"),
+                ("dryrun_draft_exec_seq_ids", "dryrun_draft"),
+            ):
+                value = e.get(list_key)
+                hit = isinstance(value, list) and member_keys.intersection(str(x) for x in value)
+                if hit and counter_name == "actual_target":
+                    actual_target_exec_hit_count += 1
+                elif hit and counter_name == "actual_draft":
+                    actual_draft_exec_hit_count += 1
+                elif hit and counter_name == "dryrun_target":
+                    dryrun_target_exec_hit_count += 1
+                    append_unique(dryrun_target_home_batch_ids, target_home_batch_id)
+                elif hit and counter_name == "dryrun_draft":
+                    dryrun_draft_exec_hit_count += 1
+                    append_unique(dryrun_draft_home_batch_ids, draft_home_batch_id)
+
             effective_gamma_values.append(
                 value_for_any_member(
                     e.get("effective_gamma_per_seq"), idx, member_seq_id, member
@@ -737,6 +783,20 @@ def aggregate_low_level_traces(
             row["plan_two_batch_shadow"] = any(plan_two_batch_shadow_values)
         row["target_batch_hit_count"] = target_batch_hit_count
         row["draft_home_batch_hit_count"] = draft_home_batch_hit_count
+        if two_batch_execution_enabled_values:
+            row["two_batch_execution_enabled"] = any(two_batch_execution_enabled_values)
+        if two_batch_execution_dryrun_values:
+            row["two_batch_execution_dryrun"] = any(two_batch_execution_dryrun_values)
+        if two_batch_execution_modes:
+            row["two_batch_execution_modes"] = two_batch_execution_modes
+        row["actual_target_exec_hit_count"] = actual_target_exec_hit_count
+        row["actual_draft_exec_hit_count"] = actual_draft_exec_hit_count
+        row["dryrun_target_exec_hit_count"] = dryrun_target_exec_hit_count
+        row["dryrun_draft_exec_hit_count"] = dryrun_draft_exec_hit_count
+        if dryrun_target_home_batch_ids:
+            row["dryrun_target_home_batch_ids"] = dryrun_target_home_batch_ids
+        if dryrun_draft_home_batch_ids:
+            row["dryrun_draft_home_batch_ids"] = dryrun_draft_home_batch_ids
         if plan_roles:
             row["plan_roles"] = plan_roles
         if plan_scheduled_seq_ids:
@@ -1573,6 +1633,15 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "plan_two_batch_shadow": row.get("plan_two_batch_shadow"),
         "target_batch_hit_count": row.get("target_batch_hit_count"),
         "draft_home_batch_hit_count": row.get("draft_home_batch_hit_count"),
+        "two_batch_execution_enabled": row.get("two_batch_execution_enabled"),
+        "two_batch_execution_dryrun": row.get("two_batch_execution_dryrun"),
+        "two_batch_execution_modes": row.get("two_batch_execution_modes"),
+        "actual_target_exec_hit_count": row.get("actual_target_exec_hit_count"),
+        "actual_draft_exec_hit_count": row.get("actual_draft_exec_hit_count"),
+        "dryrun_target_exec_hit_count": row.get("dryrun_target_exec_hit_count"),
+        "dryrun_draft_exec_hit_count": row.get("dryrun_draft_exec_hit_count"),
+        "dryrun_target_home_batch_ids": row.get("dryrun_target_home_batch_ids"),
+        "dryrun_draft_home_batch_ids": row.get("dryrun_draft_home_batch_ids"),
         "is_eager": row.get("is_eager"),
         "plan_roles": row.get("plan_roles"),
         "execution_mode": row.get("execution_mode", execution_mode),
@@ -1630,6 +1699,26 @@ def main() -> None:
             "current parallel_pearl (default: parallel_pearl)."
         ),
     )
+
+    parser.add_argument(
+        "--enable-stspec-two-batch-execution",
+        action="store_true",
+        help=(
+            "Enable ST-Spec two-batch execution dry-run metadata. V3C still "
+            "executes legacy scheduled batches unless real mode is implemented later."
+        ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-dryrun",
+        dest="stspec_two_batch_dryrun",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep ST-Spec two-batch execution in dry-run mode. "
+            "--no-stspec-two-batch-dryrun with execution enabled is unsupported in V3C."
+        ),
+    )
+
     parser.add_argument(
         "--decode-ready",
         "--prefill-elided",

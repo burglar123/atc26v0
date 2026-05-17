@@ -58,6 +58,13 @@ class StepPlan:
     draft_home_batch_seq_ids: list[int] = field(default_factory=list)
     off_batch_seq_ids: list[int] = field(default_factory=list)
     plan_two_batch_shadow: bool = False
+    two_batch_execution_enabled: bool = False
+    two_batch_execution_dryrun: bool = True
+    two_batch_execution_mode: str = "legacy"
+    actual_target_exec_seq_ids: list[int] = field(default_factory=list)
+    actual_draft_exec_seq_ids: list[int] = field(default_factory=list)
+    dryrun_target_exec_seq_ids: list[int] = field(default_factory=list)
+    dryrun_draft_exec_seq_ids: list[int] = field(default_factory=list)
     requests: list[PlanRequest] = field(default_factory=list)
 
     @property
@@ -97,6 +104,13 @@ class StepPlan:
             "draft_home_batch_seq_ids": list(self.draft_home_batch_seq_ids),
             "off_batch_seq_ids": list(self.off_batch_seq_ids),
             "plan_two_batch_shadow": self.plan_two_batch_shadow,
+            "two_batch_execution_enabled": self.two_batch_execution_enabled,
+            "two_batch_execution_dryrun": self.two_batch_execution_dryrun,
+            "two_batch_execution_mode": self.two_batch_execution_mode,
+            "actual_target_exec_seq_ids": list(self.actual_target_exec_seq_ids),
+            "actual_draft_exec_seq_ids": list(self.actual_draft_exec_seq_ids),
+            "dryrun_target_exec_seq_ids": list(self.dryrun_target_exec_seq_ids),
+            "dryrun_draft_exec_seq_ids": list(self.dryrun_draft_exec_seq_ids),
             "scheduled_seq_ids": list(self.scheduled_seq_ids),
             "request_ids": list(self.request_ids),
             "effective_gamma_per_seq": {
@@ -150,13 +164,15 @@ def build_legacy_step_plan(
     default_gamma: int,
     target_home_batch_id: int | None = None,
     draft_home_batch_id: int | None = None,
+    two_batch_execution_enabled: bool = False,
+    two_batch_execution_dryrun: bool = True,
 ) -> StepPlan:
     """Wrap the existing scheduler output in a legacy-equivalent StepPlan.
 
     The supplied ``seqs`` are used as-is. No sequence ordering, batching,
-    budgets, KV state, or verification layout is changed by this helper. V3B
-    only shadows membership-aware two-batch planning metadata; actual execution
-    of verify(A) || draft(B) is deferred to a later PR.
+    budgets, KV state, or verification layout is changed by this helper. V3C
+    is a dry-run scaffold: actual execution still uses legacy scheduled seqs,
+    while dryrun exec sets expose future verify(A) || draft(B) semantics.
     """
     scheduled_seq_ids = [seq.seq_id for seq in seqs]
     role = role_from_runner(runner_role, is_prefill)
@@ -183,6 +199,26 @@ def build_legacy_step_plan(
     ]
     classified = set(target_batch_seq_ids) | set(draft_home_batch_seq_ids)
     off_batch_seq_ids = [seq.seq_id for seq in seqs if seq.seq_id not in classified]
+
+    if two_batch_execution_enabled and not two_batch_execution_dryrun:
+        raise NotImplementedError(
+            "Real ST-Spec two-batch execution is not implemented in V3C."
+        )
+    two_batch_execution_mode = "dryrun" if two_batch_execution_enabled else "legacy"
+    # V3C never filters execution. These actual sets intentionally mirror the
+    # legacy scheduled batch for both runner families so model forward inputs are
+    # unchanged; dryrun_* records the future filtered subsets only.
+    actual_target_exec_seq_ids = list(scheduled_seq_ids)
+    actual_draft_exec_seq_ids = list(scheduled_seq_ids)
+    if is_prefill:
+        dryrun_target_exec_seq_ids: list[int] = []
+        dryrun_draft_exec_seq_ids: list[int] = []
+    elif "draft" in runner_role:
+        dryrun_target_exec_seq_ids = []
+        dryrun_draft_exec_seq_ids = list(draft_home_batch_seq_ids)
+    else:
+        dryrun_target_exec_seq_ids = list(target_batch_seq_ids)
+        dryrun_draft_exec_seq_ids = []
 
     requests = [
         PlanRequest(
@@ -218,5 +254,12 @@ def build_legacy_step_plan(
         draft_home_batch_seq_ids=draft_home_batch_seq_ids,
         off_batch_seq_ids=off_batch_seq_ids,
         plan_two_batch_shadow=plan_two_batch_shadow,
+        two_batch_execution_enabled=two_batch_execution_enabled,
+        two_batch_execution_dryrun=two_batch_execution_dryrun,
+        two_batch_execution_mode=two_batch_execution_mode,
+        actual_target_exec_seq_ids=actual_target_exec_seq_ids,
+        actual_draft_exec_seq_ids=actual_draft_exec_seq_ids,
+        dryrun_target_exec_seq_ids=dryrun_target_exec_seq_ids,
+        dryrun_draft_exec_seq_ids=dryrun_draft_exec_seq_ids,
         requests=requests,
     )

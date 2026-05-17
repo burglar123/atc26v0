@@ -35,6 +35,12 @@ class Scheduler:
         self.two_batch_shadow_step = 0
         self.current_target_home_batch_id = 0
         self.current_draft_home_batch_id = 1
+        self.enable_stspec_two_batch_execution = bool(
+            getattr(config, "enable_stspec_two_batch_execution", False)
+        )
+        self.stspec_two_batch_dryrun = bool(
+            getattr(config, "stspec_two_batch_dryrun", True)
+        )
 
     def next_batch_id(self, runner_role: str) -> tuple[int, str]:
         iteration_id = self.iteration_id
@@ -100,6 +106,10 @@ class Scheduler:
         scheduler decision. The plan_id mirrors the next trace iteration id that
         _trace_schedule() will consume, preserving current iteration accounting.
         """
+        if self.enable_stspec_two_batch_execution and not self.stspec_two_batch_dryrun:
+            raise NotImplementedError(
+                "Real ST-Spec two-batch execution is not implemented in V3C."
+            )
         plan_id = self.iteration_id
         seqs, is_prefill = self.schedule()
         target_home_batch_id = None
@@ -120,6 +130,8 @@ class Scheduler:
             default_gamma=default_gamma,
             target_home_batch_id=target_home_batch_id,
             draft_home_batch_id=draft_home_batch_id,
+            two_batch_execution_enabled=self.enable_stspec_two_batch_execution,
+            two_batch_execution_dryrun=self.stspec_two_batch_dryrun,
         )
         return seqs, is_prefill, step_plan
 

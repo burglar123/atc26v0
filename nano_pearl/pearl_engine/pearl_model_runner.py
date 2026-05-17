@@ -343,8 +343,22 @@ class ModelRunnerBase:
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
+        scheduled_seq_ids = [seq.seq_id for seq in seqs]
+        assert step_plan.scheduled_seq_ids == scheduled_seq_ids
+        assert step_plan.actual_target_exec_seq_ids == scheduled_seq_ids
+        assert step_plan.actual_draft_exec_seq_ids == scheduled_seq_ids
         plan_signature = step_plan.signature()
         plan_digest = step_plan.digest()
+        actual_exec_seq_ids = (
+            list(step_plan.actual_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.actual_target_exec_seq_ids)
+        )
+        dryrun_exec_seq_ids = (
+            list(step_plan.dryrun_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.dryrun_target_exec_seq_ids)
+        )
         record = {
             "execution_mode": self.active_execution_mode,
             "decode_ready_mode": self.active_decode_ready_mode,
@@ -365,6 +379,15 @@ class ModelRunnerBase:
             "target_batch_seq_ids": list(step_plan.target_batch_seq_ids),
             "draft_home_batch_seq_ids": list(step_plan.draft_home_batch_seq_ids),
             "off_batch_seq_ids": list(step_plan.off_batch_seq_ids),
+            "two_batch_execution_enabled": step_plan.two_batch_execution_enabled,
+            "two_batch_execution_dryrun": step_plan.two_batch_execution_dryrun,
+            "two_batch_execution_mode": step_plan.two_batch_execution_mode,
+            "actual_target_exec_seq_ids": list(step_plan.actual_target_exec_seq_ids),
+            "actual_draft_exec_seq_ids": list(step_plan.actual_draft_exec_seq_ids),
+            "dryrun_target_exec_seq_ids": list(step_plan.dryrun_target_exec_seq_ids),
+            "dryrun_draft_exec_seq_ids": list(step_plan.dryrun_draft_exec_seq_ids),
+            "actual_exec_seq_ids": actual_exec_seq_ids,
+            "dryrun_exec_seq_ids": dryrun_exec_seq_ids,
             "plan_legacy_equivalent": step_plan.legacy_equivalent,
             "plan_runner_role": step_plan.runner_role,
             "plan_scheduled_seq_ids": list(step_plan.scheduled_seq_ids),

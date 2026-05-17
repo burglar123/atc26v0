@@ -85,6 +85,8 @@ class PEARLConfig:
     enforce_eager: bool = False
     gamma: int = -1
     execution_mode: str = "parallel_pearl"
+    enable_stspec_two_batch_execution: bool = False
+    stspec_two_batch_dryrun: bool = True
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -109,6 +111,12 @@ class PEARLConfig:
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
+        logger.info(f"STSpec_Two_Batch_Execution={self.enable_stspec_two_batch_execution}")
+        logger.info(f"STSpec_Two_Batch_Dryrun={self.stspec_two_batch_dryrun}")
+        if self.enable_stspec_two_batch_execution and not self.stspec_two_batch_dryrun:
+            raise NotImplementedError(
+                "Real ST-Spec two-batch execution is not implemented in V3C."
+            )
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len
