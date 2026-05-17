@@ -25,6 +25,7 @@ class Sequence:
         slo_tpot_ms: float | None = None,
         slo_class: str | None = None,
         per_request_gamma: int | None = None,
+        home_batch_id: int | None = None,
     ):
         self.seq_id = next(Sequence.counter)
         self.request_id = self.seq_id if request_id is None else request_id
@@ -38,6 +39,10 @@ class Sequence:
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
+        # ST-Spec V3A shadow metadata. This is only a stable home-batch
+        # membership tag for future two-batch scheduling; it does not affect
+        # scheduling, verification, rollback, or token generation today.
+        self.home_batch_id = home_batch_id
         self.trace_stats = {
             "scheduled_iterations": [],
             "accepted_tokens": 0,
@@ -142,9 +147,9 @@ class Sequence:
         if self.decode_start_ts is None:
             self.decode_start_ts = time.time() if ts is None else ts
 
-    def mark_finished(self):
+    def mark_finished(self, record_finish_ts: bool = True):
         self.status = SequenceStatus.FINISHED
-        if self.finish_ts is None:
+        if record_finish_ts and self.finish_ts is None:
             self.finish_ts = time.time()
 
     def service_metadata(self):
@@ -174,6 +179,7 @@ class Sequence:
             "slo_tpot_ms": self.slo_tpot_ms,
             "slo_class": self.slo_class,
             "per_request_gamma": self.per_request_gamma,
+            "home_batch_id": self.home_batch_id,
             "trace_stats": self.trace_stats,
         }
 
@@ -183,17 +189,33 @@ class Sequence:
                 self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
                 self.first_token_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
                 self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
-                self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats,
+                self.slo_tpot_ms, self.slo_class, self.per_request_gamma,
+                self.home_batch_id, self.trace_stats,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-         self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
-         self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
-         self.first_token_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
-         self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
-         self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+        metadata = state[:-1]
+        token_state = state[-1]
+        if len(metadata) == 24:
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.first_token_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma,
+             self.home_batch_id, self.trace_stats) = metadata
         else:
-            self.last_token = state[-1]
+            # Backward compatibility for older pickles without ST-Spec V3A
+            # shadow home-batch metadata. New requests will be assigned by
+            # Scheduler.add() if this remains None.
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.first_token_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = metadata
+            self.home_batch_id = None
+        if self.num_completion_tokens == 0:
+            self.token_ids = token_state
+        else:
+            self.last_token = token_state
