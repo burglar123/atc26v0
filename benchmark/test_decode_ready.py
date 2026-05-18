@@ -8,9 +8,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
-from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams
 
 def main():
+    from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams
     DRAFT_MODEL = "/root/autodl-tmp/models/Qwen3-0.6B"
     TARGET_MODEL = "/root/autodl-tmp/models/Qwen3-8B"
 
