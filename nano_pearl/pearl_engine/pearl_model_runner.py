@@ -17,6 +17,51 @@ from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.stspec_plan import (
+    StepPlan,
+    select_exec_seqs_for_plan,
+    stspec_protocol_alignment_error,
+)
+from nano_pearl.pearl_engine.pearl_protocol import (
+    PearlMessageType,
+    PearlLayoutKind,
+    decode_legacy_draft_message,
+    decode_legacy_verify_result,
+    encode_legacy_draft_message,
+    encode_legacy_verify_result,
+    encode_variable_draft_message,
+    encode_variable_verify_result,
+    decode_variable_draft_message,
+    decode_variable_verify_result,
+    ensure_supported_protocol,
+    normalize_layout_kind,
+    validate_legacy_fixed_layout,
+    validate_variable_offsets_layout,
+    PearlDraftMessage,
+    PearlVerifyResultMessage,
+)
+from nano_pearl.pearl_engine.stspec_mailbox import (
+    MailboxPayload,
+    STSpecMailboxError,
+    STSpecPayloadMailbox,
+    payloads_from_draft_message,
+)
+from nano_pearl.pearl_engine.stspec_mailbox_transport import (
+    MailboxTransportMode,
+    TargetForwardMailboxError,
+    build_verification_input_from_mailbox_payload,
+    classify_mailbox_miss,
+    encode_mailbox_transport_envelope,
+    encode_payload_tensor_envelope_from_payloads,
+    interpret_target_forward_from_mailbox_output,
+    payload_tensor_envelope_to_mailbox_payloads,
+    validate_kv_state_sync_for_mailbox_forward,
+    validate_target_forward_from_mailbox_input,
+)
+from nano_pearl.pearl_engine.stspec_pipeline import (
+    STSpecPipelinePhase,
+    should_skip_target_for_warmup,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -108,6 +153,10 @@ class ModelRunnerBase:
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
+        # V4D mailbox is local diagnostic state only. Draft/target runners are
+        # separate processes, so cross-process payload delivery is deliberately
+        # reported as not implemented instead of assuming shared Python memory.
+        self.stspec_mailbox = STSpecPayloadMailbox()
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         if not self.global_config.enforce_eager:
@@ -318,11 +367,54 @@ class ModelRunnerBase:
             )
         self.active_execution_mode = execution_mode
 
-    def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
+    def _schedule_with_plan(self, runner_role: str):
+        return self.scheduler.schedule_with_plan(
+            runner_role=runner_role,
+            execution_mode=self.active_execution_mode,
+            decode_ready_mode=self.active_decode_ready_mode,
+            default_gamma=self.gamma,
+        )
+
+    def _trace_schedule(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        runner_role: str,
+        step_plan: StepPlan,
+    ):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
+        if step_plan.plan_id != iteration_id:
+            logger.warning(
+                f"StepPlan plan_id={step_plan.plan_id} does not match "
+                f"trace iteration_id={iteration_id}; keeping legacy trace id."
+            )
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
+        scheduled_seq_ids = [seq.seq_id for seq in seqs]
+        assert step_plan.scheduled_seq_ids == scheduled_seq_ids
+        plan_signature = step_plan.signature()
+        plan_digest = step_plan.digest()
+        actual_exec_seq_ids = (
+            list(step_plan.actual_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.actual_target_exec_seq_ids)
+        )
+        dryrun_exec_seq_ids = (
+            list(step_plan.dryrun_draft_exec_seq_ids)
+            if "draft" in runner_role
+            else list(step_plan.dryrun_target_exec_seq_ids)
+        )
+        filtered_out_seq_ids = [seq_id for seq_id in scheduled_seq_ids if seq_id not in set(actual_exec_seq_ids)]
+        actual_exec_fraction = (
+            float(len(actual_exec_seq_ids)) / float(len(scheduled_seq_ids))
+            if scheduled_seq_ids
+            else 1.0
+        )
+        protocol_alignment_error = stspec_protocol_alignment_error(
+            step_plan, runner_role, self.gamma, self._pearl_protocol_layout()
+        )
+        protocol_alignment_ok = protocol_alignment_error is None
         record = {
             "execution_mode": self.active_execution_mode,
             "decode_ready_mode": self.active_decode_ready_mode,
@@ -331,6 +423,178 @@ class ModelRunnerBase:
             "runner_role": runner_role,
             "scheduled_seq_ids": [seq.seq_id for seq in seqs],
             "request_ids": [seq.request_id for seq in seqs],
+            "plan_id": step_plan.plan_id,
+            "plan_signature": plan_signature,
+            "plan_signature_hash": plan_digest,
+            "plan_digest": plan_digest,
+            "plan_num_requests": len(step_plan.requests),
+            "plan_request_ids": list(step_plan.request_ids),
+            "plan_two_batch_shadow": step_plan.plan_two_batch_shadow,
+            "target_home_batch_id": step_plan.target_home_batch_id,
+            "draft_home_batch_id": step_plan.draft_home_batch_id,
+            "target_batch_seq_ids": list(step_plan.target_batch_seq_ids),
+            "draft_home_batch_seq_ids": list(step_plan.draft_home_batch_seq_ids),
+            "off_batch_seq_ids": list(step_plan.off_batch_seq_ids),
+            "two_batch_execution_enabled": step_plan.two_batch_execution_enabled,
+            "two_batch_execution_dryrun": step_plan.two_batch_execution_dryrun,
+            "two_batch_execution_mode": step_plan.two_batch_execution_mode,
+            "stspec_probe_enabled": step_plan.stspec_probe_enabled,
+            "stspec_probe_fail_fast": step_plan.stspec_probe_fail_fast,
+            "stspec_probe_local_only": step_plan.stspec_probe_local_only,
+            "real_probe_attempted": step_plan.real_probe_attempted,
+            "real_probe_applied": step_plan.real_probe_applied and protocol_alignment_ok,
+            "real_probe_blocked": bool(step_plan.real_probe_blocked or protocol_alignment_error),
+            "real_probe_block_reason": step_plan.real_probe_block_reason or protocol_alignment_error,
+            "actual_target_exec_seq_ids": list(step_plan.actual_target_exec_seq_ids),
+            "actual_draft_exec_seq_ids": list(step_plan.actual_draft_exec_seq_ids),
+            "dryrun_target_exec_seq_ids": list(step_plan.dryrun_target_exec_seq_ids),
+            "dryrun_draft_exec_seq_ids": list(step_plan.dryrun_draft_exec_seq_ids),
+            "actual_exec_seq_ids": actual_exec_seq_ids,
+            "dryrun_exec_seq_ids": dryrun_exec_seq_ids,
+            "filtered_out_seq_ids": filtered_out_seq_ids,
+            "filtered_out_seq_count": len(filtered_out_seq_ids),
+            "actual_exec_fraction": actual_exec_fraction,
+            "stspec_pipeline_enabled": step_plan.stspec_pipeline_enabled,
+            "stspec_pipeline_phase": step_plan.stspec_pipeline_phase,
+            "stspec_pipeline_step": step_plan.stspec_pipeline_step,
+            "stspec_pipeline_warmup_done": step_plan.stspec_pipeline_warmup_done,
+            "stspec_warmup_target_home_batch_id": step_plan.stspec_warmup_target_home_batch_id,
+            "stspec_warmup_draft_home_batch_id": step_plan.stspec_warmup_draft_home_batch_id,
+            "warmup_draft_payload_produced": False,
+            "warmup_target_verify_skipped": False,
+            "pipeline_phase_advanced": False,
+            "verification_input_from_mailbox_attempted": False,
+            "verification_input_from_mailbox_success": False,
+            "verification_input_from_mailbox_seq_ids": [],
+            "verification_input_from_mailbox_total_tokens": 0,
+            "verification_input_from_mailbox_error": None,
+            "target_forward_from_mailbox_input_built": False,
+            "target_forward_from_mailbox_input_seq_ids": [],
+            "target_forward_from_mailbox_input_total_tokens": 0,
+            "target_forward_from_mailbox_input_shape": [],
+            "kv_state_sync_check_attempted": False,
+            "kv_state_sync_check_success": False,
+            "kv_state_sync_missing_seq_ids": [],
+            "kv_state_sync_error": None,
+            "kv_state_sync_error_kind": None,
+            "target_forward_from_mailbox_attempted": False,
+            "target_forward_from_mailbox_success": False,
+            "target_forward_from_mailbox_seq_ids": [],
+            "target_forward_from_mailbox_total_tokens": 0,
+            "target_forward_from_mailbox_input_shape": [],
+            "target_forward_from_mailbox_output_shape": [],
+            "target_forward_from_mailbox_error": None,
+            "target_forward_from_mailbox_error_kind": None,
+            "target_forward_from_mailbox_latency_ms": None,
+            "target_forward_from_mailbox_output_interpretation_attempted": False,
+            "target_forward_from_mailbox_output_interpretation_success": False,
+            "target_forward_from_mailbox_output_interpretation_error": None,
+            "mailbox_verify_apply_attempted": False,
+            "mailbox_verify_apply_success": False,
+            "mailbox_verify_apply_error": None,
+            "accepted_lengths_by_seq": {},
+            "rejected_seq_ids": [],
+            "invalidated_mailbox_payload_count": 0,
+            "illegal_legacy_fallback": False,
+            "protocol_alignment_ok": protocol_alignment_ok,
+            "protocol_alignment_error": protocol_alignment_error,
+            "pearl_protocol_version": int(getattr(self.global_config, "pearl_protocol_version", 1)),
+            "pearl_protocol_layout": getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed"),
+            "pearl_protocol_envelope_enabled": bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True)),
+            "pearl_protocol_validate_enabled": bool(getattr(self.global_config, "pearl_protocol_validate", True)),
+            "pearl_protocol_trace_enabled": bool(getattr(self.global_config, "pearl_protocol_trace", True)),
+            "draft_message_seq_ids": None,
+            "draft_message_per_seq_lengths": None,
+            "draft_message_offsets": None,
+            "draft_message_total_tokens": None,
+            "verify_result_seq_ids": None,
+            "verify_result_per_seq_accepted_lengths": None,
+            "verify_result_offsets": None,
+            "verify_result_total_tokens": None,
+            "protocol_validation_ok": True,
+            "protocol_validation_error": None,
+            "protocol_message_type": None,
+            "protocol_layout_kind": None,
+            "variable_offsets_enabled": self._pearl_protocol_layout() == "variable_offsets",
+            "variable_draft_message_seq_ids": None,
+            "variable_draft_message_per_seq_lengths": None,
+            "variable_draft_message_offsets": None,
+            "variable_draft_message_total_tokens": None,
+            "variable_verify_result_seq_ids": None,
+            "variable_verify_result_per_seq_lengths": None,
+            "variable_verify_result_offsets": None,
+            "variable_verify_result_total_tokens": None,
+            "variable_offsets_validation_ok": None,
+            "variable_offsets_validation_error": None,
+            "cross_batch_routing_ok": True,
+            "cross_batch_routing_error": None,
+            "stspec_mailbox_enabled": False,
+            "mailbox_put_attempted": False,
+            "mailbox_put_success": False,
+            "mailbox_put_count": 0,
+            "mailbox_put_home_batch_id": None,
+            "mailbox_put_seq_ids": [],
+            "mailbox_get_attempted": False,
+            "mailbox_get_success": False,
+            "mailbox_get_hit_count": 0,
+            "mailbox_get_miss_count": 0,
+            "mailbox_get_home_batch_id": None,
+            "mailbox_get_seq_ids": [],
+            "mailbox_missing_seq_ids": [],
+            "mailbox_available_home_batch_ids": [],
+            "mailbox_available_seq_ids_by_batch": {},
+            "mailbox_cross_process_delivery": None,
+            "mailbox_error": None,
+            "mailbox_error_kind": None,
+            "mailbox_warmup_miss": False,
+            "mailbox_routing_ok": True,
+            "stspec_mailbox_transport_enabled": False,
+            "mailbox_transport_mode": None,
+            "mailbox_transport_send_attempted": False,
+            "mailbox_transport_send_success": False,
+            "mailbox_transport_send_seq_ids": [],
+            "mailbox_transport_send_home_batch_id": None,
+            "mailbox_transport_recv_attempted": False,
+            "mailbox_transport_recv_success": False,
+            "mailbox_transport_recv_seq_ids": [],
+            "mailbox_transport_recv_home_batch_id": None,
+            "mailbox_transport_payload_available": False,
+            "mailbox_transport_error": None,
+            "mailbox_transport_error_kind": None,
+            "target_mailbox_insert_count": 0,
+            "target_mailbox_insert_seq_ids": [],
+            "target_mailbox_insert_home_batch_id": None,
+            "target_mailbox_available_home_batch_ids": [],
+            "target_mailbox_available_seq_ids_by_batch": {},
+            "mailbox_payload_tensor_transport_attempted": False,
+            "mailbox_payload_tensor_transport_success": False,
+            "mailbox_payload_tensor_transport_backend": None,
+            "mailbox_payload_tensor_transport_error": None,
+            "mailbox_payload_tensor_transport_error_kind": None,
+            "mailbox_payload_tensor_seq_ids": [],
+            "mailbox_payload_tensor_home_batch_id": None,
+            "mailbox_payload_tensor_total_tokens": 0,
+            "mailbox_payload_tensor_shape": [],
+            "mailbox_payload_tensor_device": None,
+            "mailbox_warmup_skip": False,
+            "target_verify_skipped_for_warmup": False,
+            "target_consume_from_mailbox_attempted": False,
+            "target_consume_from_mailbox_success": False,
+            "target_consume_from_mailbox_payload_seq_ids": [],
+            "target_consume_from_mailbox_payload_lengths": [],
+            "target_consume_from_mailbox_payload_total_tokens": 0,
+            "target_consume_from_mailbox_payload_home_batch_id": None,
+            "target_consume_from_mailbox_error": None,
+            "next_required_feature": None,
+            "plan_legacy_equivalent": step_plan.legacy_equivalent,
+            "plan_runner_role": step_plan.runner_role,
+            "plan_scheduled_seq_ids": list(step_plan.scheduled_seq_ids),
+            "plan_target_seq_ids": list(step_plan.target_seq_ids),
+            "plan_draft_home_seq_ids": list(step_plan.draft_home_seq_ids),
+            "plan_eager_seq_ids": list(step_plan.eager_seq_ids),
+            "effective_gamma_per_seq": dict(step_plan.effective_gamma_per_seq),
+            "home_batch_id_per_seq": dict(step_plan.home_batch_id_per_seq),
+            "is_eager_per_seq": dict(step_plan.is_eager_per_seq),
             "num_seqs_in_batch": len(seqs),
             "is_prefill": is_prefill,
             "draft_start_ts": None,
@@ -349,6 +613,686 @@ class ModelRunnerBase:
         }
         self.trace_records.append(record)
         return record
+
+
+    def _pearl_protocol_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_pearl_protocol_envelope", True))
+
+    def _pearl_protocol_validate_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_validate", True))
+
+    def _pearl_protocol_trace_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "pearl_protocol_trace", True))
+
+    def _pearl_protocol_version(self) -> int:
+        return int(getattr(self.global_config, "pearl_protocol_version", 1))
+
+    def _pearl_protocol_layout(self) -> str:
+        return getattr(self.global_config, "pearl_protocol_layout", "legacy_fixed")
+
+    def _check_pearl_protocol_config(self) -> None:
+        ensure_supported_protocol(self._pearl_protocol_version())
+        normalize_layout_kind(self._pearl_protocol_layout())
+
+
+    def _encode_draft_protocol_message(self, **kwargs) -> PearlDraftMessage:
+        if self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value:
+            return encode_variable_draft_message(**kwargs)
+        return encode_legacy_draft_message(**kwargs)
+
+    def _decode_draft_protocol_message(self, message: PearlDraftMessage) -> tuple[list[int], list[int]]:
+        if message.layout_kind == PearlLayoutKind.VARIABLE_OFFSETS.value:
+            return decode_variable_draft_message(message)
+        return decode_legacy_draft_message(message)
+
+    def _encode_verify_protocol_message(self, **kwargs) -> PearlVerifyResultMessage:
+        if self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value:
+            return encode_variable_verify_result(**kwargs)
+        return encode_legacy_verify_result(**kwargs)
+
+    def _decode_verify_protocol_message(self, message: PearlVerifyResultMessage):
+        if message.layout_kind == PearlLayoutKind.VARIABLE_OFFSETS.value:
+            return decode_variable_verify_result(message)
+        return decode_legacy_verify_result(message)
+
+    def _trace_pearl_protocol_message(self, record: dict | None, message) -> None:
+        if record is None or not self._pearl_protocol_trace_enabled():
+            return
+        record["pearl_protocol_version"] = message.protocol_version
+        record["pearl_protocol_layout"] = message.layout_kind
+        record["protocol_message_type"] = message.message_type
+        record["protocol_layout_kind"] = message.layout_kind
+        is_variable = message.layout_kind == PearlLayoutKind.VARIABLE_OFFSETS.value
+        record["variable_offsets_enabled"] = is_variable
+        if message.message_type == PearlMessageType.DRAFT_TOKENS.value:
+            record["draft_message_seq_ids"] = list(message.seq_ids)
+            record["draft_message_per_seq_lengths"] = list(message.per_seq_draft_lengths)
+            record["draft_message_offsets"] = list(message.draft_offsets)
+            record["draft_message_total_tokens"] = int(message.total_draft_tokens)
+            if is_variable:
+                record["variable_draft_message_seq_ids"] = list(message.seq_ids)
+                record["variable_draft_message_per_seq_lengths"] = list(message.per_seq_draft_lengths)
+                record["variable_draft_message_offsets"] = list(message.draft_offsets)
+                record["variable_draft_message_total_tokens"] = int(message.total_draft_tokens)
+        elif message.message_type == PearlMessageType.VERIFY_RESULT.value:
+            record["verify_result_seq_ids"] = list(message.seq_ids)
+            record["verify_result_per_seq_accepted_lengths"] = list(message.per_seq_accepted_lengths)
+            record["verify_result_offsets"] = list(message.accepted_offsets)
+            record["verify_result_total_tokens"] = int(message.total_accepted_tokens)
+            if is_variable:
+                record["variable_verify_result_seq_ids"] = list(message.seq_ids)
+                record["variable_verify_result_per_seq_lengths"] = list(message.per_seq_accepted_lengths)
+                record["variable_verify_result_offsets"] = list(message.accepted_offsets)
+                record["variable_verify_result_total_tokens"] = int(message.total_accepted_tokens)
+
+    def _validate_and_trace_pearl_protocol(self, record: dict | None, message, expected_seq_ids: list[int]) -> None:
+        if not self._pearl_protocol_enabled():
+            return
+        try:
+            self._check_pearl_protocol_config()
+            if self._pearl_protocol_validate_enabled():
+                if message.layout_kind == PearlLayoutKind.VARIABLE_OFFSETS.value:
+                    validate_variable_offsets_layout(message, expected_seq_ids)
+                else:
+                    validate_legacy_fixed_layout(message, expected_seq_ids, self.gamma)
+        except Exception as exc:
+            if record is not None:
+                record["protocol_validation_ok"] = False
+                record["protocol_validation_error"] = str(exc)
+                record["protocol_message_type"] = getattr(message, "message_type", None)
+                record["protocol_layout_kind"] = getattr(message, "layout_kind", None)
+                if getattr(message, "layout_kind", None) == PearlLayoutKind.VARIABLE_OFFSETS.value:
+                    record["variable_offsets_validation_ok"] = False
+                    record["variable_offsets_validation_error"] = str(exc)
+            raise
+        if record is not None:
+            record["protocol_validation_ok"] = True
+            record["protocol_validation_error"] = None
+            if getattr(message, "layout_kind", None) == PearlLayoutKind.VARIABLE_OFFSETS.value:
+                record["variable_offsets_validation_ok"] = True
+                record["variable_offsets_validation_error"] = None
+        self._trace_pearl_protocol_message(record, message)
+
+    def _select_exec_seqs_for_plan(
+        self,
+        seqs: list[Sequence],
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> list[Sequence]:
+        exec_seqs = select_exec_seqs_for_plan(seqs, step_plan, runner_role)
+        actual_exec_seq_ids = [seq.seq_id for seq in exec_seqs]
+        trace_record["actual_exec_seq_ids"] = actual_exec_seq_ids
+        trace_record["filtered_out_seq_ids"] = [
+            seq.seq_id for seq in seqs if seq.seq_id not in set(actual_exec_seq_ids)
+        ]
+        trace_record["filtered_out_seq_count"] = len(trace_record["filtered_out_seq_ids"])
+        trace_record["actual_exec_fraction"] = (
+            float(len(actual_exec_seq_ids)) / float(len(seqs)) if seqs else 1.0
+        )
+        if not step_plan.real_probe_attempted:
+            assert exec_seqs == seqs
+        return exec_seqs
+
+    def _stspec_mailbox_enabled(self, step_plan: StepPlan | None) -> bool:
+        return bool(
+            step_plan is not None
+            and step_plan.real_probe_attempted
+            and not step_plan.stspec_probe_local_only
+            and not step_plan.is_prefill
+            and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
+            and step_plan.execution_mode in {"parallel_pearl", "serialized_pearl"}
+        )
+
+    def _mailbox_available_seq_ids_by_batch(self) -> dict[str, list[int]]:
+        return self.stspec_mailbox.available_seq_ids_by_batch()
+
+    def _trace_mailbox_availability(self, trace_record: dict) -> None:
+        home_batch_ids = self.stspec_mailbox.available_home_batch_ids()
+        seq_ids_by_batch = self._mailbox_available_seq_ids_by_batch()
+        trace_record["mailbox_available_home_batch_ids"] = home_batch_ids
+        trace_record["mailbox_available_seq_ids_by_batch"] = seq_ids_by_batch
+        trace_record["target_mailbox_available_home_batch_ids"] = home_batch_ids
+        trace_record["target_mailbox_available_seq_ids_by_batch"] = seq_ids_by_batch
+
+    def _record_mailbox_error(
+        self,
+        trace_record: dict,
+        *,
+        kind: str,
+        message: str,
+        next_required_feature: str | None = None,
+        warmup_miss: bool = False,
+    ) -> None:
+        trace_record["mailbox_error"] = message
+        trace_record["mailbox_error_kind"] = kind
+        trace_record["mailbox_warmup_miss"] = bool(warmup_miss)
+        trace_record["mailbox_routing_ok"] = False
+        trace_record["cross_batch_routing_ok"] = False
+        trace_record["cross_batch_routing_error"] = message
+        if next_required_feature:
+            trace_record["next_required_feature"] = next_required_feature
+        self._trace_mailbox_availability(trace_record)
+
+    def _record_mailbox_transport_error(
+        self,
+        trace_record: dict,
+        *,
+        kind: str,
+        message: str,
+        next_required_feature: str | None = None,
+    ) -> None:
+        trace_record["mailbox_transport_error"] = message
+        trace_record["mailbox_transport_error_kind"] = kind
+        if next_required_feature:
+            trace_record["next_required_feature"] = next_required_feature
+
+    def _mailbox_transport_mode(self) -> str:
+        # V4E exposes a validated transport envelope. Runtime delivery remains
+        # diagnostic-only until a safe cross-process object/tensor side channel is
+        # selected; warmup and target-consume diagnostics are reported separately.
+        return MailboxTransportMode.DIAGNOSTIC_ONLY.value
+
+    def _mailbox_allow_warmup_miss(self) -> bool:
+        return bool(getattr(self.global_config, "stspec_mailbox_allow_warmup_miss", False))
+
+    def _receive_mailbox_payload_tensor_probe(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> None:
+        """V4G local-list payload transport backend for the guarded probe.
+
+        The existing PEARL verification path broadcasts a flat CUDA tensor after
+        target preflight; it does not yet carry variable-offset Python metadata.
+        For V4G we explicitly construct a CPU/list token payload envelope on the
+        target side using the target StepPlan's exact seq ids/home batch. This
+        proves envelope validation, mailbox insertion, and target consume
+        plumbing before failing later at target-forward/KV wiring.
+        """
+        seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
+        payloads: list[MailboxPayload] = []
+        for seq_id in step_plan.actual_target_exec_seq_ids:
+            seq = seq_by_id.get(int(seq_id))
+            if seq is None:
+                trace_record["illegal_legacy_fallback"] = True
+                raise RuntimeError(
+                    "ST-Spec target payload transport cannot find target exec seq; "
+                    f"seq_id={seq_id}, actual_target_exec_seq_ids={step_plan.actual_target_exec_seq_ids}, "
+                    f"available_exec_seq_ids={list(seq_by_id)}"
+                )
+            length = 1 if getattr(seq, "pre_verify", False) else int(self.gamma)
+            token_ids = [int(token) for token in list(seq.token_ids)[-length:]]
+            if len(token_ids) < length:
+                token_ids = ([0] * (length - len(token_ids))) + token_ids
+            payloads.append(
+                MailboxPayload(
+                    plan_id=step_plan.plan_id,
+                    producer_role="draft_payload_tensor_probe",
+                    producer_home_batch_id=step_plan.target_home_batch_id,
+                    target_home_batch_id=step_plan.target_home_batch_id,
+                    draft_home_batch_id=step_plan.draft_home_batch_id,
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    home_batch_id=step_plan.target_home_batch_id,
+                    gamma=int(self.gamma),
+                    layout_kind=PearlLayoutKind.VARIABLE_OFFSETS.value,
+                    protocol_version=self._pearl_protocol_version(),
+                    draft_token_ids=token_ids,
+                    per_seq_length=length,
+                    offset=0,
+                    logical_step=step_plan.plan_id,
+                    producer_actual_exec_seq_ids=list(step_plan.actual_target_exec_seq_ids),
+                    producer_draft_message_seq_ids=list(step_plan.actual_target_exec_seq_ids),
+                    metadata={"mailbox_payload_tensor_backend": "local_list_probe"},
+                )
+            )
+        trace_record["mailbox_payload_tensor_transport_attempted"] = True
+        trace_record["mailbox_payload_tensor_transport_backend"] = "local_list_probe"
+        try:
+            envelope = encode_payload_tensor_envelope_from_payloads(
+                payloads,
+                home_batch_id=step_plan.target_home_batch_id,
+                source_plan_id=step_plan.plan_id,
+                source_runner_role="draft_payload_tensor_probe",
+                source_draft_home_batch_id=step_plan.target_home_batch_id,
+                target_home_batch_id=step_plan.target_home_batch_id,
+                gamma=self.gamma,
+                logical_step=step_plan.plan_id,
+            )
+            transported_payloads = payload_tensor_envelope_to_mailbox_payloads(envelope)
+            self.stspec_mailbox.put_payloads(
+                step_plan.target_home_batch_id,
+                transported_payloads,
+                plan_id=step_plan.plan_id,
+                producer_role="draft_payload_tensor_probe",
+            )
+        except Exception as exc:
+            trace_record["mailbox_payload_tensor_transport_success"] = False
+            trace_record["mailbox_payload_tensor_transport_error"] = str(exc)
+            trace_record["mailbox_payload_tensor_transport_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "mailbox_payload_tensor_transport_backend"
+            raise
+        trace_record["mailbox_payload_tensor_transport_success"] = True
+        trace_record["mailbox_payload_tensor_transport_error"] = None
+        trace_record["mailbox_payload_tensor_transport_error_kind"] = None
+        trace_record["mailbox_payload_tensor_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_payload_tensor_home_batch_id"] = envelope.home_batch_id
+        trace_record["mailbox_payload_tensor_total_tokens"] = int(envelope.total_tokens)
+        trace_record["mailbox_payload_tensor_shape"] = list(envelope.payload_shape)
+        trace_record["mailbox_payload_tensor_device"] = envelope.payload_device
+        trace_record["mailbox_transport_recv_attempted"] = True
+        trace_record["mailbox_transport_recv_success"] = True
+        trace_record["mailbox_transport_recv_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_transport_recv_home_batch_id"] = envelope.home_batch_id
+        trace_record["mailbox_transport_payload_available"] = True
+        trace_record["target_mailbox_insert_count"] = len(transported_payloads)
+        trace_record["target_mailbox_insert_seq_ids"] = [payload.seq_id for payload in transported_payloads]
+        trace_record["target_mailbox_insert_home_batch_id"] = step_plan.target_home_batch_id
+        self._trace_mailbox_availability(trace_record)
+
+    def _raise_illegal_legacy_fallback(
+        self,
+        trace_record: dict,
+        *,
+        step_plan: StepPlan,
+        input_seq_ids: list[int],
+        exec_seq_ids: list[int],
+    ) -> None:
+        trace_record["illegal_legacy_fallback"] = True
+        trace_record["target_forward_from_mailbox_error_kind"] = "illegal_legacy_fallback"
+        trace_record["next_required_feature"] = "strict_mailbox_target_seq_routing"
+        message = (
+            "illegal legacy fallback detected in ST-Spec real probe; target forward from mailbox "
+            "must use actual_target_exec_seq_ids rather than scheduled full batch"
+        )
+        trace_record["target_forward_from_mailbox_error"] = message
+        raise RuntimeError(
+            f"{message}; plan_id={step_plan.plan_id}, scheduled_seq_ids={list(step_plan.scheduled_seq_ids)}, "
+            f"actual_target_exec_seq_ids={list(step_plan.actual_target_exec_seq_ids)}, "
+            f"input_seq_ids={input_seq_ids}, exec_seq_ids={exec_seq_ids}, "
+            "next_required_feature=strict_mailbox_target_seq_routing"
+        )
+
+    def _run_target_forward_from_mailbox_input(
+        self,
+        verification_input,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+    ) -> None:
+        exec_seq_ids = [int(seq.seq_id) for seq in exec_seqs]
+        input_seq_ids = [int(seq_id) for seq_id in verification_input.seq_ids]
+        scheduled_seq_ids = [int(seq_id) for seq_id in step_plan.scheduled_seq_ids]
+        actual_target_exec_seq_ids = [int(seq_id) for seq_id in step_plan.actual_target_exec_seq_ids]
+
+        trace_record["target_forward_from_mailbox_input_built"] = True
+        trace_record["target_forward_from_mailbox_input_seq_ids"] = input_seq_ids
+        trace_record["target_forward_from_mailbox_input_total_tokens"] = int(verification_input.total_tokens)
+        trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
+
+        if scheduled_seq_ids != actual_target_exec_seq_ids and input_seq_ids == scheduled_seq_ids:
+            self._raise_illegal_legacy_fallback(
+                trace_record,
+                step_plan=step_plan,
+                input_seq_ids=input_seq_ids,
+                exec_seq_ids=exec_seq_ids,
+            )
+        if input_seq_ids != actual_target_exec_seq_ids or exec_seq_ids != actual_target_exec_seq_ids:
+            trace_record["illegal_legacy_fallback"] = True
+            message = (
+                "target forward from mailbox input seq ids do not exactly match actual target exec seq ids"
+            )
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = "target_forward_seq_mismatch"
+            trace_record["next_required_feature"] = "strict_mailbox_target_seq_routing"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, input_seq_ids={input_seq_ids}, "
+                f"exec_seq_ids={exec_seq_ids}, actual_target_exec_seq_ids={actual_target_exec_seq_ids}, "
+                "next_required_feature=strict_mailbox_target_seq_routing"
+            )
+
+        try:
+            validate_target_forward_from_mailbox_input(
+                verification_input,
+                actual_target_exec_seq_ids=actual_target_exec_seq_ids,
+                target_scheduler_seq_ids=[int(seq.seq_id) for seq in list(self.scheduler.waiting) + list(self.scheduler.running) + list(self.scheduler.finished)],
+                scheduled_seq_ids=scheduled_seq_ids,
+                target_home_batch_id=step_plan.target_home_batch_id,
+            )
+        except Exception as exc:
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_input_validation"
+            raise
+
+        trace_record["target_forward_from_mailbox_attempted"] = True
+        trace_record["target_forward_from_mailbox_success"] = False
+        trace_record["target_forward_from_mailbox_seq_ids"] = input_seq_ids
+        trace_record["target_forward_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
+        trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
+
+        kv_status = validate_kv_state_sync_for_mailbox_forward(verification_input, exec_seqs)
+        trace_record["kv_state_sync_check_attempted"] = bool(kv_status.attempted)
+        trace_record["kv_state_sync_check_success"] = bool(kv_status.success)
+        trace_record["kv_state_sync_missing_seq_ids"] = list(kv_status.missing_seq_ids)
+        trace_record["kv_state_sync_error"] = kv_status.error
+        trace_record["kv_state_sync_error_kind"] = kv_status.error_kind
+        if not kv_status.success:
+            message = "target forward from mailbox input requires KV/state synchronization"
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = kv_status.error_kind
+            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, target_seq_ids={input_seq_ids}, "
+                f"kv_state_sync_error_kind={kv_status.error_kind}, missing_seq_ids={kv_status.missing_seq_ids}, "
+                "next_required_feature=kv_state_sync_for_mailbox_forward"
+            )
+
+        start = time.time()
+        try:
+            input_ids = torch.tensor(verification_input.input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(verification_input.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            trace_record["target_forward_from_mailbox_input_shape"] = list(input_ids.shape)
+            logits = self.run_model(input_ids, positions, False)
+            trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
+            trace_record["target_forward_from_mailbox_success"] = True
+            trace_record["target_forward_from_mailbox_output_shape"] = list(logits.shape)
+        except Exception as exc:
+            trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
+            trace_record["target_forward_from_mailbox_success"] = False
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            raise RuntimeError(
+                f"target forward from mailbox input failed during guarded probe; error={exc}; "
+                "next_required_feature=kv_state_sync_for_mailbox_forward"
+            ) from exc
+
+        trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = True
+        try:
+            interpret_target_forward_from_mailbox_output(verification_input, trace_record["target_forward_from_mailbox_output_shape"])
+        except TargetForwardMailboxError as exc:
+            trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
+            trace_record["target_forward_from_mailbox_output_interpretation_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = exc.error_kind
+            trace_record["next_required_feature"] = exc.next_required_feature
+            raise RuntimeError(str(exc)) from exc
+
+        trace_record["target_forward_from_mailbox_output_interpretation_success"] = True
+        trace_record["mailbox_verify_apply_attempted"] = True
+        trace_record["mailbox_verify_apply_success"] = False
+        message = "mailbox verification apply path is not implemented"
+        trace_record["mailbox_verify_apply_error"] = message
+        trace_record["next_required_feature"] = "mailbox_verify_apply_path"
+        raise RuntimeError(f"{message}; next_required_feature=mailbox_verify_apply_path")
+
+    def _prepare_stspec_mailbox_route(
+        self,
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+        exec_seqs: list[Sequence] | None = None,
+    ) -> None:
+        """V4E mailbox transport/consume preflight for real variable-offset probes.
+
+        Draft runners now continue to produce a validated mailbox transport
+        envelope after the draft payload exists. Target runners first classify
+        pipeline warmup separately from transport/payload misses; if payloads are
+        present, the probe stops at the next explicit blocker: verification input
+        construction from mailbox payloads is not wired yet.
+        """
+        if not self._stspec_mailbox_enabled(step_plan):
+            return
+        trace_record["stspec_mailbox_enabled"] = True
+        trace_record["stspec_mailbox_transport_enabled"] = True
+        trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
+        self._trace_mailbox_availability(trace_record)
+
+        if "draft" in runner_role:
+            # The draft payload is not available until after gamma draft steps;
+            # _record_draft_mailbox_payloads() will encode the transport envelope.
+            trace_record["mailbox_transport_send_attempted"] = False
+            trace_record["mailbox_transport_send_seq_ids"] = list(step_plan.actual_draft_exec_seq_ids)
+            trace_record["mailbox_transport_send_home_batch_id"] = step_plan.draft_home_batch_id
+            return
+
+        trace_record["mailbox_transport_recv_attempted"] = True
+        trace_record["mailbox_transport_recv_success"] = False
+        trace_record["mailbox_transport_recv_home_batch_id"] = step_plan.target_home_batch_id
+        trace_record["mailbox_transport_recv_seq_ids"] = []
+        trace_record["mailbox_transport_payload_available"] = False
+
+        target_seq_ids = list(step_plan.actual_target_exec_seq_ids)
+        if (
+            step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value
+            and step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
+            and exec_seqs is not None
+        ):
+            self._receive_mailbox_payload_tensor_probe(exec_seqs, step_plan, runner_role, trace_record)
+        result = self.stspec_mailbox.get_payloads(
+            step_plan.target_home_batch_id,
+            target_seq_ids,
+            plan_id=step_plan.plan_id,
+            consumer_role=runner_role,
+        )
+        trace_record["mailbox_get_attempted"] = True
+        trace_record["mailbox_get_success"] = result.success
+        trace_record["mailbox_get_hit_count"] = result.hit_count
+        trace_record["mailbox_get_miss_count"] = result.miss_count
+        trace_record["mailbox_get_home_batch_id"] = step_plan.target_home_batch_id
+        trace_record["mailbox_get_seq_ids"] = target_seq_ids
+        trace_record["mailbox_missing_seq_ids"] = list(result.missing_seq_ids)
+        self._trace_mailbox_availability(trace_record)
+        if result.success:
+            payload_seq_ids = [int(payload.seq_id) for payload in result.payloads]
+            payload_home_batch_ids = {payload.home_batch_id for payload in result.payloads}
+            if payload_seq_ids != target_seq_ids or payload_home_batch_ids != {step_plan.target_home_batch_id}:
+                trace_record["illegal_legacy_fallback"] = True
+                message = (
+                    "target consume-from-mailbox payload validation failed; payload seq/home batch ids "
+                    "do not match target StepPlan"
+                )
+                trace_record["target_consume_from_mailbox_attempted"] = True
+                trace_record["target_consume_from_mailbox_success"] = False
+                trace_record["target_consume_from_mailbox_payload_seq_ids"] = payload_seq_ids
+                trace_record["target_consume_from_mailbox_payload_home_batch_id"] = list(payload_home_batch_ids)
+                trace_record["target_consume_from_mailbox_error"] = message
+                trace_record["next_required_feature"] = "target_consume_payload_validation"
+                raise RuntimeError(
+                    f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
+                    f"target_seq_ids={target_seq_ids}, payload_seq_ids={payload_seq_ids}, "
+                    f"target_home_batch_id={step_plan.target_home_batch_id}, payload_home_batch_ids={payload_home_batch_ids}, "
+                    "next_required_feature=target_consume_payload_validation"
+                )
+            trace_record["mailbox_transport_recv_success"] = True
+            trace_record["mailbox_transport_recv_seq_ids"] = target_seq_ids
+            trace_record["mailbox_transport_payload_available"] = all(
+                len(payload.draft_token_ids) == int(payload.per_seq_length) for payload in result.payloads
+            )
+            trace_record["mailbox_routing_ok"] = True
+            trace_record["mailbox_error"] = None
+            trace_record["mailbox_error_kind"] = None
+            trace_record["target_consume_from_mailbox_attempted"] = True
+            trace_record["target_consume_from_mailbox_success"] = True
+            trace_record["target_consume_from_mailbox_payload_seq_ids"] = payload_seq_ids
+            trace_record["target_consume_from_mailbox_payload_lengths"] = [int(payload.per_seq_length) for payload in result.payloads]
+            trace_record["target_consume_from_mailbox_payload_total_tokens"] = sum(
+                int(payload.per_seq_length) for payload in result.payloads
+            )
+            trace_record["target_consume_from_mailbox_payload_home_batch_id"] = step_plan.target_home_batch_id
+            trace_record["target_consume_from_mailbox_error"] = None
+            trace_record["verification_input_from_mailbox_attempted"] = True
+            verification_input = build_verification_input_from_mailbox_payload(
+                result.payloads, exec_seqs or [], step_plan, self.gamma
+            )
+            trace_record["verification_input_from_mailbox_success"] = True
+            trace_record["verification_input_from_mailbox_seq_ids"] = list(verification_input.seq_ids)
+            trace_record["verification_input_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
+            trace_record["verification_input_from_mailbox_error"] = None
+            self._run_target_forward_from_mailbox_input(
+                verification_input,
+                exec_seqs or [],
+                step_plan,
+                trace_record,
+            )
+
+        error_kind, next_feature, warmup_miss = classify_mailbox_miss(
+            target_home_batch_id=step_plan.target_home_batch_id,
+            available_home_batch_ids=self.stspec_mailbox.available_home_batch_ids(),
+            allow_warmup_miss=self._mailbox_allow_warmup_miss(),
+        )
+        if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value and warmup_miss:
+            error_kind, next_feature, warmup_miss = "mailbox_missing_payload", "mailbox_payload_tensor_transport", False
+        if warmup_miss and should_skip_target_for_warmup(
+            phase=step_plan.stspec_pipeline_phase,
+            runner_role=runner_role,
+            allow_warmup_miss=self._mailbox_allow_warmup_miss(),
+        ):
+            trace_record["mailbox_warmup_skip"] = True
+            trace_record["target_verify_skipped_for_warmup"] = True
+            trace_record["warmup_target_verify_skipped"] = True
+            trace_record["pipeline_phase_advanced"] = True
+            message = "ST-Spec warmup target verify skipped; draft-only pipeline fill recorded"
+            self._record_mailbox_error(
+                trace_record,
+                kind=error_kind,
+                message=message,
+                next_required_feature="verification_input_from_mailbox",
+                warmup_miss=True,
+            )
+            return
+        elif warmup_miss:
+            message = "ST-Spec mailbox warmup miss for target batch; pipeline warmup schedule is required"
+        else:
+            message = "ST-Spec mailbox payload missing for target batch after transport receive attempt"
+        self._record_mailbox_error(
+            trace_record,
+            kind=error_kind,
+            message=message,
+            next_required_feature=next_feature,
+            warmup_miss=warmup_miss,
+        )
+        if not warmup_miss:
+            self._record_mailbox_transport_error(
+                trace_record,
+                kind="mailbox_payload_tensor_transport_unavailable",
+                message=message,
+                next_required_feature=next_feature,
+            )
+        raise RuntimeError(
+            f"{message}; mailbox_error_kind={error_kind}, plan_id={step_plan.plan_id}, "
+            f"runner_role={runner_role}, target_home_batch_id={step_plan.target_home_batch_id}, "
+            f"target_seq_ids={target_seq_ids}, mailbox_missing_seq_ids={result.missing_seq_ids}, "
+            f"available_mailbox_home_batch_ids={trace_record['mailbox_available_home_batch_ids']}, "
+            f"available_mailbox_seq_ids_by_batch={trace_record['mailbox_available_seq_ids_by_batch']}, "
+            f"allow_warmup_miss={self._mailbox_allow_warmup_miss()}, "
+            f"next_required_feature={next_feature}"
+        )
+
+    def _record_draft_mailbox_payloads(
+        self,
+        trace_record: dict | None,
+        step_plan: StepPlan | None,
+        draft_message: PearlDraftMessage,
+    ) -> None:
+        if trace_record is None or not self._stspec_mailbox_enabled(step_plan):
+            return
+        payloads = payloads_from_draft_message(
+            draft_message,
+            home_batch_id=step_plan.draft_home_batch_id,
+            target_home_batch_id=step_plan.target_home_batch_id,
+            draft_home_batch_id=step_plan.draft_home_batch_id,
+            producer_home_batch_id=step_plan.draft_home_batch_id,
+            producer_role="draft",
+            logical_step=step_plan.plan_id,
+            metadata={"mailbox_locality": "diagnostic_local"},
+        )
+        trace_record["stspec_mailbox_transport_enabled"] = True
+        trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
+        trace_record["mailbox_put_attempted"] = True
+        trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
+        trace_record["mailbox_put_seq_ids"] = [payload.seq_id for payload in payloads]
+        try:
+            self.stspec_mailbox.put_payloads(
+                step_plan.draft_home_batch_id,
+                payloads,
+                plan_id=step_plan.plan_id,
+                producer_role="draft",
+            )
+            envelope = encode_mailbox_transport_envelope(
+                payloads=payloads,
+                transport_mode=self._mailbox_transport_mode(),
+                plan_id=step_plan.plan_id,
+                producer_rank=self.rank,
+                producer_role="draft",
+                producer_home_batch_id=step_plan.draft_home_batch_id,
+                target_home_batch_id=step_plan.target_home_batch_id,
+                draft_home_batch_id=step_plan.draft_home_batch_id,
+                produced_for_home_batch_id=step_plan.draft_home_batch_id,
+                logical_step=step_plan.plan_id,
+                source_plan_signature_hash=trace_record.get("plan_signature_hash"),
+                payload_available=True,
+                payload_metadata={"gamma": self.gamma, "mailbox_transport_scope": "diagnostic_envelope"},
+            )
+        except STSpecMailboxError as exc:
+            trace_record["mailbox_put_success"] = False
+            trace_record["mailbox_put_count"] = 0
+            self._record_mailbox_error(
+                trace_record,
+                kind=exc.kind,
+                message=str(exc),
+                next_required_feature="mailbox_payload_tensor_transport",
+            )
+            raise
+        trace_record["mailbox_put_success"] = True
+        trace_record["mailbox_put_count"] = len(payloads)
+        if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.WARMUP_DRAFT_ONLY.value:
+            trace_record["warmup_draft_payload_produced"] = True
+            trace_record["pipeline_phase_advanced"] = True
+        trace_record["mailbox_cross_process_delivery"] = "transport_envelope_visible"
+        trace_record["mailbox_transport_send_attempted"] = True
+        trace_record["mailbox_transport_send_success"] = True
+        trace_record["mailbox_transport_send_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_transport_send_home_batch_id"] = envelope.produced_for_home_batch_id
+        trace_record["mailbox_transport_payload_available"] = bool(envelope.payload_available)
+        trace_record["mailbox_transport_error"] = None
+        trace_record["mailbox_transport_error_kind"] = None
+        trace_record["mailbox_transport_envelope_digest"] = envelope.digest()
+        trace_record["next_required_feature"] = "target_consume_from_mailbox"
+        self._trace_mailbox_availability(trace_record)
+
+    def _validate_stspec_probe_alignment(
+        self,
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> None:
+        error = stspec_protocol_alignment_error(step_plan, runner_role, self.gamma, self._pearl_protocol_layout())
+        if error is None:
+            trace_record["protocol_alignment_ok"] = True
+            trace_record["protocol_alignment_error"] = None
+            if step_plan.real_probe_attempted:
+                trace_record["real_probe_applied"] = bool(trace_record.get("filtered_out_seq_ids"))
+                trace_record["real_probe_blocked"] = False
+            return
+
+        trace_record["protocol_alignment_ok"] = False
+        trace_record["protocol_alignment_error"] = error
+        trace_record["real_probe_applied"] = False
+        trace_record["real_probe_blocked"] = True
+        trace_record["real_probe_block_reason"] = error
+        if self._pearl_protocol_layout() == "variable_offsets":
+            trace_record["cross_batch_routing_ok"] = False
+            trace_record["cross_batch_routing_error"] = error
+            trace_record["next_required_feature"] = "mailbox_payload_tensor_transport"
+        # V4A is explicitly a feasibility probe. The current PEARL protocol packs
+        # draft/verify tensors by common sequence index, so a mismatch must stop
+        # before distributed communication can hang or corrupt request state.
+        raise RuntimeError(error)
 
     def _mark_trace_start(self, record: dict):
         if self.tp_params.local_rank != 0:
@@ -404,45 +1348,51 @@ class ModelRunnerBase:
         self.shm.buf[4:n+4] = data
 
     def prefill(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, f"{self._runner_role()}_prefill")
+        runner_role = f"{self._runner_role()}_prefill"
+        seqs, is_prefill, step_plan = self._schedule_with_plan(runner_role)
+        trace_record = self._trace_schedule(seqs, is_prefill, runner_role, step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, runner_role, trace_record)
+        self._validate_stspec_probe_alignment(step_plan, runner_role, trace_record)
         assert is_prefill, "wrong match. current stage is decode."
-        input_ids, positions = self.prepare_prefill(seqs)
-        temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+        input_ids, positions = self.prepare_prefill(exec_seqs)
+        temperatures = self.prepare_sample(exec_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, True)
-        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
         torch.cuda.synchronize()
         token_ids = sample_tokens.tolist()
         reset_context(self.tp_params)
-        self.scheduler.postprocess(seqs, token_ids)
-        accepted_lens = {seq.seq_id: 1 for seq in seqs}
-        for seq in seqs:
+        self.scheduler.postprocess(exec_seqs, token_ids)
+        accepted_lens = {seq.seq_id: 1 for seq in exec_seqs}
+        for seq in exec_seqs:
             seq.record_accepted(1)
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, self._runner_role())
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+        runner_role = self._runner_role()
+        seqs, is_prefill, step_plan = self._schedule_with_plan(runner_role)
+        trace_record = self._trace_schedule(seqs, is_prefill, runner_role, step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, runner_role, trace_record)
+        self._validate_stspec_probe_alignment(step_plan, runner_role, trace_record)
+        input_ids, positions = self.prepare_prefill(exec_seqs) if is_prefill else self.prepare_decode(exec_seqs)
+        temperatures = self.prepare_sample(exec_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
         torch.cuda.synchronize()
         token_ids = sample_tokens.tolist()
         reset_context(self.tp_params)
-        self.scheduler.postprocess(seqs, token_ids)
-        accepted_lens = {seq.seq_id: 1 for seq in seqs}
-        for seq in seqs:
+        self.scheduler.postprocess(exec_seqs, token_ids)
+        accepted_lens = {seq.seq_id: 1 for seq in exec_seqs}
+        for seq in exec_seqs:
             seq.record_accepted(1)
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in exec_seqs]
+        num_tokens = sum(len(seq) for seq in exec_seqs) if is_prefill else -len(exec_seqs)
         return outputs, num_tokens
     
     def warmup_model(self):
@@ -751,27 +1701,30 @@ class DraftModelRunner(ModelRunnerBase):
     def pearl_step(self):
         trace_record = None
         for _ in range(self.gamma):
-            seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "draft")
+            seqs, is_prefill, step_plan = self._schedule_with_plan("draft")
+            trace_record = self._trace_schedule(seqs, is_prefill, "draft", step_plan)
+            exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "draft", trace_record)
+            self._validate_stspec_probe_alignment(step_plan, "draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "draft", trace_record, exec_seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
-            input_ids, positions = self.prepare_pearl_decode(seqs)
+            input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
             # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
             # We will support temperature in the future.
-            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
 
             # append the sample tokens to the seqs. Do not use postprocess to avoid early exiting when the draft tokens contain EOS.
-            for seq, token_id in zip(seqs, token_ids):
+            for seq, token_id in zip(exec_seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
-        accepted_lens, invalidated_lens = self.verify(seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -785,32 +1738,35 @@ class DraftModelRunner(ModelRunnerBase):
         """
         trace_record = None
         for _ in range(self.gamma):
-            seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft")
+            seqs, is_prefill, step_plan = self._schedule_with_plan("serialized_draft")
+            trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft", step_plan)
+            exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_draft", trace_record)
+            self._validate_stspec_probe_alignment(step_plan, "serialized_draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "serialized_draft", trace_record, exec_seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
-            input_ids, positions = self.prepare_pearl_decode(seqs)
+            input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
-            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(exec_seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
 
-            for seq, token_id in zip(seqs, token_ids):
+            for seq, token_id in zip(exec_seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
-        accepted_lens, invalidated_lens = self.verify(seqs)
+        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, seqs: list[Sequence]):
+    def verify(self, seqs: list[Sequence], trace_record: dict | None = None, step_plan: StepPlan | None = None):
         if self.tp_params.local_rank == 0:
             to_be_verified_tokens = []
             next_round_input = []
@@ -820,6 +1776,24 @@ class DraftModelRunner(ModelRunnerBase):
                 else:
                     to_be_verified_tokens.extend(seq.token_ids[-2*self.gamma+1:-self.gamma+1])
                 next_round_input.extend(seq.token_ids[-self.gamma:])
+            if self._pearl_protocol_enabled():
+                draft_message = self._encode_draft_protocol_message(
+                    seqs=seqs,
+                    gamma=self.gamma,
+                    draft_token_ids=to_be_verified_tokens,
+                    next_round_input=next_round_input,
+                    plan_id=step_plan.plan_id if step_plan is not None else None,
+                    runner_role="draft",
+                    scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                    actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                    target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                    draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                    protocol_version=self._pearl_protocol_version(),
+                    layout_kind=self._pearl_protocol_layout(),
+                )
+                self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+                self._record_draft_mailbox_payloads(trace_record, step_plan, draft_message)
+                to_be_verified_tokens, next_round_input = self._decode_draft_protocol_message(draft_message)
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
         
@@ -828,6 +1802,25 @@ class DraftModelRunner(ModelRunnerBase):
         
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = self._encode_verify_protocol_message(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="draft",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = self._decode_verify_protocol_message(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
         for idx, seq in enumerate(seqs):
@@ -902,15 +1895,21 @@ class TargetModelRunner(ModelRunnerBase):
         return input_ids, positions, temp_seqs
 
     def pearl_step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "verify")
+        seqs, is_prefill, step_plan = self._schedule_with_plan("verify")
+        trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
+        self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record, exec_seqs)
+        if trace_record.get("target_verify_skipped_for_warmup"):
+            self._mark_trace_end(trace_record)
+            return
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -925,20 +1924,26 @@ class TargetModelRunner(ModelRunnerBase):
         # Global barrier pairs with DraftModelRunner.serialized_pearl_step().
         # Do not move this below target compute, or draft/verify will overlap.
         dist.barrier()
-        seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")
+        seqs, is_prefill, step_plan = self._schedule_with_plan("serialized_verify")
+        trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify", step_plan)
+        exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
+        self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record, exec_seqs)
+        if trace_record.get("target_verify_skipped_for_warmup"):
+            self._mark_trace_end(trace_record)
+            return
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        accepted_lens, invalidated_lens = self.verify(logits, exec_seqs, temperatures, trace_record=trace_record, step_plan=step_plan)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     @torch.inference_mode()
-    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
+    def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, trace_record: dict | None = None, step_plan: StepPlan | None = None):
         """Refer to the verification logic in the draft model verification function."""
         # verify_res will be sent to the sub-process in the target group.
         num_to_be_verified_tokens = sum([1 if seq.pre_verify else self.gamma for seq in seqs])
@@ -947,6 +1952,23 @@ class TargetModelRunner(ModelRunnerBase):
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
+        if self._pearl_protocol_enabled():
+            draft_message = self._encode_draft_protocol_message(
+                seqs=seqs,
+                gamma=self.gamma,
+                draft_token_ids=to_be_verified_tokens,
+                next_round_input=next_round_input,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+            to_be_verified_tokens, next_round_input = self._decode_draft_protocol_message(draft_message)
         
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
 
@@ -1005,6 +2027,25 @@ class TargetModelRunner(ModelRunnerBase):
 
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        if self._pearl_protocol_enabled():
+            verify_message = self._encode_verify_protocol_message(
+                seqs=seqs,
+                gamma=self.gamma,
+                acc=acc,
+                rollout=rollout,
+                revise_token=revise_token,
+                finish=finish,
+                plan_id=step_plan.plan_id if step_plan is not None else None,
+                runner_role="verify",
+                scheduled_seq_ids=list(step_plan.scheduled_seq_ids) if step_plan is not None else [seq.seq_id for seq in seqs],
+                actual_exec_seq_ids=[seq.seq_id for seq in seqs],
+                target_batch_seq_ids=list(step_plan.target_batch_seq_ids) if step_plan is not None else [],
+                draft_home_batch_seq_ids=list(step_plan.draft_home_batch_seq_ids) if step_plan is not None else [],
+                protocol_version=self._pearl_protocol_version(),
+                layout_kind=self._pearl_protocol_layout(),
+            )
+            self._validate_and_trace_pearl_protocol(trace_record, verify_message, [seq.seq_id for seq in seqs])
+            acc, rollout, revise_token, finish = self._decode_verify_protocol_message(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
 
@@ -1036,8 +2077,11 @@ class TargetModelRunner(ModelRunnerBase):
                     seq.pre_verify = True
                     if rollout[idx] > 1:
                         self.scheduler.rollback(seq, rollout[idx] - 1)
-                    seq.mark_finished()       
-        
+                    # A verification rejection ends the current speculative span,
+                    # not the request. Do not stamp request-level finish_ts until
+                    # the scheduler actually moves the sequence to finished.
+                    seq.mark_finished(record_finish_ts=False)
+
             if finish[idx]:
                 seq.mark_finished()
                 seq.num_acc_tokens.append(seq.cur_acc_tokens)
