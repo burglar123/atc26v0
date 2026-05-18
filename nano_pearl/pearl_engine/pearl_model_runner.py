@@ -63,6 +63,10 @@ from nano_pearl.pearl_engine.stspec_kv_sync import (
     build_mailbox_kv_sync_plan,
     normalize_kv_sync_mode,
 )
+from nano_pearl.pearl_engine.stspec_mailbox_forward_context import (
+    build_target_forward_context_from_mailbox_input,
+    validate_target_forward_mailbox_context,
+)
 from nano_pearl.pearl_engine.stspec_pipeline import (
     STSpecPipelinePhase,
     should_skip_target_for_warmup,
@@ -1070,13 +1074,87 @@ class ModelRunnerBase:
                 "next_required_feature=target_forward_from_mailbox_guarded_forward"
             )
 
+        trace_record["target_forward_mailbox_context_build_attempted"] = True
+        trace_record["target_forward_mailbox_context_build_success"] = False
+        trace_record["target_forward_mailbox_context_error"] = None
+        trace_record["target_forward_mailbox_context_error_kind"] = None
+        try:
+            mailbox_context = build_target_forward_context_from_mailbox_input(
+                verification_input,
+                kv_plan,
+                exec_seqs,
+                step_plan,
+                runner_state=self,
+            )
+        except Exception as exc:
+            trace_record["target_forward_mailbox_context_error"] = str(exc)
+            trace_record["target_forward_mailbox_context_error_kind"] = type(exc).__name__
+            trace_record["target_forward_mailbox_can_run_model"] = False
+            trace_record["target_forward_mailbox_cannot_run_reason"] = "target_forward_mailbox_context_builder"
+            trace_record["next_required_feature"] = "target_forward_mailbox_context_builder"
+            raise RuntimeError(
+                f"target forward mailbox context build failed; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, error={exc}; "
+                "next_required_feature=target_forward_mailbox_context_builder"
+            ) from exc
+
+        trace_record["target_forward_mailbox_context_json"] = mailbox_context.to_dict()
+        trace_record["target_forward_mailbox_input_ids_shape"] = mailbox_context.input_ids_shape
+        trace_record["target_forward_mailbox_positions_shape"] = mailbox_context.positions_shape
+        trace_record["target_forward_mailbox_slot_mapping_shape"] = mailbox_context.slot_mapping_shape
+        trace_record["target_forward_mailbox_slot_mapping_available"] = mailbox_context.slot_mapping_available
+        trace_record["target_forward_mailbox_attention_metadata_available"] = mailbox_context.attention_metadata_available
+        trace_record["target_forward_mailbox_can_run_model"] = mailbox_context.can_run_model
+        trace_record["target_forward_mailbox_cannot_run_reason"] = mailbox_context.cannot_run_reason
+        trace_record["target_forward_mailbox_context_error"] = mailbox_context.error_message
+        trace_record["target_forward_mailbox_context_error_kind"] = mailbox_context.error_kind
+        if mailbox_context.error_kind == "illegal_legacy_fallback":
+            trace_record["illegal_legacy_fallback"] = True
+        if not mailbox_context.can_run_model:
+            trace_record["target_forward_mailbox_context_build_success"] = False
+            trace_record["target_forward_from_mailbox_attempted"] = False
+            trace_record["target_forward_from_mailbox_success"] = False
+            message = mailbox_context.error_message or "target forward mailbox context cannot run model"
+            next_required = "mailbox_slot_mapping_backend" if mailbox_context.cannot_run_reason == "mailbox_slot_mapping_backend" else (mailbox_context.cannot_run_reason or "target_forward_mailbox_context_backend")
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = mailbox_context.error_kind
+            trace_record["next_required_feature"] = next_required
+            raise RuntimeError(
+                f"target forward mailbox context cannot run model; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, input_shape={mailbox_context.input_ids_shape}, "
+                f"positions_shape={mailbox_context.positions_shape}, slot_mapping_shape={mailbox_context.slot_mapping_shape}, "
+                f"slot_mapping_available={mailbox_context.slot_mapping_available}, reason={mailbox_context.cannot_run_reason}, "
+                f"error={message}; next_required_feature={next_required}"
+            )
+        try:
+            validate_target_forward_mailbox_context(mailbox_context)
+        except Exception as exc:
+            trace_record["target_forward_mailbox_context_build_success"] = False
+            trace_record["target_forward_mailbox_context_error"] = str(exc)
+            trace_record["target_forward_mailbox_context_error_kind"] = type(exc).__name__
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "target_forward_mailbox_context_validation"
+            raise RuntimeError(
+                f"target forward mailbox context validation failed; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, error={exc}; "
+                "next_required_feature=target_forward_mailbox_context_validation"
+            ) from exc
+        trace_record["target_forward_mailbox_context_build_success"] = True
+
         trace_record["target_forward_from_mailbox_attempted"] = True
         trace_record["target_forward_from_mailbox_success"] = False
         start = time.time()
         try:
-            input_ids = torch.tensor(verification_input.input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            positions = torch.tensor(kv_plan.mailbox_token_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            input_ids = torch.tensor(mailbox_context.input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(mailbox_context.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping = torch.tensor(mailbox_context.slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            context_lens = torch.tensor(mailbox_context.context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            block_tables = torch.tensor(mailbox_context.block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
             trace_record["target_forward_from_mailbox_input_shape"] = list(input_ids.shape)
+            trace_record["target_forward_mailbox_positions_shape"] = list(positions.shape)
+            trace_record["target_forward_mailbox_slot_mapping_shape"] = list(slot_mapping.shape)
             logits = self.run_model(input_ids, positions, False)
             trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
             trace_record["target_forward_from_mailbox_success"] = True
@@ -1087,8 +1165,18 @@ class ModelRunnerBase:
             trace_record["target_forward_from_mailbox_error"] = str(exc)
             trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
             trace_record["next_required_feature"] = "target_forward_from_mailbox_guarded_forward_backend"
+            available = {
+                "input_ids": bool(mailbox_context.input_ids),
+                "positions": bool(mailbox_context.positions),
+                "slot_mapping": mailbox_context.slot_mapping_available,
+                "context_lens": bool(mailbox_context.context_lens),
+                "block_tables": bool(mailbox_context.block_tables),
+            }
             raise RuntimeError(
-                f"target forward from mailbox input failed during guarded probe; error={exc}; "
+                f"target forward from mailbox input failed during guarded probe; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, input_shape={mailbox_context.input_ids_shape}, "
+                f"positions_shape={mailbox_context.positions_shape}, slot_mapping_shape={mailbox_context.slot_mapping_shape}, "
+                f"context_fields_available={available}, error={exc}; "
                 "next_required_feature=target_forward_from_mailbox_guarded_forward_backend"
             ) from exc
 
