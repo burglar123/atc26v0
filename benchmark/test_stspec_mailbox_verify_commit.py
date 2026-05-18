@@ -30,6 +30,7 @@ apply_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_veri
 
 TargetForwardFromMailboxInput = transport_mod.TargetForwardFromMailboxInput
 MailboxVerifyApplyError = apply_mod.MailboxVerifyApplyError
+build_mailbox_kv_commit_plan = apply_mod.build_mailbox_kv_commit_plan
 build_mailbox_verify_apply_plan = apply_mod.build_mailbox_verify_apply_plan
 build_mailbox_verify_commit_plan = apply_mod.build_mailbox_verify_commit_plan
 build_mailbox_verify_result = apply_mod.build_mailbox_verify_result
@@ -121,25 +122,30 @@ def build_commit(predicted, *, seqs=None, step_plan=None):
     verify_result = build_mailbox_verify_result(make_input(step_plan.target_home_batch_id), target_token_ids=predicted, output_owner_rank=10)
     apply_plan = build_mailbox_verify_apply_plan(verify_result, seqs, step_plan, max_model_len=32)
     commit_plan = build_mailbox_verify_commit_plan(verify_result, apply_plan, seqs, step_plan, commit_allowed=True)
-    return verify_result, apply_plan, commit_plan, seqs
+    kv_commit_plan = build_mailbox_kv_commit_plan(
+        verify_result, commit_plan, seqs, step_plan, max_model_len=32, commit_allowed=True
+    )
+    return verify_result, apply_plan, commit_plan, kv_commit_plan, seqs
 
 
 def test_all_accepted_commit_mutates_sequences_and_points_to_kv_next_feature():
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10)
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.attempted is True
     assert result.success is True
     assert result.sequence_state_commit_success is True
-    assert result.next_required_feature == "kv_commit_after_mailbox_verify"
+    assert result.next_required_feature == "mailbox_payload_consume_invalidate"
+    assert result.kv_commit_success is True
+    assert result.kv_commit_shadow_only is True
     assert seqs[0].token_ids == [7, 101, 101]
     assert seqs[1].token_ids == [8, 9, 10, 301, 301, 302, 303, 304]
-    assert result.kv_commit_attempted is False
+    assert result.kv_commit_attempted is True
 
 
 def test_partial_accepted_reject_does_not_append_rejected_suffix_and_plans_invalidate():
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 999, 999])
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10)
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 999, 999])
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.success is True
     assert commit_plan.accepted_lengths_by_seq == {1: 1, 3: 2}
@@ -151,9 +157,9 @@ def test_partial_accepted_reject_does_not_append_rejected_suffix_and_plans_inval
 
 
 def test_all_rejected_commit_records_no_sequence_mutation():
-    _, _, commit_plan, seqs = build_commit([0, 0, 0, 0, 0])
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([0, 0, 0, 0, 0])
     before = [list(seq.token_ids) for seq in seqs]
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10)
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.success is True
     assert commit_plan.accepted_lengths_by_seq == {1: 0, 3: 0}
@@ -188,7 +194,7 @@ def test_accepted_length_larger_than_drafted_length_fails():
 
 
 def test_no_commit_mode_does_not_mutate():
-    _, apply_plan, _, seqs = build_commit([101, 301, 302, 303, 304])
+    _, apply_plan, _, _, seqs = build_commit([101, 301, 302, 303, 304])
     before = [list(seq.token_ids) for seq in seqs]
     result = run_mailbox_verify_apply_no_commit_probe(apply_plan, seqs)
 
@@ -197,9 +203,9 @@ def test_no_commit_mode_does_not_mutate():
 
 
 def test_commit_disabled_does_not_mutate():
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
     before = [list(seq.token_ids) for seq in seqs]
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, commit_enabled=False)
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, commit_enabled=False, kv_commit_plan=kv_commit_plan)
 
     assert result.attempted is False
     assert result.success is True
@@ -208,9 +214,9 @@ def test_commit_disabled_does_not_mutate():
 
 def test_rollback_restores_sequence_after_mid_commit_failure():
     seqs = make_seqs(seq2_cls=FailingSeq)
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 303, 304], seqs=seqs)
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 303, 304], seqs=seqs)
     before = [list(seq.token_ids) for seq in seqs]
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10)
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.success is False
     assert result.rollback_attempted is True
@@ -220,9 +226,9 @@ def test_rollback_restores_sequence_after_mid_commit_failure():
 
 
 def test_non_owner_skip_does_not_mutate_or_error():
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 303, 304])
     before = [list(seq.token_ids) for seq in seqs]
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=11, output_owner_rank=10)
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=11, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.success is True
     assert result.skipped_non_owner is True
@@ -231,8 +237,8 @@ def test_non_owner_skip_does_not_mutate_or_error():
 
 
 def test_commit_plan_and_result_are_json_serializable():
-    _, _, commit_plan, seqs = build_commit([101, 301, 302, 999, 999])
-    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10)
+    _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 999, 999])
+    result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     json.dumps(commit_plan.to_dict(), sort_keys=True, default=str)
     json.dumps(result.to_dict(), sort_keys=True, default=str)

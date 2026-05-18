@@ -44,6 +44,8 @@ class MailboxVerifyResult:
     no_commit: bool = True
     metadata_only: bool = False
     next_required_feature: str | None = None
+    positions_by_seq: dict[int, list[int]] = field(default_factory=dict)
+    kv_slot_ids_by_seq: dict[int, list[int]] = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
@@ -131,9 +133,15 @@ class MailboxVerifyCommitResult:
     sequence_state_commit_success: bool = False
     sequence_state_before: dict[int, JsonDict] = field(default_factory=dict)
     sequence_state_after: dict[int, JsonDict] = field(default_factory=dict)
+    kv_commit_plan_built: bool = False
     kv_commit_attempted: bool = False
     kv_commit_success: bool = False
+    kv_commit_shadow_only: bool = False
     kv_commit_error: str | None = None
+    kv_commit_error_kind: str | None = None
+    kv_commit_rollback_attempted: bool = False
+    kv_commit_rollback_success: bool = True
+    kv_commit_skipped_non_owner: bool = False
     mailbox_payload_consume_attempted: bool = False
     mailbox_payload_consume_success: bool = False
     mailbox_payload_invalidate_attempted: bool = False
@@ -143,6 +151,55 @@ class MailboxVerifyCommitResult:
     skipped_non_owner: bool = False
     total_accepted_tokens: int = 0
     total_rejected_tokens: int = 0
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+@dataclass(frozen=True)
+class MailboxKVCommitPlan:
+    plan_id: int | None
+    target_home_batch_id: int | str | None
+    seq_ids: list[int]
+    request_ids: list[Any]
+    accepted_lengths_by_seq: dict[int, int]
+    accepted_token_ids_by_seq: dict[int, list[int]]
+    append_start_positions_by_seq: dict[int, int]
+    append_end_positions_by_seq: dict[int, int]
+    kv_positions_by_seq: dict[int, list[int]]
+    kv_slots_or_blocks_by_seq: dict[int, list[int]]
+    sequence_length_before_by_seq: dict[int, int]
+    sequence_length_after_by_seq: dict[int, int]
+    kv_length_before_by_seq: dict[int, int]
+    kv_length_after_by_seq: dict[int, int]
+    commit_allowed: bool
+    commit_mode: str = "shadow_only"
+    rollback_required: bool = False
+    rollback_success: bool = True
+    error_kind: str | None = None
+    error_message: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True)
+class MailboxKVCommitResult:
+    attempted: bool
+    success: bool
+    plan: MailboxKVCommitPlan | None = None
+    shadow_only: bool = False
+    skipped_non_owner: bool = False
+    error_kind: str | None = None
+    error_message: str | None = None
+    next_required_feature: str | None = None
+    rollback_attempted: bool = False
+    rollback_success: bool = True
+    kv_state_before: dict[int, JsonDict] = field(default_factory=dict)
+    kv_state_after: dict[int, JsonDict] = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
@@ -175,6 +232,10 @@ def build_mailbox_verify_result(
 
     drafted_by_seq: dict[int, list[int]] = {}
     target_by_seq: dict[int, list[int]] = {}
+    positions_by_seq: dict[int, list[int]] = {}
+    kv_slot_ids_by_seq: dict[int, list[int]] = {}
+    positions_flat = [int(pos) for pos in (getattr(verification_input, "positions", []) or [])]
+    kv_slot_ids_flat = [int(slot) for slot in (getattr(verification_input, "kv_slot_ids", []) or [])]
     accepted: dict[int, int] = {}
     rejected_seq_ids: list[int] = []
     rejected_positions: dict[int, list[int]] = {}
@@ -187,6 +248,8 @@ def build_mailbox_verify_result(
         target = target_flat[offset : offset + length] if target_token_ids is not None else []
         drafted_by_seq[seq_id] = drafted
         target_by_seq[seq_id] = target
+        positions_by_seq[seq_id] = positions_flat[offset : offset + length] if positions_flat else []
+        kv_slot_ids_by_seq[seq_id] = kv_slot_ids_flat[offset : offset + length] if kv_slot_ids_flat else []
         if metadata_only:
             accepted_len = 0
         else:
@@ -221,6 +284,8 @@ def build_mailbox_verify_result(
         no_commit=True,
         metadata_only=metadata_only,
         next_required_feature="mailbox_verify_token_decision_backend" if metadata_only else None,
+        positions_by_seq=positions_by_seq,
+        kv_slot_ids_by_seq=kv_slot_ids_by_seq,
     )
 
 
@@ -483,11 +548,253 @@ def build_mailbox_verify_commit_plan(
         sequence_state_before=state_before,
         sequence_state_after_expected=state_after_expected,
         kv_state_before={"kv_commit_available": False},
-        kv_state_after_expected={"next_required_feature": "kv_commit_after_mailbox_verify"},
+        kv_state_after_expected={"next_required_feature": "mailbox_payload_consume_invalidate", "commit_mode": "shadow_only"},
         commit_allowed=bool(commit_allowed),
         commit_mode=str(commit_mode),
     )
 
+
+
+def build_mailbox_kv_commit_plan(
+    verify_result: MailboxVerifyResult,
+    commit_plan: MailboxVerifyCommitPlan,
+    exec_seqs: Iterable[Any],
+    step_plan: Any,
+    *,
+    max_model_len: int | None = None,
+    commit_allowed: bool,
+    commit_mode: str = "shadow_only",
+) -> MailboxKVCommitPlan:
+    """Build a guarded KV shadow commit plan for accepted mailbox tokens."""
+
+    seq_list = list(exec_seqs)
+    seq_by_id = {int(seq.seq_id): seq for seq in seq_list}
+    seq_ids = [int(seq_id) for seq_id in commit_plan.seq_ids]
+    expected = [int(seq_id) for seq_id in getattr(step_plan, "actual_target_exec_seq_ids", seq_ids)]
+    if seq_ids != expected:
+        raise MailboxVerifyApplyError(
+            f"mailbox KV commit seq ids mismatch: seq_ids={seq_ids}, expected={expected}",
+            next_required_feature="kv_commit_rollback_validation",
+            error_kind="mailbox_kv_commit_seq_mismatch",
+        )
+    if verify_result.target_home_batch_id != getattr(step_plan, "target_home_batch_id", None):
+        raise MailboxVerifyApplyError(
+            "mailbox KV commit home_batch_id mismatch",
+            next_required_feature="kv_commit_rollback_validation",
+            error_kind="mailbox_kv_commit_home_batch_mismatch",
+        )
+    if set(seq_by_id) != set(seq_ids):
+        raise MailboxVerifyApplyError(
+            f"mailbox KV commit missing Sequence state: seq_ids={seq_ids}, exec_seq_ids={sorted(seq_by_id)}",
+            next_required_feature="kv_commit_rollback_validation",
+            error_kind="mailbox_kv_commit_missing_sequence_state",
+        )
+
+    append_start: dict[int, int] = {}
+    append_end: dict[int, int] = {}
+    kv_positions: dict[int, list[int]] = {}
+    kv_slots_or_blocks: dict[int, list[int]] = {}
+    seq_len_before: dict[int, int] = {}
+    seq_len_after: dict[int, int] = {}
+    kv_len_before: dict[int, int] = {}
+    kv_len_after: dict[int, int] = {}
+    for seq_id, drafted_len in zip(seq_ids, verify_result.per_seq_lengths):
+        seq = seq_by_id[seq_id]
+        if getattr(seq, "home_batch_id", None) != verify_result.target_home_batch_id:
+            raise MailboxVerifyApplyError(
+                f"mailbox KV commit Sequence home_batch_id mismatch for seq_id={seq_id}",
+                next_required_feature="kv_commit_rollback_validation",
+                error_kind="mailbox_kv_commit_sequence_home_batch_mismatch",
+            )
+        accepted_len = int(commit_plan.accepted_lengths_by_seq[seq_id])
+        if accepted_len < 0 or accepted_len > int(drafted_len):
+            raise MailboxVerifyApplyError(
+                f"accepted length out of range for KV commit seq_id={seq_id}: accepted_len={accepted_len}, drafted_len={drafted_len}",
+                next_required_feature="kv_commit_rollback_validation",
+                error_kind="mailbox_kv_commit_accepted_length_out_of_range",
+            )
+        before_len = len(seq) if hasattr(seq, "__len__") else int(getattr(seq, "num_tokens", 0) or 0)
+        start = _sequence_output_length(seq)
+        end = start + accepted_len
+        total_end = before_len + accepted_len
+        if max_model_len is not None and total_end > int(max_model_len):
+            raise MailboxVerifyApplyError(
+                f"mailbox KV commit would exceed max_model_len for seq_id={seq_id}: end_len={total_end}, max_model_len={max_model_len}",
+                next_required_feature="kv_commit_rollback_validation",
+                error_kind="mailbox_kv_commit_exceeds_max_model_len",
+            )
+        positions = list(verify_result.positions_by_seq.get(seq_id, []))[:accepted_len]
+        if accepted_len and len(positions) != accepted_len:
+            positions = list(range(before_len, total_end))
+        slots = list(verify_result.kv_slot_ids_by_seq.get(seq_id, []))[:accepted_len]
+        if accepted_len and len(slots) != accepted_len:
+            block_table = list(getattr(seq, "block_table", []) or [])
+            if not block_table:
+                raise MailboxVerifyApplyError(
+                    f"mailbox KV commit has no slot/block mapping for seq_id={seq_id}",
+                    next_required_feature="kv_slot_mapping_after_mailbox_verify",
+                    error_kind="mailbox_kv_commit_missing_slot_mapping",
+                )
+            slots = block_table
+        append_start[seq_id] = start
+        append_end[seq_id] = end
+        kv_positions[seq_id] = positions
+        kv_slots_or_blocks[seq_id] = slots
+        seq_len_before[seq_id] = before_len
+        seq_len_after[seq_id] = total_end
+        kv_before = _kv_shadow_length(seq, default=before_len)
+        kv_len_before[seq_id] = kv_before
+        kv_len_after[seq_id] = kv_before + accepted_len
+    return MailboxKVCommitPlan(
+        plan_id=commit_plan.plan_id,
+        target_home_batch_id=commit_plan.target_home_batch_id,
+        seq_ids=seq_ids,
+        request_ids=list(commit_plan.request_ids),
+        accepted_lengths_by_seq=dict(commit_plan.accepted_lengths_by_seq),
+        accepted_token_ids_by_seq=dict(commit_plan.accepted_token_ids_by_seq),
+        append_start_positions_by_seq=append_start,
+        append_end_positions_by_seq=append_end,
+        kv_positions_by_seq=kv_positions,
+        kv_slots_or_blocks_by_seq=kv_slots_or_blocks,
+        sequence_length_before_by_seq=seq_len_before,
+        sequence_length_after_by_seq=seq_len_after,
+        kv_length_before_by_seq=kv_len_before,
+        kv_length_after_by_seq=kv_len_after,
+        commit_allowed=bool(commit_allowed),
+        commit_mode=str(commit_mode),
+    )
+
+
+def run_mailbox_kv_commit_probe(
+    kv_commit_plan: MailboxKVCommitPlan,
+    exec_seqs: Iterable[Any],
+    *,
+    current_rank: int | None = None,
+    output_owner_rank: int | None = None,
+    commit_enabled: bool = True,
+) -> MailboxKVCommitResult:
+    """Apply a rollback-safe shadow KV commit for mailbox accepted tokens."""
+
+    seq_list = list(exec_seqs)
+    seq_by_id = {int(seq.seq_id): seq for seq in seq_list}
+    before = {int(seq.seq_id): _kv_shadow_snapshot(seq) for seq in seq_list}
+    if output_owner_rank is not None and current_rank is not None and int(current_rank) != int(output_owner_rank):
+        return MailboxKVCommitResult(
+            attempted=False,
+            success=True,
+            plan=kv_commit_plan,
+            shadow_only=True,
+            skipped_non_owner=True,
+            kv_state_before=before,
+            kv_state_after=before,
+        )
+    if not commit_enabled or not kv_commit_plan.commit_allowed:
+        return MailboxKVCommitResult(
+            attempted=False,
+            success=True,
+            plan=kv_commit_plan,
+            shadow_only=True,
+            kv_state_before=before,
+            kv_state_after=before,
+        )
+
+    mutated_seq_ids: list[int] = []
+    try:
+        for seq_id in kv_commit_plan.seq_ids:
+            if seq_id not in seq_by_id:
+                raise MailboxVerifyApplyError(
+                    f"mailbox KV commit missing Sequence during commit: seq_id={seq_id}",
+                    next_required_feature="kv_commit_rollback_validation",
+                    error_kind="mailbox_kv_commit_missing_sequence_state",
+                )
+            seq = seq_by_id[seq_id]
+            expected_seq_len = int(kv_commit_plan.sequence_length_after_by_seq[seq_id])
+            current_seq_len = len(seq) if hasattr(seq, "__len__") else int(getattr(seq, "num_tokens", 0) or 0)
+            if current_seq_len != expected_seq_len:
+                raise MailboxVerifyApplyError(
+                    f"mailbox KV commit sequence length mismatch for seq_id={seq_id}: current={current_seq_len}, expected={expected_seq_len}",
+                    next_required_feature="kv_commit_rollback_validation",
+                    error_kind="mailbox_kv_commit_sequence_length_mismatch",
+                )
+            if bool(getattr(seq, "fail_kv_commit", False)):
+                raise MailboxVerifyApplyError(
+                    f"injected mailbox KV commit failure for seq_id={seq_id}",
+                    next_required_feature="kv_commit_rollback_validation",
+                    error_kind="mailbox_kv_commit_injected_failure",
+                )
+            accepted_len = int(kv_commit_plan.accepted_lengths_by_seq[seq_id])
+            if accepted_len:
+                positions = list(kv_commit_plan.kv_positions_by_seq.get(seq_id, []))
+                slots = list(kv_commit_plan.kv_slots_or_blocks_by_seq.get(seq_id, []))
+                if len(positions) != accepted_len or not slots:
+                    raise MailboxVerifyApplyError(
+                        f"mailbox KV commit append mapping invalid for seq_id={seq_id}",
+                        next_required_feature="kv_slot_mapping_after_mailbox_verify",
+                        error_kind="mailbox_kv_commit_invalid_slot_mapping",
+                    )
+            _set_kv_shadow_state(
+                seq,
+                {
+                    "plan_id": kv_commit_plan.plan_id,
+                    "target_home_batch_id": kv_commit_plan.target_home_batch_id,
+                    "seq_id": seq_id,
+                    "shadow_only": True,
+                    "length": int(kv_commit_plan.kv_length_after_by_seq[seq_id]),
+                    "append_start_position": int(kv_commit_plan.append_start_positions_by_seq[seq_id]),
+                    "append_end_position": int(kv_commit_plan.append_end_positions_by_seq[seq_id]),
+                    "positions": list(kv_commit_plan.kv_positions_by_seq.get(seq_id, [])),
+                    "slots_or_blocks": list(kv_commit_plan.kv_slots_or_blocks_by_seq.get(seq_id, [])),
+                },
+            )
+            mutated_seq_ids.append(seq_id)
+        after = {int(seq.seq_id): _kv_shadow_snapshot(seq) for seq in seq_list}
+        return MailboxKVCommitResult(
+            attempted=True,
+            success=True,
+            plan=kv_commit_plan,
+            shadow_only=True,
+            next_required_feature="mailbox_payload_consume_invalidate",
+            kv_state_before=before,
+            kv_state_after=after,
+        )
+    except MailboxVerifyApplyError as exc:
+        rollback_attempted = bool(mutated_seq_ids)
+        rollback_success = True
+        if rollback_attempted:
+            rollback_success = _rollback_kv_shadow(seq_by_id, before, mutated_seq_ids)
+        after = {int(seq.seq_id): _kv_shadow_snapshot(seq) for seq in seq_list}
+        return MailboxKVCommitResult(
+            attempted=True,
+            success=False,
+            plan=kv_commit_plan,
+            shadow_only=True,
+            error_kind=exc.error_kind,
+            error_message=str(exc),
+            next_required_feature=exc.next_required_feature if rollback_success else "kv_commit_rollback_validation",
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+            kv_state_before=before,
+            kv_state_after=after,
+        )
+    except Exception as exc:
+        rollback_attempted = bool(mutated_seq_ids)
+        rollback_success = True
+        if rollback_attempted:
+            rollback_success = _rollback_kv_shadow(seq_by_id, before, mutated_seq_ids)
+        after = {int(seq.seq_id): _kv_shadow_snapshot(seq) for seq in seq_list}
+        return MailboxKVCommitResult(
+            attempted=True,
+            success=False,
+            plan=kv_commit_plan,
+            shadow_only=True,
+            error_kind=type(exc).__name__,
+            error_message=f"mailbox KV commit unexpected error: {exc}",
+            next_required_feature="kv_commit_rollback_validation",
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+            kv_state_before=before,
+            kv_state_after=after,
+        )
 
 def run_mailbox_verify_commit_probe(
     commit_plan: MailboxVerifyCommitPlan,
@@ -497,12 +804,13 @@ def run_mailbox_verify_commit_probe(
     output_owner_rank: int | None = None,
     eos_token_id: int | list[int] | None = None,
     commit_enabled: bool = True,
+    kv_commit_plan: MailboxKVCommitPlan | None = None,
 ) -> MailboxVerifyCommitResult:
     """Apply a guarded sequence-only commit with rollback on any failure.
 
-    KV append and mailbox consume/invalidate are deliberately not implemented by
-    this V4M probe; after a successful Sequence commit the result points to the
-    next explicit feature, ``kv_commit_after_mailbox_verify``.
+    The V4N path performs a shadow-only KV metadata commit when a
+    ``MailboxKVCommitPlan`` is supplied; after Sequence/KV shadow commit success
+    the result points to mailbox payload consume/invalidate.
     """
 
     seq_list = list(exec_seqs)
@@ -516,6 +824,7 @@ def run_mailbox_verify_commit_probe(
             success=True,
             plan=commit_plan,
             skipped_non_owner=True,
+            kv_commit_skipped_non_owner=True,
             sequence_state_before=before,
             sequence_state_after=before,
             total_accepted_tokens=total_accepted,
@@ -596,18 +905,67 @@ def run_mailbox_verify_commit_probe(
                     next_required_feature="mailbox_commit_rollback_validation",
                     error_kind="mailbox_verify_commit_post_state_mismatch",
                 )
+        kv_result: MailboxKVCommitResult | None = None
+        if kv_commit_plan is not None:
+            kv_result = run_mailbox_kv_commit_probe(
+                kv_commit_plan,
+                seq_list,
+                current_rank=current_rank,
+                output_owner_rank=output_owner_rank,
+                commit_enabled=commit_enabled,
+            )
+            if not kv_result.success:
+                kv_rollback_success = kv_result.rollback_success
+                seq_rollback_success = _rollback_sequences(seq_by_id, commit_plan.sequence_state_before, commit_plan.seq_ids)
+                after_rollback = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+                combined_rollback_success = bool(kv_rollback_success and seq_rollback_success)
+                return MailboxVerifyCommitResult(
+                    attempted=True,
+                    success=False,
+                    plan=commit_plan,
+                    error_kind=kv_result.error_kind,
+                    error_message=kv_result.error_message,
+                    next_required_feature=kv_result.next_required_feature if combined_rollback_success else "kv_commit_rollback_validation",
+                    sequence_state_commit_attempted=True,
+                    sequence_state_commit_success=False,
+                    sequence_state_before=before,
+                    sequence_state_after=after_rollback,
+                    kv_commit_plan_built=True,
+                    kv_commit_attempted=kv_result.attempted,
+                    kv_commit_success=False,
+                    kv_commit_shadow_only=kv_result.shadow_only,
+                    kv_commit_error=kv_result.error_message,
+                    kv_commit_error_kind=kv_result.error_kind,
+                    kv_commit_rollback_attempted=bool(kv_result.rollback_attempted),
+                    kv_commit_rollback_success=bool(kv_result.rollback_success),
+                    kv_commit_skipped_non_owner=bool(kv_result.skipped_non_owner),
+                    mailbox_payload_consume_attempted=False,
+                    mailbox_payload_consume_success=False,
+                    mailbox_payload_invalidate_attempted=False,
+                    mailbox_payload_invalidate_success=False,
+                    rollback_attempted=True,
+                    rollback_success=combined_rollback_success,
+                    total_accepted_tokens=total_accepted,
+                    total_rejected_tokens=total_rejected,
+                )
         return MailboxVerifyCommitResult(
             attempted=True,
             success=True,
             plan=commit_plan,
-            next_required_feature="kv_commit_after_mailbox_verify",
+            next_required_feature=(kv_result.next_required_feature if kv_result is not None else "kv_append_backend_after_mailbox_verify"),
             sequence_state_commit_attempted=True,
             sequence_state_commit_success=True,
             sequence_state_before=before,
-            sequence_state_after=after,
-            kv_commit_attempted=False,
-            kv_commit_success=False,
-            kv_commit_error="KV commit backend is not implemented for mailbox verify commit probe",
+            sequence_state_after={int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list},
+            kv_commit_plan_built=kv_commit_plan is not None,
+            kv_commit_attempted=bool(kv_result.attempted) if kv_result is not None else False,
+            kv_commit_success=bool(kv_result.success) if kv_result is not None else False,
+            kv_commit_shadow_only=bool(kv_result.shadow_only) if kv_result is not None else False,
+            kv_commit_error=kv_result.error_message if kv_result is not None else "KV append backend is not implemented for mailbox verify commit probe",
+            kv_commit_error_kind=kv_result.error_kind if kv_result is not None else "kv_append_backend_after_mailbox_verify",
+            kv_commit_rollback_attempted=bool(kv_result.rollback_attempted) if kv_result is not None else False,
+            kv_commit_rollback_success=bool(kv_result.rollback_success) if kv_result is not None else True,
+            kv_commit_skipped_non_owner=bool(kv_result.skipped_non_owner) if kv_result is not None else False,
             mailbox_payload_consume_attempted=False,
             mailbox_payload_consume_success=False,
             mailbox_payload_invalidate_attempted=False,
@@ -668,6 +1026,60 @@ def run_mailbox_verify_commit_probe(
             total_accepted_tokens=total_accepted,
             total_rejected_tokens=total_rejected,
         )
+
+
+def _sequence_output_length(seq: Any) -> int:
+    token_ids = list(getattr(seq, "token_ids", []) or [])
+    num_tokens = int(getattr(seq, "num_tokens", len(token_ids)) or 0)
+    num_prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+    return max(num_tokens - num_prompt_tokens, 0)
+
+
+def _kv_shadow_length(seq: Any, *, default: int = 0) -> int:
+    state = getattr(seq, "stspec_mailbox_kv_shadow", None)
+    if isinstance(state, dict) and "length" in state:
+        try:
+            return int(state.get("length") or 0)
+        except Exception:
+            return int(default)
+    return int(default)
+
+
+def _kv_shadow_snapshot(seq: Any) -> JsonDict:
+    state = getattr(seq, "stspec_mailbox_kv_shadow", None)
+    if isinstance(state, dict):
+        state = json.loads(json.dumps(state, default=str))
+    else:
+        state = None
+    return {
+        "seq_id": int(getattr(seq, "seq_id")),
+        "shadow_state": state,
+        "shadow_length": _kv_shadow_length(seq, default=int(getattr(seq, "num_tokens", 0) or 0)),
+    }
+
+
+def _set_kv_shadow_state(seq: Any, state: JsonDict | None) -> None:
+    if state is None:
+        if hasattr(seq, "stspec_mailbox_kv_shadow"):
+            delattr(seq, "stspec_mailbox_kv_shadow")
+        return
+    setattr(seq, "stspec_mailbox_kv_shadow", json.loads(json.dumps(state, default=str)))
+
+
+def _rollback_kv_shadow(seq_by_id: dict[int, Any], snapshots: dict[int, JsonDict], seq_ids: Iterable[int]) -> bool:
+    ok = True
+    for seq_id in seq_ids:
+        seq = seq_by_id.get(int(seq_id))
+        snapshot = snapshots.get(int(seq_id))
+        if seq is None or snapshot is None:
+            ok = False
+            continue
+        try:
+            _set_kv_shadow_state(seq, snapshot.get("shadow_state"))
+            ok = ok and (_kv_shadow_snapshot(seq) == snapshot)
+        except Exception:
+            ok = False
+    return ok
 
 
 def _snapshots_equal(left: JsonDict | None, right: JsonDict | None, *, ignore_volatile_timestamps: bool = False) -> bool:

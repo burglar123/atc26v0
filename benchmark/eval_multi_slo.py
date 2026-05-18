@@ -520,8 +520,15 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_verify_commit_attempt_count",
     "mailbox_verify_commit_success_count",
     "sequence_state_commit_success_count",
+    "kv_commit_plan_built_count",
     "kv_commit_attempt_count",
     "kv_commit_success_count",
+    "kv_commit_shadow_only_count",
+    "kv_commit_error_count",
+    "kv_commit_error_kinds",
+    "kv_commit_rollback_attempt_count",
+    "kv_commit_rollback_success_count",
+    "kv_commit_skipped_non_owner_count",
     "mailbox_payload_consume_success_count",
     "mailbox_payload_invalidate_success_count",
     "mailbox_verify_commit_rollback_attempt_count",
@@ -809,8 +816,15 @@ def aggregate_low_level_traces(
         mailbox_verify_commit_attempt_count = 0
         mailbox_verify_commit_success_count = 0
         sequence_state_commit_success_count = 0
+        kv_commit_plan_built_count = 0
         kv_commit_attempt_count = 0
         kv_commit_success_count = 0
+        kv_commit_shadow_only_count = 0
+        kv_commit_error_count = 0
+        kv_commit_error_kinds: List[str] = []
+        kv_commit_rollback_attempt_count = 0
+        kv_commit_rollback_success_count = 0
+        kv_commit_skipped_non_owner_count = 0
         mailbox_payload_consume_success_count = 0
         mailbox_payload_invalidate_success_count = 0
         mailbox_verify_commit_rollback_attempt_count = 0
@@ -1054,10 +1068,23 @@ def aggregate_low_level_traces(
                 mailbox_verify_commit_success_count += 1
             if e.get("sequence_state_commit_success"):
                 sequence_state_commit_success_count += 1
+            if e.get("kv_commit_plan_built"):
+                kv_commit_plan_built_count += 1
             if e.get("kv_commit_attempted"):
                 kv_commit_attempt_count += 1
             if e.get("kv_commit_success"):
                 kv_commit_success_count += 1
+            if e.get("kv_commit_shadow_only"):
+                kv_commit_shadow_only_count += 1
+            if e.get("kv_commit_error"):
+                kv_commit_error_count += 1
+            append_unique(kv_commit_error_kinds, e.get("kv_commit_error_kind"))
+            if e.get("kv_commit_rollback_attempted"):
+                kv_commit_rollback_attempt_count += 1
+            if e.get("kv_commit_rollback_success"):
+                kv_commit_rollback_success_count += 1
+            if e.get("kv_commit_skipped_non_owner"):
+                kv_commit_skipped_non_owner_count += 1
             if e.get("mailbox_payload_consume_success"):
                 mailbox_payload_consume_success_count += 1
             if e.get("mailbox_payload_invalidate_success"):
@@ -1313,8 +1340,16 @@ def aggregate_low_level_traces(
         row["mailbox_verify_commit_attempt_count"] = mailbox_verify_commit_attempt_count
         row["mailbox_verify_commit_success_count"] = mailbox_verify_commit_success_count
         row["sequence_state_commit_success_count"] = sequence_state_commit_success_count
+        row["kv_commit_plan_built_count"] = kv_commit_plan_built_count
         row["kv_commit_attempt_count"] = kv_commit_attempt_count
         row["kv_commit_success_count"] = kv_commit_success_count
+        row["kv_commit_shadow_only_count"] = kv_commit_shadow_only_count
+        row["kv_commit_error_count"] = kv_commit_error_count
+        if kv_commit_error_kinds:
+            row["kv_commit_error_kinds"] = kv_commit_error_kinds
+        row["kv_commit_rollback_attempt_count"] = kv_commit_rollback_attempt_count
+        row["kv_commit_rollback_success_count"] = kv_commit_rollback_success_count
+        row["kv_commit_skipped_non_owner_count"] = kv_commit_skipped_non_owner_count
         row["mailbox_payload_consume_success_count"] = mailbox_payload_consume_success_count
         row["mailbox_payload_invalidate_success_count"] = mailbox_payload_invalidate_success_count
         row["mailbox_verify_commit_rollback_attempt_count"] = mailbox_verify_commit_rollback_attempt_count
@@ -2215,8 +2250,15 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "mailbox_verify_commit_attempt_count": row.get("mailbox_verify_commit_attempt_count"),
         "mailbox_verify_commit_success_count": row.get("mailbox_verify_commit_success_count"),
         "sequence_state_commit_success_count": row.get("sequence_state_commit_success_count"),
+        "kv_commit_plan_built_count": row.get("kv_commit_plan_built_count"),
         "kv_commit_attempt_count": row.get("kv_commit_attempt_count"),
         "kv_commit_success_count": row.get("kv_commit_success_count"),
+        "kv_commit_shadow_only_count": row.get("kv_commit_shadow_only_count"),
+        "kv_commit_error_count": row.get("kv_commit_error_count"),
+        "kv_commit_error_kinds": row.get("kv_commit_error_kinds"),
+        "kv_commit_rollback_attempt_count": row.get("kv_commit_rollback_attempt_count"),
+        "kv_commit_rollback_success_count": row.get("kv_commit_rollback_success_count"),
+        "kv_commit_skipped_non_owner_count": row.get("kv_commit_skipped_non_owner_count"),
         "mailbox_payload_consume_success_count": row.get("mailbox_payload_consume_success_count"),
         "mailbox_payload_invalidate_success_count": row.get("mailbox_payload_invalidate_success_count"),
         "mailbox_verify_commit_rollback_attempt_count": row.get("mailbox_verify_commit_rollback_attempt_count"),

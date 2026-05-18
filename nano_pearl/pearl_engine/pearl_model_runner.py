@@ -76,6 +76,7 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
+    build_mailbox_kv_commit_plan,
     build_mailbox_verify_apply_plan,
     build_mailbox_verify_commit_plan,
     build_mailbox_verify_result,
@@ -537,9 +538,21 @@ class ModelRunnerBase:
             "sequence_state_commit_success": False,
             "sequence_state_before": {},
             "sequence_state_after": {},
+            "kv_commit_plan_built": False,
             "kv_commit_attempted": False,
             "kv_commit_success": False,
+            "kv_commit_shadow_only": False,
             "kv_commit_error": None,
+            "kv_commit_error_kind": None,
+            "kv_commit_seq_ids": [],
+            "kv_commit_accepted_lengths_by_seq": {},
+            "kv_commit_append_start_positions_by_seq": {},
+            "kv_commit_append_end_positions_by_seq": {},
+            "kv_commit_sequence_length_before_by_seq": {},
+            "kv_commit_sequence_length_after_by_seq": {},
+            "kv_commit_rollback_attempted": False,
+            "kv_commit_rollback_success": True,
+            "kv_commit_skipped_non_owner": False,
             "mailbox_payload_consume_attempted": False,
             "mailbox_payload_consume_success": False,
             "mailbox_payload_invalidate_attempted": False,
@@ -727,9 +740,21 @@ class ModelRunnerBase:
             "sequence_state_commit_success",
             "sequence_state_before",
             "sequence_state_after",
+            "kv_commit_plan_built",
             "kv_commit_attempted",
             "kv_commit_success",
+            "kv_commit_shadow_only",
             "kv_commit_error",
+            "kv_commit_error_kind",
+            "kv_commit_seq_ids",
+            "kv_commit_accepted_lengths_by_seq",
+            "kv_commit_append_start_positions_by_seq",
+            "kv_commit_append_end_positions_by_seq",
+            "kv_commit_sequence_length_before_by_seq",
+            "kv_commit_sequence_length_after_by_seq",
+            "kv_commit_rollback_attempted",
+            "kv_commit_rollback_success",
+            "kv_commit_skipped_non_owner",
             "mailbox_payload_consume_attempted",
             "mailbox_payload_consume_success",
             "mailbox_payload_invalidate_attempted",
@@ -1456,6 +1481,22 @@ class ModelRunnerBase:
             trace_record["mailbox_verify_commit_total_rejected_tokens"] = sum(
                 len(tokens) for tokens in commit_plan.rejected_token_ids_by_seq.values()
             )
+            kv_commit_plan = build_mailbox_kv_commit_plan(
+                verify_result,
+                commit_plan,
+                exec_seqs,
+                step_plan,
+                max_model_len=getattr(self.global_config, "max_model_len", None),
+                commit_allowed=True,
+                commit_mode="shadow_only",
+            )
+            trace_record["kv_commit_plan_built"] = True
+            trace_record["kv_commit_seq_ids"] = list(kv_commit_plan.seq_ids)
+            trace_record["kv_commit_accepted_lengths_by_seq"] = dict(kv_commit_plan.accepted_lengths_by_seq)
+            trace_record["kv_commit_append_start_positions_by_seq"] = dict(kv_commit_plan.append_start_positions_by_seq)
+            trace_record["kv_commit_append_end_positions_by_seq"] = dict(kv_commit_plan.append_end_positions_by_seq)
+            trace_record["kv_commit_sequence_length_before_by_seq"] = dict(kv_commit_plan.sequence_length_before_by_seq)
+            trace_record["kv_commit_sequence_length_after_by_seq"] = dict(kv_commit_plan.sequence_length_after_by_seq)
             commit_result = run_mailbox_verify_commit_probe(
                 commit_plan,
                 exec_seqs,
@@ -1463,6 +1504,7 @@ class ModelRunnerBase:
                 output_owner_rank=output.output_owner_rank,
                 eos_token_id=getattr(self.global_config, "eos", None),
                 commit_enabled=True,
+                kv_commit_plan=kv_commit_plan,
             )
             trace_record["mailbox_verify_commit_attempted"] = bool(commit_result.attempted)
             trace_record["mailbox_verify_commit_success"] = bool(commit_result.success)
@@ -1472,9 +1514,15 @@ class ModelRunnerBase:
             trace_record["sequence_state_commit_success"] = bool(commit_result.sequence_state_commit_success)
             trace_record["sequence_state_before"] = commit_result.sequence_state_before
             trace_record["sequence_state_after"] = commit_result.sequence_state_after
+            trace_record["kv_commit_plan_built"] = bool(commit_result.kv_commit_plan_built) or trace_record.get("kv_commit_plan_built", False)
             trace_record["kv_commit_attempted"] = bool(commit_result.kv_commit_attempted)
             trace_record["kv_commit_success"] = bool(commit_result.kv_commit_success)
+            trace_record["kv_commit_shadow_only"] = bool(commit_result.kv_commit_shadow_only)
             trace_record["kv_commit_error"] = commit_result.kv_commit_error
+            trace_record["kv_commit_error_kind"] = commit_result.kv_commit_error_kind
+            trace_record["kv_commit_rollback_attempted"] = bool(commit_result.kv_commit_rollback_attempted)
+            trace_record["kv_commit_rollback_success"] = bool(commit_result.kv_commit_rollback_success)
+            trace_record["kv_commit_skipped_non_owner"] = bool(commit_result.kv_commit_skipped_non_owner)
             trace_record["mailbox_payload_consume_attempted"] = bool(commit_result.mailbox_payload_consume_attempted)
             trace_record["mailbox_payload_consume_success"] = bool(commit_result.mailbox_payload_consume_success)
             trace_record["mailbox_payload_invalidate_attempted"] = bool(commit_result.mailbox_payload_invalidate_attempted)
@@ -1482,6 +1530,8 @@ class ModelRunnerBase:
             trace_record["mailbox_verify_commit_rollback_attempted"] = bool(commit_result.rollback_attempted)
             trace_record["mailbox_verify_commit_rollback_success"] = bool(commit_result.rollback_success)
             trace_record["mailbox_verify_commit_skipped_non_owner"] = bool(commit_result.skipped_non_owner)
+            if commit_result.kv_commit_skipped_non_owner:
+                trace_record["kv_commit_skipped_non_owner"] = True
             if commit_result.skipped_non_owner:
                 return
             if not commit_result.success:
@@ -1500,6 +1550,9 @@ class ModelRunnerBase:
             trace_record["mailbox_verify_commit_success"] = False
             trace_record["mailbox_verify_commit_error"] = str(exc)
             trace_record["mailbox_verify_commit_error_kind"] = exc.error_kind
+            if str(exc.error_kind).startswith("mailbox_kv_commit"):
+                trace_record["kv_commit_error"] = str(exc)
+                trace_record["kv_commit_error_kind"] = exc.error_kind
             trace_record["next_required_feature"] = exc.next_required_feature
             raise RuntimeError(str(exc)) from exc
 

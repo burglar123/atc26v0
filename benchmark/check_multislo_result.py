@@ -226,8 +226,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_verify_commit_attempt_count = 0
     mailbox_verify_commit_success_count = 0
     sequence_state_commit_success_count = 0
+    kv_commit_plan_built_count = 0
     kv_commit_attempt_count = 0
     kv_commit_success_count = 0
+    kv_commit_shadow_only_count = 0
+    kv_commit_error_count = 0
+    kv_commit_error_kinds = set()
+    kv_commit_rollback_attempt_count = 0
+    kv_commit_rollback_success_count = 0
+    kv_commit_skipped_non_owner_count = 0
     mailbox_payload_consume_success_count = 0
     mailbox_payload_invalidate_success_count = 0
     mailbox_verify_commit_rollback_attempt_count = 0
@@ -265,6 +272,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "mailbox_payload_tensor_transport_attempted",
                 "mailbox_verify_commit_attempted",
                 "sequence_state_commit_attempted",
+                "kv_commit_plan_built",
                 "kv_commit_attempted",
                 "mailbox_verify_commit_attempt_count",
             )
@@ -533,8 +541,17 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         mailbox_verify_commit_attempt_count += int(row.get("mailbox_verify_commit_attempt_count") or 0)
         mailbox_verify_commit_success_count += int(row.get("mailbox_verify_commit_success_count") or 0)
         sequence_state_commit_success_count += int(row.get("sequence_state_commit_success_count") or 0)
+        kv_commit_plan_built_count += int(row.get("kv_commit_plan_built_count") or 0)
         kv_commit_attempt_count += int(row.get("kv_commit_attempt_count") or 0)
         kv_commit_success_count += int(row.get("kv_commit_success_count") or 0)
+        kv_commit_shadow_only_count += int(row.get("kv_commit_shadow_only_count") or 0)
+        kv_commit_error_count += int(row.get("kv_commit_error_count") or 0)
+        for value in values_from_mapping(row.get("kv_commit_error_kinds")):
+            if value:
+                kv_commit_error_kinds.add(value)
+        kv_commit_rollback_attempt_count += int(row.get("kv_commit_rollback_attempt_count") or 0)
+        kv_commit_rollback_success_count += int(row.get("kv_commit_rollback_success_count") or 0)
+        kv_commit_skipped_non_owner_count += int(row.get("kv_commit_skipped_non_owner_count") or 0)
         mailbox_payload_consume_success_count += int(row.get("mailbox_payload_consume_success_count") or 0)
         mailbox_payload_invalidate_success_count += int(row.get("mailbox_payload_invalidate_success_count") or 0)
         mailbox_verify_commit_rollback_attempt_count += int(row.get("mailbox_verify_commit_rollback_attempt_count") or 0)
@@ -655,10 +672,24 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             mailbox_verify_commit_success_count += 1
         if row.get("sequence_state_commit_success"):
             sequence_state_commit_success_count += 1
+        if row.get("kv_commit_plan_built"):
+            kv_commit_plan_built_count += 1
         if row.get("kv_commit_attempted"):
             kv_commit_attempt_count += 1
         if row.get("kv_commit_success"):
             kv_commit_success_count += 1
+        if row.get("kv_commit_shadow_only"):
+            kv_commit_shadow_only_count += 1
+        if row.get("kv_commit_error"):
+            kv_commit_error_count += 1
+        if row.get("kv_commit_error_kind"):
+            kv_commit_error_kinds.add(row.get("kv_commit_error_kind"))
+        if row.get("kv_commit_rollback_attempted"):
+            kv_commit_rollback_attempt_count += 1
+        if row.get("kv_commit_rollback_success"):
+            kv_commit_rollback_success_count += 1
+        if row.get("kv_commit_skipped_non_owner"):
+            kv_commit_skipped_non_owner_count += 1
         if row.get("mailbox_payload_consume_success"):
             mailbox_payload_consume_success_count += 1
         if row.get("mailbox_payload_invalidate_success"):
@@ -828,8 +859,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_verify_commit_attempt_count": mailbox_verify_commit_attempt_count,
         "mailbox_verify_commit_success_count": mailbox_verify_commit_success_count,
         "sequence_state_commit_success_count": sequence_state_commit_success_count,
+        "kv_commit_plan_built_count": kv_commit_plan_built_count,
         "kv_commit_attempt_count": kv_commit_attempt_count,
         "kv_commit_success_count": kv_commit_success_count,
+        "kv_commit_shadow_only_count": kv_commit_shadow_only_count,
+        "kv_commit_error_count": kv_commit_error_count,
+        "kv_commit_error_kinds": sorted(kv_commit_error_kinds, key=str),
+        "kv_commit_rollback_attempt_count": kv_commit_rollback_attempt_count,
+        "kv_commit_rollback_success_count": kv_commit_rollback_success_count,
+        "kv_commit_skipped_non_owner_count": kv_commit_skipped_non_owner_count,
         "mailbox_payload_consume_success_count": mailbox_payload_consume_success_count,
         "mailbox_payload_invalidate_success_count": mailbox_payload_invalidate_success_count,
         "mailbox_verify_commit_rollback_attempt_count": mailbox_verify_commit_rollback_attempt_count,
@@ -1134,8 +1172,15 @@ def summarize(path: Path) -> int:
     print(f"mailbox verify commit attempts: {plan_summary['mailbox_verify_commit_attempt_count']}")
     print(f"mailbox verify commit successes: {plan_summary['mailbox_verify_commit_success_count']}")
     print(f"sequence state commit successes: {plan_summary['sequence_state_commit_success_count']}")
+    print(f"KV commit plans built: {plan_summary['kv_commit_plan_built_count']}")
     print(f"KV commit attempts: {plan_summary['kv_commit_attempt_count']}")
     print(f"KV commit successes: {plan_summary['kv_commit_success_count']}")
+    print(f"KV commit shadow-only count: {plan_summary['kv_commit_shadow_only_count']}")
+    print(f"KV commit errors: {plan_summary['kv_commit_error_count']}")
+    print(f"KV commit error kinds: {plan_summary['kv_commit_error_kinds']}")
+    print(f"KV commit rollback attempts: {plan_summary['kv_commit_rollback_attempt_count']}")
+    print(f"KV commit rollback successes: {plan_summary['kv_commit_rollback_success_count']}")
+    print(f"KV commit skipped non-owner count: {plan_summary['kv_commit_skipped_non_owner_count']}")
     print(f"mailbox payload consume successes: {plan_summary['mailbox_payload_consume_success_count']}")
     print(f"mailbox payload invalidate successes: {plan_summary['mailbox_payload_invalidate_success_count']}")
     print(f"mailbox verify commit rollback attempts: {plan_summary['mailbox_verify_commit_rollback_attempt_count']}")
