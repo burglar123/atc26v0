@@ -142,10 +142,29 @@ class MailboxVerifyCommitResult:
     kv_commit_rollback_attempted: bool = False
     kv_commit_rollback_success: bool = True
     kv_commit_skipped_non_owner: bool = False
+    mailbox_payload_consume_plan_built: bool = False
     mailbox_payload_consume_attempted: bool = False
     mailbox_payload_consume_success: bool = False
+    mailbox_payload_consume_error: str | None = None
+    mailbox_payload_consume_error_kind: str | None = None
+    mailbox_payload_consumed_payload_ids: list[str] = field(default_factory=list)
+    mailbox_payload_consumed_token_count: int = 0
     mailbox_payload_invalidate_attempted: bool = False
     mailbox_payload_invalidate_success: bool = False
+    mailbox_payload_invalidate_error: str | None = None
+    mailbox_payload_invalidated_payload_ids: list[str] = field(default_factory=list)
+    mailbox_payload_invalidated_token_count: int = 0
+    mailbox_payload_lifecycle_before: dict[str, JsonDict] = field(default_factory=dict)
+    mailbox_payload_lifecycle_after: dict[str, JsonDict] = field(default_factory=dict)
+    mailbox_payload_duplicate_consume_detected: bool = False
+    mailbox_payload_consume_rollback_attempted: bool = False
+    mailbox_payload_consume_rollback_success: bool = True
+    mailbox_payload_consume_skipped_non_owner: bool = False
+    mailbox_payload_invalidate_skipped_non_owner: bool = False
+    next_pipeline_step_attempted: bool = False
+    next_pipeline_step_success: bool = False
+    next_pipeline_step_error: str | None = None
+    next_pipeline_plan_id: int | None = None
     rollback_attempted: bool = False
     rollback_success: bool = True
     skipped_non_owner: bool = False
@@ -200,6 +219,57 @@ class MailboxKVCommitResult:
     rollback_success: bool = True
     kv_state_before: dict[int, JsonDict] = field(default_factory=dict)
     kv_state_after: dict[int, JsonDict] = field(default_factory=dict)
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+@dataclass(frozen=True)
+class MailboxPayloadConsumePlan:
+    plan_id: int | None
+    target_home_batch_id: int | str | None
+    seq_ids: list[int]
+    consumed_payload_ids: list[str]
+    invalidated_payload_ids: list[str]
+    consumed_token_count_by_seq: dict[int, int]
+    invalidated_token_count_by_seq: dict[int, int]
+    accepted_lengths_by_seq: dict[int, int]
+    rejected_seq_ids: list[int]
+    mailbox_state_before: dict[str, JsonDict]
+    mailbox_state_after_expected: dict[str, JsonDict]
+    rollback_required: bool = False
+    rollback_success: bool = True
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True)
+class MailboxPayloadConsumeResult:
+    attempted: bool
+    success: bool
+    plan: MailboxPayloadConsumePlan | None = None
+    error_kind: str | None = None
+    error_message: str | None = None
+    next_required_feature: str | None = None
+    consumed_payload_ids: list[str] = field(default_factory=list)
+    invalidated_payload_ids: list[str] = field(default_factory=list)
+    consumed_token_count: int = 0
+    invalidated_token_count: int = 0
+    mailbox_state_before: dict[str, JsonDict] = field(default_factory=dict)
+    mailbox_state_after: dict[str, JsonDict] = field(default_factory=dict)
+    duplicate_consume_detected: bool = False
+    rollback_attempted: bool = False
+    rollback_success: bool = True
+    skipped_non_owner: bool = False
+    invalidate_skipped_non_owner: bool = False
+    next_pipeline_step_attempted: bool = False
+    next_pipeline_step_success: bool = False
+    next_pipeline_step_error: str | None = None
+    next_pipeline_plan_id: int | None = None
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
@@ -796,6 +866,171 @@ def run_mailbox_kv_commit_probe(
             kv_state_after=after,
         )
 
+
+def build_mailbox_payload_consume_plan(
+    commit_plan: MailboxVerifyCommitPlan,
+    mailbox: Any,
+) -> MailboxPayloadConsumePlan:
+    payload_ids = sorted(
+        set(str(payload_id) for payload_id in commit_plan.mailbox_payloads_to_consume)
+        | set(str(payload_id) for payload_id in commit_plan.mailbox_payloads_to_invalidate),
+        key=str,
+    )
+    state_before = mailbox.lifecycle_snapshot(payload_ids) if hasattr(mailbox, "lifecycle_snapshot") else {}
+    consumed_by_seq: dict[int, int] = {}
+    invalidated_by_seq: dict[int, int] = {}
+    consumed_payload_ids: list[str] = []
+    invalidated_payload_ids: list[str] = []
+    state_after: dict[str, JsonDict] = {}
+    for seq_id in commit_plan.seq_ids:
+        accepted_len = int(commit_plan.accepted_lengths_by_seq.get(seq_id, 0) or 0)
+        rejected_len = len(commit_plan.rejected_token_ids_by_seq.get(seq_id, []))
+        payload_id = _payload_id_for_commit_plan(commit_plan, seq_id)
+        lifecycle = state_before.get(payload_id)
+        if lifecycle is None or lifecycle.get("lifecycle_state") == "missing":
+            raise MailboxVerifyApplyError(
+                f"mailbox payload consume plan missing lifecycle for payload_id={payload_id}",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="mailbox_payload_consume_missing_lifecycle",
+            )
+        if lifecycle.get("home_batch_id") != commit_plan.target_home_batch_id:
+            raise MailboxVerifyApplyError(
+                f"mailbox payload consume plan home_batch_id mismatch for payload_id={payload_id}",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="mailbox_payload_consume_home_batch_mismatch",
+            )
+        if int(lifecycle.get("seq_id")) != int(seq_id):
+            raise MailboxVerifyApplyError(
+                f"mailbox payload consume plan seq_id mismatch for payload_id={payload_id}",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="mailbox_payload_consume_seq_mismatch",
+            )
+        if lifecycle.get("lifecycle_state") != "available":
+            raise MailboxVerifyApplyError(
+                f"mailbox payload duplicate consume detected for payload_id={payload_id}",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="duplicate_consume_error",
+            )
+        consumed_by_seq[seq_id] = accepted_len
+        invalidated_by_seq[seq_id] = rejected_len
+        if accepted_len > 0:
+            consumed_payload_ids.append(payload_id)
+        if rejected_len > 0:
+            invalidated_payload_ids.append(payload_id)
+        after = dict(lifecycle)
+        after["consumed_by_plan_id"] = commit_plan.plan_id if accepted_len > 0 else lifecycle.get("consumed_by_plan_id")
+        after["invalidated_by_plan_id"] = commit_plan.plan_id if rejected_len > 0 else lifecycle.get("invalidated_by_plan_id")
+        after["consumed_token_count"] = accepted_len
+        after["invalidated_token_count"] = rejected_len
+        after["lifecycle_state"] = "invalidated" if rejected_len > 0 else "consumed"
+        state_after[payload_id] = after
+    return MailboxPayloadConsumePlan(
+        plan_id=commit_plan.plan_id,
+        target_home_batch_id=commit_plan.target_home_batch_id,
+        seq_ids=list(commit_plan.seq_ids),
+        consumed_payload_ids=consumed_payload_ids,
+        invalidated_payload_ids=invalidated_payload_ids,
+        consumed_token_count_by_seq=consumed_by_seq,
+        invalidated_token_count_by_seq=invalidated_by_seq,
+        accepted_lengths_by_seq=dict(commit_plan.accepted_lengths_by_seq),
+        rejected_seq_ids=list(commit_plan.rejected_seq_ids),
+        mailbox_state_before=state_before,
+        mailbox_state_after_expected=state_after,
+    )
+
+
+def run_mailbox_payload_consume_probe(
+    consume_plan: MailboxPayloadConsumePlan,
+    mailbox: Any,
+    *,
+    current_rank: int | None = None,
+    output_owner_rank: int | None = None,
+    next_pipeline_plan_id: int | None = None,
+) -> MailboxPayloadConsumeResult:
+    payload_ids = sorted(
+        set(consume_plan.consumed_payload_ids) | set(consume_plan.invalidated_payload_ids),
+        key=str,
+    )
+    before = mailbox.lifecycle_snapshot(payload_ids) if hasattr(mailbox, "lifecycle_snapshot") else dict(consume_plan.mailbox_state_before)
+    if output_owner_rank is not None and current_rank is not None and int(current_rank) != int(output_owner_rank):
+        return MailboxPayloadConsumeResult(
+            attempted=False,
+            success=True,
+            plan=consume_plan,
+            mailbox_state_before=before,
+            mailbox_state_after=before,
+            skipped_non_owner=True,
+            invalidate_skipped_non_owner=True,
+        )
+    consumed_by_payload: dict[str, int] = {}
+    invalidated_by_payload: dict[str, int] = {}
+    for seq_id in consume_plan.seq_ids:
+        payload_id = _payload_id_for_consume_plan(consume_plan, seq_id)
+        consumed_by_payload[payload_id] = int(consume_plan.consumed_token_count_by_seq.get(seq_id, 0) or 0)
+        invalidated_by_payload[payload_id] = int(consume_plan.invalidated_token_count_by_seq.get(seq_id, 0) or 0)
+    try:
+        if not hasattr(mailbox, "apply_payload_lifecycle"):
+            raise MailboxVerifyApplyError(
+                "mailbox payload lifecycle backend unavailable",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="mailbox_payload_lifecycle_backend_unavailable",
+            )
+        mailbox.apply_payload_lifecycle(
+            plan_id=consume_plan.plan_id,
+            target_home_batch_id=consume_plan.target_home_batch_id,
+            consumed_token_count_by_payload_id=consumed_by_payload,
+            invalidated_token_count_by_payload_id=invalidated_by_payload,
+        )
+        after = mailbox.lifecycle_snapshot(payload_ids) if hasattr(mailbox, "lifecycle_snapshot") else {}
+        if after != consume_plan.mailbox_state_after_expected:
+            raise MailboxVerifyApplyError(
+                "mailbox payload lifecycle post-state mismatch",
+                next_required_feature="mailbox_payload_consume_rollback_validation",
+                error_kind="mailbox_payload_lifecycle_post_state_mismatch",
+            )
+        return MailboxPayloadConsumeResult(
+            attempted=True,
+            success=True,
+            plan=consume_plan,
+            next_required_feature="next_pipeline_step_after_mailbox_commit",
+            consumed_payload_ids=list(consume_plan.consumed_payload_ids),
+            invalidated_payload_ids=list(consume_plan.invalidated_payload_ids),
+            consumed_token_count=sum(consume_plan.consumed_token_count_by_seq.values()),
+            invalidated_token_count=sum(consume_plan.invalidated_token_count_by_seq.values()),
+            mailbox_state_before=before,
+            mailbox_state_after=after,
+            next_pipeline_step_attempted=True,
+            next_pipeline_step_success=False,
+            next_pipeline_step_error="next pipeline step after mailbox commit is not implemented",
+            next_pipeline_plan_id=next_pipeline_plan_id,
+        )
+    except Exception as exc:
+        rollback_attempted = True
+        rollback_success = False
+        if hasattr(mailbox, "restore_lifecycle_snapshot"):
+            rollback_success = bool(mailbox.restore_lifecycle_snapshot(before))
+        after = mailbox.lifecycle_snapshot(payload_ids) if hasattr(mailbox, "lifecycle_snapshot") else {}
+        error_kind = getattr(exc, "error_kind", getattr(exc, "kind", type(exc).__name__))
+        error_message = str(exc)
+        duplicate = str(error_kind) == "duplicate_consume_error"
+        return MailboxPayloadConsumeResult(
+            attempted=True,
+            success=False,
+            plan=consume_plan,
+            error_kind=str(error_kind),
+            error_message=error_message,
+            next_required_feature="mailbox_payload_consume_rollback_validation",
+            consumed_payload_ids=list(consume_plan.consumed_payload_ids),
+            invalidated_payload_ids=list(consume_plan.invalidated_payload_ids),
+            consumed_token_count=sum(consume_plan.consumed_token_count_by_seq.values()),
+            invalidated_token_count=sum(consume_plan.invalidated_token_count_by_seq.values()),
+            mailbox_state_before=before,
+            mailbox_state_after=after,
+            duplicate_consume_detected=duplicate,
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+        )
+
 def run_mailbox_verify_commit_probe(
     commit_plan: MailboxVerifyCommitPlan,
     exec_seqs: Iterable[Any],
@@ -805,6 +1040,9 @@ def run_mailbox_verify_commit_probe(
     eos_token_id: int | list[int] | None = None,
     commit_enabled: bool = True,
     kv_commit_plan: MailboxKVCommitPlan | None = None,
+    payload_consume_plan: MailboxPayloadConsumePlan | None = None,
+    mailbox: Any | None = None,
+    next_pipeline_plan_id: int | None = None,
 ) -> MailboxVerifyCommitResult:
     """Apply a guarded sequence-only commit with rollback on any failure.
 
@@ -948,11 +1186,75 @@ def run_mailbox_verify_commit_probe(
                     total_accepted_tokens=total_accepted,
                     total_rejected_tokens=total_rejected,
                 )
+        payload_result: MailboxPayloadConsumeResult | None = None
+        if payload_consume_plan is not None and mailbox is not None:
+            payload_result = run_mailbox_payload_consume_probe(
+                payload_consume_plan,
+                mailbox,
+                current_rank=current_rank,
+                output_owner_rank=output_owner_rank,
+                next_pipeline_plan_id=next_pipeline_plan_id,
+            )
+            if not payload_result.success:
+                kv_rollback_success = True
+                if kv_result is not None and kv_result.kv_state_before:
+                    kv_rollback_success = _rollback_kv_shadow(seq_by_id, kv_result.kv_state_before, commit_plan.seq_ids)
+                seq_rollback_success = _rollback_sequences(seq_by_id, commit_plan.sequence_state_before, commit_plan.seq_ids)
+                after_rollback = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+                combined_rollback_success = bool(payload_result.rollback_success and kv_rollback_success and seq_rollback_success)
+                return MailboxVerifyCommitResult(
+                    attempted=True,
+                    success=False,
+                    plan=commit_plan,
+                    error_kind=payload_result.error_kind,
+                    error_message=payload_result.error_message,
+                    next_required_feature=payload_result.next_required_feature if combined_rollback_success else "mailbox_payload_consume_rollback_validation",
+                    sequence_state_commit_attempted=True,
+                    sequence_state_commit_success=False,
+                    sequence_state_before=before,
+                    sequence_state_after=after_rollback,
+                    kv_commit_plan_built=kv_commit_plan is not None,
+                    kv_commit_attempted=bool(kv_result.attempted) if kv_result is not None else False,
+                    kv_commit_success=bool(kv_result.success) if kv_result is not None else False,
+                    kv_commit_shadow_only=bool(kv_result.shadow_only) if kv_result is not None else False,
+                    kv_commit_error=kv_result.error_message if kv_result is not None else None,
+                    kv_commit_error_kind=kv_result.error_kind if kv_result is not None else None,
+                    kv_commit_rollback_attempted=True,
+                    kv_commit_rollback_success=kv_rollback_success,
+                    kv_commit_skipped_non_owner=bool(kv_result.skipped_non_owner) if kv_result is not None else False,
+                    mailbox_payload_consume_plan_built=True,
+                    mailbox_payload_consume_attempted=payload_result.attempted,
+                    mailbox_payload_consume_success=False,
+                    mailbox_payload_consume_error=payload_result.error_message,
+                    mailbox_payload_consume_error_kind=payload_result.error_kind,
+                    mailbox_payload_consumed_payload_ids=payload_result.consumed_payload_ids,
+                    mailbox_payload_consumed_token_count=payload_result.consumed_token_count,
+                    mailbox_payload_invalidate_attempted=payload_result.attempted,
+                    mailbox_payload_invalidate_success=False,
+                    mailbox_payload_invalidate_error=payload_result.error_message,
+                    mailbox_payload_invalidated_payload_ids=payload_result.invalidated_payload_ids,
+                    mailbox_payload_invalidated_token_count=payload_result.invalidated_token_count,
+                    mailbox_payload_lifecycle_before=payload_result.mailbox_state_before,
+                    mailbox_payload_lifecycle_after=payload_result.mailbox_state_after,
+                    mailbox_payload_duplicate_consume_detected=payload_result.duplicate_consume_detected,
+                    mailbox_payload_consume_rollback_attempted=payload_result.rollback_attempted,
+                    mailbox_payload_consume_rollback_success=payload_result.rollback_success,
+                    mailbox_payload_consume_skipped_non_owner=payload_result.skipped_non_owner,
+                    mailbox_payload_invalidate_skipped_non_owner=payload_result.invalidate_skipped_non_owner,
+                    rollback_attempted=True,
+                    rollback_success=combined_rollback_success,
+                    total_accepted_tokens=total_accepted,
+                    total_rejected_tokens=total_rejected,
+                )
         return MailboxVerifyCommitResult(
             attempted=True,
             success=True,
             plan=commit_plan,
-            next_required_feature=(kv_result.next_required_feature if kv_result is not None else "kv_append_backend_after_mailbox_verify"),
+            next_required_feature=(
+                payload_result.next_required_feature
+                if payload_result is not None
+                else (kv_result.next_required_feature if kv_result is not None else "kv_append_backend_after_mailbox_verify")
+            ),
             sequence_state_commit_attempted=True,
             sequence_state_commit_success=True,
             sequence_state_before=before,
@@ -966,10 +1268,29 @@ def run_mailbox_verify_commit_probe(
             kv_commit_rollback_attempted=bool(kv_result.rollback_attempted) if kv_result is not None else False,
             kv_commit_rollback_success=bool(kv_result.rollback_success) if kv_result is not None else True,
             kv_commit_skipped_non_owner=bool(kv_result.skipped_non_owner) if kv_result is not None else False,
-            mailbox_payload_consume_attempted=False,
-            mailbox_payload_consume_success=False,
-            mailbox_payload_invalidate_attempted=False,
-            mailbox_payload_invalidate_success=False,
+            mailbox_payload_consume_plan_built=payload_consume_plan is not None,
+            mailbox_payload_consume_attempted=bool(payload_result.attempted) if payload_result is not None else False,
+            mailbox_payload_consume_success=bool(payload_result.success) if payload_result is not None else False,
+            mailbox_payload_consume_error=payload_result.error_message if payload_result is not None else None,
+            mailbox_payload_consume_error_kind=payload_result.error_kind if payload_result is not None else None,
+            mailbox_payload_consumed_payload_ids=payload_result.consumed_payload_ids if payload_result is not None else [],
+            mailbox_payload_consumed_token_count=payload_result.consumed_token_count if payload_result is not None else 0,
+            mailbox_payload_invalidate_attempted=bool(payload_result.attempted) if payload_result is not None else False,
+            mailbox_payload_invalidate_success=bool(payload_result.success) if payload_result is not None else False,
+            mailbox_payload_invalidate_error=payload_result.error_message if payload_result is not None else None,
+            mailbox_payload_invalidated_payload_ids=payload_result.invalidated_payload_ids if payload_result is not None else [],
+            mailbox_payload_invalidated_token_count=payload_result.invalidated_token_count if payload_result is not None else 0,
+            mailbox_payload_lifecycle_before=payload_result.mailbox_state_before if payload_result is not None else {},
+            mailbox_payload_lifecycle_after=payload_result.mailbox_state_after if payload_result is not None else {},
+            mailbox_payload_duplicate_consume_detected=bool(payload_result.duplicate_consume_detected) if payload_result is not None else False,
+            mailbox_payload_consume_rollback_attempted=bool(payload_result.rollback_attempted) if payload_result is not None else False,
+            mailbox_payload_consume_rollback_success=bool(payload_result.rollback_success) if payload_result is not None else True,
+            mailbox_payload_consume_skipped_non_owner=bool(payload_result.skipped_non_owner) if payload_result is not None else False,
+            mailbox_payload_invalidate_skipped_non_owner=bool(payload_result.invalidate_skipped_non_owner) if payload_result is not None else False,
+            next_pipeline_step_attempted=bool(payload_result.next_pipeline_step_attempted) if payload_result is not None else False,
+            next_pipeline_step_success=bool(payload_result.next_pipeline_step_success) if payload_result is not None else False,
+            next_pipeline_step_error=payload_result.next_pipeline_step_error if payload_result is not None else None,
+            next_pipeline_plan_id=payload_result.next_pipeline_plan_id if payload_result is not None else None,
             rollback_attempted=False,
             rollback_success=True,
             total_accepted_tokens=total_accepted,
@@ -1026,6 +1347,40 @@ def run_mailbox_verify_commit_probe(
             total_accepted_tokens=total_accepted,
             total_rejected_tokens=total_rejected,
         )
+
+
+def _payload_id_for_commit_plan(commit_plan: MailboxVerifyCommitPlan, seq_id: int) -> str:
+    seq_id = int(seq_id)
+    for payload_id in list(commit_plan.mailbox_payloads_to_consume) + list(commit_plan.mailbox_payloads_to_invalidate):
+        text = str(payload_id)
+        parts = text.split(":")
+        if len(parts) >= 2:
+            try:
+                if int(parts[1]) == seq_id:
+                    return text
+            except Exception:
+                pass
+    return f"{commit_plan.target_home_batch_id}:{seq_id}"
+
+
+def _payload_id_for_consume_plan(consume_plan: MailboxPayloadConsumePlan, seq_id: int) -> str:
+    seq_id = int(seq_id)
+    for payload_id in list(consume_plan.consumed_payload_ids) + list(consume_plan.invalidated_payload_ids):
+        text = str(payload_id)
+        parts = text.split(":")
+        if len(parts) >= 2:
+            try:
+                if int(parts[1]) == seq_id:
+                    return text
+            except Exception:
+                pass
+    for payload_id, state in consume_plan.mailbox_state_before.items():
+        try:
+            if int(state.get("seq_id")) == seq_id:
+                return str(payload_id)
+        except Exception:
+            pass
+    return f"{consume_plan.target_home_batch_id}:{seq_id}"
 
 
 def _sequence_output_length(seq: Any) -> int:

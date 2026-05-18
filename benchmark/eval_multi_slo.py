@@ -529,8 +529,20 @@ PLAN_REQUEST_FIELDS = [
     "kv_commit_rollback_attempt_count",
     "kv_commit_rollback_success_count",
     "kv_commit_skipped_non_owner_count",
+    "mailbox_payload_consume_plan_built_count",
+    "mailbox_payload_consume_attempt_count",
     "mailbox_payload_consume_success_count",
+    "mailbox_payload_consume_error_count",
+    "mailbox_payload_invalidate_attempt_count",
     "mailbox_payload_invalidate_success_count",
+    "mailbox_payload_invalidate_error_count",
+    "mailbox_payload_duplicate_consume_count",
+    "mailbox_payload_consume_rollback_attempt_count",
+    "mailbox_payload_consume_rollback_success_count",
+    "mailbox_payload_consume_skipped_non_owner_count",
+    "mailbox_payload_invalidate_skipped_non_owner_count",
+    "next_pipeline_step_attempt_count",
+    "next_pipeline_step_success_count",
     "mailbox_verify_commit_rollback_attempt_count",
     "mailbox_verify_commit_rollback_success_count",
     "mailbox_verify_commit_skipped_non_owner_count",
@@ -825,8 +837,20 @@ def aggregate_low_level_traces(
         kv_commit_rollback_attempt_count = 0
         kv_commit_rollback_success_count = 0
         kv_commit_skipped_non_owner_count = 0
+        mailbox_payload_consume_plan_built_count = 0
+        mailbox_payload_consume_attempt_count = 0
         mailbox_payload_consume_success_count = 0
+        mailbox_payload_consume_error_count = 0
+        mailbox_payload_invalidate_attempt_count = 0
         mailbox_payload_invalidate_success_count = 0
+        mailbox_payload_invalidate_error_count = 0
+        mailbox_payload_duplicate_consume_count = 0
+        mailbox_payload_consume_rollback_attempt_count = 0
+        mailbox_payload_consume_rollback_success_count = 0
+        mailbox_payload_consume_skipped_non_owner_count = 0
+        mailbox_payload_invalidate_skipped_non_owner_count = 0
+        next_pipeline_step_attempt_count = 0
+        next_pipeline_step_success_count = 0
         mailbox_verify_commit_rollback_attempt_count = 0
         mailbox_verify_commit_rollback_success_count = 0
         mailbox_verify_commit_skipped_non_owner_count = 0
@@ -1085,10 +1109,34 @@ def aggregate_low_level_traces(
                 kv_commit_rollback_success_count += 1
             if e.get("kv_commit_skipped_non_owner"):
                 kv_commit_skipped_non_owner_count += 1
+            if e.get("mailbox_payload_consume_plan_built"):
+                mailbox_payload_consume_plan_built_count += 1
+            if e.get("mailbox_payload_consume_attempted"):
+                mailbox_payload_consume_attempt_count += 1
             if e.get("mailbox_payload_consume_success"):
                 mailbox_payload_consume_success_count += 1
+            if e.get("mailbox_payload_consume_error"):
+                mailbox_payload_consume_error_count += 1
+            if e.get("mailbox_payload_invalidate_attempted"):
+                mailbox_payload_invalidate_attempt_count += 1
             if e.get("mailbox_payload_invalidate_success"):
                 mailbox_payload_invalidate_success_count += 1
+            if e.get("mailbox_payload_invalidate_error"):
+                mailbox_payload_invalidate_error_count += 1
+            if e.get("mailbox_payload_duplicate_consume_detected"):
+                mailbox_payload_duplicate_consume_count += 1
+            if e.get("mailbox_payload_consume_rollback_attempted"):
+                mailbox_payload_consume_rollback_attempt_count += 1
+            if e.get("mailbox_payload_consume_rollback_success"):
+                mailbox_payload_consume_rollback_success_count += 1
+            if e.get("mailbox_payload_consume_skipped_non_owner"):
+                mailbox_payload_consume_skipped_non_owner_count += 1
+            if e.get("mailbox_payload_invalidate_skipped_non_owner"):
+                mailbox_payload_invalidate_skipped_non_owner_count += 1
+            if e.get("next_pipeline_step_attempted"):
+                next_pipeline_step_attempt_count += 1
+            if e.get("next_pipeline_step_success"):
+                next_pipeline_step_success_count += 1
             if e.get("mailbox_verify_commit_rollback_attempted"):
                 mailbox_verify_commit_rollback_attempt_count += 1
             if e.get("mailbox_verify_commit_rollback_success"):
@@ -1350,8 +1398,20 @@ def aggregate_low_level_traces(
         row["kv_commit_rollback_attempt_count"] = kv_commit_rollback_attempt_count
         row["kv_commit_rollback_success_count"] = kv_commit_rollback_success_count
         row["kv_commit_skipped_non_owner_count"] = kv_commit_skipped_non_owner_count
+        row["mailbox_payload_consume_plan_built_count"] = mailbox_payload_consume_plan_built_count
+        row["mailbox_payload_consume_attempt_count"] = mailbox_payload_consume_attempt_count
         row["mailbox_payload_consume_success_count"] = mailbox_payload_consume_success_count
+        row["mailbox_payload_consume_error_count"] = mailbox_payload_consume_error_count
+        row["mailbox_payload_invalidate_attempt_count"] = mailbox_payload_invalidate_attempt_count
         row["mailbox_payload_invalidate_success_count"] = mailbox_payload_invalidate_success_count
+        row["mailbox_payload_invalidate_error_count"] = mailbox_payload_invalidate_error_count
+        row["mailbox_payload_duplicate_consume_count"] = mailbox_payload_duplicate_consume_count
+        row["mailbox_payload_consume_rollback_attempt_count"] = mailbox_payload_consume_rollback_attempt_count
+        row["mailbox_payload_consume_rollback_success_count"] = mailbox_payload_consume_rollback_success_count
+        row["mailbox_payload_consume_skipped_non_owner_count"] = mailbox_payload_consume_skipped_non_owner_count
+        row["mailbox_payload_invalidate_skipped_non_owner_count"] = mailbox_payload_invalidate_skipped_non_owner_count
+        row["next_pipeline_step_attempt_count"] = next_pipeline_step_attempt_count
+        row["next_pipeline_step_success_count"] = next_pipeline_step_success_count
         row["mailbox_verify_commit_rollback_attempt_count"] = mailbox_verify_commit_rollback_attempt_count
         row["mailbox_verify_commit_rollback_success_count"] = mailbox_verify_commit_rollback_success_count
         row["mailbox_verify_commit_skipped_non_owner_count"] = mailbox_verify_commit_skipped_non_owner_count
@@ -2259,8 +2319,20 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "kv_commit_rollback_attempt_count": row.get("kv_commit_rollback_attempt_count"),
         "kv_commit_rollback_success_count": row.get("kv_commit_rollback_success_count"),
         "kv_commit_skipped_non_owner_count": row.get("kv_commit_skipped_non_owner_count"),
+        "mailbox_payload_consume_plan_built_count": row.get("mailbox_payload_consume_plan_built_count"),
+        "mailbox_payload_consume_attempt_count": row.get("mailbox_payload_consume_attempt_count"),
         "mailbox_payload_consume_success_count": row.get("mailbox_payload_consume_success_count"),
+        "mailbox_payload_consume_error_count": row.get("mailbox_payload_consume_error_count"),
+        "mailbox_payload_invalidate_attempt_count": row.get("mailbox_payload_invalidate_attempt_count"),
         "mailbox_payload_invalidate_success_count": row.get("mailbox_payload_invalidate_success_count"),
+        "mailbox_payload_invalidate_error_count": row.get("mailbox_payload_invalidate_error_count"),
+        "mailbox_payload_duplicate_consume_count": row.get("mailbox_payload_duplicate_consume_count"),
+        "mailbox_payload_consume_rollback_attempt_count": row.get("mailbox_payload_consume_rollback_attempt_count"),
+        "mailbox_payload_consume_rollback_success_count": row.get("mailbox_payload_consume_rollback_success_count"),
+        "mailbox_payload_consume_skipped_non_owner_count": row.get("mailbox_payload_consume_skipped_non_owner_count"),
+        "mailbox_payload_invalidate_skipped_non_owner_count": row.get("mailbox_payload_invalidate_skipped_non_owner_count"),
+        "next_pipeline_step_attempt_count": row.get("next_pipeline_step_attempt_count"),
+        "next_pipeline_step_success_count": row.get("next_pipeline_step_success_count"),
         "mailbox_verify_commit_rollback_attempt_count": row.get("mailbox_verify_commit_rollback_attempt_count"),
         "mailbox_verify_commit_rollback_success_count": row.get("mailbox_verify_commit_rollback_success_count"),
         "mailbox_verify_commit_skipped_non_owner_count": row.get("mailbox_verify_commit_skipped_non_owner_count"),

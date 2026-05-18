@@ -77,6 +77,7 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
     build_mailbox_kv_commit_plan,
+    build_mailbox_payload_consume_plan,
     build_mailbox_verify_apply_plan,
     build_mailbox_verify_commit_plan,
     build_mailbox_verify_result,
@@ -553,10 +554,29 @@ class ModelRunnerBase:
             "kv_commit_rollback_attempted": False,
             "kv_commit_rollback_success": True,
             "kv_commit_skipped_non_owner": False,
+            "mailbox_payload_consume_plan_built": False,
             "mailbox_payload_consume_attempted": False,
             "mailbox_payload_consume_success": False,
+            "mailbox_payload_consume_error": None,
+            "mailbox_payload_consume_error_kind": None,
+            "mailbox_payload_consumed_payload_ids": [],
+            "mailbox_payload_consumed_token_count": 0,
             "mailbox_payload_invalidate_attempted": False,
             "mailbox_payload_invalidate_success": False,
+            "mailbox_payload_invalidate_error": None,
+            "mailbox_payload_invalidated_payload_ids": [],
+            "mailbox_payload_invalidated_token_count": 0,
+            "mailbox_payload_lifecycle_before": {},
+            "mailbox_payload_lifecycle_after": {},
+            "mailbox_payload_duplicate_consume_detected": False,
+            "mailbox_payload_consume_rollback_attempted": False,
+            "mailbox_payload_consume_rollback_success": True,
+            "mailbox_payload_consume_skipped_non_owner": False,
+            "mailbox_payload_invalidate_skipped_non_owner": False,
+            "next_pipeline_step_attempted": False,
+            "next_pipeline_step_success": False,
+            "next_pipeline_step_error": None,
+            "next_pipeline_plan_id": None,
             "mailbox_verify_commit_rollback_attempted": False,
             "mailbox_verify_commit_rollback_success": True,
             "mailbox_verify_commit_skipped_non_owner": False,
@@ -755,10 +775,29 @@ class ModelRunnerBase:
             "kv_commit_rollback_attempted",
             "kv_commit_rollback_success",
             "kv_commit_skipped_non_owner",
+            "mailbox_payload_consume_plan_built",
             "mailbox_payload_consume_attempted",
             "mailbox_payload_consume_success",
+            "mailbox_payload_consume_error",
+            "mailbox_payload_consume_error_kind",
+            "mailbox_payload_consumed_payload_ids",
+            "mailbox_payload_consumed_token_count",
             "mailbox_payload_invalidate_attempted",
             "mailbox_payload_invalidate_success",
+            "mailbox_payload_invalidate_error",
+            "mailbox_payload_invalidated_payload_ids",
+            "mailbox_payload_invalidated_token_count",
+            "mailbox_payload_lifecycle_before",
+            "mailbox_payload_lifecycle_after",
+            "mailbox_payload_duplicate_consume_detected",
+            "mailbox_payload_consume_rollback_attempted",
+            "mailbox_payload_consume_rollback_success",
+            "mailbox_payload_consume_skipped_non_owner",
+            "mailbox_payload_invalidate_skipped_non_owner",
+            "next_pipeline_step_attempted",
+            "next_pipeline_step_success",
+            "next_pipeline_step_error",
+            "next_pipeline_plan_id",
             "mailbox_verify_commit_rollback_attempted",
             "mailbox_verify_commit_rollback_success",
             "mailbox_verify_commit_skipped_non_owner",
@@ -1497,6 +1536,11 @@ class ModelRunnerBase:
             trace_record["kv_commit_append_end_positions_by_seq"] = dict(kv_commit_plan.append_end_positions_by_seq)
             trace_record["kv_commit_sequence_length_before_by_seq"] = dict(kv_commit_plan.sequence_length_before_by_seq)
             trace_record["kv_commit_sequence_length_after_by_seq"] = dict(kv_commit_plan.sequence_length_after_by_seq)
+            payload_consume_plan = build_mailbox_payload_consume_plan(commit_plan, self.stspec_mailbox)
+            trace_record["mailbox_payload_consume_plan_built"] = True
+            trace_record["mailbox_payload_consumed_payload_ids"] = list(payload_consume_plan.consumed_payload_ids)
+            trace_record["mailbox_payload_invalidated_payload_ids"] = list(payload_consume_plan.invalidated_payload_ids)
+            trace_record["mailbox_payload_lifecycle_before"] = payload_consume_plan.mailbox_state_before
             commit_result = run_mailbox_verify_commit_probe(
                 commit_plan,
                 exec_seqs,
@@ -1505,6 +1549,9 @@ class ModelRunnerBase:
                 eos_token_id=getattr(self.global_config, "eos", None),
                 commit_enabled=True,
                 kv_commit_plan=kv_commit_plan,
+                payload_consume_plan=payload_consume_plan,
+                mailbox=self.stspec_mailbox,
+                next_pipeline_plan_id=int(getattr(step_plan, "plan_id", 0) or 0) + 1,
             )
             trace_record["mailbox_verify_commit_attempted"] = bool(commit_result.attempted)
             trace_record["mailbox_verify_commit_success"] = bool(commit_result.success)
@@ -1523,10 +1570,29 @@ class ModelRunnerBase:
             trace_record["kv_commit_rollback_attempted"] = bool(commit_result.kv_commit_rollback_attempted)
             trace_record["kv_commit_rollback_success"] = bool(commit_result.kv_commit_rollback_success)
             trace_record["kv_commit_skipped_non_owner"] = bool(commit_result.kv_commit_skipped_non_owner)
+            trace_record["mailbox_payload_consume_plan_built"] = bool(commit_result.mailbox_payload_consume_plan_built) or trace_record.get("mailbox_payload_consume_plan_built", False)
             trace_record["mailbox_payload_consume_attempted"] = bool(commit_result.mailbox_payload_consume_attempted)
             trace_record["mailbox_payload_consume_success"] = bool(commit_result.mailbox_payload_consume_success)
+            trace_record["mailbox_payload_consume_error"] = commit_result.mailbox_payload_consume_error
+            trace_record["mailbox_payload_consume_error_kind"] = commit_result.mailbox_payload_consume_error_kind
+            trace_record["mailbox_payload_consumed_payload_ids"] = list(commit_result.mailbox_payload_consumed_payload_ids)
+            trace_record["mailbox_payload_consumed_token_count"] = int(commit_result.mailbox_payload_consumed_token_count)
             trace_record["mailbox_payload_invalidate_attempted"] = bool(commit_result.mailbox_payload_invalidate_attempted)
             trace_record["mailbox_payload_invalidate_success"] = bool(commit_result.mailbox_payload_invalidate_success)
+            trace_record["mailbox_payload_invalidate_error"] = commit_result.mailbox_payload_invalidate_error
+            trace_record["mailbox_payload_invalidated_payload_ids"] = list(commit_result.mailbox_payload_invalidated_payload_ids)
+            trace_record["mailbox_payload_invalidated_token_count"] = int(commit_result.mailbox_payload_invalidated_token_count)
+            trace_record["mailbox_payload_lifecycle_before"] = commit_result.mailbox_payload_lifecycle_before or trace_record.get("mailbox_payload_lifecycle_before", {})
+            trace_record["mailbox_payload_lifecycle_after"] = commit_result.mailbox_payload_lifecycle_after
+            trace_record["mailbox_payload_duplicate_consume_detected"] = bool(commit_result.mailbox_payload_duplicate_consume_detected)
+            trace_record["mailbox_payload_consume_rollback_attempted"] = bool(commit_result.mailbox_payload_consume_rollback_attempted)
+            trace_record["mailbox_payload_consume_rollback_success"] = bool(commit_result.mailbox_payload_consume_rollback_success)
+            trace_record["mailbox_payload_consume_skipped_non_owner"] = bool(commit_result.mailbox_payload_consume_skipped_non_owner)
+            trace_record["mailbox_payload_invalidate_skipped_non_owner"] = bool(commit_result.mailbox_payload_invalidate_skipped_non_owner)
+            trace_record["next_pipeline_step_attempted"] = bool(commit_result.next_pipeline_step_attempted)
+            trace_record["next_pipeline_step_success"] = bool(commit_result.next_pipeline_step_success)
+            trace_record["next_pipeline_step_error"] = commit_result.next_pipeline_step_error
+            trace_record["next_pipeline_plan_id"] = commit_result.next_pipeline_plan_id
             trace_record["mailbox_verify_commit_rollback_attempted"] = bool(commit_result.rollback_attempted)
             trace_record["mailbox_verify_commit_rollback_success"] = bool(commit_result.rollback_success)
             trace_record["mailbox_verify_commit_skipped_non_owner"] = bool(commit_result.skipped_non_owner)

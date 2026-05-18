@@ -235,8 +235,20 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     kv_commit_rollback_attempt_count = 0
     kv_commit_rollback_success_count = 0
     kv_commit_skipped_non_owner_count = 0
+    mailbox_payload_consume_plan_built_count = 0
+    mailbox_payload_consume_attempt_count = 0
     mailbox_payload_consume_success_count = 0
+    mailbox_payload_consume_error_count = 0
+    mailbox_payload_invalidate_attempt_count = 0
     mailbox_payload_invalidate_success_count = 0
+    mailbox_payload_invalidate_error_count = 0
+    mailbox_payload_duplicate_consume_count = 0
+    mailbox_payload_consume_rollback_attempt_count = 0
+    mailbox_payload_consume_rollback_success_count = 0
+    mailbox_payload_consume_skipped_non_owner_count = 0
+    mailbox_payload_invalidate_skipped_non_owner_count = 0
+    next_pipeline_step_attempt_count = 0
+    next_pipeline_step_success_count = 0
     mailbox_verify_commit_rollback_attempt_count = 0
     mailbox_verify_commit_rollback_success_count = 0
     mailbox_verify_commit_skipped_non_owner_count = 0
@@ -274,6 +286,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "sequence_state_commit_attempted",
                 "kv_commit_plan_built",
                 "kv_commit_attempted",
+                "mailbox_payload_consume_plan_built",
+                "mailbox_payload_consume_attempted",
+                "next_pipeline_step_attempted",
                 "mailbox_verify_commit_attempt_count",
             )
         )
@@ -552,8 +567,20 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         kv_commit_rollback_attempt_count += int(row.get("kv_commit_rollback_attempt_count") or 0)
         kv_commit_rollback_success_count += int(row.get("kv_commit_rollback_success_count") or 0)
         kv_commit_skipped_non_owner_count += int(row.get("kv_commit_skipped_non_owner_count") or 0)
+        mailbox_payload_consume_plan_built_count += int(row.get("mailbox_payload_consume_plan_built_count") or 0)
+        mailbox_payload_consume_attempt_count += int(row.get("mailbox_payload_consume_attempt_count") or 0)
         mailbox_payload_consume_success_count += int(row.get("mailbox_payload_consume_success_count") or 0)
+        mailbox_payload_consume_error_count += int(row.get("mailbox_payload_consume_error_count") or 0)
+        mailbox_payload_invalidate_attempt_count += int(row.get("mailbox_payload_invalidate_attempt_count") or 0)
         mailbox_payload_invalidate_success_count += int(row.get("mailbox_payload_invalidate_success_count") or 0)
+        mailbox_payload_invalidate_error_count += int(row.get("mailbox_payload_invalidate_error_count") or 0)
+        mailbox_payload_duplicate_consume_count += int(row.get("mailbox_payload_duplicate_consume_count") or 0)
+        mailbox_payload_consume_rollback_attempt_count += int(row.get("mailbox_payload_consume_rollback_attempt_count") or 0)
+        mailbox_payload_consume_rollback_success_count += int(row.get("mailbox_payload_consume_rollback_success_count") or 0)
+        mailbox_payload_consume_skipped_non_owner_count += int(row.get("mailbox_payload_consume_skipped_non_owner_count") or 0)
+        mailbox_payload_invalidate_skipped_non_owner_count += int(row.get("mailbox_payload_invalidate_skipped_non_owner_count") or 0)
+        next_pipeline_step_attempt_count += int(row.get("next_pipeline_step_attempt_count") or 0)
+        next_pipeline_step_success_count += int(row.get("next_pipeline_step_success_count") or 0)
         mailbox_verify_commit_rollback_attempt_count += int(row.get("mailbox_verify_commit_rollback_attempt_count") or 0)
         mailbox_verify_commit_rollback_success_count += int(row.get("mailbox_verify_commit_rollback_success_count") or 0)
         mailbox_verify_commit_skipped_non_owner_count += int(row.get("mailbox_verify_commit_skipped_non_owner_count") or 0)
@@ -690,10 +717,34 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             kv_commit_rollback_success_count += 1
         if row.get("kv_commit_skipped_non_owner"):
             kv_commit_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_consume_plan_built"):
+            mailbox_payload_consume_plan_built_count += 1
+        if row.get("mailbox_payload_consume_attempted"):
+            mailbox_payload_consume_attempt_count += 1
         if row.get("mailbox_payload_consume_success"):
             mailbox_payload_consume_success_count += 1
+        if row.get("mailbox_payload_consume_error"):
+            mailbox_payload_consume_error_count += 1
+        if row.get("mailbox_payload_invalidate_attempted"):
+            mailbox_payload_invalidate_attempt_count += 1
         if row.get("mailbox_payload_invalidate_success"):
             mailbox_payload_invalidate_success_count += 1
+        if row.get("mailbox_payload_invalidate_error"):
+            mailbox_payload_invalidate_error_count += 1
+        if row.get("mailbox_payload_duplicate_consume_detected"):
+            mailbox_payload_duplicate_consume_count += 1
+        if row.get("mailbox_payload_consume_rollback_attempted"):
+            mailbox_payload_consume_rollback_attempt_count += 1
+        if row.get("mailbox_payload_consume_rollback_success"):
+            mailbox_payload_consume_rollback_success_count += 1
+        if row.get("mailbox_payload_consume_skipped_non_owner"):
+            mailbox_payload_consume_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_invalidate_skipped_non_owner"):
+            mailbox_payload_invalidate_skipped_non_owner_count += 1
+        if row.get("next_pipeline_step_attempted"):
+            next_pipeline_step_attempt_count += 1
+        if row.get("next_pipeline_step_success"):
+            next_pipeline_step_success_count += 1
         if row.get("mailbox_verify_commit_rollback_attempted"):
             mailbox_verify_commit_rollback_attempt_count += 1
         if row.get("mailbox_verify_commit_rollback_success"):
@@ -868,8 +919,20 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "kv_commit_rollback_attempt_count": kv_commit_rollback_attempt_count,
         "kv_commit_rollback_success_count": kv_commit_rollback_success_count,
         "kv_commit_skipped_non_owner_count": kv_commit_skipped_non_owner_count,
+        "mailbox_payload_consume_plan_built_count": mailbox_payload_consume_plan_built_count,
+        "mailbox_payload_consume_attempt_count": mailbox_payload_consume_attempt_count,
         "mailbox_payload_consume_success_count": mailbox_payload_consume_success_count,
+        "mailbox_payload_consume_error_count": mailbox_payload_consume_error_count,
+        "mailbox_payload_invalidate_attempt_count": mailbox_payload_invalidate_attempt_count,
         "mailbox_payload_invalidate_success_count": mailbox_payload_invalidate_success_count,
+        "mailbox_payload_invalidate_error_count": mailbox_payload_invalidate_error_count,
+        "mailbox_payload_duplicate_consume_count": mailbox_payload_duplicate_consume_count,
+        "mailbox_payload_consume_rollback_attempt_count": mailbox_payload_consume_rollback_attempt_count,
+        "mailbox_payload_consume_rollback_success_count": mailbox_payload_consume_rollback_success_count,
+        "mailbox_payload_consume_skipped_non_owner_count": mailbox_payload_consume_skipped_non_owner_count,
+        "mailbox_payload_invalidate_skipped_non_owner_count": mailbox_payload_invalidate_skipped_non_owner_count,
+        "next_pipeline_step_attempt_count": next_pipeline_step_attempt_count,
+        "next_pipeline_step_success_count": next_pipeline_step_success_count,
         "mailbox_verify_commit_rollback_attempt_count": mailbox_verify_commit_rollback_attempt_count,
         "mailbox_verify_commit_rollback_success_count": mailbox_verify_commit_rollback_success_count,
         "mailbox_verify_commit_skipped_non_owner_count": mailbox_verify_commit_skipped_non_owner_count,
@@ -1181,8 +1244,20 @@ def summarize(path: Path) -> int:
     print(f"KV commit rollback attempts: {plan_summary['kv_commit_rollback_attempt_count']}")
     print(f"KV commit rollback successes: {plan_summary['kv_commit_rollback_success_count']}")
     print(f"KV commit skipped non-owner count: {plan_summary['kv_commit_skipped_non_owner_count']}")
+    print(f"mailbox payload consume plans built: {plan_summary['mailbox_payload_consume_plan_built_count']}")
+    print(f"mailbox payload consume attempts: {plan_summary['mailbox_payload_consume_attempt_count']}")
     print(f"mailbox payload consume successes: {plan_summary['mailbox_payload_consume_success_count']}")
+    print(f"mailbox payload consume errors: {plan_summary['mailbox_payload_consume_error_count']}")
+    print(f"mailbox payload invalidate attempts: {plan_summary['mailbox_payload_invalidate_attempt_count']}")
     print(f"mailbox payload invalidate successes: {plan_summary['mailbox_payload_invalidate_success_count']}")
+    print(f"mailbox payload invalidate errors: {plan_summary['mailbox_payload_invalidate_error_count']}")
+    print(f"mailbox payload duplicate consume count: {plan_summary['mailbox_payload_duplicate_consume_count']}")
+    print(f"mailbox payload consume rollback attempts: {plan_summary['mailbox_payload_consume_rollback_attempt_count']}")
+    print(f"mailbox payload consume rollback successes: {plan_summary['mailbox_payload_consume_rollback_success_count']}")
+    print(f"mailbox payload consume skipped non-owner count: {plan_summary['mailbox_payload_consume_skipped_non_owner_count']}")
+    print(f"mailbox payload invalidate skipped non-owner count: {plan_summary['mailbox_payload_invalidate_skipped_non_owner_count']}")
+    print(f"next pipeline step attempts: {plan_summary['next_pipeline_step_attempt_count']}")
+    print(f"next pipeline step successes: {plan_summary['next_pipeline_step_success_count']}")
     print(f"mailbox verify commit rollback attempts: {plan_summary['mailbox_verify_commit_rollback_attempt_count']}")
     print(f"mailbox verify commit rollback successes: {plan_summary['mailbox_verify_commit_rollback_success_count']}")
     print(f"mailbox verify commit skipped non-owner count: {plan_summary['mailbox_verify_commit_skipped_non_owner_count']}")
