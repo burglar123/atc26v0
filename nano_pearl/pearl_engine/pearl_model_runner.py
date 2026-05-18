@@ -647,8 +647,41 @@ class ModelRunnerBase:
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
         }
+        if not self._is_stspec_real_probe_enabled(step_plan):
+            self._strip_stspec_real_probe_only_trace_fields(record)
         self.trace_records.append(record)
         return record
+
+    def _strip_stspec_real_probe_only_trace_fields(self, record: dict) -> None:
+        for key in (
+            "target_tp_current_rank",
+            "target_tp_output_owner_rank",
+            "target_tp_is_output_owner",
+            "target_tp_is_payload_owner",
+            "target_tp_should_run_forward",
+            "target_tp_should_interpret_output",
+            "target_tp_should_apply_verify_result",
+            "target_tp_skipped_non_owner",
+            "mailbox_payload_envelope_available",
+            "mailbox_payload_token_ids_available",
+            "mailbox_payload_tensor_available",
+            "mailbox_payload_available_for_seq_ids",
+            "mailbox_payload_local_to_rank",
+            "mailbox_payload_owner_rank",
+            "mailbox_payload_current_rank",
+            "mailbox_payload_missing_reason",
+            "output_interpretation_skipped_non_owner",
+            "mailbox_verify_apply_skipped_non_owner",
+            "target_forward_output_none_expected",
+            "target_forward_output_none_unexpected",
+            "mailbox_verify_apply_attempted",
+            "mailbox_verify_apply_success",
+            "mailbox_verify_apply_error",
+            "mailbox_forward_state_mutation_attempted",
+            "mailbox_forward_state_mutation_committed",
+            "mailbox_forward_state_mutation_rollback_success",
+        ):
+            record.pop(key, None)
 
 
     def _pearl_protocol_enabled(self) -> bool:

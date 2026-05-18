@@ -220,3 +220,27 @@ def test_real_probe_only_fields_are_not_seeded_in_base_trace_defaults():
 
     for literal in forbidden_default_literals:
         assert literal not in runner_source
+
+
+def test_checker_counts_absent_real_probe_fields_as_zero():
+    import importlib.util
+
+    checker_path = Path(REPO_ROOT, "benchmark", "check_multislo_result.py")
+    spec = importlib.util.spec_from_file_location("check_multislo_result_for_stspec_test", checker_path)
+    checker = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(checker)
+
+    summary = checker.summarize_plan_rows([
+        {
+            "request_id": "r0",
+            "seq_id": 1,
+            "pearl_protocol_layout": "variable_offsets",
+            "real_probe_attempted": False,
+        }
+    ])
+
+    assert summary["target_tp_owner_rows"] == 0
+    assert summary["mailbox_payload_availability_rows"] == 0
+    assert summary["target_tp_skipped_non_owner_count"] == 0
+    assert summary["mailbox_payload_envelope_available_count"] == 0
