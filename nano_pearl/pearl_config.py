@@ -85,12 +85,31 @@ class PEARLConfig:
     enforce_eager: bool = False
     gamma: int = -1
     execution_mode: str = "parallel_pearl"
+    enable_stspec_two_batch_execution: bool = False
+    stspec_two_batch_dryrun: bool = True
+    stspec_two_batch_probe: bool = False
+    stspec_two_batch_probe_fail_fast: bool = True
+    pearl_protocol_version: int = 1
+    pearl_protocol_layout: str = "legacy_fixed"
+    enable_pearl_protocol_envelope: bool = True
+    pearl_protocol_validate: bool = True
+    pearl_protocol_trace: bool = True
+    stspec_mailbox_allow_warmup_miss: bool = False
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
             raise ValueError(
                 f"Invalid execution_mode={self.execution_mode!r}. "
                 f"Expected one of {sorted(self.ALLOWED_EXECUTION_MODES)}."
+            )
+        if int(self.pearl_protocol_version) != 1:
+            raise NotImplementedError(
+                f"PEARL protocol_version={self.pearl_protocol_version!r} is unsupported; only version 1 is implemented."
+            )
+        if self.pearl_protocol_layout not in {"legacy_fixed", "variable_offsets"}:
+            raise ValueError(
+                "Invalid pearl_protocol_layout="
+                f"{self.pearl_protocol_layout!r}; expected legacy_fixed or variable_offsets."
             )
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
@@ -109,6 +128,25 @@ class PEARLConfig:
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
+        logger.info(f"STSpec_Two_Batch_Execution={self.enable_stspec_two_batch_execution}")
+        logger.info(f"STSpec_Two_Batch_Dryrun={self.stspec_two_batch_dryrun}")
+        logger.info(f"STSpec_Two_Batch_Probe={self.stspec_two_batch_probe}")
+        logger.info(f"STSpec_Two_Batch_Probe_Fail_Fast={self.stspec_two_batch_probe_fail_fast}")
+        logger.info(f"PEARL_Protocol_Version={self.pearl_protocol_version}")
+        logger.info(f"PEARL_Protocol_Layout={self.pearl_protocol_layout}")
+        logger.info(f"PEARL_Protocol_Envelope={self.enable_pearl_protocol_envelope}")
+        logger.info(f"PEARL_Protocol_Validate={self.pearl_protocol_validate}")
+        logger.info(f"PEARL_Protocol_Trace={self.pearl_protocol_trace}")
+        logger.info(f"STSpec_Mailbox_Allow_Warmup_Miss={self.stspec_mailbox_allow_warmup_miss}")
+        if (
+            self.enable_stspec_two_batch_execution
+            and not self.stspec_two_batch_dryrun
+            and not self.stspec_two_batch_probe
+        ):
+            raise NotImplementedError(
+                "Real ST-Spec two-batch execution is only available in explicit V4A "
+                "probe mode. Set stspec_two_batch_probe=True for the guarded probe."
+            )
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len
