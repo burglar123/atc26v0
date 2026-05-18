@@ -465,6 +465,13 @@ PLAN_REQUEST_FIELDS = [
     "variable_offsets_seen_count",
     "variable_offsets_validation_error_count",
     "cross_batch_routing_error_count",
+    "mailbox_put_count",
+    "mailbox_get_hit_count",
+    "mailbox_get_miss_count",
+    "mailbox_missing_count",
+    "mailbox_error_kinds",
+    "mailbox_warmup_miss_count",
+    "mailbox_routing_error_count",
     "next_required_features",
     "variable_draft_message_seen_count",
     "variable_verify_result_seen_count",
@@ -672,6 +679,13 @@ def aggregate_low_level_traces(
         variable_offsets_seen_count = 0
         variable_offsets_validation_error_count = 0
         cross_batch_routing_error_count = 0
+        mailbox_put_count = 0
+        mailbox_get_hit_count = 0
+        mailbox_get_miss_count = 0
+        mailbox_missing_count = 0
+        mailbox_error_kinds: List[str] = []
+        mailbox_warmup_miss_count = 0
+        mailbox_routing_error_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
         variable_verify_result_seen_count = 0
@@ -774,6 +788,15 @@ def aggregate_low_level_traces(
                 variable_offsets_validation_error_count += 1
             if e.get("cross_batch_routing_error"):
                 cross_batch_routing_error_count += 1
+            mailbox_put_count += int(e.get("mailbox_put_count") or 0)
+            mailbox_get_hit_count += int(e.get("mailbox_get_hit_count") or 0)
+            mailbox_get_miss_count += int(e.get("mailbox_get_miss_count") or 0)
+            mailbox_missing_count += len(e.get("mailbox_missing_seq_ids") or [])
+            append_unique(mailbox_error_kinds, e.get("mailbox_error_kind"))
+            if e.get("mailbox_warmup_miss"):
+                mailbox_warmup_miss_count += 1
+            if e.get("mailbox_routing_ok") is False or e.get("mailbox_error"):
+                mailbox_routing_error_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
             if e.get("variable_draft_message_seq_ids") is not None:
                 variable_draft_message_seen_count += 1
@@ -933,6 +956,14 @@ def aggregate_low_level_traces(
         row["variable_offsets_seen_count"] = variable_offsets_seen_count
         row["variable_offsets_validation_error_count"] = variable_offsets_validation_error_count
         row["cross_batch_routing_error_count"] = cross_batch_routing_error_count
+        row["mailbox_put_count"] = mailbox_put_count
+        row["mailbox_get_hit_count"] = mailbox_get_hit_count
+        row["mailbox_get_miss_count"] = mailbox_get_miss_count
+        row["mailbox_missing_count"] = mailbox_missing_count
+        if mailbox_error_kinds:
+            row["mailbox_error_kinds"] = mailbox_error_kinds
+        row["mailbox_warmup_miss_count"] = mailbox_warmup_miss_count
+        row["mailbox_routing_error_count"] = mailbox_routing_error_count
         if next_required_features:
             row["next_required_features"] = next_required_features
         row["variable_draft_message_seen_count"] = variable_draft_message_seen_count

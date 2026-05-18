@@ -40,6 +40,11 @@ from nano_pearl.pearl_engine.pearl_protocol import (
     PearlDraftMessage,
     PearlVerifyResultMessage,
 )
+from nano_pearl.pearl_engine.stspec_mailbox import (
+    STSpecMailboxError,
+    STSpecPayloadMailbox,
+    payloads_from_draft_message,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -131,6 +136,10 @@ class ModelRunnerBase:
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
+        # V4D mailbox is local diagnostic state only. Draft/target runners are
+        # separate processes, so cross-process payload delivery is deliberately
+        # reported as not implemented instead of assuming shared Python memory.
+        self.stspec_mailbox = STSpecPayloadMailbox()
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         if not self.global_config.enforce_eager:
@@ -460,6 +469,26 @@ class ModelRunnerBase:
             "variable_offsets_validation_error": None,
             "cross_batch_routing_ok": True,
             "cross_batch_routing_error": None,
+            "stspec_mailbox_enabled": False,
+            "mailbox_put_attempted": False,
+            "mailbox_put_success": False,
+            "mailbox_put_count": 0,
+            "mailbox_put_home_batch_id": None,
+            "mailbox_put_seq_ids": [],
+            "mailbox_get_attempted": False,
+            "mailbox_get_success": False,
+            "mailbox_get_hit_count": 0,
+            "mailbox_get_miss_count": 0,
+            "mailbox_get_home_batch_id": None,
+            "mailbox_get_seq_ids": [],
+            "mailbox_missing_seq_ids": [],
+            "mailbox_available_home_batch_ids": [],
+            "mailbox_available_seq_ids_by_batch": {},
+            "mailbox_cross_process_delivery": None,
+            "mailbox_error": None,
+            "mailbox_error_kind": None,
+            "mailbox_warmup_miss": False,
+            "mailbox_routing_ok": True,
             "next_required_feature": None,
             "plan_legacy_equivalent": step_plan.legacy_equivalent,
             "plan_runner_role": step_plan.runner_role,
@@ -609,6 +638,174 @@ class ModelRunnerBase:
             assert exec_seqs == seqs
         return exec_seqs
 
+    def _stspec_mailbox_enabled(self, step_plan: StepPlan | None) -> bool:
+        return bool(
+            step_plan is not None
+            and step_plan.real_probe_attempted
+            and not step_plan.stspec_probe_local_only
+            and not step_plan.is_prefill
+            and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
+            and step_plan.execution_mode in {"parallel_pearl", "serialized_pearl"}
+        )
+
+    def _mailbox_available_seq_ids_by_batch(self) -> dict[str, list[int]]:
+        return self.stspec_mailbox.available_seq_ids_by_batch()
+
+    def _trace_mailbox_availability(self, trace_record: dict) -> None:
+        trace_record["mailbox_available_home_batch_ids"] = self.stspec_mailbox.available_home_batch_ids()
+        trace_record["mailbox_available_seq_ids_by_batch"] = self._mailbox_available_seq_ids_by_batch()
+
+    def _record_mailbox_error(
+        self,
+        trace_record: dict,
+        *,
+        kind: str,
+        message: str,
+        next_required_feature: str | None = None,
+        warmup_miss: bool = False,
+    ) -> None:
+        trace_record["mailbox_error"] = message
+        trace_record["mailbox_error_kind"] = kind
+        trace_record["mailbox_warmup_miss"] = bool(warmup_miss)
+        trace_record["mailbox_routing_ok"] = False
+        trace_record["cross_batch_routing_ok"] = False
+        trace_record["cross_batch_routing_error"] = message
+        if next_required_feature:
+            trace_record["next_required_feature"] = next_required_feature
+        self._trace_mailbox_availability(trace_record)
+
+    def _prepare_stspec_mailbox_route(
+        self,
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> None:
+        """V4D mailbox routing preflight for real variable-offset probes.
+
+        This intentionally does not implement full payload transport. It prevents
+        the old divergent-seq generic failure from advancing into distributed
+        verification with the wrong payload, and it produces precise mailbox
+        diagnostics. The first target batch can legitimately miss because a
+        two-batch pipeline has not produced a prior payload yet; with separate
+        draft/target processes, later hits also require cross-process transport.
+        """
+        if not self._stspec_mailbox_enabled(step_plan):
+            return
+        trace_record["stspec_mailbox_enabled"] = True
+        self._trace_mailbox_availability(trace_record)
+        if "draft" in runner_role:
+            put_seq_ids = list(step_plan.actual_draft_exec_seq_ids)
+            trace_record["mailbox_put_attempted"] = True
+            trace_record["mailbox_put_success"] = False
+            trace_record["mailbox_put_count"] = len(put_seq_ids)
+            trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
+            trace_record["mailbox_put_seq_ids"] = put_seq_ids
+            trace_record["mailbox_cross_process_delivery"] = "not_implemented"
+            message = (
+                "ST-Spec mailbox handoff between processes is not implemented; "
+                "draft payload production is recorded as routing intent only"
+            )
+            self._record_mailbox_error(
+                trace_record,
+                kind="cross_process_mailbox_transport_not_implemented",
+                message=message,
+                next_required_feature="cross_process_mailbox_transport",
+            )
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
+                f"draft_home_batch_id={step_plan.draft_home_batch_id}, "
+                f"draft_seq_ids={put_seq_ids}, target_home_batch_id={step_plan.target_home_batch_id}, "
+                "mailbox_cross_process_delivery=not_implemented, "
+                "next_required_feature=cross_process_mailbox_transport"
+            )
+
+        target_seq_ids = list(step_plan.actual_target_exec_seq_ids)
+        result = self.stspec_mailbox.get_payloads(
+            step_plan.target_home_batch_id,
+            target_seq_ids,
+            plan_id=step_plan.plan_id,
+            consumer_role=runner_role,
+        )
+        trace_record["mailbox_get_attempted"] = True
+        trace_record["mailbox_get_success"] = result.success
+        trace_record["mailbox_get_hit_count"] = result.hit_count
+        trace_record["mailbox_get_miss_count"] = result.miss_count
+        trace_record["mailbox_get_home_batch_id"] = step_plan.target_home_batch_id
+        trace_record["mailbox_get_seq_ids"] = target_seq_ids
+        trace_record["mailbox_missing_seq_ids"] = list(result.missing_seq_ids)
+        self._trace_mailbox_availability(trace_record)
+        if result.success:
+            trace_record["mailbox_routing_ok"] = True
+            trace_record["mailbox_error"] = None
+            trace_record["mailbox_error_kind"] = None
+            return
+
+        warmup_miss = step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
+        error_kind = "mailbox_warmup_miss" if warmup_miss else "mailbox_payload_missing"
+        message = (
+            "ST-Spec mailbox miss for target batch; pipeline warmup or "
+            "cross-process mailbox transport is not implemented"
+        )
+        self._record_mailbox_error(
+            trace_record,
+            kind=error_kind,
+            message=message,
+            next_required_feature="cross_process_mailbox_transport",
+            warmup_miss=warmup_miss,
+        )
+        raise RuntimeError(
+            f"{message}; mailbox_error_kind={error_kind}, plan_id={step_plan.plan_id}, "
+            f"runner_role={runner_role}, target_home_batch_id={step_plan.target_home_batch_id}, "
+            f"target_seq_ids={target_seq_ids}, mailbox_missing_seq_ids={result.missing_seq_ids}, "
+            f"available_mailbox_home_batch_ids={trace_record['mailbox_available_home_batch_ids']}, "
+            f"available_mailbox_seq_ids_by_batch={trace_record['mailbox_available_seq_ids_by_batch']}, "
+            "next_required_feature=cross_process_mailbox_transport"
+        )
+
+    def _record_draft_mailbox_payloads(
+        self,
+        trace_record: dict | None,
+        step_plan: StepPlan | None,
+        draft_message: PearlDraftMessage,
+    ) -> None:
+        if trace_record is None or not self._stspec_mailbox_enabled(step_plan):
+            return
+        payloads = payloads_from_draft_message(
+            draft_message,
+            home_batch_id=step_plan.draft_home_batch_id,
+            target_home_batch_id=step_plan.target_home_batch_id,
+            draft_home_batch_id=step_plan.draft_home_batch_id,
+            producer_home_batch_id=step_plan.draft_home_batch_id,
+            producer_role="draft",
+            logical_step=step_plan.plan_id,
+            metadata={"mailbox_locality": "diagnostic_local"},
+        )
+        trace_record["mailbox_put_attempted"] = True
+        trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
+        trace_record["mailbox_put_seq_ids"] = [payload.seq_id for payload in payloads]
+        try:
+            self.stspec_mailbox.put_payloads(
+                step_plan.draft_home_batch_id,
+                payloads,
+                plan_id=step_plan.plan_id,
+                producer_role="draft",
+            )
+        except STSpecMailboxError as exc:
+            trace_record["mailbox_put_success"] = False
+            trace_record["mailbox_put_count"] = 0
+            self._record_mailbox_error(
+                trace_record,
+                kind=exc.kind,
+                message=str(exc),
+                next_required_feature="cross_process_mailbox_transport",
+            )
+            raise
+        trace_record["mailbox_put_success"] = True
+        trace_record["mailbox_put_count"] = len(payloads)
+        trace_record["mailbox_cross_process_delivery"] = "diagnostic_local_only"
+        trace_record["next_required_feature"] = "cross_process_mailbox_transport"
+        self._trace_mailbox_availability(trace_record)
+
     def _validate_stspec_probe_alignment(
         self,
         step_plan: StepPlan,
@@ -632,7 +829,7 @@ class ModelRunnerBase:
         if self._pearl_protocol_layout() == "variable_offsets":
             trace_record["cross_batch_routing_ok"] = False
             trace_record["cross_batch_routing_error"] = error
-            trace_record["next_required_feature"] = "cross_batch_payload_routing"
+            trace_record["next_required_feature"] = "cross_process_mailbox_transport"
         # V4A is explicitly a feasibility probe. The current PEARL protocol packs
         # draft/verify tensors by common sequence index, so a mismatch must stop
         # before distributed communication can hang or corrupt request state.
@@ -1049,6 +1246,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record = self._trace_schedule(seqs, is_prefill, "draft", step_plan)
             exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "draft", trace_record)
             self._validate_stspec_probe_alignment(step_plan, "draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "draft", trace_record)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
@@ -1085,6 +1283,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft", step_plan)
             exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_draft", trace_record)
             self._validate_stspec_probe_alignment(step_plan, "serialized_draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "serialized_draft", trace_record)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
@@ -1134,6 +1333,7 @@ class DraftModelRunner(ModelRunnerBase):
                     layout_kind=self._pearl_protocol_layout(),
                 )
                 self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
+                self._record_draft_mailbox_payloads(trace_record, step_plan, draft_message)
                 to_be_verified_tokens, next_round_input = self._decode_draft_protocol_message(draft_message)
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
@@ -1240,6 +1440,7 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record)
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
@@ -1265,6 +1466,7 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record)
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None

@@ -285,18 +285,12 @@ def stspec_protocol_alignment_error(
         list(step_plan.actual_draft_exec_seq_ids),
     )
     if layout_kind == "variable_offsets":
-        return (
-            "variable_offsets protocol represented divergent seq sets, but cross-batch "
-            "draft payload routing is not implemented; "
-            f"plan_id={step_plan.plan_id}, runner_role={runner_role}, layout_kind=variable_offsets, "
-            f"draft_seq_ids={draft_ids}, target_seq_ids={target_ids}, "
-            f"actual_exec_seq_ids={actual_ids}, "
-            f"actual_draft_exec_seq_ids={draft_ids}, actual_target_exec_seq_ids={target_ids}, "
-            f"scheduled_seq_ids={step_plan.scheduled_seq_ids}, "
-            f"target_batch_seq_ids={step_plan.target_batch_seq_ids}, "
-            f"draft_home_batch_seq_ids={step_plan.draft_home_batch_seq_ids}, "
-            f"gamma={gamma}, next_required_feature=cross_batch_payload_routing"
-        )
+        # V4C made the PEARL envelope capable of representing divergent draft
+        # and target sequence sets. V4D moves the remaining real-probe blocker
+        # to the explicit mailbox/routing preflight in pearl_model_runner.py so
+        # failures identify warmup misses or missing cross-process transport
+        # instead of a generic protocol-representation error.
+        return None
     return (
         "ST-Spec real two-batch probe cannot proceed: draft exec seq ids != "
         "target verify seq ids under current legacy_fixed PEARL message layout; "

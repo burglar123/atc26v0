@@ -147,6 +147,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     variable_offsets_seen_count = 0
     variable_offsets_validation_errors = 0
     cross_batch_routing_error_count = 0
+    mailbox_put_count = 0
+    mailbox_get_hit_count = 0
+    mailbox_get_miss_count = 0
+    mailbox_warmup_miss_count = 0
+    mailbox_routing_error_count = 0
+    mailbox_error_kinds = set()
+    raw_mailbox_put_rows = 0
+    raw_mailbox_get_rows = 0
+    raw_mailbox_success_rows = 0
+    raw_mailbox_missing_seq_count = 0
     next_required_features = set()
     raw_variable_draft_message_count = 0
     raw_variable_verify_result_message_count = 0
@@ -165,6 +175,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "plan_digest",
                 "plan_runner_role",
                 "effective_gamma_per_seq",
+                "stspec_mailbox_enabled",
+                "mailbox_put_attempted",
+                "mailbox_get_attempted",
             )
         )
         if not has_plan:
@@ -306,6 +319,28 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if row.get("cross_batch_routing_error"):
             cross_batch_routing_error_count += 1
         cross_batch_routing_error_count += int(row.get("cross_batch_routing_error_count") or 0)
+        mailbox_put_count += int(row.get("mailbox_put_count") or 0)
+        mailbox_get_hit_count += int(row.get("mailbox_get_hit_count") or 0)
+        mailbox_get_miss_count += int(row.get("mailbox_get_miss_count") or 0)
+        mailbox_warmup_miss_count += int(row.get("mailbox_warmup_miss_count") or 0)
+        mailbox_routing_error_count += int(row.get("mailbox_routing_error_count") or 0)
+        if row.get("mailbox_put_attempted"):
+            raw_mailbox_put_rows += 1
+        if row.get("mailbox_get_attempted"):
+            raw_mailbox_get_rows += 1
+        if row.get("mailbox_get_success") or row.get("mailbox_put_success"):
+            raw_mailbox_success_rows += 1
+        if row.get("mailbox_warmup_miss"):
+            mailbox_warmup_miss_count += 1
+        if row.get("mailbox_routing_ok") is False or row.get("mailbox_error"):
+            mailbox_routing_error_count += 1
+        if row.get("mailbox_error_kind"):
+            mailbox_error_kinds.add(row.get("mailbox_error_kind"))
+        for value in values_from_mapping(row.get("mailbox_error_kinds")):
+            if value:
+                mailbox_error_kinds.add(value)
+        raw_mailbox_missing_seq_count += len(row.get("mailbox_missing_seq_ids") or [])
+        raw_mailbox_missing_seq_count += int(row.get("mailbox_missing_count") or 0)
         if row.get("next_required_feature"):
             next_required_features.add(row.get("next_required_feature"))
         for value in values_from_mapping(row.get("next_required_features")):
@@ -382,6 +417,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "variable_offsets_seen_count": variable_offsets_seen_count,
         "variable_offsets_validation_errors": variable_offsets_validation_errors,
         "cross_batch_routing_error_count": cross_batch_routing_error_count,
+        "mailbox_put_count": mailbox_put_count,
+        "mailbox_get_hit_count": mailbox_get_hit_count,
+        "mailbox_get_miss_count": mailbox_get_miss_count,
+        "mailbox_warmup_miss_count": mailbox_warmup_miss_count,
+        "mailbox_routing_error_count": mailbox_routing_error_count,
+        "mailbox_error_kinds": sorted(mailbox_error_kinds, key=str),
+        "raw_mailbox_put_rows": raw_mailbox_put_rows,
+        "raw_mailbox_get_rows": raw_mailbox_get_rows,
+        "raw_mailbox_success_rows": raw_mailbox_success_rows,
+        "raw_mailbox_missing_seq_count": raw_mailbox_missing_seq_count,
         "next_required_features": sorted(next_required_features, key=str),
         "raw_variable_draft_message_count": raw_variable_draft_message_count,
         "raw_variable_verify_result_message_count": raw_variable_verify_result_message_count,
@@ -598,6 +643,16 @@ def summarize(path: Path) -> int:
     print(f"variable_offsets seen count: {plan_summary['variable_offsets_seen_count']}")
     print(f"variable_offsets validation errors: {plan_summary['variable_offsets_validation_errors']}")
     print(f"cross_batch_routing_error_count: {plan_summary['cross_batch_routing_error_count']}")
+    print(f"mailbox put count: {plan_summary['mailbox_put_count']}")
+    print(f"mailbox get hit count: {plan_summary['mailbox_get_hit_count']}")
+    print(f"mailbox get miss count: {plan_summary['mailbox_get_miss_count']}")
+    print(f"mailbox warmup miss count: {plan_summary['mailbox_warmup_miss_count']}")
+    print(f"mailbox routing error count: {plan_summary['mailbox_routing_error_count']}")
+    print(f"mailbox_error_kinds: {plan_summary['mailbox_error_kinds']}")
+    print(f"raw mailbox put rows: {plan_summary['raw_mailbox_put_rows']}")
+    print(f"raw mailbox get rows: {plan_summary['raw_mailbox_get_rows']}")
+    print(f"raw mailbox success rows: {plan_summary['raw_mailbox_success_rows']}")
+    print(f"raw mailbox missing seq count: {plan_summary['raw_mailbox_missing_seq_count']}")
     print(f"next_required_features: {plan_summary['next_required_features']}")
     print(f"raw variable draft message count: {plan_summary['raw_variable_draft_message_count']}")
     print(f"raw variable verify result message count: {plan_summary['raw_variable_verify_result_message_count']}")
