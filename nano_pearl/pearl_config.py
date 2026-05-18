@@ -94,6 +94,7 @@ class PEARLConfig:
     enable_pearl_protocol_envelope: bool = True
     pearl_protocol_validate: bool = True
     pearl_protocol_trace: bool = True
+    stspec_mailbox_allow_warmup_miss: bool = False
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -136,6 +137,7 @@ class PEARLConfig:
         logger.info(f"PEARL_Protocol_Envelope={self.enable_pearl_protocol_envelope}")
         logger.info(f"PEARL_Protocol_Validate={self.pearl_protocol_validate}")
         logger.info(f"PEARL_Protocol_Trace={self.pearl_protocol_trace}")
+        logger.info(f"STSpec_Mailbox_Allow_Warmup_Miss={self.stspec_mailbox_allow_warmup_miss}")
         if (
             self.enable_stspec_two_batch_execution
             and not self.stspec_two_batch_dryrun

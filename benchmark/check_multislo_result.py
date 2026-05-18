@@ -157,6 +157,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     raw_mailbox_get_rows = 0
     raw_mailbox_success_rows = 0
     raw_mailbox_missing_seq_count = 0
+    mailbox_transport_send_count = 0
+    mailbox_transport_recv_count = 0
+    mailbox_transport_send_success_count = 0
+    mailbox_transport_recv_success_count = 0
+    mailbox_transport_error_kinds = set()
+    mailbox_warmup_skip_count = 0
+    target_verify_skipped_for_warmup_count = 0
+    target_consume_from_mailbox_attempt_count = 0
+    target_consume_from_mailbox_success_count = 0
+    target_consume_from_mailbox_error_count = 0
+    raw_mailbox_transport_send_rows = 0
+    raw_mailbox_transport_recv_rows = 0
+    raw_target_consume_from_mailbox_rows = 0
     next_required_features = set()
     raw_variable_draft_message_count = 0
     raw_variable_verify_result_message_count = 0
@@ -178,6 +191,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "stspec_mailbox_enabled",
                 "mailbox_put_attempted",
                 "mailbox_get_attempted",
+                "mailbox_transport_send_attempted",
+                "mailbox_transport_recv_attempted",
+                "target_consume_from_mailbox_attempted",
             )
         )
         if not has_plan:
@@ -341,6 +357,41 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 mailbox_error_kinds.add(value)
         raw_mailbox_missing_seq_count += len(row.get("mailbox_missing_seq_ids") or [])
         raw_mailbox_missing_seq_count += int(row.get("mailbox_missing_count") or 0)
+        mailbox_transport_send_count += int(row.get("mailbox_transport_send_count") or 0)
+        mailbox_transport_recv_count += int(row.get("mailbox_transport_recv_count") or 0)
+        mailbox_transport_send_success_count += int(row.get("mailbox_transport_send_success_count") or 0)
+        mailbox_transport_recv_success_count += int(row.get("mailbox_transport_recv_success_count") or 0)
+        if row.get("mailbox_transport_send_attempted"):
+            raw_mailbox_transport_send_rows += 1
+            mailbox_transport_send_count += 1
+        if row.get("mailbox_transport_recv_attempted"):
+            raw_mailbox_transport_recv_rows += 1
+            mailbox_transport_recv_count += 1
+        if row.get("mailbox_transport_send_success"):
+            mailbox_transport_send_success_count += 1
+        if row.get("mailbox_transport_recv_success"):
+            mailbox_transport_recv_success_count += 1
+        if row.get("mailbox_transport_error_kind"):
+            mailbox_transport_error_kinds.add(row.get("mailbox_transport_error_kind"))
+        for value in values_from_mapping(row.get("mailbox_transport_error_kinds")):
+            if value:
+                mailbox_transport_error_kinds.add(value)
+        mailbox_warmup_skip_count += int(row.get("mailbox_warmup_skip_count") or 0)
+        target_verify_skipped_for_warmup_count += int(row.get("target_verify_skipped_for_warmup_count") or 0)
+        target_consume_from_mailbox_attempt_count += int(row.get("target_consume_from_mailbox_attempt_count") or 0)
+        target_consume_from_mailbox_success_count += int(row.get("target_consume_from_mailbox_success_count") or 0)
+        target_consume_from_mailbox_error_count += int(row.get("target_consume_from_mailbox_error_count") or 0)
+        if row.get("mailbox_warmup_skip"):
+            mailbox_warmup_skip_count += 1
+        if row.get("target_verify_skipped_for_warmup"):
+            target_verify_skipped_for_warmup_count += 1
+        if row.get("target_consume_from_mailbox_attempted"):
+            raw_target_consume_from_mailbox_rows += 1
+            target_consume_from_mailbox_attempt_count += 1
+        if row.get("target_consume_from_mailbox_success"):
+            target_consume_from_mailbox_success_count += 1
+        if row.get("target_consume_from_mailbox_error"):
+            target_consume_from_mailbox_error_count += 1
         if row.get("next_required_feature"):
             next_required_features.add(row.get("next_required_feature"))
         for value in values_from_mapping(row.get("next_required_features")):
@@ -427,6 +478,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "raw_mailbox_get_rows": raw_mailbox_get_rows,
         "raw_mailbox_success_rows": raw_mailbox_success_rows,
         "raw_mailbox_missing_seq_count": raw_mailbox_missing_seq_count,
+        "mailbox_transport_send_count": mailbox_transport_send_count,
+        "mailbox_transport_recv_count": mailbox_transport_recv_count,
+        "mailbox_transport_send_success_count": mailbox_transport_send_success_count,
+        "mailbox_transport_recv_success_count": mailbox_transport_recv_success_count,
+        "mailbox_transport_error_kinds": sorted(mailbox_transport_error_kinds, key=str),
+        "mailbox_warmup_skip_count": mailbox_warmup_skip_count,
+        "target_verify_skipped_for_warmup_count": target_verify_skipped_for_warmup_count,
+        "target_consume_from_mailbox_attempt_count": target_consume_from_mailbox_attempt_count,
+        "target_consume_from_mailbox_success_count": target_consume_from_mailbox_success_count,
+        "target_consume_from_mailbox_error_count": target_consume_from_mailbox_error_count,
+        "raw_mailbox_transport_send_rows": raw_mailbox_transport_send_rows,
+        "raw_mailbox_transport_recv_rows": raw_mailbox_transport_recv_rows,
+        "raw_target_consume_from_mailbox_rows": raw_target_consume_from_mailbox_rows,
         "next_required_features": sorted(next_required_features, key=str),
         "raw_variable_draft_message_count": raw_variable_draft_message_count,
         "raw_variable_verify_result_message_count": raw_variable_verify_result_message_count,
@@ -653,6 +717,19 @@ def summarize(path: Path) -> int:
     print(f"raw mailbox get rows: {plan_summary['raw_mailbox_get_rows']}")
     print(f"raw mailbox success rows: {plan_summary['raw_mailbox_success_rows']}")
     print(f"raw mailbox missing seq count: {plan_summary['raw_mailbox_missing_seq_count']}")
+    print(f"mailbox transport send count: {plan_summary['mailbox_transport_send_count']}")
+    print(f"mailbox transport recv count: {plan_summary['mailbox_transport_recv_count']}")
+    print(f"mailbox transport send success count: {plan_summary['mailbox_transport_send_success_count']}")
+    print(f"mailbox transport recv success count: {plan_summary['mailbox_transport_recv_success_count']}")
+    print(f"mailbox transport error kinds: {plan_summary['mailbox_transport_error_kinds']}")
+    print(f"warmup skip count: {plan_summary['mailbox_warmup_skip_count']}")
+    print(f"target verify skipped for warmup count: {plan_summary['target_verify_skipped_for_warmup_count']}")
+    print(f"target consume-from-mailbox attempts: {plan_summary['target_consume_from_mailbox_attempt_count']}")
+    print(f"target consume-from-mailbox successes: {plan_summary['target_consume_from_mailbox_success_count']}")
+    print(f"target consume-from-mailbox errors: {plan_summary['target_consume_from_mailbox_error_count']}")
+    print(f"raw rows with mailbox_transport_send_attempted: {plan_summary['raw_mailbox_transport_send_rows']}")
+    print(f"raw rows with mailbox_transport_recv_attempted: {plan_summary['raw_mailbox_transport_recv_rows']}")
+    print(f"raw rows with target_consume_from_mailbox_attempted: {plan_summary['raw_target_consume_from_mailbox_rows']}")
     print(f"next_required_features: {plan_summary['next_required_features']}")
     print(f"raw variable draft message count: {plan_summary['raw_variable_draft_message_count']}")
     print(f"raw variable verify result message count: {plan_summary['raw_variable_verify_result_message_count']}")

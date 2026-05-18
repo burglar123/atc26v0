@@ -139,6 +139,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_pearl_protocol_envelope": not args.disable_pearl_protocol_envelope,
         "pearl_protocol_validate": not args.disable_pearl_protocol_validate,
         "pearl_protocol_trace": not args.disable_pearl_protocol_trace,
+        "stspec_mailbox_allow_warmup_miss": args.stspec_mailbox_allow_warmup_miss,
     }
 
     # Try new named-path style with gamma.
@@ -472,6 +473,16 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_error_kinds",
     "mailbox_warmup_miss_count",
     "mailbox_routing_error_count",
+    "mailbox_transport_send_count",
+    "mailbox_transport_recv_count",
+    "mailbox_transport_send_success_count",
+    "mailbox_transport_recv_success_count",
+    "mailbox_transport_error_kinds",
+    "mailbox_warmup_skip_count",
+    "target_verify_skipped_for_warmup_count",
+    "target_consume_from_mailbox_attempt_count",
+    "target_consume_from_mailbox_success_count",
+    "target_consume_from_mailbox_error_count",
     "next_required_features",
     "variable_draft_message_seen_count",
     "variable_verify_result_seen_count",
@@ -686,6 +697,16 @@ def aggregate_low_level_traces(
         mailbox_error_kinds: List[str] = []
         mailbox_warmup_miss_count = 0
         mailbox_routing_error_count = 0
+        mailbox_transport_send_count = 0
+        mailbox_transport_recv_count = 0
+        mailbox_transport_send_success_count = 0
+        mailbox_transport_recv_success_count = 0
+        mailbox_transport_error_kinds: List[str] = []
+        mailbox_warmup_skip_count = 0
+        target_verify_skipped_for_warmup_count = 0
+        target_consume_from_mailbox_attempt_count = 0
+        target_consume_from_mailbox_success_count = 0
+        target_consume_from_mailbox_error_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
         variable_verify_result_seen_count = 0
@@ -797,6 +818,25 @@ def aggregate_low_level_traces(
                 mailbox_warmup_miss_count += 1
             if e.get("mailbox_routing_ok") is False or e.get("mailbox_error"):
                 mailbox_routing_error_count += 1
+            if e.get("mailbox_transport_send_attempted"):
+                mailbox_transport_send_count += 1
+            if e.get("mailbox_transport_recv_attempted"):
+                mailbox_transport_recv_count += 1
+            if e.get("mailbox_transport_send_success"):
+                mailbox_transport_send_success_count += 1
+            if e.get("mailbox_transport_recv_success"):
+                mailbox_transport_recv_success_count += 1
+            append_unique(mailbox_transport_error_kinds, e.get("mailbox_transport_error_kind"))
+            if e.get("mailbox_warmup_skip"):
+                mailbox_warmup_skip_count += 1
+            if e.get("target_verify_skipped_for_warmup"):
+                target_verify_skipped_for_warmup_count += 1
+            if e.get("target_consume_from_mailbox_attempted"):
+                target_consume_from_mailbox_attempt_count += 1
+            if e.get("target_consume_from_mailbox_success"):
+                target_consume_from_mailbox_success_count += 1
+            if e.get("target_consume_from_mailbox_error"):
+                target_consume_from_mailbox_error_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
             if e.get("variable_draft_message_seq_ids") is not None:
                 variable_draft_message_seen_count += 1
@@ -964,6 +1004,17 @@ def aggregate_low_level_traces(
             row["mailbox_error_kinds"] = mailbox_error_kinds
         row["mailbox_warmup_miss_count"] = mailbox_warmup_miss_count
         row["mailbox_routing_error_count"] = mailbox_routing_error_count
+        row["mailbox_transport_send_count"] = mailbox_transport_send_count
+        row["mailbox_transport_recv_count"] = mailbox_transport_recv_count
+        row["mailbox_transport_send_success_count"] = mailbox_transport_send_success_count
+        row["mailbox_transport_recv_success_count"] = mailbox_transport_recv_success_count
+        if mailbox_transport_error_kinds:
+            row["mailbox_transport_error_kinds"] = mailbox_transport_error_kinds
+        row["mailbox_warmup_skip_count"] = mailbox_warmup_skip_count
+        row["target_verify_skipped_for_warmup_count"] = target_verify_skipped_for_warmup_count
+        row["target_consume_from_mailbox_attempt_count"] = target_consume_from_mailbox_attempt_count
+        row["target_consume_from_mailbox_success_count"] = target_consume_from_mailbox_success_count
+        row["target_consume_from_mailbox_error_count"] = target_consume_from_mailbox_error_count
         if next_required_features:
             row["next_required_features"] = next_required_features
         row["variable_draft_message_seen_count"] = variable_draft_message_seen_count
@@ -1928,6 +1979,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail fast with protocol diagnostics when the V4A probe is incompatible.",
+    )
+
+    parser.add_argument(
+        "--stspec-mailbox-allow-warmup-miss",
+        action="store_true",
+        help=(
+            "Allow V4E real-probe target warmup misses to reach a controlled "
+            "warmup-skip diagnostic instead of failing at missing payload lookup."
+        ),
     )
 
     parser.add_argument(

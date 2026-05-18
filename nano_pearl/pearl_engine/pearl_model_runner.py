@@ -45,6 +45,11 @@ from nano_pearl.pearl_engine.stspec_mailbox import (
     STSpecPayloadMailbox,
     payloads_from_draft_message,
 )
+from nano_pearl.pearl_engine.stspec_mailbox_transport import (
+    MailboxTransportMode,
+    classify_mailbox_miss,
+    encode_mailbox_transport_envelope,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -489,6 +494,27 @@ class ModelRunnerBase:
             "mailbox_error_kind": None,
             "mailbox_warmup_miss": False,
             "mailbox_routing_ok": True,
+            "stspec_mailbox_transport_enabled": False,
+            "mailbox_transport_mode": None,
+            "mailbox_transport_send_attempted": False,
+            "mailbox_transport_send_success": False,
+            "mailbox_transport_send_seq_ids": [],
+            "mailbox_transport_send_home_batch_id": None,
+            "mailbox_transport_recv_attempted": False,
+            "mailbox_transport_recv_success": False,
+            "mailbox_transport_recv_seq_ids": [],
+            "mailbox_transport_recv_home_batch_id": None,
+            "mailbox_transport_payload_available": False,
+            "mailbox_transport_error": None,
+            "mailbox_transport_error_kind": None,
+            "target_mailbox_insert_count": 0,
+            "target_mailbox_available_home_batch_ids": [],
+            "target_mailbox_available_seq_ids_by_batch": {},
+            "mailbox_warmup_skip": False,
+            "target_verify_skipped_for_warmup": False,
+            "target_consume_from_mailbox_attempted": False,
+            "target_consume_from_mailbox_success": False,
+            "target_consume_from_mailbox_error": None,
             "next_required_feature": None,
             "plan_legacy_equivalent": step_plan.legacy_equivalent,
             "plan_runner_role": step_plan.runner_role,
@@ -652,8 +678,12 @@ class ModelRunnerBase:
         return self.stspec_mailbox.available_seq_ids_by_batch()
 
     def _trace_mailbox_availability(self, trace_record: dict) -> None:
-        trace_record["mailbox_available_home_batch_ids"] = self.stspec_mailbox.available_home_batch_ids()
-        trace_record["mailbox_available_seq_ids_by_batch"] = self._mailbox_available_seq_ids_by_batch()
+        home_batch_ids = self.stspec_mailbox.available_home_batch_ids()
+        seq_ids_by_batch = self._mailbox_available_seq_ids_by_batch()
+        trace_record["mailbox_available_home_batch_ids"] = home_batch_ids
+        trace_record["mailbox_available_seq_ids_by_batch"] = seq_ids_by_batch
+        trace_record["target_mailbox_available_home_batch_ids"] = home_batch_ids
+        trace_record["target_mailbox_available_seq_ids_by_batch"] = seq_ids_by_batch
 
     def _record_mailbox_error(
         self,
@@ -674,50 +704,62 @@ class ModelRunnerBase:
             trace_record["next_required_feature"] = next_required_feature
         self._trace_mailbox_availability(trace_record)
 
+    def _record_mailbox_transport_error(
+        self,
+        trace_record: dict,
+        *,
+        kind: str,
+        message: str,
+        next_required_feature: str | None = None,
+    ) -> None:
+        trace_record["mailbox_transport_error"] = message
+        trace_record["mailbox_transport_error_kind"] = kind
+        if next_required_feature:
+            trace_record["next_required_feature"] = next_required_feature
+
+    def _mailbox_transport_mode(self) -> str:
+        # V4E exposes a validated transport envelope. Runtime delivery remains
+        # diagnostic-only until a safe cross-process object/tensor side channel is
+        # selected; warmup and target-consume diagnostics are reported separately.
+        return MailboxTransportMode.DIAGNOSTIC_ONLY.value
+
+    def _mailbox_allow_warmup_miss(self) -> bool:
+        return bool(getattr(self.global_config, "stspec_mailbox_allow_warmup_miss", False))
+
     def _prepare_stspec_mailbox_route(
         self,
         step_plan: StepPlan,
         runner_role: str,
         trace_record: dict,
     ) -> None:
-        """V4D mailbox routing preflight for real variable-offset probes.
+        """V4E mailbox transport/consume preflight for real variable-offset probes.
 
-        This intentionally does not implement full payload transport. It prevents
-        the old divergent-seq generic failure from advancing into distributed
-        verification with the wrong payload, and it produces precise mailbox
-        diagnostics. The first target batch can legitimately miss because a
-        two-batch pipeline has not produced a prior payload yet; with separate
-        draft/target processes, later hits also require cross-process transport.
+        Draft runners now continue to produce a validated mailbox transport
+        envelope after the draft payload exists. Target runners first classify
+        pipeline warmup separately from transport/payload misses; if payloads are
+        present, the probe stops at the next explicit blocker: verification input
+        construction from mailbox payloads is not wired yet.
         """
         if not self._stspec_mailbox_enabled(step_plan):
             return
         trace_record["stspec_mailbox_enabled"] = True
+        trace_record["stspec_mailbox_transport_enabled"] = True
+        trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
         self._trace_mailbox_availability(trace_record)
+
         if "draft" in runner_role:
-            put_seq_ids = list(step_plan.actual_draft_exec_seq_ids)
-            trace_record["mailbox_put_attempted"] = True
-            trace_record["mailbox_put_success"] = False
-            trace_record["mailbox_put_count"] = len(put_seq_ids)
-            trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
-            trace_record["mailbox_put_seq_ids"] = put_seq_ids
-            trace_record["mailbox_cross_process_delivery"] = "not_implemented"
-            message = (
-                "ST-Spec mailbox handoff between processes is not implemented; "
-                "draft payload production is recorded as routing intent only"
-            )
-            self._record_mailbox_error(
-                trace_record,
-                kind="cross_process_mailbox_transport_not_implemented",
-                message=message,
-                next_required_feature="cross_process_mailbox_transport",
-            )
-            raise RuntimeError(
-                f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
-                f"draft_home_batch_id={step_plan.draft_home_batch_id}, "
-                f"draft_seq_ids={put_seq_ids}, target_home_batch_id={step_plan.target_home_batch_id}, "
-                "mailbox_cross_process_delivery=not_implemented, "
-                "next_required_feature=cross_process_mailbox_transport"
-            )
+            # The draft payload is not available until after gamma draft steps;
+            # _record_draft_mailbox_payloads() will encode the transport envelope.
+            trace_record["mailbox_transport_send_attempted"] = False
+            trace_record["mailbox_transport_send_seq_ids"] = list(step_plan.actual_draft_exec_seq_ids)
+            trace_record["mailbox_transport_send_home_batch_id"] = step_plan.draft_home_batch_id
+            return
+
+        trace_record["mailbox_transport_recv_attempted"] = True
+        trace_record["mailbox_transport_recv_success"] = False
+        trace_record["mailbox_transport_recv_home_batch_id"] = step_plan.target_home_batch_id
+        trace_record["mailbox_transport_recv_seq_ids"] = []
+        trace_record["mailbox_transport_payload_available"] = False
 
         target_seq_ids = list(step_plan.actual_target_exec_seq_ids)
         result = self.stspec_mailbox.get_payloads(
@@ -735,31 +777,60 @@ class ModelRunnerBase:
         trace_record["mailbox_missing_seq_ids"] = list(result.missing_seq_ids)
         self._trace_mailbox_availability(trace_record)
         if result.success:
+            trace_record["mailbox_transport_recv_success"] = True
+            trace_record["mailbox_transport_recv_seq_ids"] = target_seq_ids
+            trace_record["mailbox_transport_payload_available"] = all(
+                len(payload.draft_token_ids) == int(payload.per_seq_length) for payload in result.payloads
+            )
             trace_record["mailbox_routing_ok"] = True
             trace_record["mailbox_error"] = None
             trace_record["mailbox_error_kind"] = None
-            return
+            trace_record["target_consume_from_mailbox_attempted"] = True
+            trace_record["target_consume_from_mailbox_success"] = False
+            message = "target consume-from-mailbox not yet wired into verification input"
+            trace_record["target_consume_from_mailbox_error"] = message
+            trace_record["next_required_feature"] = "target_consume_from_mailbox"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
+                f"target_home_batch_id={step_plan.target_home_batch_id}, target_seq_ids={target_seq_ids}, "
+                "next_required_feature=target_consume_from_mailbox"
+            )
 
-        warmup_miss = step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
-        error_kind = "mailbox_warmup_miss" if warmup_miss else "mailbox_payload_missing"
-        message = (
-            "ST-Spec mailbox miss for target batch; pipeline warmup or "
-            "cross-process mailbox transport is not implemented"
+        error_kind, next_feature, warmup_miss = classify_mailbox_miss(
+            target_home_batch_id=step_plan.target_home_batch_id,
+            available_home_batch_ids=self.stspec_mailbox.available_home_batch_ids(),
+            allow_warmup_miss=self._mailbox_allow_warmup_miss(),
         )
+        if warmup_miss and self._mailbox_allow_warmup_miss():
+            trace_record["mailbox_warmup_skip"] = True
+            trace_record["target_verify_skipped_for_warmup"] = True
+            message = "warmup miss allowed, but target skip/flush is not implemented"
+        elif warmup_miss:
+            message = "ST-Spec mailbox warmup miss for target batch; pipeline warmup schedule is required"
+        else:
+            message = "ST-Spec mailbox payload missing for target batch after transport receive attempt"
         self._record_mailbox_error(
             trace_record,
             kind=error_kind,
             message=message,
-            next_required_feature="cross_process_mailbox_transport",
+            next_required_feature=next_feature,
             warmup_miss=warmup_miss,
         )
+        if not warmup_miss:
+            self._record_mailbox_transport_error(
+                trace_record,
+                kind="mailbox_payload_tensor_transport_unavailable",
+                message=message,
+                next_required_feature=next_feature,
+            )
         raise RuntimeError(
             f"{message}; mailbox_error_kind={error_kind}, plan_id={step_plan.plan_id}, "
             f"runner_role={runner_role}, target_home_batch_id={step_plan.target_home_batch_id}, "
             f"target_seq_ids={target_seq_ids}, mailbox_missing_seq_ids={result.missing_seq_ids}, "
             f"available_mailbox_home_batch_ids={trace_record['mailbox_available_home_batch_ids']}, "
             f"available_mailbox_seq_ids_by_batch={trace_record['mailbox_available_seq_ids_by_batch']}, "
-            "next_required_feature=cross_process_mailbox_transport"
+            f"allow_warmup_miss={self._mailbox_allow_warmup_miss()}, "
+            f"next_required_feature={next_feature}"
         )
 
     def _record_draft_mailbox_payloads(
@@ -780,6 +851,8 @@ class ModelRunnerBase:
             logical_step=step_plan.plan_id,
             metadata={"mailbox_locality": "diagnostic_local"},
         )
+        trace_record["stspec_mailbox_transport_enabled"] = True
+        trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
         trace_record["mailbox_put_attempted"] = True
         trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
         trace_record["mailbox_put_seq_ids"] = [payload.seq_id for payload in payloads]
@@ -790,6 +863,21 @@ class ModelRunnerBase:
                 plan_id=step_plan.plan_id,
                 producer_role="draft",
             )
+            envelope = encode_mailbox_transport_envelope(
+                payloads=payloads,
+                transport_mode=self._mailbox_transport_mode(),
+                plan_id=step_plan.plan_id,
+                producer_rank=self.rank,
+                producer_role="draft",
+                producer_home_batch_id=step_plan.draft_home_batch_id,
+                target_home_batch_id=step_plan.target_home_batch_id,
+                draft_home_batch_id=step_plan.draft_home_batch_id,
+                produced_for_home_batch_id=step_plan.draft_home_batch_id,
+                logical_step=step_plan.plan_id,
+                source_plan_signature_hash=trace_record.get("plan_signature_hash"),
+                payload_available=True,
+                payload_metadata={"gamma": self.gamma, "mailbox_transport_scope": "diagnostic_envelope"},
+            )
         except STSpecMailboxError as exc:
             trace_record["mailbox_put_success"] = False
             trace_record["mailbox_put_count"] = 0
@@ -797,13 +885,21 @@ class ModelRunnerBase:
                 trace_record,
                 kind=exc.kind,
                 message=str(exc),
-                next_required_feature="cross_process_mailbox_transport",
+                next_required_feature="mailbox_payload_tensor_transport",
             )
             raise
         trace_record["mailbox_put_success"] = True
         trace_record["mailbox_put_count"] = len(payloads)
-        trace_record["mailbox_cross_process_delivery"] = "diagnostic_local_only"
-        trace_record["next_required_feature"] = "cross_process_mailbox_transport"
+        trace_record["mailbox_cross_process_delivery"] = "transport_envelope_visible"
+        trace_record["mailbox_transport_send_attempted"] = True
+        trace_record["mailbox_transport_send_success"] = True
+        trace_record["mailbox_transport_send_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_transport_send_home_batch_id"] = envelope.produced_for_home_batch_id
+        trace_record["mailbox_transport_payload_available"] = bool(envelope.payload_available)
+        trace_record["mailbox_transport_error"] = None
+        trace_record["mailbox_transport_error_kind"] = None
+        trace_record["mailbox_transport_envelope_digest"] = envelope.digest()
+        trace_record["next_required_feature"] = "target_consume_from_mailbox"
         self._trace_mailbox_availability(trace_record)
 
     def _validate_stspec_probe_alignment(
@@ -829,7 +925,7 @@ class ModelRunnerBase:
         if self._pearl_protocol_layout() == "variable_offsets":
             trace_record["cross_batch_routing_ok"] = False
             trace_record["cross_batch_routing_error"] = error
-            trace_record["next_required_feature"] = "cross_process_mailbox_transport"
+            trace_record["next_required_feature"] = "mailbox_payload_tensor_transport"
         # V4A is explicitly a feasibility probe. The current PEARL protocol packs
         # draft/verify tensors by common sequence index, so a mismatch must stop
         # before distributed communication can hang or corrupt request state.
