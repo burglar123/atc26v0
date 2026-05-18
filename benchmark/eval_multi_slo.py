@@ -145,6 +145,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "stspec_kv_sync_probe": args.stspec_kv_sync_probe,
         "stspec_kv_sync_mode": args.stspec_kv_sync_mode,
         "stspec_disable_mailbox_forward_commit": args.stspec_disable_mailbox_forward_commit,
+        "stspec_mailbox_commit_probe": args.stspec_mailbox_commit_probe,
     }
 
     # Try new named-path style with gamma.
@@ -516,6 +517,16 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_forward_state_mutation_attempt_count",
     "mailbox_forward_state_mutation_committed_count",
     "mailbox_forward_state_mutation_rollback_success_count",
+    "mailbox_verify_commit_attempt_count",
+    "mailbox_verify_commit_success_count",
+    "sequence_state_commit_success_count",
+    "kv_commit_attempt_count",
+    "kv_commit_success_count",
+    "mailbox_payload_consume_success_count",
+    "mailbox_payload_invalidate_success_count",
+    "mailbox_verify_commit_rollback_attempt_count",
+    "mailbox_verify_commit_rollback_success_count",
+    "mailbox_verify_commit_skipped_non_owner_count",
     "illegal_legacy_fallback_count",
     "next_required_features",
     "variable_draft_message_seen_count",
@@ -795,6 +806,16 @@ def aggregate_low_level_traces(
         mailbox_forward_state_mutation_attempt_count = 0
         mailbox_forward_state_mutation_committed_count = 0
         mailbox_forward_state_mutation_rollback_success_count = 0
+        mailbox_verify_commit_attempt_count = 0
+        mailbox_verify_commit_success_count = 0
+        sequence_state_commit_success_count = 0
+        kv_commit_attempt_count = 0
+        kv_commit_success_count = 0
+        mailbox_payload_consume_success_count = 0
+        mailbox_payload_invalidate_success_count = 0
+        mailbox_verify_commit_rollback_attempt_count = 0
+        mailbox_verify_commit_rollback_success_count = 0
+        mailbox_verify_commit_skipped_non_owner_count = 0
         illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
@@ -1027,6 +1048,26 @@ def aggregate_low_level_traces(
                 mailbox_forward_state_mutation_committed_count += 1
             if e.get("mailbox_forward_state_mutation_rollback_success"):
                 mailbox_forward_state_mutation_rollback_success_count += 1
+            if e.get("mailbox_verify_commit_attempted"):
+                mailbox_verify_commit_attempt_count += 1
+            if e.get("mailbox_verify_commit_success"):
+                mailbox_verify_commit_success_count += 1
+            if e.get("sequence_state_commit_success"):
+                sequence_state_commit_success_count += 1
+            if e.get("kv_commit_attempted"):
+                kv_commit_attempt_count += 1
+            if e.get("kv_commit_success"):
+                kv_commit_success_count += 1
+            if e.get("mailbox_payload_consume_success"):
+                mailbox_payload_consume_success_count += 1
+            if e.get("mailbox_payload_invalidate_success"):
+                mailbox_payload_invalidate_success_count += 1
+            if e.get("mailbox_verify_commit_rollback_attempted"):
+                mailbox_verify_commit_rollback_attempt_count += 1
+            if e.get("mailbox_verify_commit_rollback_success"):
+                mailbox_verify_commit_rollback_success_count += 1
+            if e.get("mailbox_verify_commit_skipped_non_owner"):
+                mailbox_verify_commit_skipped_non_owner_count += 1
             if e.get("illegal_legacy_fallback"):
                 illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
@@ -1269,6 +1310,16 @@ def aggregate_low_level_traces(
         row["mailbox_forward_state_mutation_committed_count"] = mailbox_forward_state_mutation_committed_count
         row["mailbox_forward_state_mutation_commit_count"] = mailbox_forward_state_mutation_committed_count
         row["mailbox_forward_state_mutation_rollback_success_count"] = mailbox_forward_state_mutation_rollback_success_count
+        row["mailbox_verify_commit_attempt_count"] = mailbox_verify_commit_attempt_count
+        row["mailbox_verify_commit_success_count"] = mailbox_verify_commit_success_count
+        row["sequence_state_commit_success_count"] = sequence_state_commit_success_count
+        row["kv_commit_attempt_count"] = kv_commit_attempt_count
+        row["kv_commit_success_count"] = kv_commit_success_count
+        row["mailbox_payload_consume_success_count"] = mailbox_payload_consume_success_count
+        row["mailbox_payload_invalidate_success_count"] = mailbox_payload_invalidate_success_count
+        row["mailbox_verify_commit_rollback_attempt_count"] = mailbox_verify_commit_rollback_attempt_count
+        row["mailbox_verify_commit_rollback_success_count"] = mailbox_verify_commit_rollback_success_count
+        row["mailbox_verify_commit_skipped_non_owner_count"] = mailbox_verify_commit_skipped_non_owner_count
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features
@@ -2161,6 +2212,16 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "mailbox_forward_state_mutation_attempt_count": row.get("mailbox_forward_state_mutation_attempt_count"),
         "mailbox_forward_state_mutation_committed_count": row.get("mailbox_forward_state_mutation_committed_count"),
         "mailbox_forward_state_mutation_rollback_success_count": row.get("mailbox_forward_state_mutation_rollback_success_count"),
+        "mailbox_verify_commit_attempt_count": row.get("mailbox_verify_commit_attempt_count"),
+        "mailbox_verify_commit_success_count": row.get("mailbox_verify_commit_success_count"),
+        "sequence_state_commit_success_count": row.get("sequence_state_commit_success_count"),
+        "kv_commit_attempt_count": row.get("kv_commit_attempt_count"),
+        "kv_commit_success_count": row.get("kv_commit_success_count"),
+        "mailbox_payload_consume_success_count": row.get("mailbox_payload_consume_success_count"),
+        "mailbox_payload_invalidate_success_count": row.get("mailbox_payload_invalidate_success_count"),
+        "mailbox_verify_commit_rollback_attempt_count": row.get("mailbox_verify_commit_rollback_attempt_count"),
+        "mailbox_verify_commit_rollback_success_count": row.get("mailbox_verify_commit_rollback_success_count"),
+        "mailbox_verify_commit_skipped_non_owner_count": row.get("mailbox_verify_commit_skipped_non_owner_count"),
         "illegal_legacy_fallback_count": row.get("illegal_legacy_fallback_count"),
         "next_required_features": row.get("next_required_features"),
         "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
@@ -2294,6 +2355,11 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Disable permanent sequence/KV mutation for mailbox-forward probes.",
+    )
+    parser.add_argument(
+        "--stspec-mailbox-commit-probe",
+        action="store_true",
+        help="Enable guarded V4M mailbox verify Sequence commit/rollback probe in real-probe mode.",
     )
 
     parser.add_argument(

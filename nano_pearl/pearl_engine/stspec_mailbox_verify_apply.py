@@ -90,6 +90,64 @@ class MailboxVerifyApplyProbeResult:
         return _jsonable(asdict(self))
 
 
+@dataclass(frozen=True)
+class MailboxVerifyCommitPlan:
+    plan_id: int | None
+    target_home_batch_id: int | str | None
+    seq_ids: list[int]
+    request_ids: list[Any]
+    accepted_lengths_by_seq: dict[int, int]
+    accepted_token_ids_by_seq: dict[int, list[int]]
+    rejected_seq_ids: list[int]
+    rejected_token_ids_by_seq: dict[int, list[int]]
+    invalidated_payload_ids: list[str]
+    mailbox_payloads_to_consume: list[str]
+    mailbox_payloads_to_invalidate: list[str]
+    sequence_state_before: dict[int, JsonDict]
+    sequence_state_after_expected: dict[int, JsonDict]
+    kv_state_before: JsonDict
+    kv_state_after_expected: JsonDict
+    commit_allowed: bool
+    commit_mode: str = "guarded_probe"
+    rollback_required: bool = False
+    rollback_success: bool = True
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True)
+class MailboxVerifyCommitResult:
+    attempted: bool
+    success: bool
+    plan: MailboxVerifyCommitPlan | None = None
+    error_kind: str | None = None
+    error_message: str | None = None
+    next_required_feature: str | None = None
+    sequence_state_commit_attempted: bool = False
+    sequence_state_commit_success: bool = False
+    sequence_state_before: dict[int, JsonDict] = field(default_factory=dict)
+    sequence_state_after: dict[int, JsonDict] = field(default_factory=dict)
+    kv_commit_attempted: bool = False
+    kv_commit_success: bool = False
+    kv_commit_error: str | None = None
+    mailbox_payload_consume_attempted: bool = False
+    mailbox_payload_consume_success: bool = False
+    mailbox_payload_invalidate_attempted: bool = False
+    mailbox_payload_invalidate_success: bool = False
+    rollback_attempted: bool = False
+    rollback_success: bool = True
+    skipped_non_owner: bool = False
+    total_accepted_tokens: int = 0
+    total_rejected_tokens: int = 0
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
 def build_mailbox_verify_result(
     verification_input: Any,
     *,
@@ -315,6 +373,362 @@ def run_mailbox_verify_apply_no_commit_probe(
         )
 
 
+
+def build_mailbox_verify_commit_plan(
+    verify_result: MailboxVerifyResult,
+    apply_plan: MailboxVerifyApplyPlan,
+    exec_seqs: Iterable[Any],
+    step_plan: Any,
+    *,
+    commit_allowed: bool,
+    commit_mode: str = "guarded_probe",
+) -> MailboxVerifyCommitPlan:
+    """Build a guarded sequence-level commit plan from a verified apply plan."""
+
+    seq_list = list(exec_seqs)
+    seq_by_id = {int(seq.seq_id): seq for seq in seq_list}
+    seq_ids = [int(seq_id) for seq_id in apply_plan.seq_ids]
+    expected = [int(seq_id) for seq_id in getattr(step_plan, "actual_target_exec_seq_ids", seq_ids)]
+    if seq_ids != expected:
+        raise MailboxVerifyApplyError(
+            f"mailbox verify commit seq ids mismatch: seq_ids={seq_ids}, expected={expected}",
+            next_required_feature="mailbox_commit_rollback_validation",
+            error_kind="mailbox_verify_commit_seq_mismatch",
+        )
+    if verify_result.target_home_batch_id != getattr(step_plan, "target_home_batch_id", None):
+        raise MailboxVerifyApplyError(
+            "mailbox verify commit home_batch_id mismatch",
+            next_required_feature="mailbox_commit_rollback_validation",
+            error_kind="mailbox_verify_commit_home_batch_mismatch",
+        )
+    if set(seq_by_id) != set(seq_ids):
+        raise MailboxVerifyApplyError(
+            f"mailbox verify commit missing Sequence state: seq_ids={seq_ids}, exec_seq_ids={sorted(seq_by_id)}",
+            next_required_feature="mailbox_commit_rollback_validation",
+            error_kind="mailbox_verify_commit_missing_sequence_state",
+        )
+
+    state_before: dict[int, JsonDict] = {}
+    state_after_expected: dict[int, JsonDict] = {}
+    rejected_seq_ids: list[int] = []
+    invalidated_payload_ids = list(apply_plan.mailbox_payloads_to_invalidate)
+    for seq_id, drafted_len in zip(seq_ids, verify_result.per_seq_lengths):
+        seq = seq_by_id[seq_id]
+        home_batch_id = getattr(seq, "home_batch_id", None)
+        if home_batch_id != verify_result.target_home_batch_id:
+            raise MailboxVerifyApplyError(
+                f"mailbox verify commit Sequence home_batch_id mismatch for seq_id={seq_id}: "
+                f"sequence_home_batch_id={home_batch_id}, target_home_batch_id={verify_result.target_home_batch_id}",
+                next_required_feature="mailbox_commit_rollback_validation",
+                error_kind="mailbox_verify_commit_sequence_home_batch_mismatch",
+            )
+        accepted_len = int(apply_plan.accepted_lengths_by_seq[seq_id])
+        if accepted_len < 0 or accepted_len > int(drafted_len):
+            raise MailboxVerifyApplyError(
+                f"accepted length out of range for commit seq_id={seq_id}: accepted_len={accepted_len}, drafted_len={drafted_len}",
+                next_required_feature="mailbox_commit_rollback_validation",
+                error_kind="mailbox_verify_commit_accepted_length_out_of_range",
+            )
+        accepted_tokens = list(apply_plan.accepted_token_ids_by_seq[seq_id])
+        rejected_tokens = list(apply_plan.rejected_token_ids_by_seq.get(seq_id, []))
+        if len(accepted_tokens) != accepted_len:
+            raise MailboxVerifyApplyError(
+                f"mailbox verify commit accepted token length mismatch for seq_id={seq_id}",
+                next_required_feature="mailbox_commit_rollback_validation",
+                error_kind="mailbox_verify_commit_accepted_token_length_mismatch",
+            )
+        current_len = len(seq) if hasattr(seq, "__len__") else int(getattr(seq, "num_tokens", 0) or 0)
+        append_positions = list(apply_plan.append_positions_by_seq.get(seq_id, []))
+        expected_positions = list(range(current_len, current_len + accepted_len))
+        if append_positions != expected_positions:
+            raise MailboxVerifyApplyError(
+                f"mailbox verify commit append position mismatch for seq_id={seq_id}: "
+                f"append_positions={append_positions}, expected={expected_positions}",
+                next_required_feature="mailbox_commit_rollback_validation",
+                error_kind="mailbox_verify_commit_append_position_mismatch",
+            )
+        before = _sequence_snapshot(seq)
+        after = dict(before)
+        token_ids = list(before.get("token_ids") or []) + accepted_tokens
+        trace_stats = json.loads(json.dumps(before.get("trace_stats", {}) or {}, default=str))
+        if accepted_len:
+            trace_stats["accepted_tokens"] = int(trace_stats.get("accepted_tokens") or 0) + accepted_len
+        if rejected_tokens:
+            trace_stats["invalidated_predraft_tokens"] = int(trace_stats.get("invalidated_predraft_tokens") or 0) + len(rejected_tokens)
+        after.update(
+            {
+                "token_ids": token_ids,
+                "num_tokens": int(before.get("num_tokens") or 0) + accepted_len,
+                "last_token": token_ids[-1] if token_ids else before.get("last_token"),
+                "output_token_count": max(len(token_ids) - int(before.get("num_prompt_tokens") or 0), 0),
+                "trace_stats": trace_stats,
+            }
+        )
+        state_before[seq_id] = before
+        state_after_expected[seq_id] = after
+        if rejected_tokens:
+            rejected_seq_ids.append(seq_id)
+    return MailboxVerifyCommitPlan(
+        plan_id=getattr(step_plan, "plan_id", verify_result.plan_id),
+        target_home_batch_id=verify_result.target_home_batch_id,
+        seq_ids=seq_ids,
+        request_ids=list(verify_result.request_ids),
+        accepted_lengths_by_seq=dict(apply_plan.accepted_lengths_by_seq),
+        accepted_token_ids_by_seq=dict(apply_plan.accepted_token_ids_by_seq),
+        rejected_seq_ids=rejected_seq_ids,
+        rejected_token_ids_by_seq=dict(apply_plan.rejected_token_ids_by_seq),
+        invalidated_payload_ids=invalidated_payload_ids,
+        mailbox_payloads_to_consume=list(apply_plan.mailbox_payloads_to_consume),
+        mailbox_payloads_to_invalidate=list(apply_plan.mailbox_payloads_to_invalidate),
+        sequence_state_before=state_before,
+        sequence_state_after_expected=state_after_expected,
+        kv_state_before={"kv_commit_available": False},
+        kv_state_after_expected={"next_required_feature": "kv_commit_after_mailbox_verify"},
+        commit_allowed=bool(commit_allowed),
+        commit_mode=str(commit_mode),
+    )
+
+
+def run_mailbox_verify_commit_probe(
+    commit_plan: MailboxVerifyCommitPlan,
+    exec_seqs: Iterable[Any],
+    *,
+    current_rank: int | None = None,
+    output_owner_rank: int | None = None,
+    eos_token_id: int | list[int] | None = None,
+    commit_enabled: bool = True,
+) -> MailboxVerifyCommitResult:
+    """Apply a guarded sequence-only commit with rollback on any failure.
+
+    KV append and mailbox consume/invalidate are deliberately not implemented by
+    this V4M probe; after a successful Sequence commit the result points to the
+    next explicit feature, ``kv_commit_after_mailbox_verify``.
+    """
+
+    seq_list = list(exec_seqs)
+    seq_by_id = {int(seq.seq_id): seq for seq in seq_list}
+    total_accepted = sum(len(tokens) for tokens in commit_plan.accepted_token_ids_by_seq.values())
+    total_rejected = sum(len(tokens) for tokens in commit_plan.rejected_token_ids_by_seq.values())
+    before = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+    if output_owner_rank is not None and current_rank is not None and int(current_rank) != int(output_owner_rank):
+        return MailboxVerifyCommitResult(
+            attempted=False,
+            success=True,
+            plan=commit_plan,
+            skipped_non_owner=True,
+            sequence_state_before=before,
+            sequence_state_after=before,
+            total_accepted_tokens=total_accepted,
+            total_rejected_tokens=total_rejected,
+        )
+    if not commit_enabled or not commit_plan.commit_allowed:
+        return MailboxVerifyCommitResult(
+            attempted=False,
+            success=True,
+            plan=commit_plan,
+            sequence_state_before=before,
+            sequence_state_after=before,
+            total_accepted_tokens=total_accepted,
+            total_rejected_tokens=total_rejected,
+        )
+
+    mutated_seq_ids: list[int] = []
+    rollback_attempted = False
+    rollback_success = True
+    try:
+        for seq_id in commit_plan.seq_ids:
+            if seq_id not in seq_by_id:
+                raise MailboxVerifyApplyError(
+                    f"mailbox verify commit missing Sequence during commit: seq_id={seq_id}",
+                    next_required_feature="mailbox_commit_rollback_validation",
+                    error_kind="mailbox_verify_commit_missing_sequence_state",
+                )
+            seq = seq_by_id[seq_id]
+            snapshot = commit_plan.sequence_state_before.get(seq_id)
+            if snapshot is None:
+                raise MailboxVerifyApplyError(
+                    f"mailbox verify commit missing snapshot: seq_id={seq_id}",
+                    next_required_feature="mailbox_commit_rollback_validation",
+                    error_kind="mailbox_verify_commit_missing_snapshot",
+                )
+            if _sequence_snapshot(seq) != snapshot:
+                raise MailboxVerifyApplyError(
+                    f"mailbox verify commit stale Sequence snapshot: seq_id={seq_id}",
+                    next_required_feature="mailbox_commit_rollback_validation",
+                    error_kind="mailbox_verify_commit_stale_sequence_snapshot",
+                )
+            accepted_tokens = list(commit_plan.accepted_token_ids_by_seq.get(seq_id, []))
+            if accepted_tokens:
+                if seq_id not in mutated_seq_ids:
+                    mutated_seq_ids.append(seq_id)
+                for token in accepted_tokens:
+                    if not hasattr(seq, "append_token"):
+                        raise MailboxVerifyApplyError(
+                            f"mailbox verify commit Sequence cannot append token: seq_id={seq_id}",
+                            next_required_feature="mailbox_commit_rollback_validation",
+                            error_kind="mailbox_verify_commit_append_unavailable",
+                        )
+                    seq.append_token(int(token))
+                    if eos_token_id is not None and _is_eos_token(int(token), eos_token_id) and not bool(getattr(seq, "ignore_eos", False)):
+                        if hasattr(seq, "mark_finished"):
+                            seq.mark_finished(record_finish_ts=False)
+                        else:
+                            raise MailboxVerifyApplyError(
+                                f"mailbox verify commit EOS handling unavailable: seq_id={seq_id}",
+                                next_required_feature="mailbox_commit_rollback_validation",
+                                error_kind="mailbox_verify_commit_eos_handling_unavailable",
+                            )
+            rejected_len = len(commit_plan.rejected_token_ids_by_seq.get(seq_id, []))
+            if rejected_len and hasattr(seq, "record_invalidated_predraft"):
+                if seq_id not in mutated_seq_ids:
+                    mutated_seq_ids.append(seq_id)
+                seq.record_invalidated_predraft(rejected_len)
+            accepted_len = len(accepted_tokens)
+            if accepted_len and hasattr(seq, "record_accepted"):
+                if seq_id not in mutated_seq_ids:
+                    mutated_seq_ids.append(seq_id)
+                seq.record_accepted(accepted_len)
+        after = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+        for seq_id in commit_plan.seq_ids:
+            if not _snapshots_equal(after.get(seq_id), commit_plan.sequence_state_after_expected.get(seq_id), ignore_volatile_timestamps=True):
+                raise MailboxVerifyApplyError(
+                    f"mailbox verify commit post-state mismatch: seq_id={seq_id}",
+                    next_required_feature="mailbox_commit_rollback_validation",
+                    error_kind="mailbox_verify_commit_post_state_mismatch",
+                )
+        return MailboxVerifyCommitResult(
+            attempted=True,
+            success=True,
+            plan=commit_plan,
+            next_required_feature="kv_commit_after_mailbox_verify",
+            sequence_state_commit_attempted=True,
+            sequence_state_commit_success=True,
+            sequence_state_before=before,
+            sequence_state_after=after,
+            kv_commit_attempted=False,
+            kv_commit_success=False,
+            kv_commit_error="KV commit backend is not implemented for mailbox verify commit probe",
+            mailbox_payload_consume_attempted=False,
+            mailbox_payload_consume_success=False,
+            mailbox_payload_invalidate_attempted=False,
+            mailbox_payload_invalidate_success=False,
+            rollback_attempted=False,
+            rollback_success=True,
+            total_accepted_tokens=total_accepted,
+            total_rejected_tokens=total_rejected,
+        )
+    except MailboxVerifyApplyError as exc:
+        rollback_attempted = bool(mutated_seq_ids)
+        if rollback_attempted:
+            rollback_success = _rollback_sequences(seq_by_id, commit_plan.sequence_state_before, mutated_seq_ids)
+        after = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+        next_feature = exc.next_required_feature if rollback_success else "mailbox_commit_rollback_validation"
+        return MailboxVerifyCommitResult(
+            attempted=True,
+            success=False,
+            plan=commit_plan,
+            error_kind=exc.error_kind,
+            error_message=str(exc),
+            next_required_feature=next_feature,
+            sequence_state_commit_attempted=True,
+            sequence_state_commit_success=False,
+            sequence_state_before=before,
+            sequence_state_after=after,
+            kv_commit_attempted=False,
+            kv_commit_success=False,
+            mailbox_payload_consume_attempted=False,
+            mailbox_payload_invalidate_attempted=False,
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+            total_accepted_tokens=total_accepted,
+            total_rejected_tokens=total_rejected,
+        )
+    except Exception as exc:
+        rollback_attempted = bool(mutated_seq_ids)
+        if rollback_attempted:
+            rollback_success = _rollback_sequences(seq_by_id, commit_plan.sequence_state_before, mutated_seq_ids)
+        after = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
+        return MailboxVerifyCommitResult(
+            attempted=True,
+            success=False,
+            plan=commit_plan,
+            error_kind=type(exc).__name__,
+            error_message=f"mailbox verify commit unexpected error: {exc}",
+            next_required_feature="mailbox_commit_rollback_validation",
+            sequence_state_commit_attempted=True,
+            sequence_state_commit_success=False,
+            sequence_state_before=before,
+            sequence_state_after=after,
+            kv_commit_attempted=False,
+            kv_commit_success=False,
+            mailbox_payload_consume_attempted=False,
+            mailbox_payload_invalidate_attempted=False,
+            rollback_attempted=rollback_attempted,
+            rollback_success=rollback_success,
+            total_accepted_tokens=total_accepted,
+            total_rejected_tokens=total_rejected,
+        )
+
+
+def _snapshots_equal(left: JsonDict | None, right: JsonDict | None, *, ignore_volatile_timestamps: bool = False) -> bool:
+    if left is None or right is None:
+        return left == right
+    if not ignore_volatile_timestamps:
+        return left == right
+    left_cmp = dict(left)
+    right_cmp = dict(right)
+    for key in ("first_token_ts", "finish_ts"):
+        left_cmp.pop(key, None)
+        right_cmp.pop(key, None)
+    return left_cmp == right_cmp
+
+
+def _rollback_sequences(seq_by_id: dict[int, Any], snapshots: dict[int, JsonDict], seq_ids: Iterable[int]) -> bool:
+    ok = True
+    for seq_id in seq_ids:
+        seq = seq_by_id.get(int(seq_id))
+        snapshot = snapshots.get(int(seq_id))
+        if seq is None or snapshot is None:
+            ok = False
+            continue
+        try:
+            _restore_sequence_snapshot(seq, snapshot)
+            ok = ok and (_sequence_snapshot(seq) == snapshot)
+        except Exception:
+            ok = False
+    return ok
+
+
+def _restore_sequence_snapshot(seq: Any, snapshot: JsonDict) -> None:
+    for attr in (
+        "token_ids",
+        "num_tokens",
+        "last_token",
+        "first_token_ts",
+        "finish_ts",
+        "trace_stats",
+    ):
+        if attr in snapshot and hasattr(seq, attr):
+            value = snapshot[attr]
+            if attr == "token_ids":
+                value = list(value or [])
+            elif attr == "trace_stats":
+                value = json.loads(json.dumps(value, default=str))
+            setattr(seq, attr, value)
+    if "status_value" in snapshot and hasattr(seq, "status"):
+        current_status = getattr(seq, "status")
+        enum_type = type(current_status)
+        try:
+            setattr(seq, "status", enum_type[str(snapshot["status_value"])])
+        except Exception:
+            pass
+
+
+def _is_eos_token(token_id: int, eos_token_id: int | list[int]) -> bool:
+    if isinstance(eos_token_id, int):
+        return int(token_id) == int(eos_token_id)
+    return int(token_id) in {int(token) for token in eos_token_id}
+
 def _accepted_prefix_length(drafted: list[int], target: list[int]) -> int:
     accepted = 0
     for draft_token, target_token in zip(drafted, target):
@@ -337,14 +751,24 @@ def _payload_id_for_seq(verify_result: MailboxVerifyResult, seq_id: int) -> str:
 
 def _sequence_snapshot(seq: Any) -> JsonDict:
     token_ids = list(getattr(seq, "token_ids", []) or [])
+    status = getattr(seq, "status", None)
+    status_value = getattr(status, "name", status)
+    num_prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
     return {
         "seq_id": int(getattr(seq, "seq_id")),
         "request_id": getattr(seq, "request_id", None),
         "token_ids": token_ids,
         "num_tokens": int(getattr(seq, "num_tokens", len(token_ids)) or 0),
+        "num_prompt_tokens": num_prompt_tokens,
+        "output_token_count": max(len(token_ids) - num_prompt_tokens, 0),
         "last_token": getattr(seq, "last_token", token_ids[-1] if token_ids else None),
         "block_table": list(getattr(seq, "block_table", []) or []),
         "is_finished": bool(getattr(seq, "is_finished", False)),
+        "status_value": status_value,
+        "first_token_ts": getattr(seq, "first_token_ts", None),
+        "finish_ts": getattr(seq, "finish_ts", None),
+        "home_batch_id": getattr(seq, "home_batch_id", None),
+        "trace_stats": json.loads(json.dumps(getattr(seq, "trace_stats", {}) or {}, default=str)),
     }
 
 

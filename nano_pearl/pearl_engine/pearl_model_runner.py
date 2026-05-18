@@ -77,9 +77,11 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
     build_mailbox_verify_apply_plan,
+    build_mailbox_verify_commit_plan,
     build_mailbox_verify_result,
     extract_target_token_ids_from_logits,
     run_mailbox_verify_apply_no_commit_probe,
+    run_mailbox_verify_commit_probe,
 )
 from transformers import AutoTokenizer
 from tqdm import trange
@@ -521,6 +523,30 @@ class ModelRunnerBase:
             "accepted_lengths_by_seq": {},
             "rejected_seq_ids": [],
             "invalidated_mailbox_payload_count": 0,
+            "stspec_mailbox_commit_probe_enabled": bool(getattr(self.global_config, "stspec_mailbox_commit_probe", False)),
+            "mailbox_verify_commit_attempted": False,
+            "mailbox_verify_commit_success": False,
+            "mailbox_verify_commit_error": None,
+            "mailbox_verify_commit_error_kind": None,
+            "mailbox_verify_commit_seq_ids": [],
+            "mailbox_verify_commit_accepted_lengths_by_seq": {},
+            "mailbox_verify_commit_rejected_seq_ids": [],
+            "mailbox_verify_commit_total_accepted_tokens": 0,
+            "mailbox_verify_commit_total_rejected_tokens": 0,
+            "sequence_state_commit_attempted": False,
+            "sequence_state_commit_success": False,
+            "sequence_state_before": {},
+            "sequence_state_after": {},
+            "kv_commit_attempted": False,
+            "kv_commit_success": False,
+            "kv_commit_error": None,
+            "mailbox_payload_consume_attempted": False,
+            "mailbox_payload_consume_success": False,
+            "mailbox_payload_invalidate_attempted": False,
+            "mailbox_payload_invalidate_success": False,
+            "mailbox_verify_commit_rollback_attempted": False,
+            "mailbox_verify_commit_rollback_success": True,
+            "mailbox_verify_commit_skipped_non_owner": False,
             "illegal_legacy_fallback": False,
             "protocol_alignment_ok": protocol_alignment_ok,
             "protocol_alignment_error": protocol_alignment_error,
@@ -687,6 +713,30 @@ class ModelRunnerBase:
             "mailbox_forward_state_mutation_attempted",
             "mailbox_forward_state_mutation_committed",
             "mailbox_forward_state_mutation_rollback_success",
+            "stspec_mailbox_commit_probe_enabled",
+            "mailbox_verify_commit_attempted",
+            "mailbox_verify_commit_success",
+            "mailbox_verify_commit_error",
+            "mailbox_verify_commit_error_kind",
+            "mailbox_verify_commit_seq_ids",
+            "mailbox_verify_commit_accepted_lengths_by_seq",
+            "mailbox_verify_commit_rejected_seq_ids",
+            "mailbox_verify_commit_total_accepted_tokens",
+            "mailbox_verify_commit_total_rejected_tokens",
+            "sequence_state_commit_attempted",
+            "sequence_state_commit_success",
+            "sequence_state_before",
+            "sequence_state_after",
+            "kv_commit_attempted",
+            "kv_commit_success",
+            "kv_commit_error",
+            "mailbox_payload_consume_attempted",
+            "mailbox_payload_consume_success",
+            "mailbox_payload_invalidate_attempted",
+            "mailbox_payload_invalidate_success",
+            "mailbox_verify_commit_rollback_attempted",
+            "mailbox_verify_commit_rollback_success",
+            "mailbox_verify_commit_skipped_non_owner",
         ):
             record.pop(key, None)
 
@@ -1261,6 +1311,7 @@ class ModelRunnerBase:
             trace_record["target_forward_output_normalization_success"] = True
             trace_record["output_interpretation_skipped_non_owner"] = True
             trace_record["mailbox_verify_apply_skipped_non_owner"] = True
+            trace_record["mailbox_verify_commit_skipped_non_owner"] = True
             trace_record["target_tp_skipped_non_owner"] = True
             trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = False
             trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
@@ -1379,10 +1430,78 @@ class ModelRunnerBase:
             raise RuntimeError(f"{message}; next_required_feature=mailbox_verify_token_decision_backend")
 
         trace_record["mailbox_verify_apply_success"] = True
-        message = "mailbox verify no-commit apply probe succeeded; state commit after mailbox verify is not implemented"
-        trace_record["mailbox_verify_apply_error"] = message
-        trace_record["next_required_feature"] = "state_commit_after_mailbox_verify"
-        raise RuntimeError(f"{message}; next_required_feature=state_commit_after_mailbox_verify")
+        commit_probe_enabled = bool(getattr(self.global_config, "stspec_mailbox_commit_probe", False))
+        trace_record["stspec_mailbox_commit_probe_enabled"] = commit_probe_enabled
+        if not commit_probe_enabled:
+            message = "mailbox verify no-commit apply probe succeeded; state commit after mailbox verify is not implemented"
+            trace_record["mailbox_verify_apply_error"] = message
+            trace_record["next_required_feature"] = "state_commit_after_mailbox_verify"
+            raise RuntimeError(f"{message}; next_required_feature=state_commit_after_mailbox_verify")
+
+        try:
+            commit_plan = build_mailbox_verify_commit_plan(
+                verify_result,
+                apply_plan,
+                exec_seqs,
+                step_plan,
+                commit_allowed=True,
+                commit_mode="guarded_probe",
+            )
+            trace_record["mailbox_verify_commit_seq_ids"] = list(commit_plan.seq_ids)
+            trace_record["mailbox_verify_commit_accepted_lengths_by_seq"] = dict(commit_plan.accepted_lengths_by_seq)
+            trace_record["mailbox_verify_commit_rejected_seq_ids"] = list(commit_plan.rejected_seq_ids)
+            trace_record["mailbox_verify_commit_total_accepted_tokens"] = sum(
+                len(tokens) for tokens in commit_plan.accepted_token_ids_by_seq.values()
+            )
+            trace_record["mailbox_verify_commit_total_rejected_tokens"] = sum(
+                len(tokens) for tokens in commit_plan.rejected_token_ids_by_seq.values()
+            )
+            commit_result = run_mailbox_verify_commit_probe(
+                commit_plan,
+                exec_seqs,
+                current_rank=output.current_rank,
+                output_owner_rank=output.output_owner_rank,
+                eos_token_id=getattr(self.global_config, "eos", None),
+                commit_enabled=True,
+            )
+            trace_record["mailbox_verify_commit_attempted"] = bool(commit_result.attempted)
+            trace_record["mailbox_verify_commit_success"] = bool(commit_result.success)
+            trace_record["mailbox_verify_commit_error"] = commit_result.error_message
+            trace_record["mailbox_verify_commit_error_kind"] = commit_result.error_kind
+            trace_record["sequence_state_commit_attempted"] = bool(commit_result.sequence_state_commit_attempted)
+            trace_record["sequence_state_commit_success"] = bool(commit_result.sequence_state_commit_success)
+            trace_record["sequence_state_before"] = commit_result.sequence_state_before
+            trace_record["sequence_state_after"] = commit_result.sequence_state_after
+            trace_record["kv_commit_attempted"] = bool(commit_result.kv_commit_attempted)
+            trace_record["kv_commit_success"] = bool(commit_result.kv_commit_success)
+            trace_record["kv_commit_error"] = commit_result.kv_commit_error
+            trace_record["mailbox_payload_consume_attempted"] = bool(commit_result.mailbox_payload_consume_attempted)
+            trace_record["mailbox_payload_consume_success"] = bool(commit_result.mailbox_payload_consume_success)
+            trace_record["mailbox_payload_invalidate_attempted"] = bool(commit_result.mailbox_payload_invalidate_attempted)
+            trace_record["mailbox_payload_invalidate_success"] = bool(commit_result.mailbox_payload_invalidate_success)
+            trace_record["mailbox_verify_commit_rollback_attempted"] = bool(commit_result.rollback_attempted)
+            trace_record["mailbox_verify_commit_rollback_success"] = bool(commit_result.rollback_success)
+            trace_record["mailbox_verify_commit_skipped_non_owner"] = bool(commit_result.skipped_non_owner)
+            if commit_result.skipped_non_owner:
+                return
+            if not commit_result.success:
+                trace_record["next_required_feature"] = commit_result.next_required_feature or "mailbox_commit_rollback_validation"
+                raise RuntimeError(
+                    f"mailbox verify guarded commit probe failed; plan_id={step_plan.plan_id}, "
+                    f"target_seq_ids={input_seq_ids}, error={commit_result.error_message}; "
+                    f"next_required_feature={trace_record['next_required_feature']}"
+                )
+            trace_record["next_required_feature"] = commit_result.next_required_feature or "next_pipeline_step_after_mailbox_commit"
+            message = "mailbox verify guarded commit probe reached next explicit diagnostic"
+            trace_record["mailbox_verify_commit_error"] = message
+            raise RuntimeError(f"{message}; next_required_feature={trace_record['next_required_feature']}")
+        except MailboxVerifyApplyError as exc:
+            trace_record["mailbox_verify_commit_attempted"] = True
+            trace_record["mailbox_verify_commit_success"] = False
+            trace_record["mailbox_verify_commit_error"] = str(exc)
+            trace_record["mailbox_verify_commit_error_kind"] = exc.error_kind
+            trace_record["next_required_feature"] = exc.next_required_feature
+            raise RuntimeError(str(exc)) from exc
 
     def _prepare_stspec_mailbox_route(
         self,
@@ -1510,6 +1629,7 @@ class ModelRunnerBase:
                     trace_record["target_tp_skipped_non_owner"] = True
                     trace_record["output_interpretation_skipped_non_owner"] = True
                     trace_record["mailbox_verify_apply_skipped_non_owner"] = True
+                    trace_record["mailbox_verify_commit_skipped_non_owner"] = True
                     trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_unavailable_on_non_owner"
                     trace_record["target_forward_output_none_expected"] = True
                     return
