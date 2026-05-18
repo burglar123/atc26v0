@@ -731,9 +731,19 @@ def aggregate_low_level_traces(
         verification_input_from_mailbox_attempt_count = 0
         verification_input_from_mailbox_success_count = 0
         verification_input_from_mailbox_error_count = 0
+        target_forward_from_mailbox_input_built_count = 0
+        kv_state_sync_check_attempt_count = 0
+        kv_state_sync_check_success_count = 0
+        kv_state_sync_check_error_count = 0
         target_forward_from_mailbox_attempt_count = 0
         target_forward_from_mailbox_success_count = 0
         target_forward_from_mailbox_error_count = 0
+        output_interpretation_attempt_count = 0
+        output_interpretation_success_count = 0
+        output_interpretation_error_count = 0
+        mailbox_verify_apply_attempt_count = 0
+        mailbox_verify_apply_success_count = 0
+        mailbox_verify_apply_error_count = 0
         illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
@@ -881,12 +891,32 @@ def aggregate_low_level_traces(
                 verification_input_from_mailbox_success_count += 1
             if e.get("verification_input_from_mailbox_error"):
                 verification_input_from_mailbox_error_count += 1
+            if e.get("target_forward_from_mailbox_input_built"):
+                target_forward_from_mailbox_input_built_count += 1
+            if e.get("kv_state_sync_check_attempted"):
+                kv_state_sync_check_attempt_count += 1
+            if e.get("kv_state_sync_check_success"):
+                kv_state_sync_check_success_count += 1
+            if e.get("kv_state_sync_error"):
+                kv_state_sync_check_error_count += 1
             if e.get("target_forward_from_mailbox_attempted"):
                 target_forward_from_mailbox_attempt_count += 1
             if e.get("target_forward_from_mailbox_success"):
                 target_forward_from_mailbox_success_count += 1
             if e.get("target_forward_from_mailbox_error"):
                 target_forward_from_mailbox_error_count += 1
+            if e.get("target_forward_from_mailbox_output_interpretation_attempted"):
+                output_interpretation_attempt_count += 1
+            if e.get("target_forward_from_mailbox_output_interpretation_success"):
+                output_interpretation_success_count += 1
+            if e.get("target_forward_from_mailbox_output_interpretation_error"):
+                output_interpretation_error_count += 1
+            if e.get("mailbox_verify_apply_attempted"):
+                mailbox_verify_apply_attempt_count += 1
+            if e.get("mailbox_verify_apply_success"):
+                mailbox_verify_apply_success_count += 1
+            if e.get("mailbox_verify_apply_error"):
+                mailbox_verify_apply_error_count += 1
             if e.get("illegal_legacy_fallback"):
                 illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
@@ -1077,9 +1107,19 @@ def aggregate_low_level_traces(
         row["verification_input_from_mailbox_attempt_count"] = verification_input_from_mailbox_attempt_count
         row["verification_input_from_mailbox_success_count"] = verification_input_from_mailbox_success_count
         row["verification_input_from_mailbox_error_count"] = verification_input_from_mailbox_error_count
+        row["target_forward_from_mailbox_input_built_count"] = target_forward_from_mailbox_input_built_count
+        row["kv_state_sync_check_attempt_count"] = kv_state_sync_check_attempt_count
+        row["kv_state_sync_check_success_count"] = kv_state_sync_check_success_count
+        row["kv_state_sync_check_error_count"] = kv_state_sync_check_error_count
         row["target_forward_from_mailbox_attempt_count"] = target_forward_from_mailbox_attempt_count
         row["target_forward_from_mailbox_success_count"] = target_forward_from_mailbox_success_count
         row["target_forward_from_mailbox_error_count"] = target_forward_from_mailbox_error_count
+        row["output_interpretation_attempt_count"] = output_interpretation_attempt_count
+        row["output_interpretation_success_count"] = output_interpretation_success_count
+        row["output_interpretation_error_count"] = output_interpretation_error_count
+        row["mailbox_verify_apply_attempt_count"] = mailbox_verify_apply_attempt_count
+        row["mailbox_verify_apply_success_count"] = mailbox_verify_apply_success_count
+        row["mailbox_verify_apply_error_count"] = mailbox_verify_apply_error_count
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features
@@ -1953,6 +1993,20 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "variable_offsets_seen_count": row.get("variable_offsets_seen_count"),
         "variable_offsets_validation_error_count": row.get("variable_offsets_validation_error_count"),
         "cross_batch_routing_error_count": row.get("cross_batch_routing_error_count"),
+        "target_forward_from_mailbox_input_built_count": row.get("target_forward_from_mailbox_input_built_count"),
+        "kv_state_sync_check_attempt_count": row.get("kv_state_sync_check_attempt_count"),
+        "kv_state_sync_check_success_count": row.get("kv_state_sync_check_success_count"),
+        "kv_state_sync_check_error_count": row.get("kv_state_sync_check_error_count"),
+        "target_forward_from_mailbox_attempt_count": row.get("target_forward_from_mailbox_attempt_count"),
+        "target_forward_from_mailbox_success_count": row.get("target_forward_from_mailbox_success_count"),
+        "target_forward_from_mailbox_error_count": row.get("target_forward_from_mailbox_error_count"),
+        "output_interpretation_attempt_count": row.get("output_interpretation_attempt_count"),
+        "output_interpretation_success_count": row.get("output_interpretation_success_count"),
+        "output_interpretation_error_count": row.get("output_interpretation_error_count"),
+        "mailbox_verify_apply_attempt_count": row.get("mailbox_verify_apply_attempt_count"),
+        "mailbox_verify_apply_success_count": row.get("mailbox_verify_apply_success_count"),
+        "mailbox_verify_apply_error_count": row.get("mailbox_verify_apply_error_count"),
+        "illegal_legacy_fallback_count": row.get("illegal_legacy_fallback_count"),
         "next_required_features": row.get("next_required_features"),
         "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
         "variable_verify_result_seen_count": row.get("variable_verify_result_seen_count"),

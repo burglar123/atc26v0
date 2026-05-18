@@ -176,9 +176,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     verification_input_from_mailbox_attempt_count = 0
     verification_input_from_mailbox_success_count = 0
     verification_input_from_mailbox_error_count = 0
+    target_forward_from_mailbox_input_built_count = 0
+    kv_state_sync_check_attempt_count = 0
+    kv_state_sync_check_success_count = 0
+    kv_state_sync_check_error_count = 0
     target_forward_from_mailbox_attempt_count = 0
     target_forward_from_mailbox_success_count = 0
     target_forward_from_mailbox_error_count = 0
+    output_interpretation_attempt_count = 0
+    output_interpretation_success_count = 0
+    output_interpretation_error_count = 0
+    mailbox_verify_apply_attempt_count = 0
+    mailbox_verify_apply_success_count = 0
+    mailbox_verify_apply_error_count = 0
     illegal_legacy_fallback_count = 0
     raw_mailbox_transport_send_rows = 0
     raw_mailbox_transport_recv_rows = 0
@@ -417,9 +427,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         verification_input_from_mailbox_attempt_count += int(row.get("verification_input_from_mailbox_attempt_count") or 0)
         verification_input_from_mailbox_success_count += int(row.get("verification_input_from_mailbox_success_count") or 0)
         verification_input_from_mailbox_error_count += int(row.get("verification_input_from_mailbox_error_count") or 0)
+        target_forward_from_mailbox_input_built_count += int(row.get("target_forward_from_mailbox_input_built_count") or 0)
+        kv_state_sync_check_attempt_count += int(row.get("kv_state_sync_check_attempt_count") or 0)
+        kv_state_sync_check_success_count += int(row.get("kv_state_sync_check_success_count") or 0)
+        kv_state_sync_check_error_count += int(row.get("kv_state_sync_check_error_count") or 0)
         target_forward_from_mailbox_attempt_count += int(row.get("target_forward_from_mailbox_attempt_count") or 0)
         target_forward_from_mailbox_success_count += int(row.get("target_forward_from_mailbox_success_count") or 0)
         target_forward_from_mailbox_error_count += int(row.get("target_forward_from_mailbox_error_count") or 0)
+        output_interpretation_attempt_count += int(row.get("output_interpretation_attempt_count") or 0)
+        output_interpretation_success_count += int(row.get("output_interpretation_success_count") or 0)
+        output_interpretation_error_count += int(row.get("output_interpretation_error_count") or 0)
+        mailbox_verify_apply_attempt_count += int(row.get("mailbox_verify_apply_attempt_count") or 0)
+        mailbox_verify_apply_success_count += int(row.get("mailbox_verify_apply_success_count") or 0)
+        mailbox_verify_apply_error_count += int(row.get("mailbox_verify_apply_error_count") or 0)
         illegal_legacy_fallback_count += int(row.get("illegal_legacy_fallback_count") or 0)
         if row.get("mailbox_warmup_skip"):
             mailbox_warmup_skip_count += 1
@@ -438,12 +458,32 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             verification_input_from_mailbox_success_count += 1
         if row.get("verification_input_from_mailbox_error"):
             verification_input_from_mailbox_error_count += 1
+        if row.get("target_forward_from_mailbox_input_built"):
+            target_forward_from_mailbox_input_built_count += 1
+        if row.get("kv_state_sync_check_attempted"):
+            kv_state_sync_check_attempt_count += 1
+        if row.get("kv_state_sync_check_success"):
+            kv_state_sync_check_success_count += 1
+        if row.get("kv_state_sync_error"):
+            kv_state_sync_check_error_count += 1
         if row.get("target_forward_from_mailbox_attempted"):
             target_forward_from_mailbox_attempt_count += 1
         if row.get("target_forward_from_mailbox_success"):
             target_forward_from_mailbox_success_count += 1
         if row.get("target_forward_from_mailbox_error"):
             target_forward_from_mailbox_error_count += 1
+        if row.get("target_forward_from_mailbox_output_interpretation_attempted"):
+            output_interpretation_attempt_count += 1
+        if row.get("target_forward_from_mailbox_output_interpretation_success"):
+            output_interpretation_success_count += 1
+        if row.get("target_forward_from_mailbox_output_interpretation_error"):
+            output_interpretation_error_count += 1
+        if row.get("mailbox_verify_apply_attempted"):
+            mailbox_verify_apply_attempt_count += 1
+        if row.get("mailbox_verify_apply_success"):
+            mailbox_verify_apply_success_count += 1
+        if row.get("mailbox_verify_apply_error"):
+            mailbox_verify_apply_error_count += 1
         if row.get("illegal_legacy_fallback"):
             illegal_legacy_fallback_count += 1
         if row.get("next_required_feature"):
@@ -551,9 +591,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "verification_input_from_mailbox_attempt_count": verification_input_from_mailbox_attempt_count,
         "verification_input_from_mailbox_success_count": verification_input_from_mailbox_success_count,
         "verification_input_from_mailbox_error_count": verification_input_from_mailbox_error_count,
+        "target_forward_from_mailbox_input_built_count": target_forward_from_mailbox_input_built_count,
+        "kv_state_sync_check_attempt_count": kv_state_sync_check_attempt_count,
+        "kv_state_sync_check_success_count": kv_state_sync_check_success_count,
+        "kv_state_sync_check_error_count": kv_state_sync_check_error_count,
         "target_forward_from_mailbox_attempt_count": target_forward_from_mailbox_attempt_count,
         "target_forward_from_mailbox_success_count": target_forward_from_mailbox_success_count,
         "target_forward_from_mailbox_error_count": target_forward_from_mailbox_error_count,
+        "output_interpretation_attempt_count": output_interpretation_attempt_count,
+        "output_interpretation_success_count": output_interpretation_success_count,
+        "output_interpretation_error_count": output_interpretation_error_count,
+        "mailbox_verify_apply_attempt_count": mailbox_verify_apply_attempt_count,
+        "mailbox_verify_apply_success_count": mailbox_verify_apply_success_count,
+        "mailbox_verify_apply_error_count": mailbox_verify_apply_error_count,
         "illegal_legacy_fallback_count": illegal_legacy_fallback_count,
         "raw_mailbox_transport_send_rows": raw_mailbox_transport_send_rows,
         "raw_mailbox_transport_recv_rows": raw_mailbox_transport_recv_rows,
@@ -803,9 +853,19 @@ def summarize(path: Path) -> int:
     print(f"verification input from mailbox attempts: {plan_summary['verification_input_from_mailbox_attempt_count']}")
     print(f"verification input from mailbox successes: {plan_summary['verification_input_from_mailbox_success_count']}")
     print(f"verification input from mailbox errors: {plan_summary['verification_input_from_mailbox_error_count']}")
+    print(f"target forward input built count: {plan_summary['target_forward_from_mailbox_input_built_count']}")
+    print(f"KV sync check attempts: {plan_summary['kv_state_sync_check_attempt_count']}")
+    print(f"KV sync check successes: {plan_summary['kv_state_sync_check_success_count']}")
+    print(f"KV sync check errors: {plan_summary['kv_state_sync_check_error_count']}")
     print(f"target forward from mailbox attempts: {plan_summary['target_forward_from_mailbox_attempt_count']}")
     print(f"target forward from mailbox successes: {plan_summary['target_forward_from_mailbox_success_count']}")
     print(f"target forward from mailbox errors: {plan_summary['target_forward_from_mailbox_error_count']}")
+    print(f"output interpretation attempts: {plan_summary['output_interpretation_attempt_count']}")
+    print(f"output interpretation successes: {plan_summary['output_interpretation_success_count']}")
+    print(f"output interpretation errors: {plan_summary['output_interpretation_error_count']}")
+    print(f"mailbox verify apply attempts: {plan_summary['mailbox_verify_apply_attempt_count']}")
+    print(f"mailbox verify apply successes: {plan_summary['mailbox_verify_apply_success_count']}")
+    print(f"mailbox verify apply errors: {plan_summary['mailbox_verify_apply_error_count']}")
     print(f"illegal legacy fallback count: {plan_summary['illegal_legacy_fallback_count']}")
     print(f"raw rows with mailbox_transport_send_attempted: {plan_summary['raw_mailbox_transport_send_rows']}")
     print(f"raw rows with mailbox_transport_recv_attempted: {plan_summary['raw_mailbox_transport_recv_rows']}")

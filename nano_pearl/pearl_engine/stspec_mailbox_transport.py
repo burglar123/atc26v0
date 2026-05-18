@@ -313,17 +313,71 @@ class MailboxPayloadTensorEnvelope:
 
 
 @dataclass(frozen=True)
-class VerificationInputMetadata:
+class TargetForwardFromMailboxInput:
+    """V4H target-side forward input assembled from mailbox payloads.
+
+    This object is intentionally JSON-serializable and explicit about the fact
+    that position/KV metadata may still be placeholders.  Runtime code can use
+    it for guarded real-probe validation without falling back to the legacy
+    scheduled sequence set.
+    """
+
+    plan_id: int | None
+    target_home_batch_id: int | str | None
     seq_ids: list[int]
+    request_ids: list[Any]
     input_token_ids: list[int]
-    offsets: list[int]
     per_seq_lengths: list[int]
+    offsets: list[int]
     total_tokens: int
-    attention_metadata_placeholders: dict[str, Any]
-    kv_positions_placeholders: dict[str, Any]
+    gamma: int
+    positions: list[int | None]
+    kv_slot_ids: list[int | None]
+    source_mailbox_payload_ids: list[str]
+    source_draft_plan_id: int | None
+    layout_kind: str = "variable_offsets"
+    protocol_version: int = 1
+    metadata: JsonDict = field(default_factory=dict)
+
+    @property
+    def input_shape(self) -> list[int]:
+        return [int(self.total_tokens)]
+
+    @property
+    def attention_metadata_placeholders(self) -> dict[str, Any]:
+        return dict(self.metadata.get("attention_metadata_placeholders", {}))
+
+    @property
+    def kv_positions_placeholders(self) -> dict[str, Any]:
+        return dict(self.metadata.get("kv_positions_placeholders", {}))
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
+
+
+# Backward-compatible alias for the V4G public helper/tests.
+VerificationInputMetadata = TargetForwardFromMailboxInput
+
+
+@dataclass(frozen=True)
+class KVStateSyncStatus:
+    attempted: bool
+    success: bool
+    missing_seq_ids: list[int] = field(default_factory=list)
+    error: str | None = None
+    error_kind: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+class TargetForwardMailboxError(RuntimeError):
+    """Structured V4H target-forward/mailbox probe failure."""
+
+    def __init__(self, message: str, *, next_required_feature: str, error_kind: str | None = None):
+        self.next_required_feature = str(next_required_feature)
+        self.error_kind = error_kind or type(self).__name__
+        super().__init__(f"{message}; next_required_feature={self.next_required_feature}")
 
 
 def encode_payload_tensor_envelope_from_payloads(
@@ -444,6 +498,70 @@ def payload_tensor_envelope_to_mailbox_payloads(envelope: MailboxPayloadTensorEn
     return payloads
 
 
+def _seq_request_id(seq: Any) -> Any:
+    return getattr(seq, "request_id", None)
+
+
+def validate_target_forward_from_mailbox_input(
+    verification_input: TargetForwardFromMailboxInput,
+    *,
+    actual_target_exec_seq_ids: Iterable[int],
+    target_scheduler_seq_ids: Iterable[int] | None = None,
+    scheduled_seq_ids: Iterable[int] | None = None,
+    target_home_batch_id: int | str | None = None,
+) -> None:
+    seq_ids = [int(seq_id) for seq_id in verification_input.seq_ids]
+    actual_ids = [int(seq_id) for seq_id in actual_target_exec_seq_ids]
+    if scheduled_seq_ids is not None:
+        scheduled_ids = [int(seq_id) for seq_id in scheduled_seq_ids]
+        if scheduled_ids != actual_ids and seq_ids == scheduled_ids:
+            raise RuntimeError(
+                "Illegal legacy fallback detected: mailbox target forward input uses scheduled full batch "
+                f"instead of actual target exec seq ids; scheduled_seq_ids={scheduled_ids}, actual_target_exec_seq_ids={actual_ids}"
+            )
+    if seq_ids != actual_ids:
+        raise RuntimeError(
+            "Target forward mailbox input seq ids must exactly match actual_target_exec_seq_ids: "
+            f"input_seq_ids={seq_ids}, actual_target_exec_seq_ids={actual_ids}"
+        )
+    if len(set(seq_ids)) != len(seq_ids):
+        raise RuntimeError(f"Target forward mailbox input has duplicate seq_ids={seq_ids}")
+    if target_home_batch_id is not None and verification_input.target_home_batch_id != target_home_batch_id:
+        raise RuntimeError(
+            "Target forward mailbox input home_batch_id mismatch: "
+            f"input_home_batch_id={verification_input.target_home_batch_id}, target_home_batch_id={target_home_batch_id}"
+        )
+    if target_scheduler_seq_ids is not None:
+        scheduler_ids = {int(seq_id) for seq_id in target_scheduler_seq_ids}
+        missing = [seq_id for seq_id in seq_ids if seq_id not in scheduler_ids]
+        if missing:
+            raise RuntimeError(
+                "Target forward mailbox input references seq ids missing from target scheduler state: "
+                f"missing_seq_ids={missing}, scheduler_seq_ids={sorted(scheduler_ids)}"
+            )
+    validate_offsets(
+        [int(length) for length in verification_input.per_seq_lengths],
+        [int(offset) for offset in verification_input.offsets],
+        int(verification_input.total_tokens),
+        message_type="target_forward_from_mailbox_input",
+        layout_kind=verification_input.layout_kind,
+        seq_ids=seq_ids,
+    )
+    if len(verification_input.input_token_ids) != int(verification_input.total_tokens):
+        raise RuntimeError(
+            "Target forward mailbox input token length does not match total_tokens: "
+            f"token_count={len(verification_input.input_token_ids)}, total_tokens={verification_input.total_tokens}"
+        )
+    if verification_input.layout_kind != "variable_offsets":
+        raise RuntimeError(
+            f"Target forward mailbox input requires variable_offsets layout, got {verification_input.layout_kind!r}"
+        )
+    if len(verification_input.positions) not in (0, int(verification_input.total_tokens)):
+        raise RuntimeError("Target forward mailbox input positions must be empty or match total_tokens")
+    if len(verification_input.kv_slot_ids) not in (0, int(verification_input.total_tokens)):
+        raise RuntimeError("Target forward mailbox input kv_slot_ids must be empty or match total_tokens")
+
+
 def build_verification_input_from_mailbox_payload(
     payloads: Iterable[MailboxPayload],
     seqs: Iterable[Any],
@@ -459,6 +577,8 @@ def build_verification_input_from_mailbox_payload(
             "Mailbox verification input seq mismatch: "
             f"expected_seq_ids={expected_seq_ids}, payload_seq_ids={payload_seq_ids}"
         )
+    if len(set(payload_seq_ids)) != len(payload_seq_ids):
+        raise RuntimeError(f"Mailbox verification input duplicate seq_ids={payload_seq_ids}")
     home_batch_ids = {payload.home_batch_id for payload in payload_list}
     target_home_batch_id = getattr(step_plan, "target_home_batch_id", None)
     if home_batch_ids != {target_home_batch_id}:
@@ -469,20 +589,136 @@ def build_verification_input_from_mailbox_payload(
     lengths = [int(payload.per_seq_length) for payload in payload_list]
     offsets = build_offsets(lengths)
     input_token_ids: list[int] = []
-    for payload in payload_list:
+    positions: list[int | None] = []
+    kv_slot_ids: list[int | None] = []
+    for payload, seq in zip(payload_list, seq_list):
         if len(payload.draft_token_ids) != int(payload.per_seq_length):
             raise RuntimeError(
                 "Mailbox verification input payload length mismatch: "
                 f"seq_id={payload.seq_id}, token_count={len(payload.draft_token_ids)}, per_seq_length={payload.per_seq_length}"
             )
         input_token_ids.extend(int(token) for token in payload.draft_token_ids)
+        seq_len = len(seq) if hasattr(seq, "__len__") else None
+        start_pos = None if seq_len is None else max(0, int(seq_len) - int(payload.per_seq_length))
+        for idx in range(int(payload.per_seq_length)):
+            position = None if start_pos is None else start_pos + idx
+            positions.append(position)
+            slot_id = None
+            if position is not None and hasattr(seq, "token_to_slot"):
+                try:
+                    slot_id = int(seq.token_to_slot(position))
+                except Exception:
+                    slot_id = None
+            kv_slot_ids.append(slot_id)
     validate_offsets(lengths, offsets, len(input_token_ids), message_type="verification_input_from_mailbox", layout_kind="variable_offsets", seq_ids=payload_seq_ids)
-    return VerificationInputMetadata(
+    plan_id = getattr(step_plan, "plan_id", None)
+    scheduled_seq_ids = getattr(step_plan, "scheduled_seq_ids", None)
+    source_ids = [
+        f"{payload.home_batch_id}:{payload.seq_id}:{payload.offset}:{payload.per_seq_length}"
+        for payload in payload_list
+    ]
+    metadata = {
+        "attention_metadata_placeholders": {"requires_attention_metadata_wiring": True, "gamma": int(gamma)},
+        "kv_positions_placeholders": {
+            "requires_kv_position_wiring": any(slot_id is None for slot_id in kv_slot_ids),
+            "target_home_batch_id": target_home_batch_id,
+        },
+        "scheduled_seq_ids": list(scheduled_seq_ids) if scheduled_seq_ids is not None else None,
+        "actual_target_exec_seq_ids": list(getattr(step_plan, "actual_target_exec_seq_ids", expected_seq_ids)),
+        "target_forward_from_mailbox_input_scaffold_version": "v4h",
+    }
+    verification_input = TargetForwardFromMailboxInput(
+        plan_id=plan_id,
+        target_home_batch_id=target_home_batch_id,
         seq_ids=payload_seq_ids,
+        request_ids=[payload.request_id if payload.request_id is not None else _seq_request_id(seq) for payload, seq in zip(payload_list, seq_list)],
         input_token_ids=input_token_ids,
-        offsets=offsets,
         per_seq_lengths=lengths,
+        offsets=offsets,
         total_tokens=len(input_token_ids),
-        attention_metadata_placeholders={"requires_attention_metadata_wiring": True, "gamma": int(gamma)},
-        kv_positions_placeholders={"requires_kv_position_wiring": True, "target_home_batch_id": target_home_batch_id},
+        gamma=int(gamma),
+        positions=positions,
+        kv_slot_ids=kv_slot_ids,
+        source_mailbox_payload_ids=source_ids,
+        source_draft_plan_id=payload_list[0].plan_id if payload_list else None,
+        layout_kind="variable_offsets",
+        protocol_version=int(payload_list[0].protocol_version if payload_list else 1),
+        metadata=metadata,
+    )
+    validate_target_forward_from_mailbox_input(
+        verification_input,
+        actual_target_exec_seq_ids=expected_seq_ids,
+        target_scheduler_seq_ids=expected_seq_ids,
+        scheduled_seq_ids=scheduled_seq_ids,
+        target_home_batch_id=target_home_batch_id,
+    )
+    return verification_input
+
+
+def validate_kv_state_sync_for_mailbox_forward(
+    verification_input: TargetForwardFromMailboxInput,
+    exec_seqs: Iterable[Any],
+) -> KVStateSyncStatus:
+    seq_list = list(exec_seqs)
+    seq_by_id = {int(seq.seq_id): seq for seq in seq_list}
+    missing = [int(seq_id) for seq_id in verification_input.seq_ids if int(seq_id) not in seq_by_id]
+    if missing:
+        return KVStateSyncStatus(
+            attempted=True,
+            success=False,
+            missing_seq_ids=missing,
+            error="target forward from mailbox input requires KV/state synchronization",
+            error_kind="missing_target_kv_state_for_mailbox_seq",
+        )
+    if any(slot_id is None for slot_id in verification_input.kv_slot_ids):
+        return KVStateSyncStatus(
+            attempted=True,
+            success=False,
+            missing_seq_ids=[],
+            error="target forward from mailbox input requires KV/state synchronization",
+            error_kind="kv_position_mapping_not_implemented",
+        )
+    return KVStateSyncStatus(
+        attempted=True,
+        success=False,
+        missing_seq_ids=[],
+        error="target forward from mailbox input requires KV/state synchronization",
+        error_kind="variable_offset_kv_append_not_implemented",
+    )
+
+
+def map_target_forward_output_rows_to_seq_offsets(
+    verification_input: TargetForwardFromMailboxInput,
+    output_shape: Iterable[int] | None = None,
+) -> list[JsonDict]:
+    rows: list[JsonDict] = []
+    output_rows = None
+    if output_shape is not None:
+        shape = list(output_shape)
+        output_rows = int(shape[0]) if shape else 0
+        if output_rows < int(verification_input.total_tokens):
+            raise RuntimeError(
+                "Target forward mailbox output has fewer rows than input tokens: "
+                f"output_shape={shape}, total_tokens={verification_input.total_tokens}"
+            )
+    for seq_id, offset, length in zip(verification_input.seq_ids, verification_input.offsets, verification_input.per_seq_lengths):
+        rows.append({
+            "seq_id": int(seq_id),
+            "offset": int(offset),
+            "length": int(length),
+            "row_start": int(offset),
+            "row_end": int(offset) + int(length),
+        })
+    return rows
+
+
+def interpret_target_forward_from_mailbox_output(
+    verification_input: TargetForwardFromMailboxInput,
+    output_shape: Iterable[int] | None = None,
+) -> list[JsonDict]:
+    map_target_forward_output_rows_to_seq_offsets(verification_input, output_shape)
+    raise TargetForwardMailboxError(
+        "target forward from mailbox succeeded, but output interpretation is not implemented",
+        next_required_feature="target_forward_from_mailbox_output_interpretation",
+        error_kind="target_forward_from_mailbox_output_interpretation_not_implemented",
     )

@@ -48,11 +48,15 @@ from nano_pearl.pearl_engine.stspec_mailbox import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_transport import (
     MailboxTransportMode,
+    TargetForwardMailboxError,
     build_verification_input_from_mailbox_payload,
     classify_mailbox_miss,
     encode_mailbox_transport_envelope,
     encode_payload_tensor_envelope_from_payloads,
+    interpret_target_forward_from_mailbox_output,
     payload_tensor_envelope_to_mailbox_payloads,
+    validate_kv_state_sync_for_mailbox_forward,
+    validate_target_forward_from_mailbox_input,
 )
 from nano_pearl.pearl_engine.stspec_pipeline import (
     STSpecPipelinePhase,
@@ -464,9 +468,33 @@ class ModelRunnerBase:
             "verification_input_from_mailbox_seq_ids": [],
             "verification_input_from_mailbox_total_tokens": 0,
             "verification_input_from_mailbox_error": None,
+            "target_forward_from_mailbox_input_built": False,
+            "target_forward_from_mailbox_input_seq_ids": [],
+            "target_forward_from_mailbox_input_total_tokens": 0,
+            "target_forward_from_mailbox_input_shape": [],
+            "kv_state_sync_check_attempted": False,
+            "kv_state_sync_check_success": False,
+            "kv_state_sync_missing_seq_ids": [],
+            "kv_state_sync_error": None,
+            "kv_state_sync_error_kind": None,
             "target_forward_from_mailbox_attempted": False,
             "target_forward_from_mailbox_success": False,
+            "target_forward_from_mailbox_seq_ids": [],
+            "target_forward_from_mailbox_total_tokens": 0,
+            "target_forward_from_mailbox_input_shape": [],
+            "target_forward_from_mailbox_output_shape": [],
             "target_forward_from_mailbox_error": None,
+            "target_forward_from_mailbox_error_kind": None,
+            "target_forward_from_mailbox_latency_ms": None,
+            "target_forward_from_mailbox_output_interpretation_attempted": False,
+            "target_forward_from_mailbox_output_interpretation_success": False,
+            "target_forward_from_mailbox_output_interpretation_error": None,
+            "mailbox_verify_apply_attempted": False,
+            "mailbox_verify_apply_success": False,
+            "mailbox_verify_apply_error": None,
+            "accepted_lengths_by_seq": {},
+            "rejected_seq_ids": [],
+            "invalidated_mailbox_payload_count": 0,
             "illegal_legacy_fallback": False,
             "protocol_alignment_ok": protocol_alignment_ok,
             "protocol_alignment_error": protocol_alignment_error,
@@ -865,6 +893,143 @@ class ModelRunnerBase:
         trace_record["target_mailbox_insert_home_batch_id"] = step_plan.target_home_batch_id
         self._trace_mailbox_availability(trace_record)
 
+    def _raise_illegal_legacy_fallback(
+        self,
+        trace_record: dict,
+        *,
+        step_plan: StepPlan,
+        input_seq_ids: list[int],
+        exec_seq_ids: list[int],
+    ) -> None:
+        trace_record["illegal_legacy_fallback"] = True
+        trace_record["target_forward_from_mailbox_error_kind"] = "illegal_legacy_fallback"
+        trace_record["next_required_feature"] = "strict_mailbox_target_seq_routing"
+        message = (
+            "illegal legacy fallback detected in ST-Spec real probe; target forward from mailbox "
+            "must use actual_target_exec_seq_ids rather than scheduled full batch"
+        )
+        trace_record["target_forward_from_mailbox_error"] = message
+        raise RuntimeError(
+            f"{message}; plan_id={step_plan.plan_id}, scheduled_seq_ids={list(step_plan.scheduled_seq_ids)}, "
+            f"actual_target_exec_seq_ids={list(step_plan.actual_target_exec_seq_ids)}, "
+            f"input_seq_ids={input_seq_ids}, exec_seq_ids={exec_seq_ids}, "
+            "next_required_feature=strict_mailbox_target_seq_routing"
+        )
+
+    def _run_target_forward_from_mailbox_input(
+        self,
+        verification_input,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+    ) -> None:
+        exec_seq_ids = [int(seq.seq_id) for seq in exec_seqs]
+        input_seq_ids = [int(seq_id) for seq_id in verification_input.seq_ids]
+        scheduled_seq_ids = [int(seq_id) for seq_id in step_plan.scheduled_seq_ids]
+        actual_target_exec_seq_ids = [int(seq_id) for seq_id in step_plan.actual_target_exec_seq_ids]
+
+        trace_record["target_forward_from_mailbox_input_built"] = True
+        trace_record["target_forward_from_mailbox_input_seq_ids"] = input_seq_ids
+        trace_record["target_forward_from_mailbox_input_total_tokens"] = int(verification_input.total_tokens)
+        trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
+
+        if scheduled_seq_ids != actual_target_exec_seq_ids and input_seq_ids == scheduled_seq_ids:
+            self._raise_illegal_legacy_fallback(
+                trace_record,
+                step_plan=step_plan,
+                input_seq_ids=input_seq_ids,
+                exec_seq_ids=exec_seq_ids,
+            )
+        if input_seq_ids != actual_target_exec_seq_ids or exec_seq_ids != actual_target_exec_seq_ids:
+            trace_record["illegal_legacy_fallback"] = True
+            message = (
+                "target forward from mailbox input seq ids do not exactly match actual target exec seq ids"
+            )
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = "target_forward_seq_mismatch"
+            trace_record["next_required_feature"] = "strict_mailbox_target_seq_routing"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, input_seq_ids={input_seq_ids}, "
+                f"exec_seq_ids={exec_seq_ids}, actual_target_exec_seq_ids={actual_target_exec_seq_ids}, "
+                "next_required_feature=strict_mailbox_target_seq_routing"
+            )
+
+        try:
+            validate_target_forward_from_mailbox_input(
+                verification_input,
+                actual_target_exec_seq_ids=actual_target_exec_seq_ids,
+                target_scheduler_seq_ids=[int(seq.seq_id) for seq in list(self.scheduler.waiting) + list(self.scheduler.running) + list(self.scheduler.finished)],
+                scheduled_seq_ids=scheduled_seq_ids,
+                target_home_batch_id=step_plan.target_home_batch_id,
+            )
+        except Exception as exc:
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_input_validation"
+            raise
+
+        trace_record["target_forward_from_mailbox_attempted"] = True
+        trace_record["target_forward_from_mailbox_success"] = False
+        trace_record["target_forward_from_mailbox_seq_ids"] = input_seq_ids
+        trace_record["target_forward_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
+        trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
+
+        kv_status = validate_kv_state_sync_for_mailbox_forward(verification_input, exec_seqs)
+        trace_record["kv_state_sync_check_attempted"] = bool(kv_status.attempted)
+        trace_record["kv_state_sync_check_success"] = bool(kv_status.success)
+        trace_record["kv_state_sync_missing_seq_ids"] = list(kv_status.missing_seq_ids)
+        trace_record["kv_state_sync_error"] = kv_status.error
+        trace_record["kv_state_sync_error_kind"] = kv_status.error_kind
+        if not kv_status.success:
+            message = "target forward from mailbox input requires KV/state synchronization"
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = kv_status.error_kind
+            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, target_seq_ids={input_seq_ids}, "
+                f"kv_state_sync_error_kind={kv_status.error_kind}, missing_seq_ids={kv_status.missing_seq_ids}, "
+                "next_required_feature=kv_state_sync_for_mailbox_forward"
+            )
+
+        start = time.time()
+        try:
+            input_ids = torch.tensor(verification_input.input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(verification_input.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            trace_record["target_forward_from_mailbox_input_shape"] = list(input_ids.shape)
+            logits = self.run_model(input_ids, positions, False)
+            trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
+            trace_record["target_forward_from_mailbox_success"] = True
+            trace_record["target_forward_from_mailbox_output_shape"] = list(logits.shape)
+        except Exception as exc:
+            trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
+            trace_record["target_forward_from_mailbox_success"] = False
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            raise RuntimeError(
+                f"target forward from mailbox input failed during guarded probe; error={exc}; "
+                "next_required_feature=kv_state_sync_for_mailbox_forward"
+            ) from exc
+
+        trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = True
+        try:
+            interpret_target_forward_from_mailbox_output(verification_input, trace_record["target_forward_from_mailbox_output_shape"])
+        except TargetForwardMailboxError as exc:
+            trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
+            trace_record["target_forward_from_mailbox_output_interpretation_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = exc.error_kind
+            trace_record["next_required_feature"] = exc.next_required_feature
+            raise RuntimeError(str(exc)) from exc
+
+        trace_record["target_forward_from_mailbox_output_interpretation_success"] = True
+        trace_record["mailbox_verify_apply_attempted"] = True
+        trace_record["mailbox_verify_apply_success"] = False
+        message = "mailbox verification apply path is not implemented"
+        trace_record["mailbox_verify_apply_error"] = message
+        trace_record["next_required_feature"] = "mailbox_verify_apply_path"
+        raise RuntimeError(f"{message}; next_required_feature=mailbox_verify_apply_path")
+
     def _prepare_stspec_mailbox_route(
         self,
         step_plan: StepPlan,
@@ -968,18 +1133,11 @@ class ModelRunnerBase:
             trace_record["verification_input_from_mailbox_seq_ids"] = list(verification_input.seq_ids)
             trace_record["verification_input_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
             trace_record["verification_input_from_mailbox_error"] = None
-            trace_record["target_forward_from_mailbox_attempted"] = True
-            trace_record["target_forward_from_mailbox_success"] = False
-            message = (
-                "verification input from mailbox payload is constructed at metadata level, "
-                "but target model forward wiring is not implemented"
-            )
-            trace_record["target_forward_from_mailbox_error"] = message
-            trace_record["next_required_feature"] = "target_forward_from_mailbox_input"
-            raise RuntimeError(
-                f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
-                f"target_home_batch_id={step_plan.target_home_batch_id}, target_seq_ids={target_seq_ids}, "
-                "next_required_feature=target_forward_from_mailbox_input"
+            self._run_target_forward_from_mailbox_input(
+                verification_input,
+                exec_seqs or [],
+                step_plan,
+                trace_record,
             )
 
         error_kind, next_feature, warmup_miss = classify_mailbox_miss(
