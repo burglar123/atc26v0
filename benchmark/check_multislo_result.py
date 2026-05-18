@@ -190,6 +190,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     target_forward_from_mailbox_attempt_count = 0
     target_forward_from_mailbox_success_count = 0
     target_forward_from_mailbox_error_count = 0
+    target_forward_output_normalization_attempt_count = 0
+    target_forward_output_normalization_success_count = 0
+    target_forward_output_normalization_error_count = 0
+    target_forward_output_none_expected_count = 0
+    target_forward_output_none_unexpected_count = 0
+    target_forward_output_owner_ranks = set()
+    output_interpretation_skipped_non_owner_count = 0
     output_interpretation_attempt_count = 0
     output_interpretation_success_count = 0
     output_interpretation_error_count = 0
@@ -455,6 +462,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         target_forward_from_mailbox_attempt_count += int(row.get("target_forward_from_mailbox_attempt_count") or 0)
         target_forward_from_mailbox_success_count += int(row.get("target_forward_from_mailbox_success_count") or 0)
         target_forward_from_mailbox_error_count += int(row.get("target_forward_from_mailbox_error_count") or 0)
+        target_forward_output_normalization_attempt_count += int(row.get("target_forward_output_normalization_attempt_count") or 0)
+        target_forward_output_normalization_success_count += int(row.get("target_forward_output_normalization_success_count") or 0)
+        target_forward_output_normalization_error_count += int(row.get("target_forward_output_normalization_error_count") or 0)
+        target_forward_output_none_expected_count += int(row.get("target_forward_output_none_expected_count") or 0)
+        target_forward_output_none_unexpected_count += int(row.get("target_forward_output_none_unexpected_count") or 0)
+        output_interpretation_skipped_non_owner_count += int(row.get("output_interpretation_skipped_non_owner_count") or 0)
+        for value in values_from_mapping(row.get("target_forward_output_owner_ranks")):
+            if value is not None:
+                target_forward_output_owner_ranks.add(value)
         output_interpretation_attempt_count += int(row.get("output_interpretation_attempt_count") or 0)
         output_interpretation_success_count += int(row.get("output_interpretation_success_count") or 0)
         output_interpretation_error_count += int(row.get("output_interpretation_error_count") or 0)
@@ -510,6 +526,20 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             target_forward_from_mailbox_success_count += 1
         if row.get("target_forward_from_mailbox_error"):
             target_forward_from_mailbox_error_count += 1
+        if row.get("target_forward_output_normalization_attempted"):
+            target_forward_output_normalization_attempt_count += 1
+        if row.get("target_forward_output_normalization_success"):
+            target_forward_output_normalization_success_count += 1
+        if row.get("target_forward_output_normalization_error"):
+            target_forward_output_normalization_error_count += 1
+        if row.get("target_forward_output_none_expected"):
+            target_forward_output_none_expected_count += 1
+        if row.get("target_forward_output_none_unexpected"):
+            target_forward_output_none_unexpected_count += 1
+        if row.get("target_forward_output_owner_rank") is not None:
+            target_forward_output_owner_ranks.add(row.get("target_forward_output_owner_rank"))
+        if row.get("output_interpretation_skipped_non_owner"):
+            output_interpretation_skipped_non_owner_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_attempted"):
             output_interpretation_attempt_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_success"):
@@ -649,6 +679,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "target_forward_from_mailbox_attempt_count": target_forward_from_mailbox_attempt_count,
         "target_forward_from_mailbox_success_count": target_forward_from_mailbox_success_count,
         "target_forward_from_mailbox_error_count": target_forward_from_mailbox_error_count,
+        "target_forward_output_normalization_attempt_count": target_forward_output_normalization_attempt_count,
+        "target_forward_output_normalization_success_count": target_forward_output_normalization_success_count,
+        "target_forward_output_normalization_error_count": target_forward_output_normalization_error_count,
+        "target_forward_output_none_expected_count": target_forward_output_none_expected_count,
+        "target_forward_output_none_unexpected_count": target_forward_output_none_unexpected_count,
+        "target_forward_output_owner_ranks": sorted(target_forward_output_owner_ranks, key=str),
+        "output_interpretation_skipped_non_owner_count": output_interpretation_skipped_non_owner_count,
         "output_interpretation_attempt_count": output_interpretation_attempt_count,
         "output_interpretation_success_count": output_interpretation_success_count,
         "output_interpretation_error_count": output_interpretation_error_count,
@@ -922,6 +959,13 @@ def summarize(path: Path) -> int:
     print(f"target forward from mailbox attempts: {plan_summary['target_forward_from_mailbox_attempt_count']}")
     print(f"target forward from mailbox successes: {plan_summary['target_forward_from_mailbox_success_count']}")
     print(f"target forward from mailbox errors: {plan_summary['target_forward_from_mailbox_error_count']}")
+    print(f"target forward output normalization attempts: {plan_summary['target_forward_output_normalization_attempt_count']}")
+    print(f"target forward output normalization successes: {plan_summary['target_forward_output_normalization_success_count']}")
+    print(f"target forward output normalization errors: {plan_summary['target_forward_output_normalization_error_count']}")
+    print(f"target forward output owner ranks seen: {plan_summary['target_forward_output_owner_ranks']}")
+    print(f"target forward output none expected count: {plan_summary['target_forward_output_none_expected_count']}")
+    print(f"target forward output none unexpected count: {plan_summary['target_forward_output_none_unexpected_count']}")
+    print(f"output interpretation skipped non-owner count: {plan_summary['output_interpretation_skipped_non_owner_count']}")
     print(f"output interpretation attempts: {plan_summary['output_interpretation_attempt_count']}")
     print(f"output interpretation successes: {plan_summary['output_interpretation_success_count']}")
     print(f"output interpretation errors: {plan_summary['output_interpretation_error_count']}")

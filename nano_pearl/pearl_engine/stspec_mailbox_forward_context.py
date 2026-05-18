@@ -250,3 +250,278 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(inner) for inner in value]
     return value
+
+
+@dataclass(frozen=True)
+class TargetForwardMailboxOutput:
+    output_available: bool
+    output_owner: bool
+    output_owner_rank: int | None
+    current_rank: int | None
+    raw_output_type: str
+    logits: Any = None
+    logits_shape: list[int] = field(default_factory=list)
+    output_shape: list[int] = field(default_factory=list)
+    output_num_rows: int | None = None
+    output_num_tokens: int | None = None
+    seq_ids: list[int] = field(default_factory=list)
+    offsets: list[int] = field(default_factory=list)
+    per_seq_lengths: list[int] = field(default_factory=list)
+    total_tokens: int = 0
+    can_interpret: bool = False
+    cannot_interpret_reason: str | None = None
+    next_required_feature: str | None = None
+    extraction_path: str | None = None
+    output_none_expected: bool = False
+    output_none_unexpected: bool = False
+    error_kind: str | None = None
+    error_message: str | None = None
+    interpretation_map: list[JsonDict] = field(default_factory=list)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "output_available": self.output_available,
+            "output_owner": self.output_owner,
+            "output_owner_rank": self.output_owner_rank,
+            "current_rank": self.current_rank,
+            "raw_output_type": self.raw_output_type,
+            "logits_shape": list(self.logits_shape),
+            "output_shape": list(self.output_shape),
+            "output_num_rows": self.output_num_rows,
+            "output_num_tokens": self.output_num_tokens,
+            "seq_ids": list(self.seq_ids),
+            "offsets": list(self.offsets),
+            "per_seq_lengths": list(self.per_seq_lengths),
+            "total_tokens": self.total_tokens,
+            "can_interpret": self.can_interpret,
+            "cannot_interpret_reason": self.cannot_interpret_reason,
+            "next_required_feature": self.next_required_feature,
+            "extraction_path": self.extraction_path,
+            "output_none_expected": self.output_none_expected,
+            "output_none_unexpected": self.output_none_unexpected,
+            "error_kind": self.error_kind,
+            "error_message": self.error_message,
+            "interpretation_map": _jsonable(self.interpretation_map),
+        }
+
+
+def is_target_forward_output_owner(
+    rank: int | None = None,
+    target_config: Any | None = None,
+    tp_params: Any | None = None,
+    runner_role: str | None = None,
+) -> bool:
+    """Return whether this rank owns gathered target logits.
+
+    The normal target verification path only samples/interprets logits on TP
+    local rank 0; embed_head gathers sharded logits to tp_params.master_rank and
+    returns None on other TP ranks.  Mailbox verification mirrors that behavior.
+    """
+
+    del runner_role  # reserved for future role-specific ownership rules.
+    local_rank = getattr(tp_params, "local_rank", None)
+    if local_rank is not None:
+        return int(local_rank) == 0
+    master_rank = getattr(tp_params, "master_rank", None)
+    if master_rank is None and target_config is not None:
+        master_rank = getattr(target_config, "master_rank", None)
+    if rank is not None and master_rank is not None:
+        return int(rank) == int(master_rank)
+    return True
+
+
+def target_forward_output_owner_rank(runner_state: Any | None = None) -> int | None:
+    tp_params = getattr(runner_state, "tp_params", None)
+    group_config = getattr(runner_state, "group_config", None)
+    owner_rank = getattr(tp_params, "master_rank", None)
+    if owner_rank is None and group_config is not None:
+        owner_rank = getattr(group_config, "master_rank", None)
+    return None if owner_rank is None else int(owner_rank)
+
+
+def normalize_target_forward_from_mailbox_output(
+    raw_output: Any,
+    verification_input: Any,
+    step_plan: Any,
+    runner_state: Any | None = None,
+    trace_record: dict | None = None,
+) -> TargetForwardMailboxOutput:
+    """Normalize TP-aware mailbox target-forward output for interpretation.
+
+    Non-owner TP ranks are allowed to receive None because the normal LM head
+    gathers logits only to TP local rank 0.  Owner ranks must produce a
+    tensor-like logits object with a first dimension matching total_tokens.
+    """
+
+    del trace_record  # normalization is pure; caller exports fields.
+    tp_params = getattr(runner_state, "tp_params", None)
+    group_config = getattr(runner_state, "group_config", None)
+    current_rank = getattr(runner_state, "rank", None)
+    current_rank = None if current_rank is None else int(current_rank)
+    owner_rank = target_forward_output_owner_rank(runner_state)
+    expected_owner = is_target_forward_output_owner(
+        current_rank,
+        group_config,
+        tp_params,
+        runner_role="verify",
+    )
+    seq_ids = [int(seq_id) for seq_id in getattr(verification_input, "seq_ids", [])]
+    offsets = [int(offset) for offset in getattr(verification_input, "offsets", [])]
+    lengths = [int(length) for length in getattr(verification_input, "per_seq_lengths", [])]
+    total_tokens = int(getattr(verification_input, "total_tokens", 0) or 0)
+    raw_type = type(raw_output).__name__ if raw_output is not None else "NoneType"
+
+    if raw_output is None:
+        none_expected = not expected_owner
+        none_unexpected = expected_owner
+        return TargetForwardMailboxOutput(
+            output_available=False,
+            output_owner=expected_owner,
+            output_owner_rank=owner_rank,
+            current_rank=current_rank,
+            raw_output_type=raw_type,
+            seq_ids=seq_ids,
+            offsets=offsets,
+            per_seq_lengths=lengths,
+            total_tokens=total_tokens,
+            can_interpret=False,
+            cannot_interpret_reason="non_owner_rank_no_output" if none_expected else "owner_rank_missing_output",
+            next_required_feature=None if none_expected else "target_forward_output_ownership",
+            output_none_expected=none_expected,
+            output_none_unexpected=none_unexpected,
+            error_kind=None if none_expected else "target_forward_output_ownership",
+            error_message=None if none_expected else "target forward output owner rank received None logits",
+        )
+
+    logits, extraction_path = _extract_tensor_like_output(raw_output)
+    if logits is None:
+        return TargetForwardMailboxOutput(
+            output_available=False,
+            output_owner=expected_owner,
+            output_owner_rank=owner_rank,
+            current_rank=current_rank,
+            raw_output_type=raw_type,
+            seq_ids=seq_ids,
+            offsets=offsets,
+            per_seq_lengths=lengths,
+            total_tokens=total_tokens,
+            can_interpret=False,
+            cannot_interpret_reason="unsupported_output_type",
+            next_required_feature="target_forward_output_normalization",
+            error_kind="target_forward_output_normalization",
+            error_message=f"unsupported target forward output type {raw_type}",
+        )
+
+    shape = _shape_list(logits)
+    rows = int(shape[0]) if shape else 0
+    if rows != total_tokens:
+        return TargetForwardMailboxOutput(
+            output_available=True,
+            output_owner=True,
+            output_owner_rank=owner_rank,
+            current_rank=current_rank,
+            raw_output_type=raw_type,
+            logits=logits,
+            logits_shape=shape,
+            output_shape=shape,
+            output_num_rows=rows,
+            output_num_tokens=total_tokens,
+            seq_ids=seq_ids,
+            offsets=offsets,
+            per_seq_lengths=lengths,
+            total_tokens=total_tokens,
+            can_interpret=False,
+            cannot_interpret_reason="target_forward_output_row_count_mismatch",
+            next_required_feature="target_forward_output_normalization",
+            extraction_path=extraction_path,
+            error_kind="target_forward_output_row_count_mismatch",
+            error_message=f"target forward output rows {rows} != mailbox total_tokens {total_tokens}",
+        )
+
+    interpretation_map = build_target_forward_output_interpretation_map(verification_input, shape)
+    return TargetForwardMailboxOutput(
+        output_available=True,
+        output_owner=True,
+        output_owner_rank=owner_rank,
+        current_rank=current_rank,
+        raw_output_type=raw_type,
+        logits=logits,
+        logits_shape=shape,
+        output_shape=shape,
+        output_num_rows=rows,
+        output_num_tokens=total_tokens,
+        seq_ids=seq_ids,
+        offsets=offsets,
+        per_seq_lengths=lengths,
+        total_tokens=total_tokens,
+        can_interpret=True,
+        extraction_path=extraction_path,
+        interpretation_map=interpretation_map,
+    )
+
+
+def build_target_forward_output_interpretation_map(
+    verification_input: Any,
+    output_shape: Iterable[int] | None = None,
+) -> list[JsonDict]:
+    shape = list(output_shape or [])
+    total_tokens = int(getattr(verification_input, "total_tokens", 0) or 0)
+    if shape:
+        rows = int(shape[0])
+        if rows != total_tokens:
+            raise RuntimeError(
+                "Target forward mailbox output row count does not match input tokens: "
+                f"output_shape={shape}, total_tokens={total_tokens}; "
+                "next_required_feature=target_forward_output_normalization"
+            )
+    mapping: list[JsonDict] = []
+    for seq_id, offset, length in zip(
+        getattr(verification_input, "seq_ids", []),
+        getattr(verification_input, "offsets", []),
+        getattr(verification_input, "per_seq_lengths", []),
+    ):
+        row_start = int(offset)
+        row_end = row_start + int(length)
+        mapping.append(
+            {
+                "seq_id": int(seq_id),
+                "offset": int(offset),
+                "length": int(length),
+                "row_start": row_start,
+                "row_end": row_end,
+                "token_range": [row_start, row_end],
+            }
+        )
+    return mapping
+
+
+def _extract_tensor_like_output(raw_output: Any) -> tuple[Any | None, str | None]:
+    if _is_tensor_like(raw_output):
+        return raw_output, "self"
+    if isinstance(raw_output, dict):
+        for key in ("logits", "output", "outputs", "last_hidden_state"):
+            value = raw_output.get(key)
+            if _is_tensor_like(value):
+                return value, f"dict.{key}"
+        for key, value in raw_output.items():
+            if _is_tensor_like(value):
+                return value, f"dict.{key}"
+        return None, None
+    if isinstance(raw_output, (tuple, list)):
+        for idx, value in enumerate(raw_output):
+            if _is_tensor_like(value):
+                return value, f"{type(raw_output).__name__}[{idx}]"
+        return None, None
+    for attr in ("logits", "output", "last_hidden_state"):
+        value = getattr(raw_output, attr, None)
+        if _is_tensor_like(value):
+            return value, f"attr.{attr}"
+    return None, None
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return value is not None and hasattr(value, "shape")
+
+
+def _shape_list(value: Any) -> list[int]:
+    return [int(dim) for dim in list(getattr(value, "shape"))]

@@ -65,6 +65,7 @@ from nano_pearl.pearl_engine.stspec_kv_sync import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_forward_context import (
     build_target_forward_context_from_mailbox_input,
+    normalize_target_forward_from_mailbox_output,
     validate_target_forward_mailbox_context,
 )
 from nano_pearl.pearl_engine.stspec_pipeline import (
@@ -1145,6 +1146,7 @@ class ModelRunnerBase:
         trace_record["target_forward_from_mailbox_attempted"] = True
         trace_record["target_forward_from_mailbox_success"] = False
         start = time.time()
+        raw_output = None
         try:
             input_ids = torch.tensor(mailbox_context.input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             positions = torch.tensor(mailbox_context.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1155,10 +1157,9 @@ class ModelRunnerBase:
             trace_record["target_forward_from_mailbox_input_shape"] = list(input_ids.shape)
             trace_record["target_forward_mailbox_positions_shape"] = list(positions.shape)
             trace_record["target_forward_mailbox_slot_mapping_shape"] = list(slot_mapping.shape)
-            logits = self.run_model(input_ids, positions, False)
+            raw_output = self.run_model(input_ids, positions, False)
             trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
             trace_record["target_forward_from_mailbox_success"] = True
-            trace_record["target_forward_from_mailbox_output_shape"] = list(logits.shape)
         except Exception as exc:
             trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
             trace_record["target_forward_from_mailbox_success"] = False
@@ -1180,9 +1181,51 @@ class ModelRunnerBase:
                 "next_required_feature=target_forward_from_mailbox_guarded_forward_backend"
             ) from exc
 
+        trace_record["target_forward_output_normalization_attempted"] = True
+        trace_record["target_forward_output_normalization_success"] = False
+        output = normalize_target_forward_from_mailbox_output(
+            raw_output,
+            verification_input,
+            step_plan,
+            runner_state=self,
+            trace_record=trace_record,
+        )
+        trace_record["target_forward_output_owner_rank"] = output.output_owner_rank
+        trace_record["target_forward_output_current_rank"] = output.current_rank
+        trace_record["target_forward_output_is_owner"] = output.output_owner
+        trace_record["target_forward_output_available"] = output.output_available
+        trace_record["target_forward_output_none_expected"] = output.output_none_expected
+        trace_record["target_forward_output_none_unexpected"] = output.output_none_unexpected
+        trace_record["target_forward_output_raw_type"] = output.raw_output_type
+        trace_record["target_forward_output_shape"] = list(output.output_shape)
+        trace_record["target_forward_from_mailbox_output_shape"] = list(output.output_shape)
+        trace_record["target_forward_output_num_rows"] = output.output_num_rows
+        trace_record["target_forward_output_num_tokens"] = output.output_num_tokens
+        trace_record["target_forward_output_extraction_path"] = output.extraction_path
+        if output.output_none_expected and not output.output_available:
+            trace_record["target_forward_output_normalization_success"] = True
+            trace_record["output_interpretation_skipped_non_owner"] = True
+            trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = False
+            trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
+            return
+        if not output.can_interpret:
+            trace_record["target_forward_output_normalization_error"] = output.error_message
+            trace_record["target_forward_output_normalization_error_kind"] = output.error_kind
+            trace_record["target_forward_from_mailbox_error"] = output.error_message
+            trace_record["target_forward_from_mailbox_error_kind"] = output.error_kind
+            trace_record["next_required_feature"] = output.next_required_feature or "target_forward_output_normalization"
+            raise RuntimeError(
+                f"target forward output normalization failed; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, current_rank={output.current_rank}, "
+                f"owner_rank={output.output_owner_rank}, output_owner={output.output_owner}, "
+                f"raw_output_type={output.raw_output_type}, output_shape={output.output_shape}, "
+                f"error={output.error_message}; next_required_feature={trace_record['next_required_feature']}"
+            )
+        trace_record["target_forward_output_normalization_success"] = True
+
         trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = True
         try:
-            interpret_target_forward_from_mailbox_output(verification_input, trace_record["target_forward_from_mailbox_output_shape"])
+            interpretation = interpret_target_forward_from_mailbox_output(verification_input, output.output_shape)
         except TargetForwardMailboxError as exc:
             trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
             trace_record["target_forward_from_mailbox_output_interpretation_error"] = str(exc)
@@ -1190,8 +1233,22 @@ class ModelRunnerBase:
             trace_record["target_forward_from_mailbox_error_kind"] = exc.error_kind
             trace_record["next_required_feature"] = exc.next_required_feature
             raise RuntimeError(str(exc)) from exc
+        except Exception as exc:
+            trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
+            trace_record["target_forward_from_mailbox_output_interpretation_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_output_interpretation"
+            raise RuntimeError(
+                f"target forward mailbox output interpretation failed; plan_id={step_plan.plan_id}, "
+                f"target_seq_ids={input_seq_ids}, output_shape={output.output_shape}, error={exc}; "
+                "next_required_feature=target_forward_from_mailbox_output_interpretation"
+            ) from exc
 
         trace_record["target_forward_from_mailbox_output_interpretation_success"] = True
+        trace_record["target_forward_from_mailbox_output_interpretation_seq_ids"] = list(output.seq_ids)
+        trace_record["target_forward_from_mailbox_output_interpretation_offsets"] = list(output.offsets)
+        trace_record["target_forward_from_mailbox_output_interpretation_map"] = interpretation
         trace_record["mailbox_verify_apply_attempted"] = True
         trace_record["mailbox_verify_apply_success"] = False
         message = "mailbox verification apply path is not implemented"

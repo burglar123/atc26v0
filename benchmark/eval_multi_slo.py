@@ -764,6 +764,13 @@ def aggregate_low_level_traces(
         target_forward_from_mailbox_attempt_count = 0
         target_forward_from_mailbox_success_count = 0
         target_forward_from_mailbox_error_count = 0
+        target_forward_output_normalization_attempt_count = 0
+        target_forward_output_normalization_success_count = 0
+        target_forward_output_normalization_error_count = 0
+        target_forward_output_none_expected_count = 0
+        target_forward_output_none_unexpected_count = 0
+        target_forward_output_owner_ranks: List[int] = []
+        output_interpretation_skipped_non_owner_count = 0
         output_interpretation_attempt_count = 0
         output_interpretation_success_count = 0
         output_interpretation_error_count = 0
@@ -946,6 +953,21 @@ def aggregate_low_level_traces(
                 target_forward_from_mailbox_success_count += 1
             if e.get("target_forward_from_mailbox_error"):
                 target_forward_from_mailbox_error_count += 1
+            if e.get("target_forward_output_normalization_attempted"):
+                target_forward_output_normalization_attempt_count += 1
+            if e.get("target_forward_output_normalization_success"):
+                target_forward_output_normalization_success_count += 1
+            if e.get("target_forward_output_normalization_error"):
+                target_forward_output_normalization_error_count += 1
+            if e.get("target_forward_output_none_expected"):
+                target_forward_output_none_expected_count += 1
+            if e.get("target_forward_output_none_unexpected"):
+                target_forward_output_none_unexpected_count += 1
+            owner_rank = to_int(e.get("target_forward_output_owner_rank"))
+            if owner_rank is not None:
+                append_unique(target_forward_output_owner_ranks, owner_rank)
+            if e.get("output_interpretation_skipped_non_owner"):
+                output_interpretation_skipped_non_owner_count += 1
             if e.get("target_forward_from_mailbox_output_interpretation_attempted"):
                 output_interpretation_attempt_count += 1
             if e.get("target_forward_from_mailbox_output_interpretation_success"):
@@ -1171,6 +1193,14 @@ def aggregate_low_level_traces(
         row["target_forward_from_mailbox_attempt_count"] = target_forward_from_mailbox_attempt_count
         row["target_forward_from_mailbox_success_count"] = target_forward_from_mailbox_success_count
         row["target_forward_from_mailbox_error_count"] = target_forward_from_mailbox_error_count
+        row["target_forward_output_normalization_attempt_count"] = target_forward_output_normalization_attempt_count
+        row["target_forward_output_normalization_success_count"] = target_forward_output_normalization_success_count
+        row["target_forward_output_normalization_error_count"] = target_forward_output_normalization_error_count
+        row["target_forward_output_none_expected_count"] = target_forward_output_none_expected_count
+        row["target_forward_output_none_unexpected_count"] = target_forward_output_none_unexpected_count
+        if target_forward_output_owner_ranks:
+            row["target_forward_output_owner_ranks"] = target_forward_output_owner_ranks
+        row["output_interpretation_skipped_non_owner_count"] = output_interpretation_skipped_non_owner_count
         row["output_interpretation_attempt_count"] = output_interpretation_attempt_count
         row["output_interpretation_success_count"] = output_interpretation_success_count
         row["output_interpretation_error_count"] = output_interpretation_error_count
