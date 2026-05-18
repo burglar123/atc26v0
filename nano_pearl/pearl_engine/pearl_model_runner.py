@@ -50,6 +50,10 @@ from nano_pearl.pearl_engine.stspec_mailbox_transport import (
     classify_mailbox_miss,
     encode_mailbox_transport_envelope,
 )
+from nano_pearl.pearl_engine.stspec_pipeline import (
+    STSpecPipelinePhase,
+    should_skip_target_for_warmup,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -442,6 +446,19 @@ class ModelRunnerBase:
             "filtered_out_seq_ids": filtered_out_seq_ids,
             "filtered_out_seq_count": len(filtered_out_seq_ids),
             "actual_exec_fraction": actual_exec_fraction,
+            "stspec_pipeline_enabled": step_plan.stspec_pipeline_enabled,
+            "stspec_pipeline_phase": step_plan.stspec_pipeline_phase,
+            "stspec_pipeline_step": step_plan.stspec_pipeline_step,
+            "stspec_pipeline_warmup_done": step_plan.stspec_pipeline_warmup_done,
+            "stspec_warmup_target_home_batch_id": step_plan.stspec_warmup_target_home_batch_id,
+            "stspec_warmup_draft_home_batch_id": step_plan.stspec_warmup_draft_home_batch_id,
+            "warmup_draft_payload_produced": False,
+            "warmup_target_verify_skipped": False,
+            "pipeline_phase_advanced": False,
+            "verification_input_from_mailbox_attempted": False,
+            "verification_input_from_mailbox_success": False,
+            "verification_input_from_mailbox_error": None,
+            "illegal_legacy_fallback": False,
             "protocol_alignment_ok": protocol_alignment_ok,
             "protocol_alignment_error": protocol_alignment_error,
             "pearl_protocol_version": int(getattr(self.global_config, "pearl_protocol_version", 1)),
@@ -514,6 +531,8 @@ class ModelRunnerBase:
             "target_verify_skipped_for_warmup": False,
             "target_consume_from_mailbox_attempted": False,
             "target_consume_from_mailbox_success": False,
+            "target_consume_from_mailbox_payload_seq_ids": [],
+            "target_consume_from_mailbox_payload_home_batch_id": None,
             "target_consume_from_mailbox_error": None,
             "next_required_feature": None,
             "plan_legacy_equivalent": step_plan.legacy_equivalent,
@@ -777,6 +796,26 @@ class ModelRunnerBase:
         trace_record["mailbox_missing_seq_ids"] = list(result.missing_seq_ids)
         self._trace_mailbox_availability(trace_record)
         if result.success:
+            payload_seq_ids = [int(payload.seq_id) for payload in result.payloads]
+            payload_home_batch_ids = {payload.home_batch_id for payload in result.payloads}
+            if payload_seq_ids != target_seq_ids or payload_home_batch_ids != {step_plan.target_home_batch_id}:
+                trace_record["illegal_legacy_fallback"] = True
+                message = (
+                    "target consume-from-mailbox payload validation failed; payload seq/home batch ids "
+                    "do not match target StepPlan"
+                )
+                trace_record["target_consume_from_mailbox_attempted"] = True
+                trace_record["target_consume_from_mailbox_success"] = False
+                trace_record["target_consume_from_mailbox_payload_seq_ids"] = payload_seq_ids
+                trace_record["target_consume_from_mailbox_payload_home_batch_id"] = list(payload_home_batch_ids)
+                trace_record["target_consume_from_mailbox_error"] = message
+                trace_record["next_required_feature"] = "target_consume_payload_validation"
+                raise RuntimeError(
+                    f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
+                    f"target_seq_ids={target_seq_ids}, payload_seq_ids={payload_seq_ids}, "
+                    f"target_home_batch_id={step_plan.target_home_batch_id}, payload_home_batch_ids={payload_home_batch_ids}, "
+                    "next_required_feature=target_consume_payload_validation"
+                )
             trace_record["mailbox_transport_recv_success"] = True
             trace_record["mailbox_transport_recv_seq_ids"] = target_seq_ids
             trace_record["mailbox_transport_payload_available"] = all(
@@ -786,14 +825,22 @@ class ModelRunnerBase:
             trace_record["mailbox_error"] = None
             trace_record["mailbox_error_kind"] = None
             trace_record["target_consume_from_mailbox_attempted"] = True
-            trace_record["target_consume_from_mailbox_success"] = False
-            message = "target consume-from-mailbox not yet wired into verification input"
-            trace_record["target_consume_from_mailbox_error"] = message
-            trace_record["next_required_feature"] = "target_consume_from_mailbox"
+            trace_record["target_consume_from_mailbox_success"] = True
+            trace_record["target_consume_from_mailbox_payload_seq_ids"] = payload_seq_ids
+            trace_record["target_consume_from_mailbox_payload_home_batch_id"] = step_plan.target_home_batch_id
+            trace_record["target_consume_from_mailbox_error"] = None
+            trace_record["verification_input_from_mailbox_attempted"] = True
+            trace_record["verification_input_from_mailbox_success"] = False
+            message = (
+                "target consume-from-mailbox succeeded, but verification input construction "
+                "from mailbox payload is not implemented"
+            )
+            trace_record["verification_input_from_mailbox_error"] = message
+            trace_record["next_required_feature"] = "verification_input_from_mailbox"
             raise RuntimeError(
                 f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
                 f"target_home_batch_id={step_plan.target_home_batch_id}, target_seq_ids={target_seq_ids}, "
-                "next_required_feature=target_consume_from_mailbox"
+                "next_required_feature=verification_input_from_mailbox"
             )
 
         error_kind, next_feature, warmup_miss = classify_mailbox_miss(
@@ -801,10 +848,26 @@ class ModelRunnerBase:
             available_home_batch_ids=self.stspec_mailbox.available_home_batch_ids(),
             allow_warmup_miss=self._mailbox_allow_warmup_miss(),
         )
-        if warmup_miss and self._mailbox_allow_warmup_miss():
+        if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value and warmup_miss:
+            error_kind, next_feature, warmup_miss = "mailbox_missing_payload", "mailbox_payload_tensor_transport", False
+        if warmup_miss and should_skip_target_for_warmup(
+            phase=step_plan.stspec_pipeline_phase,
+            runner_role=runner_role,
+            allow_warmup_miss=self._mailbox_allow_warmup_miss(),
+        ):
             trace_record["mailbox_warmup_skip"] = True
             trace_record["target_verify_skipped_for_warmup"] = True
-            message = "warmup miss allowed, but target skip/flush is not implemented"
+            trace_record["warmup_target_verify_skipped"] = True
+            trace_record["pipeline_phase_advanced"] = True
+            message = "ST-Spec warmup target verify skipped; draft-only pipeline fill recorded"
+            self._record_mailbox_error(
+                trace_record,
+                kind=error_kind,
+                message=message,
+                next_required_feature="verification_input_from_mailbox",
+                warmup_miss=True,
+            )
+            return
         elif warmup_miss:
             message = "ST-Spec mailbox warmup miss for target batch; pipeline warmup schedule is required"
         else:
@@ -890,6 +953,9 @@ class ModelRunnerBase:
             raise
         trace_record["mailbox_put_success"] = True
         trace_record["mailbox_put_count"] = len(payloads)
+        if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.WARMUP_DRAFT_ONLY.value:
+            trace_record["warmup_draft_payload_produced"] = True
+            trace_record["pipeline_phase_advanced"] = True
         trace_record["mailbox_cross_process_delivery"] = "transport_envelope_visible"
         trace_record["mailbox_transport_send_attempted"] = True
         trace_record["mailbox_transport_send_success"] = True
@@ -1537,6 +1603,9 @@ class TargetModelRunner(ModelRunnerBase):
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
         self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record)
+        if trace_record.get("target_verify_skipped_for_warmup"):
+            self._mark_trace_end(trace_record)
+            return
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
@@ -1563,6 +1632,9 @@ class TargetModelRunner(ModelRunnerBase):
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
         self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record)
+        if trace_record.get("target_verify_skipped_for_warmup"):
+            self._mark_trace_end(trace_record)
+            return
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(exec_seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None

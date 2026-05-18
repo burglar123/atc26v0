@@ -140,6 +140,8 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "pearl_protocol_validate": not args.disable_pearl_protocol_validate,
         "pearl_protocol_trace": not args.disable_pearl_protocol_trace,
         "stspec_mailbox_allow_warmup_miss": args.stspec_mailbox_allow_warmup_miss,
+        "stspec_pipeline_warmup": args.stspec_pipeline_warmup,
+        "stspec_warmup_draft_only": args.stspec_warmup_draft_only,
     }
 
     # Try new named-path style with gamma.
@@ -478,11 +480,17 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_transport_send_success_count",
     "mailbox_transport_recv_success_count",
     "mailbox_transport_error_kinds",
+    "stspec_pipeline_phases",
+    "warmup_draft_payload_produced_count",
     "mailbox_warmup_skip_count",
     "target_verify_skipped_for_warmup_count",
     "target_consume_from_mailbox_attempt_count",
     "target_consume_from_mailbox_success_count",
     "target_consume_from_mailbox_error_count",
+    "verification_input_from_mailbox_attempt_count",
+    "verification_input_from_mailbox_success_count",
+    "verification_input_from_mailbox_error_count",
+    "illegal_legacy_fallback_count",
     "next_required_features",
     "variable_draft_message_seen_count",
     "variable_verify_result_seen_count",
@@ -702,11 +710,17 @@ def aggregate_low_level_traces(
         mailbox_transport_send_success_count = 0
         mailbox_transport_recv_success_count = 0
         mailbox_transport_error_kinds: List[str] = []
+        stspec_pipeline_phases: List[str] = []
+        warmup_draft_payload_produced_count = 0
         mailbox_warmup_skip_count = 0
         target_verify_skipped_for_warmup_count = 0
         target_consume_from_mailbox_attempt_count = 0
         target_consume_from_mailbox_success_count = 0
         target_consume_from_mailbox_error_count = 0
+        verification_input_from_mailbox_attempt_count = 0
+        verification_input_from_mailbox_success_count = 0
+        verification_input_from_mailbox_error_count = 0
+        illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
         variable_verify_result_seen_count = 0
@@ -827,6 +841,9 @@ def aggregate_low_level_traces(
             if e.get("mailbox_transport_recv_success"):
                 mailbox_transport_recv_success_count += 1
             append_unique(mailbox_transport_error_kinds, e.get("mailbox_transport_error_kind"))
+            append_unique(stspec_pipeline_phases, e.get("stspec_pipeline_phase"))
+            if e.get("warmup_draft_payload_produced"):
+                warmup_draft_payload_produced_count += 1
             if e.get("mailbox_warmup_skip"):
                 mailbox_warmup_skip_count += 1
             if e.get("target_verify_skipped_for_warmup"):
@@ -837,6 +854,14 @@ def aggregate_low_level_traces(
                 target_consume_from_mailbox_success_count += 1
             if e.get("target_consume_from_mailbox_error"):
                 target_consume_from_mailbox_error_count += 1
+            if e.get("verification_input_from_mailbox_attempted"):
+                verification_input_from_mailbox_attempt_count += 1
+            if e.get("verification_input_from_mailbox_success"):
+                verification_input_from_mailbox_success_count += 1
+            if e.get("verification_input_from_mailbox_error"):
+                verification_input_from_mailbox_error_count += 1
+            if e.get("illegal_legacy_fallback"):
+                illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
             if e.get("variable_draft_message_seq_ids") is not None:
                 variable_draft_message_seen_count += 1
@@ -1010,11 +1035,18 @@ def aggregate_low_level_traces(
         row["mailbox_transport_recv_success_count"] = mailbox_transport_recv_success_count
         if mailbox_transport_error_kinds:
             row["mailbox_transport_error_kinds"] = mailbox_transport_error_kinds
+        if stspec_pipeline_phases:
+            row["stspec_pipeline_phases"] = stspec_pipeline_phases
+        row["warmup_draft_payload_produced_count"] = warmup_draft_payload_produced_count
         row["mailbox_warmup_skip_count"] = mailbox_warmup_skip_count
         row["target_verify_skipped_for_warmup_count"] = target_verify_skipped_for_warmup_count
         row["target_consume_from_mailbox_attempt_count"] = target_consume_from_mailbox_attempt_count
         row["target_consume_from_mailbox_success_count"] = target_consume_from_mailbox_success_count
         row["target_consume_from_mailbox_error_count"] = target_consume_from_mailbox_error_count
+        row["verification_input_from_mailbox_attempt_count"] = verification_input_from_mailbox_attempt_count
+        row["verification_input_from_mailbox_success_count"] = verification_input_from_mailbox_success_count
+        row["verification_input_from_mailbox_error_count"] = verification_input_from_mailbox_error_count
+        row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features
         row["variable_draft_message_seen_count"] = variable_draft_message_seen_count
@@ -1982,11 +2014,23 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--stspec-pipeline-warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable V4F real-probe pipeline warmup phase metadata.",
+    )
+    parser.add_argument(
+        "--stspec-warmup-draft-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use a draft-only first decode cycle for V4F real-probe warmup.",
+    )
+    parser.add_argument(
         "--stspec-mailbox-allow-warmup-miss",
         action="store_true",
         help=(
-            "Allow V4E real-probe target warmup misses to reach a controlled "
-            "warmup-skip diagnostic instead of failing at missing payload lookup."
+            "Allow V4F real-probe target warmup misses to be recorded/skipped "
+            "instead of failing at missing payload lookup."
         ),
     )
 

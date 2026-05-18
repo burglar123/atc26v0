@@ -5,6 +5,7 @@ from nano_pearl.pearl_engine.sequence import Sequence, SequenceStatus
 from nano_pearl.pearl_engine.block_manager import BlockManager
 from nano_pearl.utils.pearl_logger import logger
 from nano_pearl.pearl_engine.stspec_plan import StepPlan, build_legacy_step_plan
+from nano_pearl.pearl_engine.stspec_pipeline import STSpecPipelineController
 
 
 def is_eos(token_id: int, eos_token_id: int | list[int]):
@@ -46,6 +47,17 @@ class Scheduler:
         )
         self.stspec_two_batch_probe_fail_fast = bool(
             getattr(config, "stspec_two_batch_probe_fail_fast", True)
+        )
+        self.stspec_pipeline_warmup = bool(getattr(config, "stspec_pipeline_warmup", True))
+        self.stspec_warmup_draft_only = bool(getattr(config, "stspec_warmup_draft_only", True))
+        self.stspec_pipeline = STSpecPipelineController(
+            enabled=(
+                self.enable_stspec_two_batch_execution
+                and not self.stspec_two_batch_dryrun
+                and self.stspec_two_batch_probe
+            ),
+            warmup_enabled=self.stspec_pipeline_warmup,
+            warmup_draft_only=self.stspec_warmup_draft_only,
         )
 
     def next_batch_id(self, runner_role: str) -> tuple[int, str]:
@@ -125,12 +137,15 @@ class Scheduler:
         seqs, is_prefill = self.schedule()
         target_home_batch_id = None
         draft_home_batch_id = None
+        pipeline_state = self.stspec_pipeline.state_for_next_decode(None, None)
         if not is_prefill:
             target_home_batch_id = self.two_batch_shadow_step % 2
             draft_home_batch_id = 1 - target_home_batch_id
+            pipeline_state = self.stspec_pipeline.state_for_next_decode(target_home_batch_id, draft_home_batch_id)
             self.current_target_home_batch_id = target_home_batch_id
             self.current_draft_home_batch_id = draft_home_batch_id
             self.two_batch_shadow_step += 1
+            self.stspec_pipeline.advance_after_decode()
         step_plan = build_legacy_step_plan(
             plan_id=plan_id,
             seqs=seqs,
@@ -145,6 +160,12 @@ class Scheduler:
             two_batch_execution_dryrun=self.stspec_two_batch_dryrun,
             stspec_two_batch_probe=self.stspec_two_batch_probe,
             stspec_two_batch_probe_fail_fast=self.stspec_two_batch_probe_fail_fast,
+            stspec_pipeline_enabled=pipeline_state.enabled,
+            stspec_pipeline_phase=pipeline_state.phase,
+            stspec_pipeline_step=pipeline_state.step,
+            stspec_pipeline_warmup_done=pipeline_state.warmup_done,
+            stspec_warmup_target_home_batch_id=pipeline_state.warmup_target_home_batch_id,
+            stspec_warmup_draft_home_batch_id=pipeline_state.warmup_draft_home_batch_id,
         )
         return seqs, is_prefill, step_plan
 
@@ -180,6 +201,7 @@ class Scheduler:
         self.two_batch_shadow_step = 0
         self.current_target_home_batch_id = 0
         self.current_draft_home_batch_id = 1
+        self.stspec_pipeline.clear()
         self.block_manager.hash_to_block_id.clear()
         for block in self.block_manager.blocks:
             block.hash = -1

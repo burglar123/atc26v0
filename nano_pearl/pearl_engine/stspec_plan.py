@@ -82,6 +82,12 @@ class StepPlan:
     dryrun_draft_exec_seq_ids: list[int] = field(default_factory=list)
     filtered_out_seq_ids: list[int] = field(default_factory=list)
     actual_exec_fraction: float = 1.0
+    stspec_pipeline_enabled: bool = False
+    stspec_pipeline_phase: str = "disabled"
+    stspec_pipeline_step: int = 0
+    stspec_pipeline_warmup_done: bool = True
+    stspec_warmup_target_home_batch_id: int | None = None
+    stspec_warmup_draft_home_batch_id: int | None = None
     requests: list[PlanRequest] = field(default_factory=list)
 
     @property
@@ -140,6 +146,12 @@ class StepPlan:
             "dryrun_draft_exec_seq_ids": list(self.dryrun_draft_exec_seq_ids),
             "filtered_out_seq_ids": list(self.filtered_out_seq_ids),
             "actual_exec_fraction": self.actual_exec_fraction,
+            "stspec_pipeline_enabled": self.stspec_pipeline_enabled,
+            "stspec_pipeline_phase": self.stspec_pipeline_phase,
+            "stspec_pipeline_step": self.stspec_pipeline_step,
+            "stspec_pipeline_warmup_done": self.stspec_pipeline_warmup_done,
+            "stspec_warmup_target_home_batch_id": self.stspec_warmup_target_home_batch_id,
+            "stspec_warmup_draft_home_batch_id": self.stspec_warmup_draft_home_batch_id,
             "scheduled_seq_ids": list(self.scheduled_seq_ids),
             "request_ids": list(self.request_ids),
             "effective_gamma_per_seq": {
@@ -333,6 +345,12 @@ def build_legacy_step_plan(
     stspec_two_batch_probe: bool = False,
     stspec_two_batch_probe_fail_fast: bool = True,
     stspec_two_batch_probe_local_only: bool = False,
+    stspec_pipeline_enabled: bool = False,
+    stspec_pipeline_phase: str = "disabled",
+    stspec_pipeline_step: int = 0,
+    stspec_pipeline_warmup_done: bool = True,
+    stspec_warmup_target_home_batch_id: int | None = None,
+    stspec_warmup_draft_home_batch_id: int | None = None,
 ) -> StepPlan:
     """Wrap the existing scheduler output in a legacy-equivalent StepPlan.
 
@@ -472,5 +490,11 @@ def build_legacy_step_plan(
         dryrun_draft_exec_seq_ids=dryrun_draft_exec_seq_ids,
         filtered_out_seq_ids=filtered_out_seq_ids,
         actual_exec_fraction=actual_exec_fraction,
+        stspec_pipeline_enabled=stspec_pipeline_enabled,
+        stspec_pipeline_phase=stspec_pipeline_phase,
+        stspec_pipeline_step=stspec_pipeline_step,
+        stspec_pipeline_warmup_done=stspec_pipeline_warmup_done,
+        stspec_warmup_target_home_batch_id=stspec_warmup_target_home_batch_id,
+        stspec_warmup_draft_home_batch_id=stspec_warmup_draft_home_batch_id,
         requests=requests,
     )
