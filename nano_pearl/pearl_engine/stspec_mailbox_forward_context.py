@@ -640,3 +640,28 @@ def classify_mailbox_payload_availability(
         "next_required_feature": next_required_feature,
         "should_skip_non_owner": should_skip_non_owner,
     }
+
+
+def is_stspec_real_probe_enabled(config: Any | None, step_plan: Any | None = None) -> bool:
+    """Return True only for the real two-batch variable-offset probe path."""
+
+    layout = getattr(config, "pearl_protocol_layout", None)
+    if layout is None and hasattr(config, "_pearl_protocol_layout"):
+        layout = config._pearl_protocol_layout()
+    config_enabled = bool(getattr(config, "enable_stspec_two_batch_execution", False))
+    config_dryrun = bool(getattr(config, "stspec_two_batch_dryrun", True))
+    config_probe = bool(getattr(config, "stspec_two_batch_probe", False))
+    step_enabled = True if step_plan is None else bool(getattr(step_plan, "two_batch_execution_enabled", False))
+    step_dryrun = False if step_plan is None else bool(getattr(step_plan, "two_batch_execution_dryrun", True))
+    step_probe = True if step_plan is None else bool(getattr(step_plan, "stspec_probe_enabled", False))
+    step_real = True if step_plan is None else bool(getattr(step_plan, "real_probe_attempted", False))
+    return bool(
+        config_enabled
+        and not config_dryrun
+        and config_probe
+        and step_enabled
+        and not step_dryrun
+        and step_probe
+        and step_real
+        and layout == "variable_offsets"
+    )

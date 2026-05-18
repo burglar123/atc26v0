@@ -66,6 +66,7 @@ from nano_pearl.pearl_engine.stspec_kv_sync import (
 from nano_pearl.pearl_engine.stspec_mailbox_forward_context import (
     build_target_forward_context_from_mailbox_input,
     classify_target_tp_rank_role_for_mailbox_forward,
+    is_stspec_real_probe_enabled,
     normalize_target_forward_from_mailbox_output,
     validate_target_forward_mailbox_context,
 )
@@ -510,12 +511,6 @@ class ModelRunnerBase:
             "target_forward_from_mailbox_output_interpretation_attempted": False,
             "target_forward_from_mailbox_output_interpretation_success": False,
             "target_forward_from_mailbox_output_interpretation_error": None,
-            "mailbox_verify_apply_attempted": False,
-            "mailbox_verify_apply_success": False,
-            "mailbox_verify_apply_error": None,
-            "mailbox_forward_state_mutation_attempted": False,
-            "mailbox_forward_state_mutation_committed": False,
-            "mailbox_forward_state_mutation_rollback_success": False,
             "accepted_lengths_by_seq": {},
             "rejected_seq_ids": [],
             "invalidated_mailbox_payload_count": 0,
@@ -775,13 +770,15 @@ class ModelRunnerBase:
             assert exec_seqs == seqs
         return exec_seqs
 
+    def _is_stspec_real_probe_enabled(self, step_plan: StepPlan | None = None) -> bool:
+        return is_stspec_real_probe_enabled(self.global_config, step_plan)
+
     def _stspec_mailbox_enabled(self, step_plan: StepPlan | None) -> bool:
         return bool(
             step_plan is not None
-            and step_plan.real_probe_attempted
+            and self._is_stspec_real_probe_enabled(step_plan)
             and not step_plan.stspec_probe_local_only
             and not step_plan.is_prefill
-            and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
             and step_plan.execution_mode in {"parallel_pearl", "serialized_pearl"}
         )
 

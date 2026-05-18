@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 import os
 import sys
 import types
@@ -162,3 +163,60 @@ def test_target_tp_mailbox_role_classification_json():
     assert role.should_apply_verify_result is False
     assert role.should_skip_non_owner is True
     json.dumps(role.to_dict(), sort_keys=True)
+
+
+def test_real_probe_enabled_helper_gates_dryrun_and_normal_modes():
+    real_config = SimpleNamespace(
+        enable_stspec_two_batch_execution=True,
+        stspec_two_batch_dryrun=False,
+        stspec_two_batch_probe=True,
+        pearl_protocol_layout="variable_offsets",
+    )
+    dryrun_config = SimpleNamespace(
+        enable_stspec_two_batch_execution=True,
+        stspec_two_batch_dryrun=True,
+        stspec_two_batch_probe=True,
+        pearl_protocol_layout="variable_offsets",
+    )
+    normal_config = SimpleNamespace(
+        enable_stspec_two_batch_execution=False,
+        stspec_two_batch_dryrun=True,
+        stspec_two_batch_probe=False,
+        pearl_protocol_layout="variable_offsets",
+    )
+    step_plan = SimpleNamespace(
+        two_batch_execution_enabled=True,
+        two_batch_execution_dryrun=False,
+        stspec_probe_enabled=True,
+        real_probe_attempted=True,
+    )
+
+    assert context_mod.is_stspec_real_probe_enabled(real_config, step_plan) is True
+    assert context_mod.is_stspec_real_probe_enabled(dryrun_config, step_plan) is False
+    assert context_mod.is_stspec_real_probe_enabled(normal_config, step_plan) is False
+    assert context_mod.is_stspec_real_probe_enabled(real_config, SimpleNamespace(**{**step_plan.__dict__, "two_batch_execution_dryrun": True})) is False
+
+
+def test_real_probe_only_fields_are_not_seeded_in_base_trace_defaults():
+    runner_source = Path(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py").read_text()
+    forbidden_default_literals = [
+        '"target_tp_is_output_owner": False',
+        '"target_tp_should_interpret_output": False',
+        '"target_tp_should_apply_verify_result": False',
+        '"target_tp_skipped_non_owner": False',
+        '"mailbox_payload_envelope_available": False',
+        '"mailbox_payload_token_ids_available": False',
+        '"mailbox_payload_tensor_available": False',
+        '"mailbox_payload_missing_reason": None',
+        '"output_interpretation_skipped_non_owner": False',
+        '"mailbox_verify_apply_skipped_non_owner": False',
+        '"target_forward_output_none_expected": False',
+        '"target_forward_output_none_unexpected": False',
+        '"mailbox_verify_apply_attempted": False',
+        '"mailbox_verify_apply_success": False',
+        '"mailbox_forward_state_mutation_attempted": False',
+        '"mailbox_forward_state_mutation_committed": False',
+    ]
+
+    for literal in forbidden_default_literals:
+        assert literal not in runner_source
