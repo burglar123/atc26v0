@@ -74,6 +74,13 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
     STSpecPipelinePhase,
     should_skip_target_for_warmup,
 )
+from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
+    MailboxVerifyApplyError,
+    build_mailbox_verify_apply_plan,
+    build_mailbox_verify_result,
+    extract_target_token_ids_from_logits,
+    run_mailbox_verify_apply_no_commit_probe,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -1301,12 +1308,81 @@ class ModelRunnerBase:
         trace_record["target_forward_from_mailbox_output_interpretation_seq_ids"] = list(output.seq_ids)
         trace_record["target_forward_from_mailbox_output_interpretation_offsets"] = list(output.offsets)
         trace_record["target_forward_from_mailbox_output_interpretation_map"] = interpretation
+
         trace_record["mailbox_verify_apply_attempted"] = True
+        trace_record["mailbox_verify_apply_no_commit"] = True
         trace_record["mailbox_verify_apply_success"] = False
-        message = "mailbox verification apply path is not implemented"
+        trace_record["mailbox_verify_apply_plan_built"] = False
+        trace_record["mailbox_verify_apply_probe_success"] = False
+        trace_record["mailbox_verify_token_decision_attempted"] = True
+        trace_record["mailbox_verify_token_decision_success"] = False
+        trace_record["mailbox_forward_state_mutation_attempted"] = False
+        trace_record["mailbox_forward_state_mutation_committed"] = False
+        trace_record["mailbox_forward_state_mutation_rollback_success"] = True
+        try:
+            target_token_ids = extract_target_token_ids_from_logits(output.logits, int(verification_input.total_tokens))
+            metadata_only = target_token_ids is None
+            trace_record["mailbox_verify_result_metadata_only"] = metadata_only
+            if metadata_only:
+                trace_record["mailbox_verify_token_decision_error"] = "target token decision backend unavailable for mailbox verify logits"
+            else:
+                trace_record["mailbox_verify_token_decision_success"] = True
+                trace_record["mailbox_verify_token_decision_error"] = None
+            verify_result = build_mailbox_verify_result(
+                verification_input,
+                target_token_ids=target_token_ids,
+                output_owner_rank=output.output_owner_rank,
+                metadata_only=metadata_only,
+            )
+            trace_record["mailbox_verify_seq_ids"] = list(verify_result.seq_ids)
+            trace_record["mailbox_verify_accepted_lengths_by_seq"] = dict(verify_result.accepted_lengths_by_seq)
+            trace_record["mailbox_verify_rejected_seq_ids"] = list(verify_result.rejected_seq_ids)
+            trace_record["mailbox_verify_total_accepted_tokens"] = int(verify_result.total_accepted_tokens)
+            trace_record["mailbox_verify_total_rejected_tokens"] = int(verify_result.total_rejected_tokens)
+            trace_record["mailbox_verify_invalidated_payload_count"] = len(verify_result.invalidated_mailbox_payload_ids)
+            apply_plan = build_mailbox_verify_apply_plan(
+                verify_result,
+                exec_seqs,
+                step_plan,
+                max_model_len=getattr(self.global_config, "max_model_len", None),
+                state_mutation_allowed=False,
+            )
+            trace_record["mailbox_verify_apply_plan_built"] = True
+            trace_record["mailbox_verify_payloads_to_consume_count"] = len(apply_plan.mailbox_payloads_to_consume)
+            trace_record["mailbox_verify_payloads_to_invalidate_count"] = len(apply_plan.mailbox_payloads_to_invalidate)
+            trace_record["mailbox_verify_apply_plan_json"] = apply_plan.to_dict()
+            probe_result = run_mailbox_verify_apply_no_commit_probe(apply_plan, exec_seqs)
+            trace_record["mailbox_verify_apply_probe_success"] = bool(probe_result.success)
+            trace_record["mailbox_forward_state_mutation_attempted"] = bool(probe_result.state_mutation_attempted)
+            trace_record["mailbox_forward_state_mutation_committed"] = bool(probe_result.state_mutation_committed)
+            trace_record["mailbox_forward_state_mutation_rollback_success"] = bool(probe_result.state_mutation_rollback_success)
+            if not probe_result.success:
+                trace_record["mailbox_verify_apply_error"] = probe_result.error_message
+                trace_record["mailbox_verify_apply_error_kind"] = probe_result.error_kind
+                trace_record["next_required_feature"] = probe_result.next_required_feature or "mailbox_verify_apply_plan_validation"
+                raise RuntimeError(
+                    f"mailbox verify apply no-commit probe failed; plan_id={step_plan.plan_id}, "
+                    f"target_seq_ids={input_seq_ids}, error={probe_result.error_message}; "
+                    f"next_required_feature={trace_record['next_required_feature']}"
+                )
+        except MailboxVerifyApplyError as exc:
+            trace_record["mailbox_verify_apply_error"] = str(exc)
+            trace_record["mailbox_verify_apply_error_kind"] = exc.error_kind
+            trace_record["next_required_feature"] = exc.next_required_feature
+            raise RuntimeError(str(exc)) from exc
+
+        if trace_record.get("mailbox_verify_result_metadata_only"):
+            message = "mailbox verify token decision backend is not implemented for no-commit apply probe"
+            trace_record["mailbox_verify_apply_error"] = message
+            trace_record["mailbox_verify_apply_error_kind"] = "mailbox_verify_token_decision_backend"
+            trace_record["next_required_feature"] = "mailbox_verify_token_decision_backend"
+            raise RuntimeError(f"{message}; next_required_feature=mailbox_verify_token_decision_backend")
+
+        trace_record["mailbox_verify_apply_success"] = True
+        message = "mailbox verify no-commit apply probe succeeded; state commit after mailbox verify is not implemented"
         trace_record["mailbox_verify_apply_error"] = message
-        trace_record["next_required_feature"] = "mailbox_verify_apply_path"
-        raise RuntimeError(f"{message}; next_required_feature=mailbox_verify_apply_path")
+        trace_record["next_required_feature"] = "state_commit_after_mailbox_verify"
+        raise RuntimeError(f"{message}; next_required_feature=state_commit_after_mailbox_verify")
 
     def _prepare_stspec_mailbox_route(
         self,

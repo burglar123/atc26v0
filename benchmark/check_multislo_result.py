@@ -213,6 +213,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_verify_apply_attempt_count = 0
     mailbox_verify_apply_success_count = 0
     mailbox_verify_apply_error_count = 0
+    mailbox_verify_apply_plan_built_count = 0
+    mailbox_verify_apply_probe_success_count = 0
+    mailbox_verify_token_decision_attempt_count = 0
+    mailbox_verify_token_decision_success_count = 0
+    mailbox_verify_total_accepted_tokens_count = 0
+    mailbox_verify_total_rejected_tokens_count = 0
+    mailbox_verify_invalidated_payload_count = 0
     mailbox_forward_state_mutation_attempt_count = 0
     mailbox_forward_state_mutation_committed_count = 0
     mailbox_forward_state_mutation_rollback_success_count = 0
@@ -499,6 +506,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         mailbox_verify_apply_attempt_count += int(row.get("mailbox_verify_apply_attempt_count") or 0)
         mailbox_verify_apply_success_count += int(row.get("mailbox_verify_apply_success_count") or 0)
         mailbox_verify_apply_error_count += int(row.get("mailbox_verify_apply_error_count") or 0)
+        mailbox_verify_apply_plan_built_count += int(row.get("mailbox_verify_apply_plan_built_count") or 0)
+        mailbox_verify_apply_probe_success_count += int(row.get("mailbox_verify_apply_probe_success_count") or 0)
+        mailbox_verify_token_decision_attempt_count += int(row.get("mailbox_verify_token_decision_attempt_count") or 0)
+        mailbox_verify_token_decision_success_count += int(row.get("mailbox_verify_token_decision_success_count") or 0)
+        mailbox_verify_total_accepted_tokens_count += int(row.get("mailbox_verify_total_accepted_tokens") or 0)
+        mailbox_verify_total_rejected_tokens_count += int(row.get("mailbox_verify_total_rejected_tokens") or 0)
+        mailbox_verify_invalidated_payload_count += int(row.get("mailbox_verify_invalidated_payload_count") or 0)
         mailbox_forward_state_mutation_attempt_count += int(row.get("mailbox_forward_state_mutation_attempt_count") or 0)
         mailbox_forward_state_mutation_committed_count += int(row.get("mailbox_forward_state_mutation_committed_count") or row.get("mailbox_forward_state_mutation_commit_count") or 0)
         mailbox_forward_state_mutation_rollback_success_count += int(row.get("mailbox_forward_state_mutation_rollback_success_count") or 0)
@@ -594,6 +608,17 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             mailbox_verify_apply_success_count += 1
         if row.get("mailbox_verify_apply_error"):
             mailbox_verify_apply_error_count += 1
+        if row.get("mailbox_verify_apply_plan_built"):
+            mailbox_verify_apply_plan_built_count += 1
+        if row.get("mailbox_verify_apply_probe_success"):
+            mailbox_verify_apply_probe_success_count += 1
+        if row.get("mailbox_verify_token_decision_attempted"):
+            mailbox_verify_token_decision_attempt_count += 1
+        if row.get("mailbox_verify_token_decision_success"):
+            mailbox_verify_token_decision_success_count += 1
+        mailbox_verify_total_accepted_tokens_count += int(row.get("mailbox_verify_total_accepted_tokens") or 0)
+        mailbox_verify_total_rejected_tokens_count += int(row.get("mailbox_verify_total_rejected_tokens") or 0)
+        mailbox_verify_invalidated_payload_count += int(row.get("mailbox_verify_invalidated_payload_count") or 0)
         if row.get("mailbox_forward_state_mutation_attempted"):
             mailbox_forward_state_mutation_attempt_count += 1
         if row.get("mailbox_forward_state_mutation_committed"):
@@ -745,6 +770,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_verify_apply_attempt_count": mailbox_verify_apply_attempt_count,
         "mailbox_verify_apply_success_count": mailbox_verify_apply_success_count,
         "mailbox_verify_apply_error_count": mailbox_verify_apply_error_count,
+        "mailbox_verify_apply_plan_built_count": mailbox_verify_apply_plan_built_count,
+        "mailbox_verify_apply_probe_success_count": mailbox_verify_apply_probe_success_count,
+        "mailbox_verify_token_decision_attempt_count": mailbox_verify_token_decision_attempt_count,
+        "mailbox_verify_token_decision_success_count": mailbox_verify_token_decision_success_count,
+        "mailbox_verify_total_accepted_tokens": mailbox_verify_total_accepted_tokens_count,
+        "mailbox_verify_total_rejected_tokens": mailbox_verify_total_rejected_tokens_count,
+        "mailbox_verify_invalidated_payload_count": mailbox_verify_invalidated_payload_count,
         "mailbox_forward_state_mutation_attempt_count": mailbox_forward_state_mutation_attempt_count,
         "mailbox_forward_state_mutation_committed_count": mailbox_forward_state_mutation_committed_count,
         "mailbox_forward_state_mutation_commit_count": mailbox_forward_state_mutation_committed_count,
@@ -1035,6 +1067,13 @@ def summarize(path: Path) -> int:
     print(f"mailbox verify apply attempts: {plan_summary['mailbox_verify_apply_attempt_count']}")
     print(f"mailbox verify apply successes: {plan_summary['mailbox_verify_apply_success_count']}")
     print(f"mailbox verify apply errors: {plan_summary['mailbox_verify_apply_error_count']}")
+    print(f"mailbox verify apply plan built count: {plan_summary['mailbox_verify_apply_plan_built_count']}")
+    print(f"mailbox verify apply no-commit probe successes: {plan_summary['mailbox_verify_apply_probe_success_count']}")
+    print(f"mailbox verify token decision attempts: {plan_summary['mailbox_verify_token_decision_attempt_count']}")
+    print(f"mailbox verify token decision successes: {plan_summary['mailbox_verify_token_decision_success_count']}")
+    print(f"mailbox verify accepted tokens: {plan_summary['mailbox_verify_total_accepted_tokens']}")
+    print(f"mailbox verify rejected tokens: {plan_summary['mailbox_verify_total_rejected_tokens']}")
+    print(f"mailbox verify invalidated payload count: {plan_summary['mailbox_verify_invalidated_payload_count']}")
     print(f"mailbox forward state mutation attempts: {plan_summary['mailbox_forward_state_mutation_attempt_count']}")
     print(f"mailbox forward state mutation commits: {plan_summary['mailbox_forward_state_mutation_committed_count']}")
     print(f"mailbox forward state mutation rollback successes: {plan_summary['mailbox_forward_state_mutation_rollback_success_count']}")

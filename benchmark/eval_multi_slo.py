@@ -785,6 +785,13 @@ def aggregate_low_level_traces(
         mailbox_verify_apply_attempt_count = 0
         mailbox_verify_apply_success_count = 0
         mailbox_verify_apply_error_count = 0
+        mailbox_verify_apply_plan_built_count = 0
+        mailbox_verify_apply_probe_success_count = 0
+        mailbox_verify_token_decision_attempt_count = 0
+        mailbox_verify_token_decision_success_count = 0
+        mailbox_verify_total_accepted_tokens_count = 0
+        mailbox_verify_total_rejected_tokens_count = 0
+        mailbox_verify_invalidated_payload_count = 0
         mailbox_forward_state_mutation_attempt_count = 0
         mailbox_forward_state_mutation_committed_count = 0
         mailbox_forward_state_mutation_rollback_success_count = 0
@@ -1003,6 +1010,17 @@ def aggregate_low_level_traces(
                 mailbox_verify_apply_success_count += 1
             if e.get("mailbox_verify_apply_error"):
                 mailbox_verify_apply_error_count += 1
+            if e.get("mailbox_verify_apply_plan_built"):
+                mailbox_verify_apply_plan_built_count += 1
+            if e.get("mailbox_verify_apply_probe_success"):
+                mailbox_verify_apply_probe_success_count += 1
+            if e.get("mailbox_verify_token_decision_attempted"):
+                mailbox_verify_token_decision_attempt_count += 1
+            if e.get("mailbox_verify_token_decision_success"):
+                mailbox_verify_token_decision_success_count += 1
+            mailbox_verify_total_accepted_tokens_count += int(e.get("mailbox_verify_total_accepted_tokens") or 0)
+            mailbox_verify_total_rejected_tokens_count += int(e.get("mailbox_verify_total_rejected_tokens") or 0)
+            mailbox_verify_invalidated_payload_count += int(e.get("mailbox_verify_invalidated_payload_count") or 0)
             if e.get("mailbox_forward_state_mutation_attempted"):
                 mailbox_forward_state_mutation_attempt_count += 1
             if e.get("mailbox_forward_state_mutation_committed"):
@@ -1240,6 +1258,13 @@ def aggregate_low_level_traces(
         row["mailbox_verify_apply_attempt_count"] = mailbox_verify_apply_attempt_count
         row["mailbox_verify_apply_success_count"] = mailbox_verify_apply_success_count
         row["mailbox_verify_apply_error_count"] = mailbox_verify_apply_error_count
+        row["mailbox_verify_apply_plan_built_count"] = mailbox_verify_apply_plan_built_count
+        row["mailbox_verify_apply_probe_success_count"] = mailbox_verify_apply_probe_success_count
+        row["mailbox_verify_token_decision_attempt_count"] = mailbox_verify_token_decision_attempt_count
+        row["mailbox_verify_token_decision_success_count"] = mailbox_verify_token_decision_success_count
+        row["mailbox_verify_total_accepted_tokens"] = mailbox_verify_total_accepted_tokens_count
+        row["mailbox_verify_total_rejected_tokens"] = mailbox_verify_total_rejected_tokens_count
+        row["mailbox_verify_invalidated_payload_count"] = mailbox_verify_invalidated_payload_count
         row["mailbox_forward_state_mutation_attempt_count"] = mailbox_forward_state_mutation_attempt_count
         row["mailbox_forward_state_mutation_committed_count"] = mailbox_forward_state_mutation_committed_count
         row["mailbox_forward_state_mutation_commit_count"] = mailbox_forward_state_mutation_committed_count
