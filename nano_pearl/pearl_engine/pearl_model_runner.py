@@ -65,6 +65,7 @@ from nano_pearl.pearl_engine.stspec_kv_sync import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_forward_context import (
     build_target_forward_context_from_mailbox_input,
+    classify_target_tp_rank_role_for_mailbox_forward,
     normalize_target_forward_from_mailbox_output,
     validate_target_forward_mailbox_context,
 )
@@ -599,6 +600,23 @@ class ModelRunnerBase:
             "mailbox_payload_tensor_total_tokens": 0,
             "mailbox_payload_tensor_shape": [],
             "mailbox_payload_tensor_device": None,
+            "mailbox_payload_envelope_available": False,
+            "mailbox_payload_token_ids_available": False,
+            "mailbox_payload_tensor_available": False,
+            "mailbox_payload_available_for_seq_ids": False,
+            "mailbox_payload_local_to_rank": False,
+            "mailbox_payload_owner_rank": None,
+            "mailbox_payload_current_rank": None,
+            "mailbox_payload_missing_reason": None,
+            "target_tp_current_rank": None,
+            "target_tp_output_owner_rank": None,
+            "target_tp_is_output_owner": False,
+            "target_tp_is_payload_owner": False,
+            "target_tp_should_run_forward": False,
+            "target_tp_should_interpret_output": False,
+            "target_tp_should_apply_verify_result": False,
+            "target_tp_skipped_non_owner": False,
+            "mailbox_verify_apply_skipped_non_owner": False,
             "mailbox_warmup_skip": False,
             "target_verify_skipped_for_warmup": False,
             "target_consume_from_mailbox_attempted": False,
@@ -1205,8 +1223,12 @@ class ModelRunnerBase:
         if output.output_none_expected and not output.output_available:
             trace_record["target_forward_output_normalization_success"] = True
             trace_record["output_interpretation_skipped_non_owner"] = True
+            trace_record["mailbox_verify_apply_skipped_non_owner"] = True
+            trace_record["target_tp_skipped_non_owner"] = True
             trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = False
             trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
+            trace_record["mailbox_verify_apply_attempted"] = False
+            trace_record["mailbox_verify_apply_success"] = False
             return
         if not output.can_interpret:
             trace_record["target_forward_output_normalization_error"] = output.error_message
@@ -1293,6 +1315,17 @@ class ModelRunnerBase:
         trace_record["mailbox_transport_payload_available"] = False
 
         target_seq_ids = list(step_plan.actual_target_exec_seq_ids)
+        target_tp_role = classify_target_tp_rank_role_for_mailbox_forward(self)
+        trace_record["target_tp_current_rank"] = target_tp_role.current_rank
+        trace_record["target_tp_output_owner_rank"] = target_tp_role.owner_rank
+        trace_record["target_tp_is_output_owner"] = target_tp_role.is_output_owner
+        trace_record["target_tp_is_payload_owner"] = target_tp_role.is_payload_owner
+        trace_record["target_tp_should_run_forward"] = target_tp_role.should_run_target_forward
+        trace_record["target_tp_should_interpret_output"] = target_tp_role.should_interpret_output
+        trace_record["target_tp_should_apply_verify_result"] = target_tp_role.should_apply_verify_result
+        trace_record["target_tp_skipped_non_owner"] = False
+        trace_record["mailbox_payload_owner_rank"] = target_tp_role.owner_rank
+        trace_record["mailbox_payload_current_rank"] = target_tp_role.current_rank
         if (
             step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value
             and step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
@@ -1313,6 +1346,14 @@ class ModelRunnerBase:
         trace_record["mailbox_get_seq_ids"] = target_seq_ids
         trace_record["mailbox_missing_seq_ids"] = list(result.missing_seq_ids)
         self._trace_mailbox_availability(trace_record)
+        available_by_batch = trace_record.get("mailbox_available_seq_ids_by_batch") or {}
+        available_seq_ids = [int(seq_id) for seq_id in available_by_batch.get(str(step_plan.target_home_batch_id), [])]
+        payload_available_for_seq_ids = all(int(seq_id) in set(available_seq_ids) for seq_id in target_seq_ids)
+        trace_record["mailbox_payload_envelope_available"] = step_plan.target_home_batch_id in self.stspec_mailbox.available_home_batch_ids()
+        trace_record["mailbox_payload_available_for_seq_ids"] = payload_available_for_seq_ids
+        trace_record["mailbox_payload_missing_reason"] = None if result.success else (
+            "missing_seq_ids" if result.missing_seq_ids else "payload_metadata_available_but_local_payload_unavailable"
+        )
         if result.success:
             payload_seq_ids = [int(payload.seq_id) for payload in result.payloads]
             payload_home_batch_ids = {payload.home_batch_id for payload in result.payloads}
@@ -1336,9 +1377,16 @@ class ModelRunnerBase:
                 )
             trace_record["mailbox_transport_recv_success"] = True
             trace_record["mailbox_transport_recv_seq_ids"] = target_seq_ids
-            trace_record["mailbox_transport_payload_available"] = all(
+            token_ids_available = all(
                 len(payload.draft_token_ids) == int(payload.per_seq_length) for payload in result.payloads
             )
+            trace_record["mailbox_transport_payload_available"] = token_ids_available
+            trace_record["mailbox_payload_envelope_available"] = True
+            trace_record["mailbox_payload_token_ids_available"] = token_ids_available
+            trace_record["mailbox_payload_tensor_available"] = token_ids_available
+            trace_record["mailbox_payload_available_for_seq_ids"] = True
+            trace_record["mailbox_payload_local_to_rank"] = token_ids_available
+            trace_record["mailbox_payload_missing_reason"] = None if token_ids_available else "mailbox_payload_token_ids_unavailable"
             trace_record["mailbox_routing_ok"] = True
             trace_record["mailbox_error"] = None
             trace_record["mailbox_error_kind"] = None
@@ -1351,6 +1399,31 @@ class ModelRunnerBase:
             )
             trace_record["target_consume_from_mailbox_payload_home_batch_id"] = step_plan.target_home_batch_id
             trace_record["target_consume_from_mailbox_error"] = None
+            if not token_ids_available:
+                if target_tp_role.should_skip_non_owner:
+                    trace_record["target_tp_skipped_non_owner"] = True
+                    trace_record["output_interpretation_skipped_non_owner"] = True
+                    trace_record["mailbox_verify_apply_skipped_non_owner"] = True
+                    trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_unavailable_on_non_owner"
+                    trace_record["target_forward_output_none_expected"] = True
+                    return
+                message = "ST-Spec mailbox payload tensor unavailable on output owner rank"
+                trace_record["target_consume_from_mailbox_success"] = False
+                trace_record["target_consume_from_mailbox_error"] = message
+                self._record_mailbox_transport_error(
+                    trace_record,
+                    kind="mailbox_payload_tensor_backend_unavailable",
+                    message=message,
+                    next_required_feature="mailbox_payload_tensor_backend",
+                )
+                trace_record["next_required_feature"] = "mailbox_payload_tensor_backend"
+                raise RuntimeError(
+                    f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
+                    f"owner_rank={target_tp_role.owner_rank}, current_rank={target_tp_role.current_rank}, "
+                    f"target_home_batch_id={step_plan.target_home_batch_id}, target_seq_ids={target_seq_ids}, "
+                    f"available_mailbox_seq_ids_by_batch={trace_record['mailbox_available_seq_ids_by_batch']}, "
+                    "next_required_feature=mailbox_payload_tensor_backend"
+                )
             trace_record["verification_input_from_mailbox_attempted"] = True
             verification_input = build_verification_input_from_mailbox_payload(
                 result.payloads, exec_seqs or [], step_plan, self.gamma
@@ -1365,6 +1438,7 @@ class ModelRunnerBase:
                 step_plan,
                 trace_record,
             )
+            return
 
         error_kind, next_feature, warmup_miss = classify_mailbox_miss(
             target_home_batch_id=step_plan.target_home_batch_id,
@@ -1373,6 +1447,18 @@ class ModelRunnerBase:
         )
         if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value and warmup_miss:
             error_kind, next_feature, warmup_miss = "mailbox_missing_payload", "mailbox_payload_tensor_transport", False
+        if not result.missing_seq_ids and payload_available_for_seq_ids and not result.success:
+            trace_record["mailbox_payload_envelope_available"] = True
+            trace_record["mailbox_payload_available_for_seq_ids"] = True
+            if target_tp_role.should_skip_non_owner:
+                trace_record["target_tp_skipped_non_owner"] = True
+                trace_record["output_interpretation_skipped_non_owner"] = True
+                trace_record["mailbox_verify_apply_skipped_non_owner"] = True
+                trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_unavailable_on_non_owner"
+                trace_record["target_forward_output_none_expected"] = True
+                return
+            error_kind, next_feature, warmup_miss = "mailbox_payload_tensor_backend_unavailable", "mailbox_payload_tensor_backend", False
+            trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_backend_unavailable"
         if warmup_miss and should_skip_target_for_warmup(
             phase=step_plan.stspec_pipeline_phase,
             runner_role=runner_role,

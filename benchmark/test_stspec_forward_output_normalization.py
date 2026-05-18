@@ -150,3 +150,15 @@ def test_unsupported_output_type_fails_with_normalization_feature():
     assert output.can_interpret is False
     assert output.next_required_feature == "target_forward_output_normalization"
     assert output.error_kind == "target_forward_output_normalization"
+
+
+def test_target_tp_mailbox_role_classification_json():
+    role = context_mod.classify_target_tp_rank_role_for_mailbox_forward(make_runner(local_rank=1, rank=11))
+
+    assert role.is_output_owner is False
+    assert role.is_payload_owner is False
+    assert role.should_run_target_forward is True
+    assert role.should_interpret_output is False
+    assert role.should_apply_verify_result is False
+    assert role.should_skip_non_owner is True
+    json.dumps(role.to_dict(), sort_keys=True)

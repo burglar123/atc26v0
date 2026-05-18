@@ -770,7 +770,15 @@ def aggregate_low_level_traces(
         target_forward_output_none_expected_count = 0
         target_forward_output_none_unexpected_count = 0
         target_forward_output_owner_ranks: List[int] = []
+        target_tp_skipped_non_owner_count = 0
+        mailbox_payload_envelope_available_count = 0
+        mailbox_payload_token_ids_available_count = 0
+        mailbox_payload_tensor_available_count = 0
+        mailbox_payload_missing_reasons: List[str] = []
+        mailbox_missing_payload_count = 0
+        mailbox_verify_apply_path_count = 0
         output_interpretation_skipped_non_owner_count = 0
+        mailbox_verify_apply_skipped_non_owner_count = 0
         output_interpretation_attempt_count = 0
         output_interpretation_success_count = 0
         output_interpretation_error_count = 0
@@ -966,8 +974,23 @@ def aggregate_low_level_traces(
             owner_rank = to_int(e.get("target_forward_output_owner_rank"))
             if owner_rank is not None:
                 append_unique(target_forward_output_owner_ranks, owner_rank)
+            if e.get("target_tp_skipped_non_owner"):
+                target_tp_skipped_non_owner_count += 1
+            if e.get("mailbox_payload_envelope_available"):
+                mailbox_payload_envelope_available_count += 1
+            if e.get("mailbox_payload_token_ids_available"):
+                mailbox_payload_token_ids_available_count += 1
+            if e.get("mailbox_payload_tensor_available"):
+                mailbox_payload_tensor_available_count += 1
+            append_unique(mailbox_payload_missing_reasons, e.get("mailbox_payload_missing_reason"))
+            if e.get("mailbox_error_kind") == "mailbox_missing_payload":
+                mailbox_missing_payload_count += 1
+            if e.get("next_required_feature") == "mailbox_verify_apply_path":
+                mailbox_verify_apply_path_count += 1
             if e.get("output_interpretation_skipped_non_owner"):
                 output_interpretation_skipped_non_owner_count += 1
+            if e.get("mailbox_verify_apply_skipped_non_owner"):
+                mailbox_verify_apply_skipped_non_owner_count += 1
             if e.get("target_forward_from_mailbox_output_interpretation_attempted"):
                 output_interpretation_attempt_count += 1
             if e.get("target_forward_from_mailbox_output_interpretation_success"):
@@ -1200,7 +1223,17 @@ def aggregate_low_level_traces(
         row["target_forward_output_none_unexpected_count"] = target_forward_output_none_unexpected_count
         if target_forward_output_owner_ranks:
             row["target_forward_output_owner_ranks"] = target_forward_output_owner_ranks
+            row["target_tp_owner_ranks_seen"] = target_forward_output_owner_ranks
+        row["target_tp_skipped_non_owner_count"] = target_tp_skipped_non_owner_count
+        row["mailbox_payload_envelope_available_count"] = mailbox_payload_envelope_available_count
+        row["mailbox_payload_token_ids_available_count"] = mailbox_payload_token_ids_available_count
+        row["mailbox_payload_tensor_available_count"] = mailbox_payload_tensor_available_count
+        if mailbox_payload_missing_reasons:
+            row["mailbox_payload_missing_reasons"] = mailbox_payload_missing_reasons
+        row["mailbox_missing_payload_count"] = mailbox_missing_payload_count
+        row["mailbox_verify_apply_path_count"] = mailbox_verify_apply_path_count
         row["output_interpretation_skipped_non_owner_count"] = output_interpretation_skipped_non_owner_count
+        row["mailbox_verify_apply_skipped_non_owner_count"] = mailbox_verify_apply_skipped_non_owner_count
         row["output_interpretation_attempt_count"] = output_interpretation_attempt_count
         row["output_interpretation_success_count"] = output_interpretation_success_count
         row["output_interpretation_error_count"] = output_interpretation_error_count

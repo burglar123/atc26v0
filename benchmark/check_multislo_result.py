@@ -196,7 +196,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     target_forward_output_none_expected_count = 0
     target_forward_output_none_unexpected_count = 0
     target_forward_output_owner_ranks = set()
+    target_tp_skipped_non_owner_count = 0
+    mailbox_payload_envelope_available_count = 0
+    mailbox_payload_token_ids_available_count = 0
+    mailbox_payload_tensor_available_count = 0
+    mailbox_payload_missing_reasons = set()
+    mailbox_missing_payload_count = 0
+    mailbox_verify_apply_path_count = 0
     output_interpretation_skipped_non_owner_count = 0
+    mailbox_verify_apply_skipped_non_owner_count = 0
     output_interpretation_attempt_count = 0
     output_interpretation_success_count = 0
     output_interpretation_error_count = 0
@@ -467,8 +475,18 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         target_forward_output_normalization_error_count += int(row.get("target_forward_output_normalization_error_count") or 0)
         target_forward_output_none_expected_count += int(row.get("target_forward_output_none_expected_count") or 0)
         target_forward_output_none_unexpected_count += int(row.get("target_forward_output_none_unexpected_count") or 0)
+        target_tp_skipped_non_owner_count += int(row.get("target_tp_skipped_non_owner_count") or 0)
+        mailbox_payload_envelope_available_count += int(row.get("mailbox_payload_envelope_available_count") or 0)
+        mailbox_payload_token_ids_available_count += int(row.get("mailbox_payload_token_ids_available_count") or 0)
+        mailbox_payload_tensor_available_count += int(row.get("mailbox_payload_tensor_available_count") or 0)
+        for value in values_from_mapping(row.get("mailbox_payload_missing_reasons")):
+            if value:
+                mailbox_payload_missing_reasons.add(value)
+        mailbox_missing_payload_count += int(row.get("mailbox_missing_payload_count") or 0)
+        mailbox_verify_apply_path_count += int(row.get("mailbox_verify_apply_path_count") or 0)
         output_interpretation_skipped_non_owner_count += int(row.get("output_interpretation_skipped_non_owner_count") or 0)
-        for value in values_from_mapping(row.get("target_forward_output_owner_ranks")):
+        mailbox_verify_apply_skipped_non_owner_count += int(row.get("mailbox_verify_apply_skipped_non_owner_count") or 0)
+        for value in values_from_mapping(row.get("target_forward_output_owner_ranks") or row.get("target_tp_owner_ranks_seen")):
             if value is not None:
                 target_forward_output_owner_ranks.add(value)
         output_interpretation_attempt_count += int(row.get("output_interpretation_attempt_count") or 0)
@@ -538,8 +556,24 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             target_forward_output_none_unexpected_count += 1
         if row.get("target_forward_output_owner_rank") is not None:
             target_forward_output_owner_ranks.add(row.get("target_forward_output_owner_rank"))
+        if row.get("target_tp_skipped_non_owner"):
+            target_tp_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_envelope_available"):
+            mailbox_payload_envelope_available_count += 1
+        if row.get("mailbox_payload_token_ids_available"):
+            mailbox_payload_token_ids_available_count += 1
+        if row.get("mailbox_payload_tensor_available"):
+            mailbox_payload_tensor_available_count += 1
+        if row.get("mailbox_payload_missing_reason"):
+            mailbox_payload_missing_reasons.add(row.get("mailbox_payload_missing_reason"))
+        if row.get("mailbox_error_kind") == "mailbox_missing_payload":
+            mailbox_missing_payload_count += 1
+        if row.get("next_required_feature") == "mailbox_verify_apply_path":
+            mailbox_verify_apply_path_count += 1
         if row.get("output_interpretation_skipped_non_owner"):
             output_interpretation_skipped_non_owner_count += 1
+        if row.get("mailbox_verify_apply_skipped_non_owner"):
+            mailbox_verify_apply_skipped_non_owner_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_attempted"):
             output_interpretation_attempt_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_success"):
@@ -685,7 +719,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "target_forward_output_none_expected_count": target_forward_output_none_expected_count,
         "target_forward_output_none_unexpected_count": target_forward_output_none_unexpected_count,
         "target_forward_output_owner_ranks": sorted(target_forward_output_owner_ranks, key=str),
+        "target_tp_owner_ranks_seen": sorted(target_forward_output_owner_ranks, key=str),
+        "target_tp_skipped_non_owner_count": target_tp_skipped_non_owner_count,
+        "mailbox_payload_envelope_available_count": mailbox_payload_envelope_available_count,
+        "mailbox_payload_token_ids_available_count": mailbox_payload_token_ids_available_count,
+        "mailbox_payload_tensor_available_count": mailbox_payload_tensor_available_count,
+        "mailbox_payload_missing_reasons": sorted(mailbox_payload_missing_reasons, key=str),
+        "mailbox_missing_payload_count": mailbox_missing_payload_count,
+        "mailbox_verify_apply_path_count": mailbox_verify_apply_path_count,
         "output_interpretation_skipped_non_owner_count": output_interpretation_skipped_non_owner_count,
+        "mailbox_verify_apply_skipped_non_owner_count": mailbox_verify_apply_skipped_non_owner_count,
         "output_interpretation_attempt_count": output_interpretation_attempt_count,
         "output_interpretation_success_count": output_interpretation_success_count,
         "output_interpretation_error_count": output_interpretation_error_count,
@@ -963,9 +1006,17 @@ def summarize(path: Path) -> int:
     print(f"target forward output normalization successes: {plan_summary['target_forward_output_normalization_success_count']}")
     print(f"target forward output normalization errors: {plan_summary['target_forward_output_normalization_error_count']}")
     print(f"target forward output owner ranks seen: {plan_summary['target_forward_output_owner_ranks']}")
+    print(f"target TP non-owner skip count: {plan_summary['target_tp_skipped_non_owner_count']}")
+    print(f"mailbox payload envelope available count: {plan_summary['mailbox_payload_envelope_available_count']}")
+    print(f"mailbox payload token ids available count: {plan_summary['mailbox_payload_token_ids_available_count']}")
+    print(f"mailbox payload tensor available count: {plan_summary['mailbox_payload_tensor_available_count']}")
+    print(f"mailbox payload missing reasons: {plan_summary['mailbox_payload_missing_reasons']}")
+    print(f"mailbox_missing_payload count: {plan_summary['mailbox_missing_payload_count']}")
+    print(f"mailbox_verify_apply_path count: {plan_summary['mailbox_verify_apply_path_count']}")
     print(f"target forward output none expected count: {plan_summary['target_forward_output_none_expected_count']}")
     print(f"target forward output none unexpected count: {plan_summary['target_forward_output_none_unexpected_count']}")
     print(f"output interpretation skipped non-owner count: {plan_summary['output_interpretation_skipped_non_owner_count']}")
+    print(f"mailbox verify apply skipped non-owner count: {plan_summary['mailbox_verify_apply_skipped_non_owner_count']}")
     print(f"output interpretation attempts: {plan_summary['output_interpretation_attempt_count']}")
     print(f"output interpretation successes: {plan_summary['output_interpretation_success_count']}")
     print(f"output interpretation errors: {plan_summary['output_interpretation_error_count']}")

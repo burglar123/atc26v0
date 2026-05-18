@@ -253,6 +253,54 @@ def _jsonable(value: Any) -> Any:
 
 
 @dataclass(frozen=True)
+class TargetTPMailboxRole:
+    is_output_owner: bool
+    is_payload_owner: bool
+    should_run_target_forward: bool
+    should_interpret_output: bool
+    should_apply_verify_result: bool
+    should_skip_non_owner: bool
+    owner_rank: int | None
+    current_rank: int | None
+    reason: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+def classify_target_tp_rank_role_for_mailbox_forward(runner_state: Any | None = None) -> TargetTPMailboxRole:
+    """Classify target TP role for mailbox-forward probe decisions.
+
+    nano-PEARL gathers logits to TP local rank 0.  All TP ranks may run the
+    forward backend, but only the owner rank should interpret logits or advance
+    the mailbox verify/apply probe boundary.
+    """
+
+    tp_params = getattr(runner_state, "tp_params", None)
+    group_config = getattr(runner_state, "group_config", None)
+    current_rank = getattr(runner_state, "rank", None)
+    current_rank = None if current_rank is None else int(current_rank)
+    owner_rank = target_forward_output_owner_rank(runner_state)
+    is_owner = is_target_forward_output_owner(
+        current_rank,
+        group_config,
+        tp_params,
+        runner_role="verify",
+    )
+    return TargetTPMailboxRole(
+        is_output_owner=is_owner,
+        is_payload_owner=is_owner,
+        should_run_target_forward=True,
+        should_interpret_output=is_owner,
+        should_apply_verify_result=is_owner,
+        should_skip_non_owner=not is_owner,
+        owner_rank=owner_rank,
+        current_rank=current_rank,
+        reason="output_owner" if is_owner else "non_owner_skip_interpret_apply",
+    )
+
+
+@dataclass(frozen=True)
 class TargetForwardMailboxOutput:
     output_available: bool
     output_owner: bool
@@ -525,3 +573,70 @@ def _is_tensor_like(value: Any) -> bool:
 
 def _shape_list(value: Any) -> list[int]:
     return [int(dim) for dim in list(getattr(value, "shape"))]
+
+
+def classify_mailbox_payload_availability(
+    *,
+    target_home_batch_id: int | str | None,
+    target_seq_ids: Iterable[int],
+    available_home_batch_ids: Iterable[int | str | None],
+    available_seq_ids_by_batch: dict[str, Iterable[int]] | None,
+    missing_seq_ids: Iterable[int],
+    payloads: Iterable[Any] | None = None,
+    is_payload_owner: bool = True,
+    owner_rank: int | None = None,
+    current_rank: int | None = None,
+) -> JsonDict:
+    """Classify mailbox payload availability without conflating metadata and tensors."""
+
+    seq_ids = [int(seq_id) for seq_id in target_seq_ids]
+    missing = [int(seq_id) for seq_id in missing_seq_ids]
+    available_batches = set(available_home_batch_ids)
+    available_by_batch = available_seq_ids_by_batch or {}
+    available_seq_ids = {int(seq_id) for seq_id in available_by_batch.get(str(target_home_batch_id), [])}
+    payload_list = list(payloads or [])
+    envelope_available = target_home_batch_id in available_batches
+    available_for_seq_ids = bool(seq_ids) and all(seq_id in available_seq_ids for seq_id in seq_ids)
+    token_ids_available = bool(payload_list) and all(
+        len(getattr(payload, "draft_token_ids", []) or []) == int(getattr(payload, "per_seq_length", 0) or 0)
+        for payload in payload_list
+    )
+    tensor_available = token_ids_available
+    missing_reason = None
+    error_kind = None
+    next_required_feature = None
+    should_skip_non_owner = False
+    if missing:
+        missing_reason = "missing_seq_ids"
+        error_kind = "mailbox_missing_payload"
+        next_required_feature = "mailbox_payload_tensor_transport"
+    elif not envelope_available:
+        missing_reason = "missing_home_batch"
+        error_kind = "mailbox_warmup_miss"
+        next_required_feature = "pipeline_warmup_schedule"
+    elif not available_for_seq_ids:
+        missing_reason = "seq_ids_not_available_in_home_batch"
+        error_kind = "mailbox_missing_payload"
+        next_required_feature = "mailbox_payload_tensor_transport"
+    elif not tensor_available:
+        if not is_payload_owner:
+            missing_reason = "mailbox_payload_tensor_unavailable_on_non_owner"
+            error_kind = "mailbox_payload_tensor_unavailable_on_non_owner"
+            should_skip_non_owner = True
+        else:
+            missing_reason = "mailbox_payload_tensor_backend_unavailable"
+            error_kind = "mailbox_payload_tensor_backend_unavailable"
+            next_required_feature = "mailbox_payload_tensor_backend"
+    return {
+        "mailbox_payload_envelope_available": envelope_available,
+        "mailbox_payload_token_ids_available": token_ids_available,
+        "mailbox_payload_tensor_available": tensor_available,
+        "mailbox_payload_available_for_seq_ids": available_for_seq_ids,
+        "mailbox_payload_local_to_rank": tensor_available,
+        "mailbox_payload_owner_rank": owner_rank,
+        "mailbox_payload_current_rank": current_rank,
+        "mailbox_payload_missing_reason": missing_reason,
+        "mailbox_error_kind": error_kind,
+        "next_required_feature": next_required_feature,
+        "should_skip_non_owner": should_skip_non_owner,
+    }
