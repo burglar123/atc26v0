@@ -751,6 +751,11 @@ def aggregate_low_level_traces(
         verification_input_from_mailbox_success_count = 0
         verification_input_from_mailbox_error_count = 0
         target_forward_from_mailbox_input_built_count = 0
+        target_forward_mailbox_context_build_count = 0
+        target_forward_mailbox_context_success_count = 0
+        target_forward_mailbox_context_error_count = 0
+        target_forward_mailbox_slot_mapping_available_count = 0
+        target_forward_mailbox_cannot_run_reasons: List[str] = []
         mailbox_kv_sync_plan_built_count = 0
         kv_state_sync_check_attempt_count = 0
         kv_state_sync_check_success_count = 0
@@ -917,6 +922,15 @@ def aggregate_low_level_traces(
                 verification_input_from_mailbox_error_count += 1
             if e.get("target_forward_from_mailbox_input_built"):
                 target_forward_from_mailbox_input_built_count += 1
+            if e.get("target_forward_mailbox_context_build_attempted"):
+                target_forward_mailbox_context_build_count += 1
+            if e.get("target_forward_mailbox_context_build_success"):
+                target_forward_mailbox_context_success_count += 1
+            if e.get("target_forward_mailbox_context_error"):
+                target_forward_mailbox_context_error_count += 1
+            if e.get("target_forward_mailbox_slot_mapping_available"):
+                target_forward_mailbox_slot_mapping_available_count += 1
+            append_unique(target_forward_mailbox_cannot_run_reasons, e.get("target_forward_mailbox_cannot_run_reason"))
             if e.get("mailbox_kv_sync_plan_built"):
                 mailbox_kv_sync_plan_built_count += 1
             append_unique(kv_state_sync_error_kinds, e.get("kv_state_sync_error_kind"))
@@ -1141,6 +1155,12 @@ def aggregate_low_level_traces(
         row["verification_input_from_mailbox_success_count"] = verification_input_from_mailbox_success_count
         row["verification_input_from_mailbox_error_count"] = verification_input_from_mailbox_error_count
         row["target_forward_from_mailbox_input_built_count"] = target_forward_from_mailbox_input_built_count
+        row["target_forward_mailbox_context_build_count"] = target_forward_mailbox_context_build_count
+        row["target_forward_mailbox_context_success_count"] = target_forward_mailbox_context_success_count
+        row["target_forward_mailbox_context_error_count"] = target_forward_mailbox_context_error_count
+        row["target_forward_mailbox_slot_mapping_available_count"] = target_forward_mailbox_slot_mapping_available_count
+        if target_forward_mailbox_cannot_run_reasons:
+            row["target_forward_mailbox_cannot_run_reasons"] = target_forward_mailbox_cannot_run_reasons
         row["mailbox_kv_sync_plan_built_count"] = mailbox_kv_sync_plan_built_count
         row["kv_state_sync_check_attempt_count"] = kv_state_sync_check_attempt_count
         row["kv_state_sync_check_success_count"] = kv_state_sync_check_success_count
@@ -1159,6 +1179,7 @@ def aggregate_low_level_traces(
         row["mailbox_verify_apply_error_count"] = mailbox_verify_apply_error_count
         row["mailbox_forward_state_mutation_attempt_count"] = mailbox_forward_state_mutation_attempt_count
         row["mailbox_forward_state_mutation_committed_count"] = mailbox_forward_state_mutation_committed_count
+        row["mailbox_forward_state_mutation_commit_count"] = mailbox_forward_state_mutation_committed_count
         row["mailbox_forward_state_mutation_rollback_success_count"] = mailbox_forward_state_mutation_rollback_success_count
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
