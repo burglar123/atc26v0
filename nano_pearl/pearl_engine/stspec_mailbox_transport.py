@@ -271,3 +271,218 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     return value
+
+
+@dataclass(frozen=True)
+class MailboxPayloadTensorEnvelope:
+    """JSON-traceable V4G token payload envelope.
+
+    The probe represents the payload as CPU/list token ids. Future backends can
+    replace this with a real tensor side channel while preserving the same
+    sequence/offset/home-batch validation contract.
+    """
+
+    payload_tensor_ids: list[int]
+    seq_ids: list[int]
+    request_ids: list[Any]
+    per_seq_lengths: list[int]
+    offsets: list[int]
+    total_tokens: int
+    home_batch_id: int | str | None
+    source_plan_id: int | None
+    source_runner_role: str | None
+    source_draft_home_batch_id: int | str | None
+    target_home_batch_id: int | str | None
+    gamma: int
+    layout_kind: str
+    protocol_version: int
+    logical_step: int | None = None
+    payload_device: str = "cpu"
+    payload_dtype: str = "int64"
+    payload_shape: list[int] = field(default_factory=list)
+    is_tensor_payload_available: bool = True
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), default=str)
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class VerificationInputMetadata:
+    seq_ids: list[int]
+    input_token_ids: list[int]
+    offsets: list[int]
+    per_seq_lengths: list[int]
+    total_tokens: int
+    attention_metadata_placeholders: dict[str, Any]
+    kv_positions_placeholders: dict[str, Any]
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+def encode_payload_tensor_envelope_from_payloads(
+    payloads: Iterable[MailboxPayload],
+    *,
+    home_batch_id: int | str | None,
+    source_plan_id: int | None = None,
+    source_runner_role: str | None = None,
+    source_draft_home_batch_id: int | str | None = None,
+    target_home_batch_id: int | str | None = None,
+    gamma: int | None = None,
+    logical_step: int | None = None,
+    payload_device: str = "cpu",
+    payload_dtype: str = "int64",
+) -> MailboxPayloadTensorEnvelope:
+    payload_list = list(payloads)
+    seq_ids = [int(payload.seq_id) for payload in payload_list]
+    request_ids = [payload.request_id for payload in payload_list]
+    per_seq_lengths = [int(payload.per_seq_length) for payload in payload_list]
+    offsets = build_offsets(per_seq_lengths)
+    token_ids: list[int] = []
+    for payload in payload_list:
+        token_ids.extend(int(token) for token in payload.draft_token_ids)
+    first = payload_list[0] if payload_list else None
+    envelope = MailboxPayloadTensorEnvelope(
+        payload_tensor_ids=token_ids,
+        seq_ids=seq_ids,
+        request_ids=request_ids,
+        per_seq_lengths=per_seq_lengths,
+        offsets=offsets,
+        total_tokens=sum(per_seq_lengths),
+        home_batch_id=home_batch_id,
+        source_plan_id=source_plan_id if source_plan_id is not None else (first.plan_id if first else None),
+        source_runner_role=source_runner_role if source_runner_role is not None else (first.producer_role if first else None),
+        source_draft_home_batch_id=source_draft_home_batch_id if source_draft_home_batch_id is not None else (first.draft_home_batch_id if first else None),
+        target_home_batch_id=target_home_batch_id if target_home_batch_id is not None else (first.target_home_batch_id if first else None),
+        gamma=int(gamma if gamma is not None else (first.gamma if first else 0)),
+        layout_kind=first.layout_kind if first else "variable_offsets",
+        protocol_version=int(first.protocol_version if first else 1),
+        logical_step=logical_step if logical_step is not None else (first.logical_step if first else None),
+        payload_device=payload_device,
+        payload_dtype=payload_dtype,
+        payload_shape=[len(token_ids)],
+        is_tensor_payload_available=True,
+    )
+    validate_payload_tensor_envelope(envelope)
+    return envelope
+
+
+def decode_payload_tensor_envelope(payload: MailboxPayloadTensorEnvelope | str | JsonDict) -> MailboxPayloadTensorEnvelope:
+    if isinstance(payload, MailboxPayloadTensorEnvelope):
+        envelope = payload
+    else:
+        data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        envelope = MailboxPayloadTensorEnvelope(**data)
+    validate_payload_tensor_envelope(envelope)
+    return envelope
+
+
+def validate_payload_tensor_envelope(envelope: MailboxPayloadTensorEnvelope) -> None:
+    if envelope.layout_kind != "variable_offsets":
+        raise RuntimeError(f"Mailbox payload tensor envelope requires variable_offsets layout, got {envelope.layout_kind!r}")
+    if len(envelope.seq_ids) != len(envelope.per_seq_lengths):
+        raise RuntimeError("Invalid mailbox payload tensor envelope; len(seq_ids) != len(per_seq_lengths)")
+    if envelope.request_ids and len(envelope.request_ids) != len(envelope.seq_ids):
+        raise RuntimeError("Invalid mailbox payload tensor envelope; len(request_ids) != len(seq_ids)")
+    if len(set(envelope.seq_ids)) != len(envelope.seq_ids):
+        raise RuntimeError(f"Invalid mailbox payload tensor envelope; duplicate seq_ids={envelope.seq_ids}")
+    validate_offsets(
+        [int(length) for length in envelope.per_seq_lengths],
+        [int(offset) for offset in envelope.offsets],
+        int(envelope.total_tokens),
+        message_type="mailbox_payload_tensor",
+        layout_kind=envelope.layout_kind,
+        seq_ids=[int(seq_id) for seq_id in envelope.seq_ids],
+    )
+    if envelope.is_tensor_payload_available and len(envelope.payload_tensor_ids) != int(envelope.total_tokens):
+        raise RuntimeError(
+            "Invalid mailbox payload tensor envelope; payload_tensor_ids length does not match total_tokens: "
+            f"payload_length={len(envelope.payload_tensor_ids)}, total_tokens={envelope.total_tokens}"
+        )
+
+
+def payload_tensor_envelope_to_mailbox_payloads(envelope: MailboxPayloadTensorEnvelope) -> list[MailboxPayload]:
+    validate_payload_tensor_envelope(envelope)
+    payloads: list[MailboxPayload] = []
+    for idx, seq_id in enumerate(envelope.seq_ids):
+        offset = int(envelope.offsets[idx])
+        length = int(envelope.per_seq_lengths[idx])
+        payloads.append(
+            MailboxPayload(
+                plan_id=envelope.source_plan_id,
+                producer_role=envelope.source_runner_role,
+                producer_home_batch_id=envelope.source_draft_home_batch_id,
+                target_home_batch_id=envelope.target_home_batch_id,
+                draft_home_batch_id=envelope.source_draft_home_batch_id,
+                seq_id=int(seq_id),
+                request_id=envelope.request_ids[idx] if idx < len(envelope.request_ids) else None,
+                home_batch_id=envelope.home_batch_id,
+                gamma=int(envelope.gamma),
+                layout_kind=envelope.layout_kind,
+                protocol_version=int(envelope.protocol_version),
+                draft_token_ids=list(envelope.payload_tensor_ids[offset : offset + length]),
+                per_seq_length=length,
+                offset=offset,
+                logical_step=envelope.logical_step,
+                producer_actual_exec_seq_ids=list(envelope.seq_ids),
+                producer_draft_message_seq_ids=list(envelope.seq_ids),
+                metadata={
+                    "mailbox_payload_tensor_digest": envelope.digest(),
+                    "payload_device": envelope.payload_device,
+                    "payload_dtype": envelope.payload_dtype,
+                    "payload_shape": list(envelope.payload_shape),
+                    "is_tensor_payload_available": envelope.is_tensor_payload_available,
+                },
+            )
+        )
+    return payloads
+
+
+def build_verification_input_from_mailbox_payload(
+    payloads: Iterable[MailboxPayload],
+    seqs: Iterable[Any],
+    step_plan: Any,
+    gamma: int,
+) -> VerificationInputMetadata:
+    payload_list = list(payloads)
+    seq_list = list(seqs)
+    expected_seq_ids = [int(seq.seq_id) for seq in seq_list]
+    payload_seq_ids = [int(payload.seq_id) for payload in payload_list]
+    if payload_seq_ids != expected_seq_ids:
+        raise RuntimeError(
+            "Mailbox verification input seq mismatch: "
+            f"expected_seq_ids={expected_seq_ids}, payload_seq_ids={payload_seq_ids}"
+        )
+    home_batch_ids = {payload.home_batch_id for payload in payload_list}
+    target_home_batch_id = getattr(step_plan, "target_home_batch_id", None)
+    if home_batch_ids != {target_home_batch_id}:
+        raise RuntimeError(
+            "Mailbox verification input home batch mismatch: "
+            f"target_home_batch_id={target_home_batch_id}, payload_home_batch_ids={home_batch_ids}"
+        )
+    lengths = [int(payload.per_seq_length) for payload in payload_list]
+    offsets = build_offsets(lengths)
+    input_token_ids: list[int] = []
+    for payload in payload_list:
+        if len(payload.draft_token_ids) != int(payload.per_seq_length):
+            raise RuntimeError(
+                "Mailbox verification input payload length mismatch: "
+                f"seq_id={payload.seq_id}, token_count={len(payload.draft_token_ids)}, per_seq_length={payload.per_seq_length}"
+            )
+        input_token_ids.extend(int(token) for token in payload.draft_token_ids)
+    validate_offsets(lengths, offsets, len(input_token_ids), message_type="verification_input_from_mailbox", layout_kind="variable_offsets", seq_ids=payload_seq_ids)
+    return VerificationInputMetadata(
+        seq_ids=payload_seq_ids,
+        input_token_ids=input_token_ids,
+        offsets=offsets,
+        per_seq_lengths=lengths,
+        total_tokens=len(input_token_ids),
+        attention_metadata_placeholders={"requires_attention_metadata_wiring": True, "gamma": int(gamma)},
+        kv_positions_placeholders={"requires_kv_position_wiring": True, "target_home_batch_id": target_home_batch_id},
+    )

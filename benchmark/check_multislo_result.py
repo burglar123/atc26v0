@@ -162,6 +162,10 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_transport_send_success_count = 0
     mailbox_transport_recv_success_count = 0
     mailbox_transport_error_kinds = set()
+    mailbox_payload_tensor_transport_attempt_count = 0
+    mailbox_payload_tensor_transport_success_count = 0
+    mailbox_payload_tensor_transport_error_count = 0
+    target_mailbox_insert_count = 0
     pipeline_phases_seen = set()
     warmup_draft_payload_produced_count = 0
     mailbox_warmup_skip_count = 0
@@ -172,6 +176,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     verification_input_from_mailbox_attempt_count = 0
     verification_input_from_mailbox_success_count = 0
     verification_input_from_mailbox_error_count = 0
+    target_forward_from_mailbox_attempt_count = 0
+    target_forward_from_mailbox_success_count = 0
+    target_forward_from_mailbox_error_count = 0
     illegal_legacy_fallback_count = 0
     raw_mailbox_transport_send_rows = 0
     raw_mailbox_transport_recv_rows = 0
@@ -201,6 +208,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "mailbox_transport_recv_attempted",
                 "target_consume_from_mailbox_attempted",
                 "stspec_pipeline_phase",
+                "mailbox_payload_tensor_transport_attempted",
             )
         )
         if not has_plan:
@@ -391,6 +399,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         warmup_draft_payload_produced_count += int(row.get("warmup_draft_payload_produced_count") or 0)
         if row.get("warmup_draft_payload_produced"):
             warmup_draft_payload_produced_count += 1
+        mailbox_payload_tensor_transport_attempt_count += int(row.get("mailbox_payload_tensor_transport_attempt_count") or 0)
+        mailbox_payload_tensor_transport_success_count += int(row.get("mailbox_payload_tensor_transport_success_count") or 0)
+        mailbox_payload_tensor_transport_error_count += int(row.get("mailbox_payload_tensor_transport_error_count") or 0)
+        target_mailbox_insert_count += int(row.get("target_mailbox_insert_count") or 0)
+        if row.get("mailbox_payload_tensor_transport_attempted"):
+            mailbox_payload_tensor_transport_attempt_count += 1
+        if row.get("mailbox_payload_tensor_transport_success"):
+            mailbox_payload_tensor_transport_success_count += 1
+        if row.get("mailbox_payload_tensor_transport_error"):
+            mailbox_payload_tensor_transport_error_count += 1
         mailbox_warmup_skip_count += int(row.get("mailbox_warmup_skip_count") or 0)
         target_verify_skipped_for_warmup_count += int(row.get("target_verify_skipped_for_warmup_count") or 0)
         target_consume_from_mailbox_attempt_count += int(row.get("target_consume_from_mailbox_attempt_count") or 0)
@@ -399,6 +417,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         verification_input_from_mailbox_attempt_count += int(row.get("verification_input_from_mailbox_attempt_count") or 0)
         verification_input_from_mailbox_success_count += int(row.get("verification_input_from_mailbox_success_count") or 0)
         verification_input_from_mailbox_error_count += int(row.get("verification_input_from_mailbox_error_count") or 0)
+        target_forward_from_mailbox_attempt_count += int(row.get("target_forward_from_mailbox_attempt_count") or 0)
+        target_forward_from_mailbox_success_count += int(row.get("target_forward_from_mailbox_success_count") or 0)
+        target_forward_from_mailbox_error_count += int(row.get("target_forward_from_mailbox_error_count") or 0)
         illegal_legacy_fallback_count += int(row.get("illegal_legacy_fallback_count") or 0)
         if row.get("mailbox_warmup_skip"):
             mailbox_warmup_skip_count += 1
@@ -417,6 +438,12 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             verification_input_from_mailbox_success_count += 1
         if row.get("verification_input_from_mailbox_error"):
             verification_input_from_mailbox_error_count += 1
+        if row.get("target_forward_from_mailbox_attempted"):
+            target_forward_from_mailbox_attempt_count += 1
+        if row.get("target_forward_from_mailbox_success"):
+            target_forward_from_mailbox_success_count += 1
+        if row.get("target_forward_from_mailbox_error"):
+            target_forward_from_mailbox_error_count += 1
         if row.get("illegal_legacy_fallback"):
             illegal_legacy_fallback_count += 1
         if row.get("next_required_feature"):
@@ -510,6 +537,10 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_transport_send_success_count": mailbox_transport_send_success_count,
         "mailbox_transport_recv_success_count": mailbox_transport_recv_success_count,
         "mailbox_transport_error_kinds": sorted(mailbox_transport_error_kinds, key=str),
+        "mailbox_payload_tensor_transport_attempt_count": mailbox_payload_tensor_transport_attempt_count,
+        "mailbox_payload_tensor_transport_success_count": mailbox_payload_tensor_transport_success_count,
+        "mailbox_payload_tensor_transport_error_count": mailbox_payload_tensor_transport_error_count,
+        "target_mailbox_insert_count": target_mailbox_insert_count,
         "pipeline_phases_seen": sorted(pipeline_phases_seen, key=str),
         "warmup_draft_payload_produced_count": warmup_draft_payload_produced_count,
         "mailbox_warmup_skip_count": mailbox_warmup_skip_count,
@@ -520,6 +551,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "verification_input_from_mailbox_attempt_count": verification_input_from_mailbox_attempt_count,
         "verification_input_from_mailbox_success_count": verification_input_from_mailbox_success_count,
         "verification_input_from_mailbox_error_count": verification_input_from_mailbox_error_count,
+        "target_forward_from_mailbox_attempt_count": target_forward_from_mailbox_attempt_count,
+        "target_forward_from_mailbox_success_count": target_forward_from_mailbox_success_count,
+        "target_forward_from_mailbox_error_count": target_forward_from_mailbox_error_count,
         "illegal_legacy_fallback_count": illegal_legacy_fallback_count,
         "raw_mailbox_transport_send_rows": raw_mailbox_transport_send_rows,
         "raw_mailbox_transport_recv_rows": raw_mailbox_transport_recv_rows,
@@ -755,6 +789,10 @@ def summarize(path: Path) -> int:
     print(f"mailbox transport send success count: {plan_summary['mailbox_transport_send_success_count']}")
     print(f"mailbox transport recv success count: {plan_summary['mailbox_transport_recv_success_count']}")
     print(f"mailbox transport error kinds: {plan_summary['mailbox_transport_error_kinds']}")
+    print(f"mailbox payload tensor transport attempts: {plan_summary['mailbox_payload_tensor_transport_attempt_count']}")
+    print(f"mailbox payload tensor transport successes: {plan_summary['mailbox_payload_tensor_transport_success_count']}")
+    print(f"mailbox payload tensor transport errors: {plan_summary['mailbox_payload_tensor_transport_error_count']}")
+    print(f"target mailbox insert count: {plan_summary['target_mailbox_insert_count']}")
     print(f"pipeline phases seen: {plan_summary['pipeline_phases_seen']}")
     print(f"warmup draft payload produced count: {plan_summary['warmup_draft_payload_produced_count']}")
     print(f"warmup skip count: {plan_summary['mailbox_warmup_skip_count']}")
@@ -765,6 +803,9 @@ def summarize(path: Path) -> int:
     print(f"verification input from mailbox attempts: {plan_summary['verification_input_from_mailbox_attempt_count']}")
     print(f"verification input from mailbox successes: {plan_summary['verification_input_from_mailbox_success_count']}")
     print(f"verification input from mailbox errors: {plan_summary['verification_input_from_mailbox_error_count']}")
+    print(f"target forward from mailbox attempts: {plan_summary['target_forward_from_mailbox_attempt_count']}")
+    print(f"target forward from mailbox successes: {plan_summary['target_forward_from_mailbox_success_count']}")
+    print(f"target forward from mailbox errors: {plan_summary['target_forward_from_mailbox_error_count']}")
     print(f"illegal legacy fallback count: {plan_summary['illegal_legacy_fallback_count']}")
     print(f"raw rows with mailbox_transport_send_attempted: {plan_summary['raw_mailbox_transport_send_rows']}")
     print(f"raw rows with mailbox_transport_recv_attempted: {plan_summary['raw_mailbox_transport_recv_rows']}")

@@ -480,6 +480,10 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_transport_send_success_count",
     "mailbox_transport_recv_success_count",
     "mailbox_transport_error_kinds",
+    "mailbox_payload_tensor_transport_attempt_count",
+    "mailbox_payload_tensor_transport_success_count",
+    "mailbox_payload_tensor_transport_error_count",
+    "target_mailbox_insert_count",
     "stspec_pipeline_phases",
     "warmup_draft_payload_produced_count",
     "mailbox_warmup_skip_count",
@@ -490,6 +494,9 @@ PLAN_REQUEST_FIELDS = [
     "verification_input_from_mailbox_attempt_count",
     "verification_input_from_mailbox_success_count",
     "verification_input_from_mailbox_error_count",
+    "target_forward_from_mailbox_attempt_count",
+    "target_forward_from_mailbox_success_count",
+    "target_forward_from_mailbox_error_count",
     "illegal_legacy_fallback_count",
     "next_required_features",
     "variable_draft_message_seen_count",
@@ -710,6 +717,10 @@ def aggregate_low_level_traces(
         mailbox_transport_send_success_count = 0
         mailbox_transport_recv_success_count = 0
         mailbox_transport_error_kinds: List[str] = []
+        mailbox_payload_tensor_transport_attempt_count = 0
+        mailbox_payload_tensor_transport_success_count = 0
+        mailbox_payload_tensor_transport_error_count = 0
+        target_mailbox_insert_count = 0
         stspec_pipeline_phases: List[str] = []
         warmup_draft_payload_produced_count = 0
         mailbox_warmup_skip_count = 0
@@ -720,6 +731,9 @@ def aggregate_low_level_traces(
         verification_input_from_mailbox_attempt_count = 0
         verification_input_from_mailbox_success_count = 0
         verification_input_from_mailbox_error_count = 0
+        target_forward_from_mailbox_attempt_count = 0
+        target_forward_from_mailbox_success_count = 0
+        target_forward_from_mailbox_error_count = 0
         illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
@@ -841,6 +855,13 @@ def aggregate_low_level_traces(
             if e.get("mailbox_transport_recv_success"):
                 mailbox_transport_recv_success_count += 1
             append_unique(mailbox_transport_error_kinds, e.get("mailbox_transport_error_kind"))
+            if e.get("mailbox_payload_tensor_transport_attempted"):
+                mailbox_payload_tensor_transport_attempt_count += 1
+            if e.get("mailbox_payload_tensor_transport_success"):
+                mailbox_payload_tensor_transport_success_count += 1
+            if e.get("mailbox_payload_tensor_transport_error"):
+                mailbox_payload_tensor_transport_error_count += 1
+            target_mailbox_insert_count += int(e.get("target_mailbox_insert_count") or 0)
             append_unique(stspec_pipeline_phases, e.get("stspec_pipeline_phase"))
             if e.get("warmup_draft_payload_produced"):
                 warmup_draft_payload_produced_count += 1
@@ -860,6 +881,12 @@ def aggregate_low_level_traces(
                 verification_input_from_mailbox_success_count += 1
             if e.get("verification_input_from_mailbox_error"):
                 verification_input_from_mailbox_error_count += 1
+            if e.get("target_forward_from_mailbox_attempted"):
+                target_forward_from_mailbox_attempt_count += 1
+            if e.get("target_forward_from_mailbox_success"):
+                target_forward_from_mailbox_success_count += 1
+            if e.get("target_forward_from_mailbox_error"):
+                target_forward_from_mailbox_error_count += 1
             if e.get("illegal_legacy_fallback"):
                 illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
@@ -1035,6 +1062,10 @@ def aggregate_low_level_traces(
         row["mailbox_transport_recv_success_count"] = mailbox_transport_recv_success_count
         if mailbox_transport_error_kinds:
             row["mailbox_transport_error_kinds"] = mailbox_transport_error_kinds
+        row["mailbox_payload_tensor_transport_attempt_count"] = mailbox_payload_tensor_transport_attempt_count
+        row["mailbox_payload_tensor_transport_success_count"] = mailbox_payload_tensor_transport_success_count
+        row["mailbox_payload_tensor_transport_error_count"] = mailbox_payload_tensor_transport_error_count
+        row["target_mailbox_insert_count"] = target_mailbox_insert_count
         if stspec_pipeline_phases:
             row["stspec_pipeline_phases"] = stspec_pipeline_phases
         row["warmup_draft_payload_produced_count"] = warmup_draft_payload_produced_count
@@ -1046,6 +1077,9 @@ def aggregate_low_level_traces(
         row["verification_input_from_mailbox_attempt_count"] = verification_input_from_mailbox_attempt_count
         row["verification_input_from_mailbox_success_count"] = verification_input_from_mailbox_success_count
         row["verification_input_from_mailbox_error_count"] = verification_input_from_mailbox_error_count
+        row["target_forward_from_mailbox_attempt_count"] = target_forward_from_mailbox_attempt_count
+        row["target_forward_from_mailbox_success_count"] = target_forward_from_mailbox_success_count
+        row["target_forward_from_mailbox_error_count"] = target_forward_from_mailbox_error_count
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features

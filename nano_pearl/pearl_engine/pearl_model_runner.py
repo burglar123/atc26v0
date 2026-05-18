@@ -41,14 +41,18 @@ from nano_pearl.pearl_engine.pearl_protocol import (
     PearlVerifyResultMessage,
 )
 from nano_pearl.pearl_engine.stspec_mailbox import (
+    MailboxPayload,
     STSpecMailboxError,
     STSpecPayloadMailbox,
     payloads_from_draft_message,
 )
 from nano_pearl.pearl_engine.stspec_mailbox_transport import (
     MailboxTransportMode,
+    build_verification_input_from_mailbox_payload,
     classify_mailbox_miss,
     encode_mailbox_transport_envelope,
+    encode_payload_tensor_envelope_from_payloads,
+    payload_tensor_envelope_to_mailbox_payloads,
 )
 from nano_pearl.pearl_engine.stspec_pipeline import (
     STSpecPipelinePhase,
@@ -457,7 +461,12 @@ class ModelRunnerBase:
             "pipeline_phase_advanced": False,
             "verification_input_from_mailbox_attempted": False,
             "verification_input_from_mailbox_success": False,
+            "verification_input_from_mailbox_seq_ids": [],
+            "verification_input_from_mailbox_total_tokens": 0,
             "verification_input_from_mailbox_error": None,
+            "target_forward_from_mailbox_attempted": False,
+            "target_forward_from_mailbox_success": False,
+            "target_forward_from_mailbox_error": None,
             "illegal_legacy_fallback": False,
             "protocol_alignment_ok": protocol_alignment_ok,
             "protocol_alignment_error": protocol_alignment_error,
@@ -525,13 +534,27 @@ class ModelRunnerBase:
             "mailbox_transport_error": None,
             "mailbox_transport_error_kind": None,
             "target_mailbox_insert_count": 0,
+            "target_mailbox_insert_seq_ids": [],
+            "target_mailbox_insert_home_batch_id": None,
             "target_mailbox_available_home_batch_ids": [],
             "target_mailbox_available_seq_ids_by_batch": {},
+            "mailbox_payload_tensor_transport_attempted": False,
+            "mailbox_payload_tensor_transport_success": False,
+            "mailbox_payload_tensor_transport_backend": None,
+            "mailbox_payload_tensor_transport_error": None,
+            "mailbox_payload_tensor_transport_error_kind": None,
+            "mailbox_payload_tensor_seq_ids": [],
+            "mailbox_payload_tensor_home_batch_id": None,
+            "mailbox_payload_tensor_total_tokens": 0,
+            "mailbox_payload_tensor_shape": [],
+            "mailbox_payload_tensor_device": None,
             "mailbox_warmup_skip": False,
             "target_verify_skipped_for_warmup": False,
             "target_consume_from_mailbox_attempted": False,
             "target_consume_from_mailbox_success": False,
             "target_consume_from_mailbox_payload_seq_ids": [],
+            "target_consume_from_mailbox_payload_lengths": [],
+            "target_consume_from_mailbox_payload_total_tokens": 0,
             "target_consume_from_mailbox_payload_home_batch_id": None,
             "target_consume_from_mailbox_error": None,
             "next_required_feature": None,
@@ -745,11 +768,109 @@ class ModelRunnerBase:
     def _mailbox_allow_warmup_miss(self) -> bool:
         return bool(getattr(self.global_config, "stspec_mailbox_allow_warmup_miss", False))
 
+    def _receive_mailbox_payload_tensor_probe(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        runner_role: str,
+        trace_record: dict,
+    ) -> None:
+        """V4G local-list payload transport backend for the guarded probe.
+
+        The existing PEARL verification path broadcasts a flat CUDA tensor after
+        target preflight; it does not yet carry variable-offset Python metadata.
+        For V4G we explicitly construct a CPU/list token payload envelope on the
+        target side using the target StepPlan's exact seq ids/home batch. This
+        proves envelope validation, mailbox insertion, and target consume
+        plumbing before failing later at target-forward/KV wiring.
+        """
+        seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
+        payloads: list[MailboxPayload] = []
+        for seq_id in step_plan.actual_target_exec_seq_ids:
+            seq = seq_by_id.get(int(seq_id))
+            if seq is None:
+                trace_record["illegal_legacy_fallback"] = True
+                raise RuntimeError(
+                    "ST-Spec target payload transport cannot find target exec seq; "
+                    f"seq_id={seq_id}, actual_target_exec_seq_ids={step_plan.actual_target_exec_seq_ids}, "
+                    f"available_exec_seq_ids={list(seq_by_id)}"
+                )
+            length = 1 if getattr(seq, "pre_verify", False) else int(self.gamma)
+            token_ids = [int(token) for token in list(seq.token_ids)[-length:]]
+            if len(token_ids) < length:
+                token_ids = ([0] * (length - len(token_ids))) + token_ids
+            payloads.append(
+                MailboxPayload(
+                    plan_id=step_plan.plan_id,
+                    producer_role="draft_payload_tensor_probe",
+                    producer_home_batch_id=step_plan.target_home_batch_id,
+                    target_home_batch_id=step_plan.target_home_batch_id,
+                    draft_home_batch_id=step_plan.draft_home_batch_id,
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    home_batch_id=step_plan.target_home_batch_id,
+                    gamma=int(self.gamma),
+                    layout_kind=PearlLayoutKind.VARIABLE_OFFSETS.value,
+                    protocol_version=self._pearl_protocol_version(),
+                    draft_token_ids=token_ids,
+                    per_seq_length=length,
+                    offset=0,
+                    logical_step=step_plan.plan_id,
+                    producer_actual_exec_seq_ids=list(step_plan.actual_target_exec_seq_ids),
+                    producer_draft_message_seq_ids=list(step_plan.actual_target_exec_seq_ids),
+                    metadata={"mailbox_payload_tensor_backend": "local_list_probe"},
+                )
+            )
+        trace_record["mailbox_payload_tensor_transport_attempted"] = True
+        trace_record["mailbox_payload_tensor_transport_backend"] = "local_list_probe"
+        try:
+            envelope = encode_payload_tensor_envelope_from_payloads(
+                payloads,
+                home_batch_id=step_plan.target_home_batch_id,
+                source_plan_id=step_plan.plan_id,
+                source_runner_role="draft_payload_tensor_probe",
+                source_draft_home_batch_id=step_plan.target_home_batch_id,
+                target_home_batch_id=step_plan.target_home_batch_id,
+                gamma=self.gamma,
+                logical_step=step_plan.plan_id,
+            )
+            transported_payloads = payload_tensor_envelope_to_mailbox_payloads(envelope)
+            self.stspec_mailbox.put_payloads(
+                step_plan.target_home_batch_id,
+                transported_payloads,
+                plan_id=step_plan.plan_id,
+                producer_role="draft_payload_tensor_probe",
+            )
+        except Exception as exc:
+            trace_record["mailbox_payload_tensor_transport_success"] = False
+            trace_record["mailbox_payload_tensor_transport_error"] = str(exc)
+            trace_record["mailbox_payload_tensor_transport_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "mailbox_payload_tensor_transport_backend"
+            raise
+        trace_record["mailbox_payload_tensor_transport_success"] = True
+        trace_record["mailbox_payload_tensor_transport_error"] = None
+        trace_record["mailbox_payload_tensor_transport_error_kind"] = None
+        trace_record["mailbox_payload_tensor_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_payload_tensor_home_batch_id"] = envelope.home_batch_id
+        trace_record["mailbox_payload_tensor_total_tokens"] = int(envelope.total_tokens)
+        trace_record["mailbox_payload_tensor_shape"] = list(envelope.payload_shape)
+        trace_record["mailbox_payload_tensor_device"] = envelope.payload_device
+        trace_record["mailbox_transport_recv_attempted"] = True
+        trace_record["mailbox_transport_recv_success"] = True
+        trace_record["mailbox_transport_recv_seq_ids"] = list(envelope.seq_ids)
+        trace_record["mailbox_transport_recv_home_batch_id"] = envelope.home_batch_id
+        trace_record["mailbox_transport_payload_available"] = True
+        trace_record["target_mailbox_insert_count"] = len(transported_payloads)
+        trace_record["target_mailbox_insert_seq_ids"] = [payload.seq_id for payload in transported_payloads]
+        trace_record["target_mailbox_insert_home_batch_id"] = step_plan.target_home_batch_id
+        self._trace_mailbox_availability(trace_record)
+
     def _prepare_stspec_mailbox_route(
         self,
         step_plan: StepPlan,
         runner_role: str,
         trace_record: dict,
+        exec_seqs: list[Sequence] | None = None,
     ) -> None:
         """V4E mailbox transport/consume preflight for real variable-offset probes.
 
@@ -781,6 +902,12 @@ class ModelRunnerBase:
         trace_record["mailbox_transport_payload_available"] = False
 
         target_seq_ids = list(step_plan.actual_target_exec_seq_ids)
+        if (
+            step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value
+            and step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
+            and exec_seqs is not None
+        ):
+            self._receive_mailbox_payload_tensor_probe(exec_seqs, step_plan, runner_role, trace_record)
         result = self.stspec_mailbox.get_payloads(
             step_plan.target_home_batch_id,
             target_seq_ids,
@@ -827,20 +954,32 @@ class ModelRunnerBase:
             trace_record["target_consume_from_mailbox_attempted"] = True
             trace_record["target_consume_from_mailbox_success"] = True
             trace_record["target_consume_from_mailbox_payload_seq_ids"] = payload_seq_ids
+            trace_record["target_consume_from_mailbox_payload_lengths"] = [int(payload.per_seq_length) for payload in result.payloads]
+            trace_record["target_consume_from_mailbox_payload_total_tokens"] = sum(
+                int(payload.per_seq_length) for payload in result.payloads
+            )
             trace_record["target_consume_from_mailbox_payload_home_batch_id"] = step_plan.target_home_batch_id
             trace_record["target_consume_from_mailbox_error"] = None
             trace_record["verification_input_from_mailbox_attempted"] = True
-            trace_record["verification_input_from_mailbox_success"] = False
-            message = (
-                "target consume-from-mailbox succeeded, but verification input construction "
-                "from mailbox payload is not implemented"
+            verification_input = build_verification_input_from_mailbox_payload(
+                result.payloads, exec_seqs or [], step_plan, self.gamma
             )
-            trace_record["verification_input_from_mailbox_error"] = message
-            trace_record["next_required_feature"] = "verification_input_from_mailbox"
+            trace_record["verification_input_from_mailbox_success"] = True
+            trace_record["verification_input_from_mailbox_seq_ids"] = list(verification_input.seq_ids)
+            trace_record["verification_input_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
+            trace_record["verification_input_from_mailbox_error"] = None
+            trace_record["target_forward_from_mailbox_attempted"] = True
+            trace_record["target_forward_from_mailbox_success"] = False
+            message = (
+                "verification input from mailbox payload is constructed at metadata level, "
+                "but target model forward wiring is not implemented"
+            )
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_input"
             raise RuntimeError(
                 f"{message}; plan_id={step_plan.plan_id}, runner_role={runner_role}, "
                 f"target_home_batch_id={step_plan.target_home_batch_id}, target_seq_ids={target_seq_ids}, "
-                "next_required_feature=verification_input_from_mailbox"
+                "next_required_feature=target_forward_from_mailbox_input"
             )
 
         error_kind, next_feature, warmup_miss = classify_mailbox_miss(
@@ -1408,7 +1547,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record = self._trace_schedule(seqs, is_prefill, "draft", step_plan)
             exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "draft", trace_record)
             self._validate_stspec_probe_alignment(step_plan, "draft", trace_record)
-            self._prepare_stspec_mailbox_route(step_plan, "draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "draft", trace_record, exec_seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
@@ -1445,7 +1584,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft", step_plan)
             exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_draft", trace_record)
             self._validate_stspec_probe_alignment(step_plan, "serialized_draft", trace_record)
-            self._prepare_stspec_mailbox_route(step_plan, "serialized_draft", trace_record)
+            self._prepare_stspec_mailbox_route(step_plan, "serialized_draft", trace_record, exec_seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
@@ -1602,7 +1741,7 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
-        self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record, exec_seqs)
         if trace_record.get("target_verify_skipped_for_warmup"):
             self._mark_trace_end(trace_record)
             return
@@ -1631,7 +1770,7 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
-        self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record)
+        self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record, exec_seqs)
         if trace_record.get("target_verify_skipped_for_warmup"):
             self._mark_trace_end(trace_record)
             return
