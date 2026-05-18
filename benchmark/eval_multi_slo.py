@@ -131,6 +131,14 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "target_tensor_parallel_size": args.target_tp,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "execution_mode": args.execution_mode,
+        "enable_stspec_two_batch_execution": args.enable_stspec_two_batch_execution,
+        "stspec_two_batch_dryrun": args.stspec_two_batch_dryrun,
+        "stspec_two_batch_probe": args.stspec_two_batch_probe,
+        "stspec_two_batch_probe_fail_fast": args.stspec_two_batch_probe_fail_fast,
+        "pearl_protocol_layout": args.pearl_protocol_layout,
+        "enable_pearl_protocol_envelope": not args.disable_pearl_protocol_envelope,
+        "pearl_protocol_validate": not args.disable_pearl_protocol_validate,
+        "pearl_protocol_trace": not args.disable_pearl_protocol_trace,
     }
 
     # Try new named-path style with gamma.
@@ -194,18 +202,30 @@ def get_request_prompt(req: Dict[str, Any]) -> Any:
     return req["prompt"]
 
 
-def absolute_arrival_ts(
+def materialize_arrival_ts(
     req: Dict[str, Any],
     workload_start_ts: float,
     use_absolute_arrival_ts: bool,
+    replay_arrivals: bool,
 ) -> float:
+    """Return the wall-clock arrival timestamp to pass to the engine.
+
+    ``arrival_offset_sec`` is workload metadata. It becomes a wall-clock
+    timestamp only when we are replaying arrivals. In offline/chunked mode all
+    requests are prepared immediately, so the evaluator records the real time at
+    which the request is materialized instead of adding the offset to a synthetic
+    workload start.
+    """
     if use_absolute_arrival_ts and "arrival_ts" in req:
         return float(req["arrival_ts"])
 
-    if "arrival_offset_sec" in req:
+    if replay_arrivals and "arrival_offset_sec" in req:
         return workload_start_ts + float(req["arrival_offset_sec"])
 
-    return float(req["arrival_ts"])
+    if "arrival_offset_sec" not in req and "arrival_ts" in req:
+        return float(req["arrival_ts"])
+
+    return time.time()
 
 
 def add_request_with_metadata(
@@ -398,6 +418,131 @@ def flatten_trace_stats(row: Dict[str, Any]) -> None:
             row[dst] = stats[src]
 
 
+PLAN_REQUEST_FIELDS = [
+    "plan_ids",
+    "last_plan_id",
+    "plan_legacy_equivalent",
+    "effective_gamma",
+    "home_batch_id",
+    "home_batch_ids",
+    "plan_home_batch_ids",
+    "target_home_batch_ids",
+    "draft_home_batch_ids",
+    "last_target_home_batch_id",
+    "last_draft_home_batch_id",
+    "plan_two_batch_shadow",
+    "target_batch_hit_count",
+    "draft_home_batch_hit_count",
+    "two_batch_execution_enabled",
+    "two_batch_execution_dryrun",
+    "two_batch_execution_modes",
+    "actual_target_exec_hit_count",
+    "actual_draft_exec_hit_count",
+    "dryrun_target_exec_hit_count",
+    "dryrun_draft_exec_hit_count",
+    "dryrun_target_home_batch_ids",
+    "dryrun_draft_home_batch_ids",
+    "stspec_probe_enabled",
+    "stspec_probe_fail_fast",
+    "stspec_probe_local_only",
+    "real_probe_attempted",
+    "real_probe_applied",
+    "real_probe_blocked",
+    "real_probe_block_reasons",
+    "filtered_out_seq_count",
+    "avg_actual_exec_fraction",
+    "protocol_alignment_ok",
+    "protocol_alignment_errors",
+    "scheduled_seq_ids",
+    "actual_exec_seq_ids",
+    "filtered_out_seq_ids",
+    "pearl_protocol_layouts",
+    "protocol_validation_ok",
+    "protocol_validation_error_count",
+    "draft_message_seen_count",
+    "verify_result_seen_count",
+    "protocol_seq_alignment_error_count",
+    "variable_offsets_seen_count",
+    "variable_offsets_validation_error_count",
+    "cross_batch_routing_error_count",
+    "mailbox_put_count",
+    "mailbox_get_hit_count",
+    "mailbox_get_miss_count",
+    "mailbox_missing_count",
+    "mailbox_error_kinds",
+    "mailbox_warmup_miss_count",
+    "mailbox_routing_error_count",
+    "next_required_features",
+    "variable_draft_message_seen_count",
+    "variable_verify_result_seen_count",
+    "is_eager",
+    "plan_roles",
+]
+
+
+def append_unique(dst: List[Any], value: Any) -> None:
+    if value is None:
+        return
+    if value not in dst:
+        dst.append(value)
+
+
+def value_for_any_member(value: Any, idx: int, *members: Any) -> Any:
+    if isinstance(value, dict):
+        for member in members:
+            if member is None:
+                continue
+            if member in value:
+                return value[member]
+            member_str = str(member)
+            if member_str in value:
+                return value[member_str]
+        return None
+    return value_for_member(value, idx, members[0] if members else None)
+
+
+def trace_identities(row: Dict[str, Any]) -> List[str]:
+    identities: List[str] = []
+    req_id = first_present(row, REQUEST_ID_KEYS)
+    if req_id is not None:
+        identities.append(f"request:{req_id}")
+    seq_id = first_present(row, SEQ_ID_KEYS)
+    if seq_id is not None:
+        identities.append(f"seq:{seq_id}")
+    return identities
+
+
+def plan_fields_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: row[key] for key in PLAN_REQUEST_FIELDS if key in row}
+
+
+def overlay_plan_fields(
+    request_rows: List[Dict[str, Any]],
+    plan_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not request_rows or not plan_rows:
+        return request_rows
+
+    plan_by_identity: Dict[str, Dict[str, Any]] = {}
+    for row in plan_rows:
+        for identity in trace_identities(row):
+            plan_by_identity[identity] = row
+    merged_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(request_rows):
+        merged = dict(row)
+        plan_row = None
+        for identity in trace_identities(row):
+            plan_row = plan_by_identity.get(identity)
+            if plan_row is not None:
+                break
+        if plan_row is None and idx < len(plan_rows):
+            plan_row = plan_rows[idx]
+        if plan_row is not None:
+            merged.update(plan_fields_from_row(plan_row))
+        merged_rows.append(merged)
+    return merged_rows
+
+
 def aggregate_low_level_traces(
     trace_rows: List[Dict[str, Any]],
     abs_workload: List[Dict[str, Any]],
@@ -433,11 +578,25 @@ def aggregate_low_level_traces(
 
         for idx, (key_name, member_id) in enumerate(members):
             group_key = str(member_id)
+            member_seq_id = None
+            if isinstance(seq_ids, list) and idx < len(seq_ids):
+                member_seq_id = seq_ids[idx]
+            elif key_name == "seq_id":
+                member_seq_id = member_id
             if key_name == "seq_id" and group_key in seq_to_request:
                 group_key = seq_to_request[group_key]
             member_event = dict(event)
             member_event[key_name] = member_id
-            groups[group_key].append({"event": member_event, "member": member_id, "member_idx": idx})
+            if member_seq_id is not None:
+                member_event["seq_id"] = member_seq_id
+            groups[group_key].append(
+                {
+                    "event": member_event,
+                    "member": member_id,
+                    "member_seq_id": member_seq_id,
+                    "member_idx": idx,
+                }
+            )
 
     aggregated: List[Dict[str, Any]] = []
     for group_key, entries in groups.items():
@@ -473,18 +632,352 @@ def aggregate_low_level_traces(
 
         accepted: List[Any] = []
         invalidated: List[Any] = []
+        plan_ids: List[int] = []
+        plan_roles: List[str] = []
+        plan_legacy_values: List[bool] = []
+        effective_gamma_values: List[Any] = []
+        home_batch_id_values: List[Any] = []
+        is_eager_values: List[Any] = []
+        plan_scheduled_seq_ids: List[Any] = []
+        plan_target_seq_ids: List[Any] = []
+        plan_draft_home_seq_ids: List[Any] = []
+        plan_eager_seq_ids: List[Any] = []
+        target_home_batch_ids: List[int] = []
+        draft_home_batch_ids: List[int] = []
+        plan_two_batch_shadow_values: List[bool] = []
+        target_batch_hit_count = 0
+        draft_home_batch_hit_count = 0
+        two_batch_execution_enabled_values: List[bool] = []
+        two_batch_execution_dryrun_values: List[bool] = []
+        two_batch_execution_modes: List[str] = []
+        actual_target_exec_hit_count = 0
+        actual_draft_exec_hit_count = 0
+        dryrun_target_exec_hit_count = 0
+        dryrun_draft_exec_hit_count = 0
+        dryrun_target_home_batch_ids: List[int] = []
+        dryrun_draft_home_batch_ids: List[int] = []
+        stspec_probe_enabled_values: List[bool] = []
+        stspec_probe_fail_fast_values: List[bool] = []
+        stspec_probe_local_only_values: List[bool] = []
+        real_probe_attempted_values: List[bool] = []
+        real_probe_applied_values: List[bool] = []
+        real_probe_blocked_values: List[bool] = []
+        real_probe_block_reasons: List[str] = []
+        protocol_alignment_values: List[bool] = []
+        protocol_alignment_errors: List[str] = []
+        filtered_out_seq_count = 0
+        actual_exec_fractions: List[float] = []
+        scheduled_exec_seq_ids: List[Any] = []
+        actual_exec_seq_ids: List[Any] = []
+        filtered_out_seq_ids: List[Any] = []
+        pearl_protocol_layouts: List[str] = []
+        protocol_validation_values: List[bool] = []
+        protocol_validation_error_count = 0
+        draft_message_seen_count = 0
+        verify_result_seen_count = 0
+        protocol_seq_alignment_error_count = 0
+        variable_offsets_seen_count = 0
+        variable_offsets_validation_error_count = 0
+        cross_batch_routing_error_count = 0
+        mailbox_put_count = 0
+        mailbox_get_hit_count = 0
+        mailbox_get_miss_count = 0
+        mailbox_missing_count = 0
+        mailbox_error_kinds: List[str] = []
+        mailbox_warmup_miss_count = 0
+        mailbox_routing_error_count = 0
+        next_required_features: List[str] = []
+        variable_draft_message_seen_count = 0
+        variable_verify_result_seen_count = 0
+
         for entry in entries:
             e = entry["event"]
             member = entry["member"]
+            member_seq_id = entry.get("member_seq_id")
             idx = entry["member_idx"]
-            accepted.append(value_for_member(first_present(e, ["accepted_tokens_per_seq", "per_seq_accepted_len", "accepted_tokens"]), idx, member))
-            invalidated.append(value_for_member(first_present(e, ["per_seq_invalidated_predraft_len", "invalidated_predraft_tokens"]), idx, member))
+            accepted.append(
+                value_for_any_member(
+                    first_present(
+                        e,
+                        [
+                            "accepted_tokens_per_seq",
+                            "per_seq_accepted_len",
+                            "accepted_tokens",
+                        ],
+                    ),
+                    idx,
+                    member_seq_id,
+                    member,
+                )
+            )
+            invalidated.append(
+                value_for_any_member(
+                    first_present(
+                        e,
+                        [
+                            "per_seq_invalidated_predraft_len",
+                            "invalidated_predraft_tokens",
+                        ],
+                    ),
+                    idx,
+                    member_seq_id,
+                    member,
+                )
+            )
+
+            plan_id = to_int(e.get("plan_id"))
+            if plan_id is not None:
+                append_unique(plan_ids, plan_id)
+            if (
+                "plan_legacy_equivalent" in e
+                and e.get("plan_legacy_equivalent") is not None
+            ):
+                plan_legacy_values.append(bool(e.get("plan_legacy_equivalent")))
+            append_unique(plan_roles, e.get("plan_runner_role"))
+            for value, dst in (
+                (e.get("plan_scheduled_seq_ids"), plan_scheduled_seq_ids),
+                (e.get("plan_target_seq_ids"), plan_target_seq_ids),
+                (e.get("plan_draft_home_seq_ids"), plan_draft_home_seq_ids),
+                (e.get("plan_eager_seq_ids"), plan_eager_seq_ids),
+            ):
+                if isinstance(value, list):
+                    for item in value:
+                        append_unique(dst, item)
+
+            target_home_batch_id = to_int(e.get("target_home_batch_id"))
+            draft_home_batch_id = to_int(e.get("draft_home_batch_id"))
+            append_unique(target_home_batch_ids, target_home_batch_id)
+            append_unique(draft_home_batch_ids, draft_home_batch_id)
+            if e.get("plan_two_batch_shadow") is not None:
+                plan_two_batch_shadow_values.append(bool(e.get("plan_two_batch_shadow")))
+            target_batch_seq_ids = e.get("target_batch_seq_ids")
+            draft_home_batch_seq_ids = e.get("draft_home_batch_seq_ids")
+            member_keys = {str(x) for x in (member_seq_id, member) if x is not None}
+            if isinstance(target_batch_seq_ids, list) and member_keys.intersection(
+                str(x) for x in target_batch_seq_ids
+            ):
+                target_batch_hit_count += 1
+            if isinstance(draft_home_batch_seq_ids, list) and member_keys.intersection(
+                str(x) for x in draft_home_batch_seq_ids
+            ):
+                draft_home_batch_hit_count += 1
+
+            for bool_key, dst in (
+                ("two_batch_execution_enabled", two_batch_execution_enabled_values),
+                ("two_batch_execution_dryrun", two_batch_execution_dryrun_values),
+                ("stspec_probe_enabled", stspec_probe_enabled_values),
+                ("stspec_probe_fail_fast", stspec_probe_fail_fast_values),
+                ("stspec_probe_local_only", stspec_probe_local_only_values),
+                ("real_probe_attempted", real_probe_attempted_values),
+                ("real_probe_applied", real_probe_applied_values),
+                ("real_probe_blocked", real_probe_blocked_values),
+                ("protocol_alignment_ok", protocol_alignment_values),
+                ("protocol_validation_ok", protocol_validation_values),
+            ):
+                if e.get(bool_key) is not None:
+                    dst.append(bool(e.get(bool_key)))
+            append_unique(two_batch_execution_modes, e.get("two_batch_execution_mode"))
+            append_unique(real_probe_block_reasons, e.get("real_probe_block_reason"))
+            append_unique(protocol_alignment_errors, e.get("protocol_alignment_error"))
+            append_unique(pearl_protocol_layouts, e.get("pearl_protocol_layout"))
+            if e.get("pearl_protocol_layout") == "variable_offsets" or e.get("variable_offsets_enabled") is True:
+                variable_offsets_seen_count += 1
+            if e.get("protocol_validation_error"):
+                protocol_validation_error_count += 1
+            if e.get("variable_offsets_validation_error"):
+                variable_offsets_validation_error_count += 1
+            if e.get("cross_batch_routing_error"):
+                cross_batch_routing_error_count += 1
+            mailbox_put_count += int(e.get("mailbox_put_count") or 0)
+            mailbox_get_hit_count += int(e.get("mailbox_get_hit_count") or 0)
+            mailbox_get_miss_count += int(e.get("mailbox_get_miss_count") or 0)
+            mailbox_missing_count += len(e.get("mailbox_missing_seq_ids") or [])
+            append_unique(mailbox_error_kinds, e.get("mailbox_error_kind"))
+            if e.get("mailbox_warmup_miss"):
+                mailbox_warmup_miss_count += 1
+            if e.get("mailbox_routing_ok") is False or e.get("mailbox_error"):
+                mailbox_routing_error_count += 1
+            append_unique(next_required_features, e.get("next_required_feature"))
+            if e.get("variable_draft_message_seq_ids") is not None:
+                variable_draft_message_seen_count += 1
+            if e.get("variable_verify_result_seq_ids") is not None:
+                variable_verify_result_seen_count += 1
+            if e.get("draft_message_seq_ids") is not None:
+                draft_message_seen_count += 1
+            if e.get("verify_result_seq_ids") is not None:
+                verify_result_seen_count += 1
+            validation_error_text = str(e.get("protocol_validation_error") or "")
+            if "seq alignment" in validation_error_text.lower():
+                protocol_seq_alignment_error_count += 1
+            filtered_out_seq_count += int(e.get("filtered_out_seq_count") or 0)
+            fraction = to_float(e.get("actual_exec_fraction"))
+            if fraction is not None:
+                actual_exec_fractions.append(fraction)
+            for value, dst in (
+                (e.get("scheduled_seq_ids"), scheduled_exec_seq_ids),
+                (e.get("actual_exec_seq_ids"), actual_exec_seq_ids),
+                (e.get("filtered_out_seq_ids"), filtered_out_seq_ids),
+            ):
+                if isinstance(value, list):
+                    for item in value:
+                        append_unique(dst, item)
+            for list_key, counter_name in (
+                ("actual_target_exec_seq_ids", "actual_target"),
+                ("actual_draft_exec_seq_ids", "actual_draft"),
+                ("dryrun_target_exec_seq_ids", "dryrun_target"),
+                ("dryrun_draft_exec_seq_ids", "dryrun_draft"),
+            ):
+                value = e.get(list_key)
+                hit = isinstance(value, list) and member_keys.intersection(str(x) for x in value)
+                if hit and counter_name == "actual_target":
+                    actual_target_exec_hit_count += 1
+                elif hit and counter_name == "actual_draft":
+                    actual_draft_exec_hit_count += 1
+                elif hit and counter_name == "dryrun_target":
+                    dryrun_target_exec_hit_count += 1
+                    append_unique(dryrun_target_home_batch_ids, target_home_batch_id)
+                elif hit and counter_name == "dryrun_draft":
+                    dryrun_draft_exec_hit_count += 1
+                    append_unique(dryrun_draft_home_batch_ids, draft_home_batch_id)
+
+            effective_gamma_values.append(
+                value_for_any_member(
+                    e.get("effective_gamma_per_seq"), idx, member_seq_id, member
+                )
+            )
+            home_batch_id_values.append(
+                value_for_any_member(
+                    e.get("home_batch_id_per_seq"), idx, member_seq_id, member
+                )
+            )
+            is_eager_values.append(
+                value_for_any_member(
+                    e.get("is_eager_per_seq"), idx, member_seq_id, member
+                )
+            )
         accepted_sum = numeric_sum(accepted)
         invalidated_sum = numeric_sum(invalidated)
         if accepted_sum is not None:
             row["accepted_tokens"] = int(accepted_sum)
         if invalidated_sum is not None:
             row["invalidated_predraft_tokens"] = int(invalidated_sum)
+
+        if plan_ids:
+            row["plan_ids"] = plan_ids
+            row["last_plan_id"] = plan_ids[-1]
+        if plan_legacy_values:
+            row["plan_legacy_equivalent"] = all(plan_legacy_values)
+        effective_gamma_candidates = [
+            to_int(value) for value in effective_gamma_values if to_int(value) is not None
+        ]
+        effective_gamma = (
+            effective_gamma_candidates[-1] if effective_gamma_candidates else None
+        )
+        if effective_gamma is not None:
+            row["effective_gamma"] = effective_gamma
+        home_batch_ids: List[int] = []
+        for value in home_batch_id_values:
+            value_int = to_int(value)
+            if value_int is not None:
+                append_unique(home_batch_ids, value_int)
+        if home_batch_ids:
+            row["home_batch_id"] = home_batch_ids[-1]
+            row["home_batch_ids"] = home_batch_ids
+            row["plan_home_batch_ids"] = home_batch_ids
+        elif home_batch_id_values:
+            row["home_batch_id"] = None
+            row["home_batch_ids"] = []
+            row["plan_home_batch_ids"] = []
+        if any(value is not None for value in is_eager_values):
+            row["is_eager"] = bool(
+                next(
+                    (value for value in reversed(is_eager_values) if value is not None),
+                    False,
+                )
+            )
+        elif is_eager_values:
+            row["is_eager"] = False
+        if target_home_batch_ids:
+            row["target_home_batch_ids"] = target_home_batch_ids
+            row["last_target_home_batch_id"] = target_home_batch_ids[-1]
+        if draft_home_batch_ids:
+            row["draft_home_batch_ids"] = draft_home_batch_ids
+            row["last_draft_home_batch_id"] = draft_home_batch_ids[-1]
+        if plan_two_batch_shadow_values:
+            row["plan_two_batch_shadow"] = any(plan_two_batch_shadow_values)
+        row["target_batch_hit_count"] = target_batch_hit_count
+        row["draft_home_batch_hit_count"] = draft_home_batch_hit_count
+        if two_batch_execution_enabled_values:
+            row["two_batch_execution_enabled"] = any(two_batch_execution_enabled_values)
+        if two_batch_execution_dryrun_values:
+            row["two_batch_execution_dryrun"] = any(two_batch_execution_dryrun_values)
+        if two_batch_execution_modes:
+            row["two_batch_execution_modes"] = two_batch_execution_modes
+        row["actual_target_exec_hit_count"] = actual_target_exec_hit_count
+        row["actual_draft_exec_hit_count"] = actual_draft_exec_hit_count
+        row["dryrun_target_exec_hit_count"] = dryrun_target_exec_hit_count
+        row["dryrun_draft_exec_hit_count"] = dryrun_draft_exec_hit_count
+        if dryrun_target_home_batch_ids:
+            row["dryrun_target_home_batch_ids"] = dryrun_target_home_batch_ids
+        if dryrun_draft_home_batch_ids:
+            row["dryrun_draft_home_batch_ids"] = dryrun_draft_home_batch_ids
+        if stspec_probe_enabled_values:
+            row["stspec_probe_enabled"] = any(stspec_probe_enabled_values)
+        if stspec_probe_fail_fast_values:
+            row["stspec_probe_fail_fast"] = any(stspec_probe_fail_fast_values)
+        if stspec_probe_local_only_values:
+            row["stspec_probe_local_only"] = any(stspec_probe_local_only_values)
+        row["real_probe_attempted"] = any(real_probe_attempted_values)
+        row["real_probe_applied"] = any(real_probe_applied_values)
+        row["real_probe_blocked"] = any(real_probe_blocked_values)
+        if real_probe_block_reasons:
+            row["real_probe_block_reasons"] = real_probe_block_reasons
+        row["filtered_out_seq_count"] = filtered_out_seq_count
+        if actual_exec_fractions:
+            row["avg_actual_exec_fraction"] = sum(actual_exec_fractions) / len(actual_exec_fractions)
+        if protocol_alignment_values:
+            row["protocol_alignment_ok"] = all(protocol_alignment_values)
+        if protocol_alignment_errors:
+            row["protocol_alignment_errors"] = protocol_alignment_errors
+        if scheduled_exec_seq_ids:
+            row["scheduled_seq_ids"] = scheduled_exec_seq_ids
+        if actual_exec_seq_ids:
+            row["actual_exec_seq_ids"] = actual_exec_seq_ids
+        if filtered_out_seq_ids:
+            row["filtered_out_seq_ids"] = filtered_out_seq_ids
+        if pearl_protocol_layouts:
+            row["pearl_protocol_layouts"] = pearl_protocol_layouts
+        if protocol_validation_values:
+            row["protocol_validation_ok"] = all(protocol_validation_values)
+        row["protocol_validation_error_count"] = protocol_validation_error_count
+        row["draft_message_seen_count"] = draft_message_seen_count
+        row["verify_result_seen_count"] = verify_result_seen_count
+        row["protocol_seq_alignment_error_count"] = protocol_seq_alignment_error_count
+        row["variable_offsets_seen_count"] = variable_offsets_seen_count
+        row["variable_offsets_validation_error_count"] = variable_offsets_validation_error_count
+        row["cross_batch_routing_error_count"] = cross_batch_routing_error_count
+        row["mailbox_put_count"] = mailbox_put_count
+        row["mailbox_get_hit_count"] = mailbox_get_hit_count
+        row["mailbox_get_miss_count"] = mailbox_get_miss_count
+        row["mailbox_missing_count"] = mailbox_missing_count
+        if mailbox_error_kinds:
+            row["mailbox_error_kinds"] = mailbox_error_kinds
+        row["mailbox_warmup_miss_count"] = mailbox_warmup_miss_count
+        row["mailbox_routing_error_count"] = mailbox_routing_error_count
+        if next_required_features:
+            row["next_required_features"] = next_required_features
+        row["variable_draft_message_seen_count"] = variable_draft_message_seen_count
+        row["variable_verify_result_seen_count"] = variable_verify_result_seen_count
+        if plan_roles:
+            row["plan_roles"] = plan_roles
+        if plan_scheduled_seq_ids:
+            row["plan_scheduled_seq_ids"] = plan_scheduled_seq_ids
+        if plan_target_seq_ids:
+            row["plan_target_seq_ids"] = plan_target_seq_ids
+        if plan_draft_home_seq_ids:
+            row["plan_draft_home_seq_ids"] = plan_draft_home_seq_ids
+        if plan_eager_seq_ids:
+            row["plan_eager_seq_ids"] = plan_eager_seq_ids
 
         row["num_low_level_events"] = len(events)
         aggregated.append(row)
@@ -562,9 +1055,15 @@ def request_level_traces_from_payload(
     abs_workload: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     high_level = extract_high_level_trace_list(trace_payload)
+    low_level = list(iter_low_level_trace_rows(trace_payload))
     if high_level:
-        return select_request_level_traces(high_level, abs_workload)
-    return select_request_level_traces(list(iter_low_level_trace_rows(trace_payload)), abs_workload)
+        request_rows = select_request_level_traces(high_level, abs_workload)
+        # Engines often return accurate request summaries under ``requests`` and
+        # scheduler/StepPlan details under low-level ``traces``. Preserve the
+        # request summary timing fields and overlay only compact plan metadata.
+        plan_rows = aggregate_low_level_traces(low_level, abs_workload) if low_level else []
+        return overlay_plan_fields(request_rows, plan_rows)
+    return select_request_level_traces(low_level, abs_workload)
 
 
 def first_present(row: Dict[str, Any], keys: List[str]) -> Any:
@@ -732,15 +1231,17 @@ def build_abs_workload(
     workload: List[Dict[str, Any]],
     workload_start_ts: float,
     use_absolute_arrival_ts: bool,
+    replay_arrivals: bool,
 ) -> List[Dict[str, Any]]:
     abs_workload: List[Dict[str, Any]] = []
 
     for req in workload:
         row = dict(req)
-        row["arrival_ts"] = absolute_arrival_ts(
+        row["arrival_ts"] = materialize_arrival_ts(
             req,
             workload_start_ts=workload_start_ts,
             use_absolute_arrival_ts=use_absolute_arrival_ts,
+            replay_arrivals=replay_arrivals,
         )
         abs_workload.append(row)
 
@@ -831,6 +1332,7 @@ def merge_traces_with_workload(
             pass
 
         row["run_start_ts"] = run_start_ts
+        row["decode_start_ts"] = max(run_start_ts, run_end_ts - engine_elapsed_s)
         row["finish_ts"] = run_end_ts
         row["decode_elapsed_ms"] = engine_elapsed_s * 1000.0
 
@@ -838,6 +1340,135 @@ def merge_traces_with_workload(
 
     return merged
 
+
+
+
+def normalize_request_timing(
+    row: Dict[str, Any],
+    num_output_tokens: int,
+    decode_ready: bool,
+) -> Dict[str, Any]:
+    """Normalize request-level decode timing fields.
+
+    In decode-ready evaluation, prefill is intentionally outside the measured
+    interval. If wall-clock decode start and finish timestamps are available,
+    they are the source of truth for request-level elapsed time and TPOT.
+    """
+    finish_ts = to_float(
+        first_present(row, ["finish_ts", "finished_ts", "end_ts", "end_time"])
+    )
+    decode_start_ts = to_float(
+        first_present(
+            row,
+            [
+                "decode_start_ts",
+                "decoding_start_ts",
+                "first_decode_ts",
+                "first_token_ts",
+                "start_decode_ts",
+            ],
+        )
+    )
+
+    if decode_ready and finish_ts is not None and decode_start_ts is not None:
+        if finish_ts >= decode_start_ts:
+            decode_elapsed_ms = (finish_ts - decode_start_ts) * 1000.0
+            row["decode_elapsed_ms"] = decode_elapsed_ms
+            row["observed_tpot_ms"] = (
+                decode_elapsed_ms / num_output_tokens if num_output_tokens > 0 else None
+            )
+        else:
+            row["decode_elapsed_ms"] = None
+            row["observed_tpot_ms"] = None
+
+    return row
+
+
+def validate_timing_invariants(rows: List[Dict[str, Any]], decode_ready: bool) -> None:
+    arrival_after_finish = 0
+    missing_decode_elapsed = 0
+    finish_before_decode_start = 0
+    missing_observed_tpot = 0
+    elapsed_mismatch = 0
+    tpot_mismatch = 0
+    suspicious_short = 0
+    tol_ms = 1e-3
+
+    for row in rows:
+        arrival_ts = to_float(row.get("arrival_ts"))
+        finish_ts = to_float(
+            first_present(row, ["finish_ts", "finished_ts", "end_ts", "end_time"])
+        )
+        decode_start_ts = to_float(
+            first_present(
+                row,
+                [
+                    "decode_start_ts",
+                    "decoding_start_ts",
+                    "first_decode_ts",
+                    "first_token_ts",
+                    "start_decode_ts",
+                ],
+            )
+        )
+        decode_elapsed_ms = to_float(row.get("decode_elapsed_ms"))
+        observed_tpot_ms = to_float(row.get("observed_tpot_ms"))
+        num_output_tokens = infer_num_output_tokens(row)
+
+        if arrival_ts is not None and finish_ts is not None and arrival_ts > finish_ts:
+            arrival_after_finish += 1
+        if decode_ready and decode_elapsed_ms is None:
+            missing_decode_elapsed += 1
+        if finish_ts is not None and decode_start_ts is not None:
+            if finish_ts < decode_start_ts:
+                finish_before_decode_start += 1
+            else:
+                expected_elapsed_ms = (finish_ts - decode_start_ts) * 1000.0
+                if (
+                    decode_elapsed_ms is not None
+                    and abs(decode_elapsed_ms - expected_elapsed_ms) > tol_ms
+                ):
+                    elapsed_mismatch += 1
+        if num_output_tokens > 0 and observed_tpot_ms is None:
+            missing_observed_tpot += 1
+        if (
+            num_output_tokens > 0
+            and decode_elapsed_ms is not None
+            and observed_tpot_ms is not None
+        ):
+            expected_tpot_ms = decode_elapsed_ms / num_output_tokens
+            if abs(observed_tpot_ms - expected_tpot_ms) > tol_ms:
+                tpot_mismatch += 1
+        if (
+            decode_ready
+            and num_output_tokens > 200
+            and decode_elapsed_ms is not None
+            and decode_elapsed_ms < 1000
+        ):
+            suspicious_short += 1
+
+    warnings = [
+        (arrival_after_finish, "row(s) have arrival_ts > finish_ts"),
+        (missing_decode_elapsed, "decode-ready row(s) are missing decode_elapsed_ms"),
+        (finish_before_decode_start, "row(s) have finish_ts < decode_start_ts"),
+        (missing_observed_tpot, "row(s) with output tokens are missing observed_tpot_ms"),
+        (
+            elapsed_mismatch,
+            "row(s) have decode_elapsed_ms inconsistent with finish_ts - decode_start_ts",
+        ),
+        (
+            tpot_mismatch,
+            "row(s) have observed_tpot_ms inconsistent with decode_elapsed_ms / tokens",
+        ),
+        (
+            suspicious_short,
+            "decode-ready row(s) generated >200 tokens in <1000ms; "
+            "verify wall-clock timestamps",
+        ),
+    ]
+    for count, message in warnings:
+        if count:
+            print(f"[WARN] Timing invariant: {count} {message}.")
 
 def choose_goodput_denominator_s(
     rows: List[Dict[str, Any]],
@@ -922,6 +1553,7 @@ def compute_metrics(
     engine_elapsed_s: float,
     denominator_mode: str,
     workload_meta: Dict[str, Any],
+    decode_ready: bool = False,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     evaluated_rows: List[Dict[str, Any]] = []
 
@@ -930,6 +1562,13 @@ def compute_metrics(
 
         num_output_tokens = infer_num_output_tokens(row)
         row["num_output_tokens"] = int(num_output_tokens)
+        row = normalize_request_timing(row, num_output_tokens, decode_ready=decode_ready)
+        if row.get("decode_elapsed_ms") is None:
+            row["decode_elapsed_ms"] = infer_decode_elapsed_ms(
+                row,
+                num_output_tokens=num_output_tokens,
+                fallback_engine_elapsed_s=engine_elapsed_s,
+            )
 
         observed_tpot_ms = infer_observed_tpot_ms(
             row,
@@ -937,6 +1576,13 @@ def compute_metrics(
             fallback_engine_elapsed_s=engine_elapsed_s,
         )
         row["observed_tpot_ms"] = observed_tpot_ms
+        if (
+            decode_ready
+            and row.get("decode_elapsed_ms") is not None
+            and num_output_tokens > 0
+        ):
+            observed_tpot_ms = row["decode_elapsed_ms"] / num_output_tokens
+            row["observed_tpot_ms"] = observed_tpot_ms
 
         slo_tpot_ms = to_float(row.get("slo_tpot_ms"))
         row["slo_tpot_ms"] = slo_tpot_ms
@@ -947,6 +1593,8 @@ def compute_metrics(
             row["slo_attained"] = observed_tpot_ms <= slo_tpot_ms
 
         evaluated_rows.append(row)
+
+    validate_timing_invariants(evaluated_rows, decode_ready=decode_ready)
 
     denominator_s = choose_goodput_denominator_s(
         evaluated_rows,
@@ -1066,6 +1714,13 @@ def add_workload_chunk(
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
+        if not args.use_workload_absolute_arrival_ts:
+            # For offline/chunked evaluation, workload offsets are metadata; the
+            # request's wall-clock arrival is when we actually enqueue it. When
+            # --replay-arrivals is enabled this timestamp is taken after any
+            # sleep, so it still reflects the real enqueue time.
+            req["arrival_ts"] = time.time()
+
         sampling_params = make_sampling_params(req, args)
         prompt = get_request_prompt(req)
 
@@ -1134,8 +1789,64 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "category": row.get("category"),
         "slo_class": row.get("slo_class"),
         "slo_tpot_ms": row.get("slo_tpot_ms"),
+        "per_request_gamma": row.get("per_request_gamma"),
+        "plan_ids": row.get("plan_ids"),
+        "last_plan_id": row.get("last_plan_id"),
+        "plan_legacy_equivalent": row.get("plan_legacy_equivalent"),
+        "effective_gamma": row.get("effective_gamma"),
+        "home_batch_id": row.get("home_batch_id"),
+        "home_batch_ids": row.get("home_batch_ids"),
+        "plan_home_batch_ids": row.get("plan_home_batch_ids"),
+        "target_home_batch_ids": row.get("target_home_batch_ids"),
+        "draft_home_batch_ids": row.get("draft_home_batch_ids"),
+        "last_target_home_batch_id": row.get("last_target_home_batch_id"),
+        "last_draft_home_batch_id": row.get("last_draft_home_batch_id"),
+        "plan_two_batch_shadow": row.get("plan_two_batch_shadow"),
+        "target_batch_hit_count": row.get("target_batch_hit_count"),
+        "draft_home_batch_hit_count": row.get("draft_home_batch_hit_count"),
+        "two_batch_execution_enabled": row.get("two_batch_execution_enabled"),
+        "two_batch_execution_dryrun": row.get("two_batch_execution_dryrun"),
+        "two_batch_execution_modes": row.get("two_batch_execution_modes"),
+        "actual_target_exec_hit_count": row.get("actual_target_exec_hit_count"),
+        "actual_draft_exec_hit_count": row.get("actual_draft_exec_hit_count"),
+        "dryrun_target_exec_hit_count": row.get("dryrun_target_exec_hit_count"),
+        "dryrun_draft_exec_hit_count": row.get("dryrun_draft_exec_hit_count"),
+        "dryrun_target_home_batch_ids": row.get("dryrun_target_home_batch_ids"),
+        "dryrun_draft_home_batch_ids": row.get("dryrun_draft_home_batch_ids"),
+        "stspec_probe_enabled": row.get("stspec_probe_enabled"),
+        "stspec_probe_fail_fast": row.get("stspec_probe_fail_fast"),
+        "stspec_probe_local_only": row.get("stspec_probe_local_only"),
+        "real_probe_attempted": row.get("real_probe_attempted"),
+        "real_probe_applied": row.get("real_probe_applied"),
+        "real_probe_blocked": row.get("real_probe_blocked"),
+        "real_probe_block_reasons": row.get("real_probe_block_reasons"),
+        "filtered_out_seq_count": row.get("filtered_out_seq_count"),
+        "avg_actual_exec_fraction": row.get("avg_actual_exec_fraction"),
+        "protocol_alignment_ok": row.get("protocol_alignment_ok"),
+        "protocol_alignment_errors": row.get("protocol_alignment_errors"),
+        "scheduled_seq_ids": row.get("scheduled_seq_ids"),
+        "actual_exec_seq_ids": row.get("actual_exec_seq_ids"),
+        "filtered_out_seq_ids": row.get("filtered_out_seq_ids"),
+        "pearl_protocol_layouts": row.get("pearl_protocol_layouts"),
+        "protocol_validation_ok": row.get("protocol_validation_ok"),
+        "protocol_validation_error_count": row.get("protocol_validation_error_count"),
+        "draft_message_seen_count": row.get("draft_message_seen_count"),
+        "verify_result_seen_count": row.get("verify_result_seen_count"),
+        "protocol_seq_alignment_error_count": row.get("protocol_seq_alignment_error_count"),
+        "variable_offsets_seen_count": row.get("variable_offsets_seen_count"),
+        "variable_offsets_validation_error_count": row.get("variable_offsets_validation_error_count"),
+        "cross_batch_routing_error_count": row.get("cross_batch_routing_error_count"),
+        "next_required_features": row.get("next_required_features"),
+        "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
+        "variable_verify_result_seen_count": row.get("variable_verify_result_seen_count"),
+        "is_eager": row.get("is_eager"),
+        "plan_roles": row.get("plan_roles"),
         "execution_mode": row.get("execution_mode", execution_mode),
         "decode_ready_mode": row.get("decode_ready_mode", decode_ready),
+        "arrival_offset_sec": row.get("arrival_offset_sec"),
+        "arrival_ts": row.get("arrival_ts"),
+        "decode_ready_ts": row.get("decode_ready_ts"),
+        "first_token_ts": row.get("first_token_ts"),
         "num_output_tokens": row.get("num_output_tokens"),
         "num_decode_output_tokens": row.get("num_decode_output_tokens"),
         "num_acc_tokens": row.get("num_acc_tokens"),
@@ -1185,6 +1896,62 @@ def main() -> None:
             "current parallel_pearl (default: parallel_pearl)."
         ),
     )
+
+    parser.add_argument(
+        "--enable-stspec-two-batch-execution",
+        action="store_true",
+        help=(
+            "Enable ST-Spec two-batch execution dry-run metadata. V3C still "
+            "executes legacy scheduled batches unless real mode is implemented later."
+        ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-dryrun",
+        dest="stspec_two_batch_dryrun",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep ST-Spec two-batch execution in dry-run mode. "
+            "Use --no-stspec-two-batch-dryrun only with --stspec-two-batch-probe for V4A."
+        ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-probe",
+        action="store_true",
+        help=(
+            "Enable the guarded V4A real two-batch feasibility probe. Requires "
+            "--enable-stspec-two-batch-execution and --no-stspec-two-batch-dryrun."
+        ),
+    )
+    parser.add_argument(
+        "--stspec-two-batch-probe-fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail fast with protocol diagnostics when the V4A probe is incompatible.",
+    )
+
+    parser.add_argument(
+        "--pearl-protocol-layout",
+        choices=["legacy_fixed", "variable_offsets"],
+        default="legacy_fixed",
+        help="Explicit PEARL protocol layout. variable_offsets is reserved for V4C.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-envelope",
+        action="store_true",
+        help="Disable the V4B sidecar protocol envelope while preserving legacy tensor transport.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-validate",
+        action="store_true",
+        help="Disable V4B PEARL protocol envelope validation.",
+    )
+    parser.add_argument(
+        "--disable-pearl-protocol-trace",
+        action="store_true",
+        help="Disable V4B PEARL protocol trace metadata export.",
+    )
+
     parser.add_argument(
         "--decode-ready",
         "--prefill-elided",
@@ -1300,6 +2067,7 @@ def main() -> None:
             workload,
             workload_start_ts=workload_start_ts,
             use_absolute_arrival_ts=args.use_workload_absolute_arrival_ts,
+            replay_arrivals=args.replay_arrivals,
         )
 
         if args.eval_batch_size is not None and args.eval_batch_size <= 0:
@@ -1350,6 +2118,7 @@ def main() -> None:
             engine_elapsed_s=elapsed_time,
             denominator_mode=args.goodput_denominator,
             workload_meta=workload_meta,
+            decode_ready=bool(args.decode_ready),
         )
         metrics["execution_mode"] = args.execution_mode
         metrics["decode_ready_mode"] = bool(args.decode_ready)
