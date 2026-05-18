@@ -683,7 +683,7 @@ def validate_kv_state_sync_for_mailbox_forward(
         success=False,
         missing_seq_ids=[],
         error="target forward from mailbox input requires KV/state synchronization",
-        error_kind="variable_offset_kv_append_not_implemented",
+        error_kind="mailbox_kv_sync_plan_required",
     )
 
 

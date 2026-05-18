@@ -97,6 +97,9 @@ class PEARLConfig:
     stspec_mailbox_allow_warmup_miss: bool = False
     stspec_pipeline_warmup: bool = True
     stspec_warmup_draft_only: bool = True
+    stspec_kv_sync_probe: bool = True
+    stspec_kv_sync_mode: str = "metadata_only"
+    stspec_disable_mailbox_forward_commit: bool = True
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -112,6 +115,11 @@ class PEARLConfig:
             raise ValueError(
                 "Invalid pearl_protocol_layout="
                 f"{self.pearl_protocol_layout!r}; expected legacy_fixed or variable_offsets."
+            )
+        if self.stspec_kv_sync_mode not in {"metadata_only", "guarded_forward", "no_commit_probe"}:
+            raise ValueError(
+                "Invalid stspec_kv_sync_mode="
+                f"{self.stspec_kv_sync_mode!r}; expected metadata_only, guarded_forward, or no_commit_probe."
             )
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
@@ -142,6 +150,9 @@ class PEARLConfig:
         logger.info(f"STSpec_Mailbox_Allow_Warmup_Miss={self.stspec_mailbox_allow_warmup_miss}")
         logger.info(f"STSpec_Pipeline_Warmup={self.stspec_pipeline_warmup}")
         logger.info(f"STSpec_Warmup_Draft_Only={self.stspec_warmup_draft_only}")
+        logger.info(f"STSpec_KV_Sync_Probe={self.stspec_kv_sync_probe}")
+        logger.info(f"STSpec_KV_Sync_Mode={self.stspec_kv_sync_mode}")
+        logger.info(f"STSpec_Disable_Mailbox_Forward_Commit={self.stspec_disable_mailbox_forward_commit}")
         if (
             self.enable_stspec_two_batch_execution
             and not self.stspec_two_batch_dryrun

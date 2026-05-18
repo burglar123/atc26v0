@@ -55,8 +55,13 @@ from nano_pearl.pearl_engine.stspec_mailbox_transport import (
     encode_payload_tensor_envelope_from_payloads,
     interpret_target_forward_from_mailbox_output,
     payload_tensor_envelope_to_mailbox_payloads,
-    validate_kv_state_sync_for_mailbox_forward,
     validate_target_forward_from_mailbox_input,
+)
+from nano_pearl.pearl_engine.stspec_kv_sync import (
+    MailboxKVSyncMode,
+    apply_mailbox_kv_sync_plan_probe,
+    build_mailbox_kv_sync_plan,
+    normalize_kv_sync_mode,
 )
 from nano_pearl.pearl_engine.stspec_pipeline import (
     STSpecPipelinePhase,
@@ -472,11 +477,21 @@ class ModelRunnerBase:
             "target_forward_from_mailbox_input_seq_ids": [],
             "target_forward_from_mailbox_input_total_tokens": 0,
             "target_forward_from_mailbox_input_shape": [],
+            "stspec_kv_sync_probe_enabled": False,
+            "stspec_kv_sync_mode": None,
+            "mailbox_kv_sync_plan_built": False,
+            "mailbox_kv_sync_plan_seq_ids": [],
+            "mailbox_kv_sync_plan_total_tokens": 0,
+            "mailbox_kv_sync_current_seq_lengths": {},
+            "mailbox_kv_sync_append_start_positions": {},
+            "mailbox_kv_sync_append_end_positions": {},
+            "mailbox_kv_sync_position_ids": [],
             "kv_state_sync_check_attempted": False,
             "kv_state_sync_check_success": False,
             "kv_state_sync_missing_seq_ids": [],
             "kv_state_sync_error": None,
             "kv_state_sync_error_kind": None,
+            "kv_state_sync_plan_json": None,
             "target_forward_from_mailbox_attempted": False,
             "target_forward_from_mailbox_success": False,
             "target_forward_from_mailbox_seq_ids": [],
@@ -492,6 +507,9 @@ class ModelRunnerBase:
             "mailbox_verify_apply_attempted": False,
             "mailbox_verify_apply_success": False,
             "mailbox_verify_apply_error": None,
+            "mailbox_forward_state_mutation_attempted": False,
+            "mailbox_forward_state_mutation_committed": False,
+            "mailbox_forward_state_mutation_rollback_success": False,
             "accepted_lengths_by_seq": {},
             "rejected_seq_ids": [],
             "invalidated_mailbox_payload_count": 0,
@@ -747,6 +765,19 @@ class ModelRunnerBase:
     def _mailbox_available_seq_ids_by_batch(self) -> dict[str, list[int]]:
         return self.stspec_mailbox.available_seq_ids_by_batch()
 
+    def _stspec_kv_sync_probe_enabled(self, step_plan: StepPlan | None) -> bool:
+        return bool(
+            step_plan is not None
+            and step_plan.real_probe_attempted
+            and getattr(self.global_config, "stspec_kv_sync_probe", True)
+        )
+
+    def _stspec_kv_sync_mode(self) -> str:
+        return normalize_kv_sync_mode(getattr(self.global_config, "stspec_kv_sync_mode", "metadata_only")).value
+
+    def _mailbox_forward_commit_disabled(self) -> bool:
+        return bool(getattr(self.global_config, "stspec_disable_mailbox_forward_commit", True))
+
     def _trace_mailbox_availability(self, trace_record: dict) -> None:
         home_batch_ids = self.stspec_mailbox.available_home_batch_ids()
         seq_ids_by_batch = self._mailbox_available_seq_ids_by_batch()
@@ -968,33 +999,83 @@ class ModelRunnerBase:
             trace_record["next_required_feature"] = "target_forward_from_mailbox_input_validation"
             raise
 
-        trace_record["target_forward_from_mailbox_attempted"] = True
-        trace_record["target_forward_from_mailbox_success"] = False
         trace_record["target_forward_from_mailbox_seq_ids"] = input_seq_ids
         trace_record["target_forward_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
         trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
 
-        kv_status = validate_kv_state_sync_for_mailbox_forward(verification_input, exec_seqs)
-        trace_record["kv_state_sync_check_attempted"] = bool(kv_status.attempted)
-        trace_record["kv_state_sync_check_success"] = bool(kv_status.success)
-        trace_record["kv_state_sync_missing_seq_ids"] = list(kv_status.missing_seq_ids)
-        trace_record["kv_state_sync_error"] = kv_status.error
-        trace_record["kv_state_sync_error_kind"] = kv_status.error_kind
-        if not kv_status.success:
-            message = "target forward from mailbox input requires KV/state synchronization"
+        kv_sync_mode = self._stspec_kv_sync_mode()
+        trace_record["stspec_kv_sync_probe_enabled"] = self._stspec_kv_sync_probe_enabled(step_plan)
+        trace_record["stspec_kv_sync_mode"] = kv_sync_mode
+        try:
+            kv_plan = build_mailbox_kv_sync_plan(
+                verification_input,
+                exec_seqs,
+                state_sync_mode=kv_sync_mode,
+                max_model_len=getattr(self.global_config, "max_model_len", None),
+                mailbox_forward_commit_disabled=self._mailbox_forward_commit_disabled(),
+            )
+            kv_result = apply_mailbox_kv_sync_plan_probe(
+                kv_plan,
+                commit_enabled=not self._mailbox_forward_commit_disabled(),
+                forward_backend_available=True,
+            )
+        except Exception as exc:
+            trace_record["mailbox_kv_sync_plan_built"] = False
+            trace_record["kv_state_sync_check_attempted"] = True
+            trace_record["kv_state_sync_check_success"] = False
+            trace_record["kv_state_sync_error"] = str(exc)
+            trace_record["kv_state_sync_error_kind"] = type(exc).__name__
+            trace_record["target_forward_from_mailbox_error"] = str(exc)
+            trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
+            trace_record["next_required_feature"] = "mailbox_kv_sync_plan"
+            raise RuntimeError(
+                f"mailbox KV/state sync plan construction failed; error={exc}; "
+                "next_required_feature=mailbox_kv_sync_plan"
+            ) from exc
+
+        trace_record["mailbox_kv_sync_plan_built"] = kv_result.plan is not None
+        trace_record["mailbox_kv_sync_plan_seq_ids"] = list(kv_plan.seq_ids)
+        trace_record["mailbox_kv_sync_plan_total_tokens"] = int(kv_plan.total_tokens)
+        trace_record["mailbox_kv_sync_current_seq_lengths"] = dict(kv_plan.current_seq_lengths)
+        trace_record["mailbox_kv_sync_append_start_positions"] = dict(kv_plan.append_start_positions)
+        trace_record["mailbox_kv_sync_append_end_positions"] = dict(kv_plan.append_end_positions)
+        trace_record["mailbox_kv_sync_position_ids"] = list(kv_plan.mailbox_token_positions)
+        trace_record["kv_state_sync_plan_json"] = kv_plan.to_dict()
+        trace_record["kv_state_sync_check_attempted"] = bool(kv_result.attempted)
+        trace_record["kv_state_sync_check_success"] = bool(kv_result.success)
+        trace_record["kv_state_sync_missing_seq_ids"] = list(kv_result.missing_seq_ids)
+        trace_record["kv_state_sync_error"] = kv_result.error_message
+        trace_record["kv_state_sync_error_kind"] = kv_result.error_kind
+        trace_record["mailbox_forward_state_mutation_attempted"] = bool(kv_result.mutation_attempted)
+        trace_record["mailbox_forward_state_mutation_committed"] = bool(kv_result.mutation_committed)
+        trace_record["mailbox_forward_state_mutation_rollback_success"] = bool(kv_result.mutation_rollback_success)
+        if not kv_result.success:
+            message = kv_result.error_message or "mailbox KV/state sync plan failed"
             trace_record["target_forward_from_mailbox_error"] = message
-            trace_record["target_forward_from_mailbox_error_kind"] = kv_status.error_kind
-            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            trace_record["target_forward_from_mailbox_error_kind"] = kv_result.error_kind
+            trace_record["next_required_feature"] = "mailbox_kv_sync_plan"
             raise RuntimeError(
                 f"{message}; plan_id={step_plan.plan_id}, target_seq_ids={input_seq_ids}, "
-                f"kv_state_sync_error_kind={kv_status.error_kind}, missing_seq_ids={kv_status.missing_seq_ids}, "
-                "next_required_feature=kv_state_sync_for_mailbox_forward"
+                f"kv_state_sync_error_kind={kv_result.error_kind}, missing_seq_ids={kv_result.missing_seq_ids}, "
+                "next_required_feature=mailbox_kv_sync_plan"
             )
 
+        if kv_sync_mode == MailboxKVSyncMode.METADATA_ONLY.value:
+            message = "KV/state sync metadata plan constructed; target forward from mailbox is not enabled in metadata_only mode"
+            trace_record["target_forward_from_mailbox_error"] = message
+            trace_record["target_forward_from_mailbox_error_kind"] = "metadata_only_sync"
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_guarded_forward"
+            raise RuntimeError(
+                f"{message}; plan_id={step_plan.plan_id}, target_seq_ids={input_seq_ids}, "
+                "next_required_feature=target_forward_from_mailbox_guarded_forward"
+            )
+
+        trace_record["target_forward_from_mailbox_attempted"] = True
+        trace_record["target_forward_from_mailbox_success"] = False
         start = time.time()
         try:
             input_ids = torch.tensor(verification_input.input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            positions = torch.tensor(verification_input.positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(kv_plan.mailbox_token_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             trace_record["target_forward_from_mailbox_input_shape"] = list(input_ids.shape)
             logits = self.run_model(input_ids, positions, False)
             trace_record["target_forward_from_mailbox_latency_ms"] = (time.time() - start) * 1000
@@ -1005,10 +1086,10 @@ class ModelRunnerBase:
             trace_record["target_forward_from_mailbox_success"] = False
             trace_record["target_forward_from_mailbox_error"] = str(exc)
             trace_record["target_forward_from_mailbox_error_kind"] = type(exc).__name__
-            trace_record["next_required_feature"] = "kv_state_sync_for_mailbox_forward"
+            trace_record["next_required_feature"] = "target_forward_from_mailbox_guarded_forward_backend"
             raise RuntimeError(
                 f"target forward from mailbox input failed during guarded probe; error={exc}; "
-                "next_required_feature=kv_state_sync_for_mailbox_forward"
+                "next_required_feature=target_forward_from_mailbox_guarded_forward_backend"
             ) from exc
 
         trace_record["target_forward_from_mailbox_output_interpretation_attempted"] = True

@@ -142,6 +142,9 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "stspec_mailbox_allow_warmup_miss": args.stspec_mailbox_allow_warmup_miss,
         "stspec_pipeline_warmup": args.stspec_pipeline_warmup,
         "stspec_warmup_draft_only": args.stspec_warmup_draft_only,
+        "stspec_kv_sync_probe": args.stspec_kv_sync_probe,
+        "stspec_kv_sync_mode": args.stspec_kv_sync_mode,
+        "stspec_disable_mailbox_forward_commit": args.stspec_disable_mailbox_forward_commit,
     }
 
     # Try new named-path style with gamma.
@@ -494,9 +497,25 @@ PLAN_REQUEST_FIELDS = [
     "verification_input_from_mailbox_attempt_count",
     "verification_input_from_mailbox_success_count",
     "verification_input_from_mailbox_error_count",
+    "target_forward_from_mailbox_input_built_count",
+    "mailbox_kv_sync_plan_built_count",
+    "kv_state_sync_check_attempt_count",
+    "kv_state_sync_check_success_count",
+    "kv_state_sync_error_count",
+    "kv_state_sync_check_error_count",
+    "kv_state_sync_error_kinds",
     "target_forward_from_mailbox_attempt_count",
     "target_forward_from_mailbox_success_count",
     "target_forward_from_mailbox_error_count",
+    "output_interpretation_attempt_count",
+    "output_interpretation_success_count",
+    "output_interpretation_error_count",
+    "mailbox_verify_apply_attempt_count",
+    "mailbox_verify_apply_success_count",
+    "mailbox_verify_apply_error_count",
+    "mailbox_forward_state_mutation_attempt_count",
+    "mailbox_forward_state_mutation_committed_count",
+    "mailbox_forward_state_mutation_rollback_success_count",
     "illegal_legacy_fallback_count",
     "next_required_features",
     "variable_draft_message_seen_count",
@@ -732,9 +751,11 @@ def aggregate_low_level_traces(
         verification_input_from_mailbox_success_count = 0
         verification_input_from_mailbox_error_count = 0
         target_forward_from_mailbox_input_built_count = 0
+        mailbox_kv_sync_plan_built_count = 0
         kv_state_sync_check_attempt_count = 0
         kv_state_sync_check_success_count = 0
         kv_state_sync_check_error_count = 0
+        kv_state_sync_error_kinds: List[str] = []
         target_forward_from_mailbox_attempt_count = 0
         target_forward_from_mailbox_success_count = 0
         target_forward_from_mailbox_error_count = 0
@@ -744,6 +765,9 @@ def aggregate_low_level_traces(
         mailbox_verify_apply_attempt_count = 0
         mailbox_verify_apply_success_count = 0
         mailbox_verify_apply_error_count = 0
+        mailbox_forward_state_mutation_attempt_count = 0
+        mailbox_forward_state_mutation_committed_count = 0
+        mailbox_forward_state_mutation_rollback_success_count = 0
         illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
@@ -893,6 +917,9 @@ def aggregate_low_level_traces(
                 verification_input_from_mailbox_error_count += 1
             if e.get("target_forward_from_mailbox_input_built"):
                 target_forward_from_mailbox_input_built_count += 1
+            if e.get("mailbox_kv_sync_plan_built"):
+                mailbox_kv_sync_plan_built_count += 1
+            append_unique(kv_state_sync_error_kinds, e.get("kv_state_sync_error_kind"))
             if e.get("kv_state_sync_check_attempted"):
                 kv_state_sync_check_attempt_count += 1
             if e.get("kv_state_sync_check_success"):
@@ -917,6 +944,12 @@ def aggregate_low_level_traces(
                 mailbox_verify_apply_success_count += 1
             if e.get("mailbox_verify_apply_error"):
                 mailbox_verify_apply_error_count += 1
+            if e.get("mailbox_forward_state_mutation_attempted"):
+                mailbox_forward_state_mutation_attempt_count += 1
+            if e.get("mailbox_forward_state_mutation_committed"):
+                mailbox_forward_state_mutation_committed_count += 1
+            if e.get("mailbox_forward_state_mutation_rollback_success"):
+                mailbox_forward_state_mutation_rollback_success_count += 1
             if e.get("illegal_legacy_fallback"):
                 illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
@@ -1108,9 +1141,13 @@ def aggregate_low_level_traces(
         row["verification_input_from_mailbox_success_count"] = verification_input_from_mailbox_success_count
         row["verification_input_from_mailbox_error_count"] = verification_input_from_mailbox_error_count
         row["target_forward_from_mailbox_input_built_count"] = target_forward_from_mailbox_input_built_count
+        row["mailbox_kv_sync_plan_built_count"] = mailbox_kv_sync_plan_built_count
         row["kv_state_sync_check_attempt_count"] = kv_state_sync_check_attempt_count
         row["kv_state_sync_check_success_count"] = kv_state_sync_check_success_count
+        row["kv_state_sync_error_count"] = kv_state_sync_check_error_count
         row["kv_state_sync_check_error_count"] = kv_state_sync_check_error_count
+        if kv_state_sync_error_kinds:
+            row["kv_state_sync_error_kinds"] = kv_state_sync_error_kinds
         row["target_forward_from_mailbox_attempt_count"] = target_forward_from_mailbox_attempt_count
         row["target_forward_from_mailbox_success_count"] = target_forward_from_mailbox_success_count
         row["target_forward_from_mailbox_error_count"] = target_forward_from_mailbox_error_count
@@ -1120,6 +1157,9 @@ def aggregate_low_level_traces(
         row["mailbox_verify_apply_attempt_count"] = mailbox_verify_apply_attempt_count
         row["mailbox_verify_apply_success_count"] = mailbox_verify_apply_success_count
         row["mailbox_verify_apply_error_count"] = mailbox_verify_apply_error_count
+        row["mailbox_forward_state_mutation_attempt_count"] = mailbox_forward_state_mutation_attempt_count
+        row["mailbox_forward_state_mutation_committed_count"] = mailbox_forward_state_mutation_committed_count
+        row["mailbox_forward_state_mutation_rollback_success_count"] = mailbox_forward_state_mutation_rollback_success_count
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features
@@ -1994,9 +2034,12 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "variable_offsets_validation_error_count": row.get("variable_offsets_validation_error_count"),
         "cross_batch_routing_error_count": row.get("cross_batch_routing_error_count"),
         "target_forward_from_mailbox_input_built_count": row.get("target_forward_from_mailbox_input_built_count"),
+        "mailbox_kv_sync_plan_built_count": row.get("mailbox_kv_sync_plan_built_count"),
         "kv_state_sync_check_attempt_count": row.get("kv_state_sync_check_attempt_count"),
         "kv_state_sync_check_success_count": row.get("kv_state_sync_check_success_count"),
+        "kv_state_sync_error_count": row.get("kv_state_sync_error_count"),
         "kv_state_sync_check_error_count": row.get("kv_state_sync_check_error_count"),
+        "kv_state_sync_error_kinds": row.get("kv_state_sync_error_kinds"),
         "target_forward_from_mailbox_attempt_count": row.get("target_forward_from_mailbox_attempt_count"),
         "target_forward_from_mailbox_success_count": row.get("target_forward_from_mailbox_success_count"),
         "target_forward_from_mailbox_error_count": row.get("target_forward_from_mailbox_error_count"),
@@ -2006,6 +2049,9 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "mailbox_verify_apply_attempt_count": row.get("mailbox_verify_apply_attempt_count"),
         "mailbox_verify_apply_success_count": row.get("mailbox_verify_apply_success_count"),
         "mailbox_verify_apply_error_count": row.get("mailbox_verify_apply_error_count"),
+        "mailbox_forward_state_mutation_attempt_count": row.get("mailbox_forward_state_mutation_attempt_count"),
+        "mailbox_forward_state_mutation_committed_count": row.get("mailbox_forward_state_mutation_committed_count"),
+        "mailbox_forward_state_mutation_rollback_success_count": row.get("mailbox_forward_state_mutation_rollback_success_count"),
         "illegal_legacy_fallback_count": row.get("illegal_legacy_fallback_count"),
         "next_required_features": row.get("next_required_features"),
         "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
@@ -2120,6 +2166,25 @@ def main() -> None:
             "Allow V4F real-probe target warmup misses to be recorded/skipped "
             "instead of failing at missing payload lookup."
         ),
+    )
+
+    parser.add_argument(
+        "--stspec-kv-sync-probe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable V4I mailbox KV/state synchronization metadata probe in real-probe mode.",
+    )
+    parser.add_argument(
+        "--stspec-kv-sync-mode",
+        choices=["metadata_only", "guarded_forward", "no_commit_probe"],
+        default="metadata_only",
+        help="V4I mailbox KV sync mode. metadata_only is the safest default.",
+    )
+    parser.add_argument(
+        "--stspec-disable-mailbox-forward-commit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable permanent sequence/KV mutation for mailbox-forward probes.",
     )
 
     parser.add_argument(
