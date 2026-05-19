@@ -238,3 +238,44 @@ def test_consume_plan_and_result_json_serializable():
 
     json.dumps(consume_plan.to_dict(), sort_keys=True, default=str)
     json.dumps(result.to_dict(), sort_keys=True, default=str)
+
+
+def test_continue_after_commit_missing_payload_advances_diagnostic():
+    mailbox, seqs, commit_plan, kv_plan, consume_plan = build_all([101, 301, 302, 303, 304])
+    seqs[0].is_finished = False
+    seqs[1].is_finished = False
+    result = run_mailbox_verify_commit_probe(
+        commit_plan,
+        seqs,
+        current_rank=10,
+        output_owner_rank=10,
+        kv_commit_plan=kv_plan,
+        payload_consume_plan=consume_plan,
+        mailbox=mailbox,
+        continue_after_commit=True,
+        continuation_context={"active_seq_ids": [1, 3]},
+    )
+    assert result.success is True
+    assert result.second_step_state_check_attempted is True
+    assert result.second_step_state_check_success is True
+    assert result.next_required_feature in {"mailbox_payload_after_second_step", "request_completion_after_breadth_only_step"}
+    assert result.next_pipeline_step_error_kind == "request_completion_after_breadth_only_step"
+
+
+def test_continue_after_commit_all_finished_sets_breadth_completed():
+    mailbox, seqs, commit_plan, kv_plan, consume_plan = build_all([101, 301, 302, 303, 304])
+    result = run_mailbox_verify_commit_probe(
+        commit_plan,
+        seqs,
+        current_rank=10,
+        output_owner_rank=10,
+        kv_commit_plan=kv_plan,
+        payload_consume_plan=consume_plan,
+        mailbox=mailbox,
+        continue_after_commit=True,
+        continuation_context={"active_seq_ids": []},
+    )
+    assert result.success is True
+    assert result.breadth_only_completed is True
+    assert result.breadth_only_completion_reason == "all_requests_finished"
+    assert result.next_required_feature == "end_to_end_breadth_only_completion"

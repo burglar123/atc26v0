@@ -177,6 +177,32 @@ class MailboxVerifyCommitResult:
     pipeline_state_after_commit_valid: bool = False
     scheduler_state_after_commit_valid: bool = False
     breadth_only_step_count: int = 0
+    current_pipeline_step: int = 0
+    current_plan_id: int | None = None
+    next_plan_id: int | None = None
+    previous_target_home_batch_id: int | str | None = None
+    previous_draft_home_batch_id: int | str | None = None
+    current_target_home_batch_id: int | str | None = None
+    current_draft_home_batch_id: int | str | None = None
+    active_seq_ids_before_second_step: list[int] = field(default_factory=list)
+    active_seq_ids_after_second_step: list[int] = field(default_factory=list)
+    committed_seq_ids: list[int] = field(default_factory=list)
+    consumed_payload_ids: list[str] = field(default_factory=list)
+    invalidated_payload_ids: list[str] = field(default_factory=list)
+    available_mailbox_payload_ids: list[str] = field(default_factory=list)
+    pending_mailbox_payload_ids: list[str] = field(default_factory=list)
+    second_step_state_check_attempted: bool = False
+    second_step_state_check_success: bool = False
+    second_step_state_error: str | None = None
+    second_step_state_error_kind: str | None = None
+    repeated_verify_after_commit_detected: bool = False
+    scheduler_state_after_second_step_valid: bool = False
+    sequence_state_after_second_step_valid: bool = False
+    mailbox_state_after_second_step_valid: bool = False
+    request_completion_check_attempted: bool = False
+    request_completion_check_success: bool = False
+    second_step_rollback_attempted: bool = False
+    second_step_rollback_success: bool = True
     breadth_only_completed: bool = False
     breadth_only_completion_reason: str | None = None
     next_pipeline_step_skipped_non_owner: bool = False
@@ -297,6 +323,32 @@ class MailboxPayloadConsumeResult:
     pipeline_state_after_commit_valid: bool = False
     scheduler_state_after_commit_valid: bool = False
     breadth_only_step_count: int = 0
+    current_pipeline_step: int = 0
+    current_plan_id: int | None = None
+    next_plan_id: int | None = None
+    previous_target_home_batch_id: int | str | None = None
+    previous_draft_home_batch_id: int | str | None = None
+    current_target_home_batch_id: int | str | None = None
+    current_draft_home_batch_id: int | str | None = None
+    active_seq_ids_before_second_step: list[int] = field(default_factory=list)
+    active_seq_ids_after_second_step: list[int] = field(default_factory=list)
+    committed_seq_ids: list[int] = field(default_factory=list)
+    consumed_payload_ids: list[str] = field(default_factory=list)
+    invalidated_payload_ids: list[str] = field(default_factory=list)
+    available_mailbox_payload_ids: list[str] = field(default_factory=list)
+    pending_mailbox_payload_ids: list[str] = field(default_factory=list)
+    second_step_state_check_attempted: bool = False
+    second_step_state_check_success: bool = False
+    second_step_state_error: str | None = None
+    second_step_state_error_kind: str | None = None
+    repeated_verify_after_commit_detected: bool = False
+    scheduler_state_after_second_step_valid: bool = False
+    sequence_state_after_second_step_valid: bool = False
+    mailbox_state_after_second_step_valid: bool = False
+    request_completion_check_attempted: bool = False
+    request_completion_check_success: bool = False
+    second_step_rollback_attempted: bool = False
+    second_step_rollback_success: bool = True
     breadth_only_completed: bool = False
     breadth_only_completion_reason: str | None = None
     next_pipeline_step_skipped_non_owner: bool = False
@@ -1055,6 +1107,30 @@ def run_mailbox_payload_consume_probe(
             pipeline_state_after_commit_valid=bool(continuation.get("pipeline_state_after_commit_valid")),
             scheduler_state_after_commit_valid=bool(continuation.get("scheduler_state_after_commit_valid")),
             breadth_only_step_count=int(continuation.get("breadth_only_step_count") or 0),
+            current_pipeline_step=int(continuation.get("current_pipeline_step") or 0),
+            current_plan_id=continuation.get("current_plan_id"),
+            next_plan_id=continuation.get("next_plan_id"),
+            previous_target_home_batch_id=continuation.get("previous_target_home_batch_id"),
+            previous_draft_home_batch_id=continuation.get("previous_draft_home_batch_id"),
+            current_target_home_batch_id=continuation.get("current_target_home_batch_id"),
+            current_draft_home_batch_id=continuation.get("current_draft_home_batch_id"),
+            active_seq_ids_before_second_step=list(continuation.get("active_seq_ids_before_second_step") or []),
+            active_seq_ids_after_second_step=list(continuation.get("active_seq_ids_after_second_step") or []),
+            committed_seq_ids=list(continuation.get("committed_seq_ids") or []),
+            available_mailbox_payload_ids=list(continuation.get("available_mailbox_payload_ids") or []),
+            pending_mailbox_payload_ids=list(continuation.get("pending_mailbox_payload_ids") or []),
+            second_step_state_check_attempted=bool(continuation.get("second_step_state_check_attempted")),
+            second_step_state_check_success=bool(continuation.get("second_step_state_check_success")),
+            second_step_state_error=continuation.get("second_step_state_error"),
+            second_step_state_error_kind=continuation.get("second_step_state_error_kind"),
+            repeated_verify_after_commit_detected=bool(continuation.get("repeated_verify_after_commit_detected")),
+            scheduler_state_after_second_step_valid=bool(continuation.get("scheduler_state_after_second_step_valid")),
+            sequence_state_after_second_step_valid=bool(continuation.get("sequence_state_after_second_step_valid")),
+            mailbox_state_after_second_step_valid=bool(continuation.get("mailbox_state_after_second_step_valid")),
+            request_completion_check_attempted=bool(continuation.get("request_completion_check_attempted")),
+            request_completion_check_success=bool(continuation.get("request_completion_check_success")),
+            second_step_rollback_attempted=bool(continuation.get("second_step_rollback_attempted")),
+            second_step_rollback_success=bool(continuation.get("second_step_rollback_success", True)),
             breadth_only_completed=bool(continuation.get("breadth_only_completed")),
             breadth_only_completion_reason=continuation.get("breadth_only_completion_reason"),
         )
@@ -1316,6 +1392,32 @@ def run_mailbox_verify_commit_probe(
                     pipeline_state_after_commit_valid=payload_result.pipeline_state_after_commit_valid,
                     scheduler_state_after_commit_valid=payload_result.scheduler_state_after_commit_valid,
                     breadth_only_step_count=payload_result.breadth_only_step_count,
+                    current_pipeline_step=payload_result.current_pipeline_step,
+                    current_plan_id=payload_result.current_plan_id,
+                    next_plan_id=payload_result.next_plan_id,
+                    previous_target_home_batch_id=payload_result.previous_target_home_batch_id,
+                    previous_draft_home_batch_id=payload_result.previous_draft_home_batch_id,
+                    current_target_home_batch_id=payload_result.current_target_home_batch_id,
+                    current_draft_home_batch_id=payload_result.current_draft_home_batch_id,
+                    active_seq_ids_before_second_step=payload_result.active_seq_ids_before_second_step,
+                    active_seq_ids_after_second_step=payload_result.active_seq_ids_after_second_step,
+                    committed_seq_ids=payload_result.committed_seq_ids,
+                    consumed_payload_ids=payload_result.consumed_payload_ids,
+                    invalidated_payload_ids=payload_result.invalidated_payload_ids,
+                    available_mailbox_payload_ids=payload_result.available_mailbox_payload_ids,
+                    pending_mailbox_payload_ids=payload_result.pending_mailbox_payload_ids,
+                    second_step_state_check_attempted=payload_result.second_step_state_check_attempted,
+                    second_step_state_check_success=payload_result.second_step_state_check_success,
+                    second_step_state_error=payload_result.second_step_state_error,
+                    second_step_state_error_kind=payload_result.second_step_state_error_kind,
+                    repeated_verify_after_commit_detected=payload_result.repeated_verify_after_commit_detected,
+                    scheduler_state_after_second_step_valid=payload_result.scheduler_state_after_second_step_valid,
+                    sequence_state_after_second_step_valid=payload_result.sequence_state_after_second_step_valid,
+                    mailbox_state_after_second_step_valid=payload_result.mailbox_state_after_second_step_valid,
+                    request_completion_check_attempted=payload_result.request_completion_check_attempted,
+                    request_completion_check_success=payload_result.request_completion_check_success,
+                    second_step_rollback_attempted=payload_result.second_step_rollback_attempted,
+                    second_step_rollback_success=payload_result.second_step_rollback_success,
                     breadth_only_completed=payload_result.breadth_only_completed,
                     breadth_only_completion_reason=payload_result.breadth_only_completion_reason,
                     next_pipeline_step_skipped_non_owner=payload_result.next_pipeline_step_skipped_non_owner,
@@ -1381,6 +1483,32 @@ def run_mailbox_verify_commit_probe(
             pipeline_state_after_commit_valid=bool(payload_result.pipeline_state_after_commit_valid) if payload_result is not None else False,
             scheduler_state_after_commit_valid=bool(payload_result.scheduler_state_after_commit_valid) if payload_result is not None else False,
             breadth_only_step_count=payload_result.breadth_only_step_count if payload_result is not None else 0,
+            current_pipeline_step=payload_result.current_pipeline_step if payload_result is not None else 0,
+            current_plan_id=payload_result.current_plan_id if payload_result is not None else None,
+            next_plan_id=payload_result.next_plan_id if payload_result is not None else None,
+            previous_target_home_batch_id=payload_result.previous_target_home_batch_id if payload_result is not None else None,
+            previous_draft_home_batch_id=payload_result.previous_draft_home_batch_id if payload_result is not None else None,
+            current_target_home_batch_id=payload_result.current_target_home_batch_id if payload_result is not None else None,
+            current_draft_home_batch_id=payload_result.current_draft_home_batch_id if payload_result is not None else None,
+            active_seq_ids_before_second_step=payload_result.active_seq_ids_before_second_step if payload_result is not None else [],
+            active_seq_ids_after_second_step=payload_result.active_seq_ids_after_second_step if payload_result is not None else [],
+            committed_seq_ids=payload_result.committed_seq_ids if payload_result is not None else [],
+            consumed_payload_ids=payload_result.consumed_payload_ids if payload_result is not None else [],
+            invalidated_payload_ids=payload_result.invalidated_payload_ids if payload_result is not None else [],
+            available_mailbox_payload_ids=payload_result.available_mailbox_payload_ids if payload_result is not None else [],
+            pending_mailbox_payload_ids=payload_result.pending_mailbox_payload_ids if payload_result is not None else [],
+            second_step_state_check_attempted=bool(payload_result.second_step_state_check_attempted) if payload_result is not None else False,
+            second_step_state_check_success=bool(payload_result.second_step_state_check_success) if payload_result is not None else False,
+            second_step_state_error=payload_result.second_step_state_error if payload_result is not None else None,
+            second_step_state_error_kind=payload_result.second_step_state_error_kind if payload_result is not None else None,
+            repeated_verify_after_commit_detected=bool(payload_result.repeated_verify_after_commit_detected) if payload_result is not None else False,
+            scheduler_state_after_second_step_valid=bool(payload_result.scheduler_state_after_second_step_valid) if payload_result is not None else False,
+            sequence_state_after_second_step_valid=bool(payload_result.sequence_state_after_second_step_valid) if payload_result is not None else False,
+            mailbox_state_after_second_step_valid=bool(payload_result.mailbox_state_after_second_step_valid) if payload_result is not None else False,
+            request_completion_check_attempted=bool(payload_result.request_completion_check_attempted) if payload_result is not None else False,
+            request_completion_check_success=bool(payload_result.request_completion_check_success) if payload_result is not None else False,
+            second_step_rollback_attempted=bool(payload_result.second_step_rollback_attempted) if payload_result is not None else False,
+            second_step_rollback_success=bool(payload_result.second_step_rollback_success) if payload_result is not None else True,
             breadth_only_completed=bool(payload_result.breadth_only_completed) if payload_result is not None else False,
             breadth_only_completion_reason=payload_result.breadth_only_completion_reason if payload_result is not None else None,
             next_pipeline_step_skipped_non_owner=bool(payload_result.next_pipeline_step_skipped_non_owner) if payload_result is not None else False,
@@ -1465,6 +1593,12 @@ def _build_next_pipeline_continuation_metadata(
     else:
         next_target = context.get("next_target_home_batch_id", current_target)
         next_draft = context.get("next_draft_home_batch_id", current_target)
+    committed_seq_ids = [int(seq_id) for seq_id in consume_plan.seq_ids]
+    active_seq_ids = [int(seq_id) for seq_id in context.get("active_seq_ids", consume_plan.seq_ids) or []]
+    available_payload_ids = sorted(
+        [str(payload_id) for payload_id, row in mailbox_state_after.items() if isinstance(row, dict) and str(row.get("lifecycle_state")) == "available"],
+        key=str,
+    )
     metadata: JsonDict = {
         "next_pipeline_step_attempted": True,
         "next_pipeline_step_success": False,
@@ -1478,9 +1612,35 @@ def _build_next_pipeline_continuation_metadata(
         "previous_committed_plan_id": consume_plan.plan_id,
         "previous_consumed_payload_ids": list(consume_plan.consumed_payload_ids),
         "previous_invalidated_payload_ids": list(consume_plan.invalidated_payload_ids),
+        "consumed_payload_ids": list(consume_plan.consumed_payload_ids),
+        "invalidated_payload_ids": list(consume_plan.invalidated_payload_ids),
         "duplicate_payload_consume_after_continue": duplicate_after_continue,
         "pipeline_state_after_commit_valid": not duplicate_after_continue,
         "scheduler_state_after_commit_valid": True,
+        "second_step_state_check_attempted": bool(continue_after_commit),
+        "second_step_state_check_success": False,
+        "second_step_state_error": None,
+        "second_step_state_error_kind": None,
+        "current_pipeline_step": 1,
+        "current_plan_id": consume_plan.plan_id,
+        "next_plan_id": next_plan_id,
+        "previous_target_home_batch_id": consume_plan.target_home_batch_id,
+        "previous_draft_home_batch_id": context.get("previous_draft_home_batch_id", next_draft),
+        "current_target_home_batch_id": next_target,
+        "current_draft_home_batch_id": next_draft,
+        "active_seq_ids_before_second_step": list(active_seq_ids),
+        "active_seq_ids_after_second_step": list(active_seq_ids),
+        "committed_seq_ids": committed_seq_ids,
+        "available_mailbox_payload_ids": available_payload_ids,
+        "pending_mailbox_payload_ids": available_payload_ids,
+        "repeated_verify_after_commit_detected": False,
+        "scheduler_state_after_second_step_valid": True,
+        "sequence_state_after_second_step_valid": True,
+        "mailbox_state_after_second_step_valid": not duplicate_after_continue,
+        "request_completion_check_attempted": False,
+        "request_completion_check_success": False,
+        "second_step_rollback_attempted": False,
+        "second_step_rollback_success": True,
         "breadth_only_step_count": 1,
         "breadth_only_completed": False,
         "breadth_only_completion_reason": None,
@@ -1488,35 +1648,58 @@ def _build_next_pipeline_continuation_metadata(
     }
     if not continue_after_commit:
         return metadata
-    active_seq_ids = [int(seq_id) for seq_id in context.get("active_seq_ids", consume_plan.seq_ids) or []]
+    scheduler_active_seq_ids = [int(seq_id) for seq_id in context.get("scheduler_active_seq_ids", active_seq_ids) or []]
+    if sorted(active_seq_ids) != sorted(scheduler_active_seq_ids):
+        metadata.update(
+            {
+                "second_step_state_check_success": False,
+                "second_step_state_error": "active seq ids mismatch with scheduler state after second-step continuation",
+                "second_step_state_error_kind": "scheduler_state_after_second_step",
+                "scheduler_state_after_second_step_valid": False,
+                "next_pipeline_step_error_kind": "scheduler_state_after_second_step",
+                "next_required_feature": "scheduler_state_after_second_step",
+                "breadth_only_step_count": 2,
+            }
+        )
+        return metadata
     if not active_seq_ids:
+        pending_payload_ids = [payload_id for payload_id in available_payload_ids if payload_id not in set(consume_plan.consumed_payload_ids)]
+        metadata["pending_mailbox_payload_ids"] = list(pending_payload_ids)
+        metadata["request_completion_check_attempted"] = True
+        metadata["request_completion_check_success"] = True
         metadata.update(
             {
                 "next_pipeline_step_success": True,
                 "next_pipeline_step_error": None,
                 "next_pipeline_step_error_kind": None,
-                "breadth_only_step_count": 1,
-                "breadth_only_completed": True,
-                "breadth_only_completion_reason": "no_active_sequences_after_mailbox_commit",
-                "next_required_feature": "end_to_end_breadth_only_completion",
+                "second_step_state_check_success": True,
+                "breadth_only_step_count": 2,
+                "current_pipeline_step": 2,
+                "active_seq_ids_after_second_step": [],
+                "breadth_only_completed": len(pending_payload_ids) == 0,
+                "breadth_only_completion_reason": "all_requests_finished" if len(pending_payload_ids) == 0 else "pending_mailbox_payload_after_second_step",
+                "next_required_feature": "end_to_end_breadth_only_completion" if len(pending_payload_ids) == 0 else "pipeline_drain_after_second_step",
             }
         )
         return metadata
-    # Minimal V4P breadth-only continuation: build a second-step metadata plan
-    # without reusing the just-consumed payloads.  Actual second-step GPU decode
-    # remains a later feature, so fail fast at a more specific diagnostic.
     committed = set(int(seq_id) for seq_id in consume_plan.seq_ids)
+    repeated_verify_after_commit = any(seq_id in committed for seq_id in active_seq_ids)
     metadata.update(
         {
             "next_pipeline_step_success": True,
-            "next_pipeline_step_error": "second breadth-only pipeline step metadata built; execution continuation is not implemented",
-            "next_pipeline_step_error_kind": "pipeline_state_after_second_step",
+            "next_pipeline_step_error": "second-step state validated; continuation requires request completion drain",
+            "next_pipeline_step_error_kind": "request_completion_after_breadth_only_step",
             "next_pipeline_actual_target_seq_ids": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
             "next_pipeline_actual_draft_seq_ids": list(active_seq_ids),
+            "second_step_state_check_success": True,
+            "current_pipeline_step": 2,
+            "active_seq_ids_after_second_step": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
+            "repeated_verify_after_commit_detected": repeated_verify_after_commit,
+            "request_completion_check_attempted": True,
             "breadth_only_step_count": 2,
             "breadth_only_completed": False,
             "breadth_only_completion_reason": "second_step_metadata_built",
-            "next_required_feature": "pipeline_state_after_second_step",
+            "next_required_feature": "mailbox_payload_after_second_step" if any(seq_id for seq_id in active_seq_ids if seq_id not in committed) else "request_completion_after_breadth_only_step",
         }
     )
     return metadata

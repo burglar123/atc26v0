@@ -592,6 +592,32 @@ class ModelRunnerBase:
             "breadth_only_step_count": 0,
             "breadth_only_completed": False,
             "breadth_only_completion_reason": None,
+            "second_step_state_check_attempted": False,
+            "second_step_state_check_success": False,
+            "second_step_state_error": None,
+            "second_step_state_error_kind": None,
+            "current_pipeline_step": 0,
+            "current_plan_id": None,
+            "next_plan_id": None,
+            "previous_target_home_batch_id": None,
+            "previous_draft_home_batch_id": None,
+            "current_target_home_batch_id": None,
+            "current_draft_home_batch_id": None,
+            "active_seq_ids_before_second_step": [],
+            "active_seq_ids_after_second_step": [],
+            "committed_seq_ids": [],
+            "consumed_payload_ids": [],
+            "invalidated_payload_ids": [],
+            "available_mailbox_payload_ids": [],
+            "pending_mailbox_payload_ids": [],
+            "repeated_verify_after_commit_detected": False,
+            "scheduler_state_after_second_step_valid": False,
+            "sequence_state_after_second_step_valid": False,
+            "mailbox_state_after_second_step_valid": False,
+            "request_completion_check_attempted": False,
+            "request_completion_check_success": False,
+            "second_step_rollback_attempted": False,
+            "second_step_rollback_success": False,
             "next_pipeline_step_skipped_non_owner": False,
             "mailbox_verify_commit_rollback_attempted": False,
             "mailbox_verify_commit_rollback_success": True,
@@ -830,6 +856,32 @@ class ModelRunnerBase:
             "breadth_only_completed",
             "breadth_only_completion_reason",
             "next_pipeline_step_skipped_non_owner",
+            "second_step_state_check_attempted",
+            "second_step_state_check_success",
+            "second_step_state_error",
+            "second_step_state_error_kind",
+            "current_pipeline_step",
+            "current_plan_id",
+            "next_plan_id",
+            "previous_target_home_batch_id",
+            "previous_draft_home_batch_id",
+            "current_target_home_batch_id",
+            "current_draft_home_batch_id",
+            "active_seq_ids_before_second_step",
+            "active_seq_ids_after_second_step",
+            "committed_seq_ids",
+            "consumed_payload_ids",
+            "invalidated_payload_ids",
+            "available_mailbox_payload_ids",
+            "pending_mailbox_payload_ids",
+            "repeated_verify_after_commit_detected",
+            "scheduler_state_after_second_step_valid",
+            "sequence_state_after_second_step_valid",
+            "mailbox_state_after_second_step_valid",
+            "request_completion_check_attempted",
+            "request_completion_check_success",
+            "second_step_rollback_attempted",
+            "second_step_rollback_success",
             "mailbox_verify_commit_rollback_attempted",
             "mailbox_verify_commit_rollback_success",
             "mailbox_verify_commit_skipped_non_owner",
@@ -1645,6 +1697,32 @@ class ModelRunnerBase:
             trace_record["breadth_only_step_count"] = int(commit_result.breadth_only_step_count)
             trace_record["breadth_only_completed"] = bool(commit_result.breadth_only_completed)
             trace_record["breadth_only_completion_reason"] = commit_result.breadth_only_completion_reason
+            trace_record["second_step_state_check_attempted"] = commit_result.second_step_state_check_attempted
+            trace_record["second_step_state_check_success"] = commit_result.second_step_state_check_success
+            trace_record["second_step_state_error"] = commit_result.second_step_state_error
+            trace_record["second_step_state_error_kind"] = commit_result.second_step_state_error_kind
+            trace_record["current_pipeline_step"] = commit_result.current_pipeline_step
+            trace_record["current_plan_id"] = commit_result.current_plan_id
+            trace_record["next_plan_id"] = commit_result.next_plan_id
+            trace_record["previous_target_home_batch_id"] = commit_result.previous_target_home_batch_id
+            trace_record["previous_draft_home_batch_id"] = commit_result.previous_draft_home_batch_id
+            trace_record["current_target_home_batch_id"] = commit_result.current_target_home_batch_id
+            trace_record["current_draft_home_batch_id"] = commit_result.current_draft_home_batch_id
+            trace_record["active_seq_ids_before_second_step"] = commit_result.active_seq_ids_before_second_step
+            trace_record["active_seq_ids_after_second_step"] = commit_result.active_seq_ids_after_second_step
+            trace_record["committed_seq_ids"] = commit_result.committed_seq_ids
+            trace_record["consumed_payload_ids"] = commit_result.consumed_payload_ids
+            trace_record["invalidated_payload_ids"] = commit_result.invalidated_payload_ids
+            trace_record["available_mailbox_payload_ids"] = commit_result.available_mailbox_payload_ids
+            trace_record["pending_mailbox_payload_ids"] = commit_result.pending_mailbox_payload_ids
+            trace_record["repeated_verify_after_commit_detected"] = commit_result.repeated_verify_after_commit_detected
+            trace_record["scheduler_state_after_second_step_valid"] = commit_result.scheduler_state_after_second_step_valid
+            trace_record["sequence_state_after_second_step_valid"] = commit_result.sequence_state_after_second_step_valid
+            trace_record["mailbox_state_after_second_step_valid"] = commit_result.mailbox_state_after_second_step_valid
+            trace_record["request_completion_check_attempted"] = commit_result.request_completion_check_attempted
+            trace_record["request_completion_check_success"] = commit_result.request_completion_check_success
+            trace_record["second_step_rollback_attempted"] = commit_result.second_step_rollback_attempted
+            trace_record["second_step_rollback_success"] = commit_result.second_step_rollback_success
             trace_record["next_pipeline_step_skipped_non_owner"] = bool(commit_result.next_pipeline_step_skipped_non_owner)
             trace_record["mailbox_verify_commit_rollback_attempted"] = bool(commit_result.rollback_attempted)
             trace_record["mailbox_verify_commit_rollback_success"] = bool(commit_result.rollback_success)
