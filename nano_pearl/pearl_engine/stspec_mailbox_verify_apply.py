@@ -1651,6 +1651,7 @@ def _build_next_pipeline_continuation_metadata(
         [str(payload_id) for payload_id, row in mailbox_state_after.items() if isinstance(row, dict) and str(row.get("lifecycle_state")) == "available"],
         key=str,
     )
+    context_pending_payload_ids = [str(payload_id) for payload_id in context.get("pending_mailbox_payload_ids", [])]
     metadata: JsonDict = {
         "next_pipeline_step_attempted": True,
         "next_pipeline_step_success": False,
@@ -1731,7 +1732,10 @@ def _build_next_pipeline_continuation_metadata(
         )
         return metadata
     if not active_seq_ids:
-        pending_payload_ids = [payload_id for payload_id in available_payload_ids if payload_id not in set(consume_plan.consumed_payload_ids)]
+        pending_payload_ids = sorted(
+            set([payload_id for payload_id in available_payload_ids if payload_id not in set(consume_plan.consumed_payload_ids)] + context_pending_payload_ids),
+            key=str,
+        )
         metadata["pending_mailbox_payload_ids"] = list(pending_payload_ids)
         metadata["request_completion_check_attempted"] = True
         metadata["request_completion_check_success"] = True

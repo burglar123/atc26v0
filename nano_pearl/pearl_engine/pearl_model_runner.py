@@ -616,6 +616,23 @@ class ModelRunnerBase:
             "mailbox_state_after_second_step_valid": False,
             "request_completion_check_attempted": False,
             "request_completion_check_success": False,
+            "request_completion_reason": None,
+            "active_seq_ids_at_completion_check": [],
+            "finished_seq_ids_at_completion_check": [],
+            "unfinished_seq_ids_at_completion_check": [],
+            "max_tokens_reached_seq_ids": [],
+            "eos_reached_seq_ids": [],
+            "mailbox_pending_payload_ids_at_completion": [],
+            "mailbox_consumed_payload_ids_at_completion": [],
+            "scheduler_active_seq_ids_at_completion": [],
+            "sequence_state_completion_valid": False,
+            "scheduler_state_completion_valid": False,
+            "mailbox_state_completion_valid": False,
+            "request_completion_error": None,
+            "request_completion_error_kind": None,
+            "result_finalization_attempted": False,
+            "result_finalization_success": False,
+            "result_finalization_error": None,
             "second_step_rollback_attempted": False,
             "second_step_rollback_success": False,
             "next_pipeline_step_skipped_non_owner": False,
@@ -1721,6 +1738,23 @@ class ModelRunnerBase:
             trace_record["mailbox_state_after_second_step_valid"] = commit_result.mailbox_state_after_second_step_valid
             trace_record["request_completion_check_attempted"] = commit_result.request_completion_check_attempted
             trace_record["request_completion_check_success"] = commit_result.request_completion_check_success
+            trace_record["request_completion_reason"] = commit_result.request_completion_reason
+            trace_record["active_seq_ids_at_completion_check"] = list(commit_result.active_seq_ids_at_completion_check)
+            trace_record["finished_seq_ids_at_completion_check"] = list(commit_result.finished_seq_ids_at_completion_check)
+            trace_record["unfinished_seq_ids_at_completion_check"] = list(commit_result.unfinished_seq_ids_at_completion_check)
+            trace_record["max_tokens_reached_seq_ids"] = list(commit_result.max_tokens_reached_seq_ids)
+            trace_record["eos_reached_seq_ids"] = list(commit_result.eos_reached_seq_ids)
+            trace_record["mailbox_pending_payload_ids_at_completion"] = list(commit_result.mailbox_pending_payload_ids_at_completion)
+            trace_record["mailbox_consumed_payload_ids_at_completion"] = list(commit_result.mailbox_consumed_payload_ids_at_completion)
+            trace_record["scheduler_active_seq_ids_at_completion"] = list(commit_result.scheduler_active_seq_ids_at_completion)
+            trace_record["sequence_state_completion_valid"] = bool(commit_result.sequence_state_completion_valid)
+            trace_record["scheduler_state_completion_valid"] = bool(commit_result.scheduler_state_completion_valid)
+            trace_record["mailbox_state_completion_valid"] = bool(commit_result.mailbox_state_completion_valid)
+            trace_record["request_completion_error"] = commit_result.request_completion_error
+            trace_record["request_completion_error_kind"] = commit_result.request_completion_error_kind
+            trace_record["result_finalization_attempted"] = bool(commit_result.result_finalization_attempted)
+            trace_record["result_finalization_success"] = bool(commit_result.result_finalization_success)
+            trace_record["result_finalization_error"] = commit_result.result_finalization_error
             trace_record["second_step_rollback_attempted"] = commit_result.second_step_rollback_attempted
             trace_record["second_step_rollback_success"] = commit_result.second_step_rollback_success
             trace_record["next_pipeline_step_skipped_non_owner"] = bool(commit_result.next_pipeline_step_skipped_non_owner)

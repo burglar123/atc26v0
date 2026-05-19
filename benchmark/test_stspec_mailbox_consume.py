@@ -282,3 +282,40 @@ def test_continue_after_commit_all_finished_sets_breadth_completed():
     assert result.breadth_only_completed is True
     assert result.breadth_only_completion_reason == "all_requests_finished"
     assert result.next_required_feature == "end_to_end_breadth_only_completion"
+
+
+def test_continue_after_commit_pending_payload_sets_mailbox_drain_diagnostic():
+    mailbox, seqs, commit_plan, kv_plan, consume_plan = build_all([101, 301, 302, 303, 304])
+    # inject a pending available payload not in consumed set
+    mailbox.put_payloads(1, [payload(9, [901], offset=5)])
+    result = run_mailbox_verify_commit_probe(
+        commit_plan,
+        seqs,
+        current_rank=10,
+        output_owner_rank=10,
+        kv_commit_plan=kv_plan,
+        payload_consume_plan=consume_plan,
+        mailbox=mailbox,
+        continue_after_commit=True,
+        continuation_context={"active_seq_ids": [], "pending_mailbox_payload_ids": ["1:9:5:1"]},
+    )
+    assert result.success is True
+    assert result.breadth_only_completed is False
+    assert result.next_required_feature == "mailbox_drain_after_breadth_only_completion"
+
+
+def test_continue_after_commit_scheduler_mismatch_sets_specific_diagnostic():
+    mailbox, seqs, commit_plan, kv_plan, consume_plan = build_all([101, 301, 302, 303, 304])
+    result = run_mailbox_verify_commit_probe(
+        commit_plan,
+        seqs,
+        current_rank=10,
+        output_owner_rank=10,
+        kv_commit_plan=kv_plan,
+        payload_consume_plan=consume_plan,
+        mailbox=mailbox,
+        continue_after_commit=True,
+        continuation_context={"active_seq_ids": [1], "scheduler_active_seq_ids": [3]},
+    )
+    assert result.success is True
+    assert result.next_required_feature == "scheduler_state_after_breadth_only_completion"
