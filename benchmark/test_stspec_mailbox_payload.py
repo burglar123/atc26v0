@@ -143,3 +143,88 @@ def test_illegal_legacy_fallback_detection_shape():
     if actual_target_exec_seq_ids != scheduled_seq_ids:
         record["illegal_legacy_fallback"] = True
     assert record["illegal_legacy_fallback"] is True
+
+
+def test_payload_availability_with_empty_missing_seq_ids_is_not_missing_payload():
+    context_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_forward_context")
+    payloads = make_payloads()
+    status = context_mod.classify_mailbox_payload_availability(
+        target_home_batch_id=1,
+        target_seq_ids=[1, 3],
+        available_home_batch_ids=[1],
+        available_seq_ids_by_batch={"1": [1, 3]},
+        missing_seq_ids=[],
+        payloads=payloads,
+        is_payload_owner=True,
+        owner_rank=10,
+        current_rank=10,
+    )
+
+    assert status["mailbox_payload_envelope_available"] is True
+    assert status["mailbox_payload_available_for_seq_ids"] is True
+    assert status["mailbox_payload_token_ids_available"] is True
+    assert status["mailbox_error_kind"] is None
+    assert status["next_required_feature"] is None
+    json.dumps(status, sort_keys=True)
+
+
+def test_payload_tensor_unavailable_on_non_owner_skips_not_missing_payload():
+    context_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_forward_context")
+    status = context_mod.classify_mailbox_payload_availability(
+        target_home_batch_id=1,
+        target_seq_ids=[1, 3],
+        available_home_batch_ids=[1],
+        available_seq_ids_by_batch={"1": [1, 3]},
+        missing_seq_ids=[],
+        payloads=[],
+        is_payload_owner=False,
+        owner_rank=10,
+        current_rank=11,
+    )
+
+    assert status["mailbox_payload_missing_reason"] == "mailbox_payload_tensor_unavailable_on_non_owner"
+    assert status["mailbox_error_kind"] == "mailbox_payload_tensor_unavailable_on_non_owner"
+    assert status["should_skip_non_owner"] is True
+    assert status["next_required_feature"] is None
+
+
+def test_payload_tensor_unavailable_on_owner_uses_backend_feature():
+    context_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_forward_context")
+    status = context_mod.classify_mailbox_payload_availability(
+        target_home_batch_id=1,
+        target_seq_ids=[1, 3],
+        available_home_batch_ids=[1],
+        available_seq_ids_by_batch={"1": [1, 3]},
+        missing_seq_ids=[],
+        payloads=[],
+        is_payload_owner=True,
+        owner_rank=10,
+        current_rank=10,
+    )
+
+    assert status["mailbox_payload_missing_reason"] == "mailbox_payload_tensor_backend_unavailable"
+    assert status["mailbox_error_kind"] == "mailbox_payload_tensor_backend_unavailable"
+    assert status["next_required_feature"] == "mailbox_payload_tensor_backend"
+
+
+def test_wrong_seq_ids_and_home_batch_still_classified_as_missing():
+    context_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_forward_context")
+    wrong_seq = context_mod.classify_mailbox_payload_availability(
+        target_home_batch_id=1,
+        target_seq_ids=[1, 4],
+        available_home_batch_ids=[1],
+        available_seq_ids_by_batch={"1": [1, 3]},
+        missing_seq_ids=[4],
+        payloads=[],
+    )
+    wrong_batch = context_mod.classify_mailbox_payload_availability(
+        target_home_batch_id=2,
+        target_seq_ids=[1, 3],
+        available_home_batch_ids=[1],
+        available_seq_ids_by_batch={"1": [1, 3]},
+        missing_seq_ids=[1, 3],
+        payloads=[],
+    )
+
+    assert wrong_seq["mailbox_error_kind"] == "mailbox_missing_payload"
+    assert wrong_batch["mailbox_error_kind"] == "mailbox_missing_payload"
