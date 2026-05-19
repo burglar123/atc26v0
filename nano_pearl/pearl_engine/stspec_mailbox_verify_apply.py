@@ -164,7 +164,22 @@ class MailboxVerifyCommitResult:
     next_pipeline_step_attempted: bool = False
     next_pipeline_step_success: bool = False
     next_pipeline_step_error: str | None = None
+    next_pipeline_step_error_kind: str | None = None
     next_pipeline_plan_id: int | None = None
+    next_pipeline_target_home_batch_id: int | str | None = None
+    next_pipeline_draft_home_batch_id: int | str | None = None
+    next_pipeline_actual_target_seq_ids: list[int] = field(default_factory=list)
+    next_pipeline_actual_draft_seq_ids: list[int] = field(default_factory=list)
+    previous_committed_plan_id: int | None = None
+    previous_consumed_payload_ids: list[str] = field(default_factory=list)
+    previous_invalidated_payload_ids: list[str] = field(default_factory=list)
+    duplicate_payload_consume_after_continue: bool = False
+    pipeline_state_after_commit_valid: bool = False
+    scheduler_state_after_commit_valid: bool = False
+    breadth_only_step_count: int = 0
+    breadth_only_completed: bool = False
+    breadth_only_completion_reason: str | None = None
+    next_pipeline_step_skipped_non_owner: bool = False
     rollback_attempted: bool = False
     rollback_success: bool = True
     skipped_non_owner: bool = False
@@ -269,7 +284,22 @@ class MailboxPayloadConsumeResult:
     next_pipeline_step_attempted: bool = False
     next_pipeline_step_success: bool = False
     next_pipeline_step_error: str | None = None
+    next_pipeline_step_error_kind: str | None = None
     next_pipeline_plan_id: int | None = None
+    next_pipeline_target_home_batch_id: int | str | None = None
+    next_pipeline_draft_home_batch_id: int | str | None = None
+    next_pipeline_actual_target_seq_ids: list[int] = field(default_factory=list)
+    next_pipeline_actual_draft_seq_ids: list[int] = field(default_factory=list)
+    previous_committed_plan_id: int | None = None
+    previous_consumed_payload_ids: list[str] = field(default_factory=list)
+    previous_invalidated_payload_ids: list[str] = field(default_factory=list)
+    duplicate_payload_consume_after_continue: bool = False
+    pipeline_state_after_commit_valid: bool = False
+    scheduler_state_after_commit_valid: bool = False
+    breadth_only_step_count: int = 0
+    breadth_only_completed: bool = False
+    breadth_only_completion_reason: str | None = None
+    next_pipeline_step_skipped_non_owner: bool = False
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
@@ -946,6 +976,8 @@ def run_mailbox_payload_consume_probe(
     current_rank: int | None = None,
     output_owner_rank: int | None = None,
     next_pipeline_plan_id: int | None = None,
+    continue_after_commit: bool = False,
+    continuation_context: JsonDict | None = None,
 ) -> MailboxPayloadConsumeResult:
     payload_ids = sorted(
         set(consume_plan.consumed_payload_ids) | set(consume_plan.invalidated_payload_ids),
@@ -961,6 +993,7 @@ def run_mailbox_payload_consume_probe(
             mailbox_state_after=before,
             skipped_non_owner=True,
             invalidate_skipped_non_owner=True,
+            next_pipeline_step_skipped_non_owner=True,
         )
     consumed_by_payload: dict[str, int] = {}
     invalidated_by_payload: dict[str, int] = {}
@@ -988,21 +1021,42 @@ def run_mailbox_payload_consume_probe(
                 next_required_feature="mailbox_payload_consume_rollback_validation",
                 error_kind="mailbox_payload_lifecycle_post_state_mismatch",
             )
+        continuation = _build_next_pipeline_continuation_metadata(
+            consume_plan,
+            after,
+            next_pipeline_plan_id=next_pipeline_plan_id,
+            continue_after_commit=continue_after_commit,
+            continuation_context=continuation_context,
+        )
         return MailboxPayloadConsumeResult(
             attempted=True,
             success=True,
             plan=consume_plan,
-            next_required_feature="next_pipeline_step_after_mailbox_commit",
+            next_required_feature=continuation["next_required_feature"],
             consumed_payload_ids=list(consume_plan.consumed_payload_ids),
             invalidated_payload_ids=list(consume_plan.invalidated_payload_ids),
             consumed_token_count=sum(consume_plan.consumed_token_count_by_seq.values()),
             invalidated_token_count=sum(consume_plan.invalidated_token_count_by_seq.values()),
             mailbox_state_before=before,
             mailbox_state_after=after,
-            next_pipeline_step_attempted=True,
-            next_pipeline_step_success=False,
-            next_pipeline_step_error="next pipeline step after mailbox commit is not implemented",
-            next_pipeline_plan_id=next_pipeline_plan_id,
+            next_pipeline_step_attempted=bool(continuation["next_pipeline_step_attempted"]),
+            next_pipeline_step_success=bool(continuation["next_pipeline_step_success"]),
+            next_pipeline_step_error=continuation.get("next_pipeline_step_error"),
+            next_pipeline_step_error_kind=continuation.get("next_pipeline_step_error_kind"),
+            next_pipeline_plan_id=continuation.get("next_pipeline_plan_id"),
+            next_pipeline_target_home_batch_id=continuation.get("next_pipeline_target_home_batch_id"),
+            next_pipeline_draft_home_batch_id=continuation.get("next_pipeline_draft_home_batch_id"),
+            next_pipeline_actual_target_seq_ids=list(continuation.get("next_pipeline_actual_target_seq_ids") or []),
+            next_pipeline_actual_draft_seq_ids=list(continuation.get("next_pipeline_actual_draft_seq_ids") or []),
+            previous_committed_plan_id=continuation.get("previous_committed_plan_id"),
+            previous_consumed_payload_ids=list(continuation.get("previous_consumed_payload_ids") or []),
+            previous_invalidated_payload_ids=list(continuation.get("previous_invalidated_payload_ids") or []),
+            duplicate_payload_consume_after_continue=bool(continuation.get("duplicate_payload_consume_after_continue")),
+            pipeline_state_after_commit_valid=bool(continuation.get("pipeline_state_after_commit_valid")),
+            scheduler_state_after_commit_valid=bool(continuation.get("scheduler_state_after_commit_valid")),
+            breadth_only_step_count=int(continuation.get("breadth_only_step_count") or 0),
+            breadth_only_completed=bool(continuation.get("breadth_only_completed")),
+            breadth_only_completion_reason=continuation.get("breadth_only_completion_reason"),
         )
     except Exception as exc:
         rollback_attempted = True
@@ -1043,6 +1097,8 @@ def run_mailbox_verify_commit_probe(
     payload_consume_plan: MailboxPayloadConsumePlan | None = None,
     mailbox: Any | None = None,
     next_pipeline_plan_id: int | None = None,
+    continue_after_commit: bool = False,
+    continuation_context: JsonDict | None = None,
 ) -> MailboxVerifyCommitResult:
     """Apply a guarded sequence-only commit with rollback on any failure.
 
@@ -1063,6 +1119,7 @@ def run_mailbox_verify_commit_probe(
             plan=commit_plan,
             skipped_non_owner=True,
             kv_commit_skipped_non_owner=True,
+            next_pipeline_step_skipped_non_owner=True,
             sequence_state_before=before,
             sequence_state_after=before,
             total_accepted_tokens=total_accepted,
@@ -1194,6 +1251,8 @@ def run_mailbox_verify_commit_probe(
                 current_rank=current_rank,
                 output_owner_rank=output_owner_rank,
                 next_pipeline_plan_id=next_pipeline_plan_id,
+                continue_after_commit=continue_after_commit,
+                continuation_context=continuation_context,
             )
             if not payload_result.success:
                 kv_rollback_success = True
@@ -1241,6 +1300,25 @@ def run_mailbox_verify_commit_probe(
                     mailbox_payload_consume_rollback_success=payload_result.rollback_success,
                     mailbox_payload_consume_skipped_non_owner=payload_result.skipped_non_owner,
                     mailbox_payload_invalidate_skipped_non_owner=payload_result.invalidate_skipped_non_owner,
+                    next_pipeline_step_attempted=payload_result.next_pipeline_step_attempted,
+                    next_pipeline_step_success=payload_result.next_pipeline_step_success,
+                    next_pipeline_step_error=payload_result.next_pipeline_step_error,
+                    next_pipeline_step_error_kind=payload_result.next_pipeline_step_error_kind,
+                    next_pipeline_plan_id=payload_result.next_pipeline_plan_id,
+                    next_pipeline_target_home_batch_id=payload_result.next_pipeline_target_home_batch_id,
+                    next_pipeline_draft_home_batch_id=payload_result.next_pipeline_draft_home_batch_id,
+                    next_pipeline_actual_target_seq_ids=payload_result.next_pipeline_actual_target_seq_ids,
+                    next_pipeline_actual_draft_seq_ids=payload_result.next_pipeline_actual_draft_seq_ids,
+                    previous_committed_plan_id=payload_result.previous_committed_plan_id,
+                    previous_consumed_payload_ids=payload_result.previous_consumed_payload_ids,
+                    previous_invalidated_payload_ids=payload_result.previous_invalidated_payload_ids,
+                    duplicate_payload_consume_after_continue=payload_result.duplicate_payload_consume_after_continue,
+                    pipeline_state_after_commit_valid=payload_result.pipeline_state_after_commit_valid,
+                    scheduler_state_after_commit_valid=payload_result.scheduler_state_after_commit_valid,
+                    breadth_only_step_count=payload_result.breadth_only_step_count,
+                    breadth_only_completed=payload_result.breadth_only_completed,
+                    breadth_only_completion_reason=payload_result.breadth_only_completion_reason,
+                    next_pipeline_step_skipped_non_owner=payload_result.next_pipeline_step_skipped_non_owner,
                     rollback_attempted=True,
                     rollback_success=combined_rollback_success,
                     total_accepted_tokens=total_accepted,
@@ -1290,7 +1368,22 @@ def run_mailbox_verify_commit_probe(
             next_pipeline_step_attempted=bool(payload_result.next_pipeline_step_attempted) if payload_result is not None else False,
             next_pipeline_step_success=bool(payload_result.next_pipeline_step_success) if payload_result is not None else False,
             next_pipeline_step_error=payload_result.next_pipeline_step_error if payload_result is not None else None,
+            next_pipeline_step_error_kind=payload_result.next_pipeline_step_error_kind if payload_result is not None else None,
             next_pipeline_plan_id=payload_result.next_pipeline_plan_id if payload_result is not None else None,
+            next_pipeline_target_home_batch_id=payload_result.next_pipeline_target_home_batch_id if payload_result is not None else None,
+            next_pipeline_draft_home_batch_id=payload_result.next_pipeline_draft_home_batch_id if payload_result is not None else None,
+            next_pipeline_actual_target_seq_ids=payload_result.next_pipeline_actual_target_seq_ids if payload_result is not None else [],
+            next_pipeline_actual_draft_seq_ids=payload_result.next_pipeline_actual_draft_seq_ids if payload_result is not None else [],
+            previous_committed_plan_id=payload_result.previous_committed_plan_id if payload_result is not None else None,
+            previous_consumed_payload_ids=payload_result.previous_consumed_payload_ids if payload_result is not None else [],
+            previous_invalidated_payload_ids=payload_result.previous_invalidated_payload_ids if payload_result is not None else [],
+            duplicate_payload_consume_after_continue=bool(payload_result.duplicate_payload_consume_after_continue) if payload_result is not None else False,
+            pipeline_state_after_commit_valid=bool(payload_result.pipeline_state_after_commit_valid) if payload_result is not None else False,
+            scheduler_state_after_commit_valid=bool(payload_result.scheduler_state_after_commit_valid) if payload_result is not None else False,
+            breadth_only_step_count=payload_result.breadth_only_step_count if payload_result is not None else 0,
+            breadth_only_completed=bool(payload_result.breadth_only_completed) if payload_result is not None else False,
+            breadth_only_completion_reason=payload_result.breadth_only_completion_reason if payload_result is not None else None,
+            next_pipeline_step_skipped_non_owner=bool(payload_result.next_pipeline_step_skipped_non_owner) if payload_result is not None else False,
             rollback_attempted=False,
             rollback_success=True,
             total_accepted_tokens=total_accepted,
@@ -1348,6 +1441,85 @@ def run_mailbox_verify_commit_probe(
             total_rejected_tokens=total_rejected,
         )
 
+
+
+def _build_next_pipeline_continuation_metadata(
+    consume_plan: MailboxPayloadConsumePlan,
+    mailbox_state_after: dict[str, JsonDict],
+    *,
+    next_pipeline_plan_id: int | None,
+    continue_after_commit: bool,
+    continuation_context: JsonDict | None,
+) -> JsonDict:
+    context = dict(continuation_context or {})
+    duplicate_after_continue = any(
+        str(row.get("lifecycle_state")) == "duplicate_consume_error"
+        for row in mailbox_state_after.values()
+        if isinstance(row, dict)
+    )
+    next_plan_id = int(next_pipeline_plan_id) if next_pipeline_plan_id is not None else int(consume_plan.plan_id or 0) + 1
+    current_target = consume_plan.target_home_batch_id
+    if isinstance(current_target, int):
+        next_target = 1 - current_target if current_target in (0, 1) else current_target
+        next_draft = current_target
+    else:
+        next_target = context.get("next_target_home_batch_id", current_target)
+        next_draft = context.get("next_draft_home_batch_id", current_target)
+    metadata: JsonDict = {
+        "next_pipeline_step_attempted": True,
+        "next_pipeline_step_success": False,
+        "next_pipeline_step_error": "next pipeline step after mailbox commit is not implemented",
+        "next_pipeline_step_error_kind": "next_pipeline_step_after_mailbox_commit",
+        "next_pipeline_plan_id": next_plan_id,
+        "next_pipeline_target_home_batch_id": next_target,
+        "next_pipeline_draft_home_batch_id": next_draft,
+        "next_pipeline_actual_target_seq_ids": [],
+        "next_pipeline_actual_draft_seq_ids": [],
+        "previous_committed_plan_id": consume_plan.plan_id,
+        "previous_consumed_payload_ids": list(consume_plan.consumed_payload_ids),
+        "previous_invalidated_payload_ids": list(consume_plan.invalidated_payload_ids),
+        "duplicate_payload_consume_after_continue": duplicate_after_continue,
+        "pipeline_state_after_commit_valid": not duplicate_after_continue,
+        "scheduler_state_after_commit_valid": True,
+        "breadth_only_step_count": 1,
+        "breadth_only_completed": False,
+        "breadth_only_completion_reason": None,
+        "next_required_feature": "next_pipeline_step_after_mailbox_commit",
+    }
+    if not continue_after_commit:
+        return metadata
+    active_seq_ids = [int(seq_id) for seq_id in context.get("active_seq_ids", consume_plan.seq_ids) or []]
+    if not active_seq_ids:
+        metadata.update(
+            {
+                "next_pipeline_step_success": True,
+                "next_pipeline_step_error": None,
+                "next_pipeline_step_error_kind": None,
+                "breadth_only_step_count": 1,
+                "breadth_only_completed": True,
+                "breadth_only_completion_reason": "no_active_sequences_after_mailbox_commit",
+                "next_required_feature": "end_to_end_breadth_only_completion",
+            }
+        )
+        return metadata
+    # Minimal V4P breadth-only continuation: build a second-step metadata plan
+    # without reusing the just-consumed payloads.  Actual second-step GPU decode
+    # remains a later feature, so fail fast at a more specific diagnostic.
+    committed = set(int(seq_id) for seq_id in consume_plan.seq_ids)
+    metadata.update(
+        {
+            "next_pipeline_step_success": True,
+            "next_pipeline_step_error": "second breadth-only pipeline step metadata built; execution continuation is not implemented",
+            "next_pipeline_step_error_kind": "pipeline_state_after_second_step",
+            "next_pipeline_actual_target_seq_ids": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
+            "next_pipeline_actual_draft_seq_ids": list(active_seq_ids),
+            "breadth_only_step_count": 2,
+            "breadth_only_completed": False,
+            "breadth_only_completion_reason": "second_step_metadata_built",
+            "next_required_feature": "pipeline_state_after_second_step",
+        }
+    )
+    return metadata
 
 def _payload_id_for_commit_plan(commit_plan: MailboxVerifyCommitPlan, seq_id: int) -> str:
     seq_id = int(seq_id)

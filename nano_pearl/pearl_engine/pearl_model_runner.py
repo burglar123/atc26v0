@@ -526,6 +526,7 @@ class ModelRunnerBase:
             "rejected_seq_ids": [],
             "invalidated_mailbox_payload_count": 0,
             "stspec_mailbox_commit_probe_enabled": bool(getattr(self.global_config, "stspec_mailbox_commit_probe", False)),
+            "stspec_continue_after_mailbox_commit_enabled": bool(getattr(self.global_config, "stspec_continue_after_mailbox_commit", False)),
             "mailbox_verify_commit_attempted": False,
             "mailbox_verify_commit_success": False,
             "mailbox_verify_commit_error": None,
@@ -576,7 +577,22 @@ class ModelRunnerBase:
             "next_pipeline_step_attempted": False,
             "next_pipeline_step_success": False,
             "next_pipeline_step_error": None,
+            "next_pipeline_step_error_kind": None,
             "next_pipeline_plan_id": None,
+            "next_pipeline_target_home_batch_id": None,
+            "next_pipeline_draft_home_batch_id": None,
+            "next_pipeline_actual_target_seq_ids": [],
+            "next_pipeline_actual_draft_seq_ids": [],
+            "previous_committed_plan_id": None,
+            "previous_consumed_payload_ids": [],
+            "previous_invalidated_payload_ids": [],
+            "duplicate_payload_consume_after_continue": False,
+            "pipeline_state_after_commit_valid": False,
+            "scheduler_state_after_commit_valid": False,
+            "breadth_only_step_count": 0,
+            "breadth_only_completed": False,
+            "breadth_only_completion_reason": None,
+            "next_pipeline_step_skipped_non_owner": False,
             "mailbox_verify_commit_rollback_attempted": False,
             "mailbox_verify_commit_rollback_success": True,
             "mailbox_verify_commit_skipped_non_owner": False,
@@ -747,6 +763,7 @@ class ModelRunnerBase:
             "mailbox_forward_state_mutation_committed",
             "mailbox_forward_state_mutation_rollback_success",
             "stspec_mailbox_commit_probe_enabled",
+            "stspec_continue_after_mailbox_commit_enabled",
             "mailbox_verify_commit_attempted",
             "mailbox_verify_commit_success",
             "mailbox_verify_commit_error",
@@ -797,7 +814,22 @@ class ModelRunnerBase:
             "next_pipeline_step_attempted",
             "next_pipeline_step_success",
             "next_pipeline_step_error",
+            "next_pipeline_step_error_kind",
             "next_pipeline_plan_id",
+            "next_pipeline_target_home_batch_id",
+            "next_pipeline_draft_home_batch_id",
+            "next_pipeline_actual_target_seq_ids",
+            "next_pipeline_actual_draft_seq_ids",
+            "previous_committed_plan_id",
+            "previous_consumed_payload_ids",
+            "previous_invalidated_payload_ids",
+            "duplicate_payload_consume_after_continue",
+            "pipeline_state_after_commit_valid",
+            "scheduler_state_after_commit_valid",
+            "breadth_only_step_count",
+            "breadth_only_completed",
+            "breadth_only_completion_reason",
+            "next_pipeline_step_skipped_non_owner",
             "mailbox_verify_commit_rollback_attempted",
             "mailbox_verify_commit_rollback_success",
             "mailbox_verify_commit_skipped_non_owner",
@@ -1541,6 +1573,8 @@ class ModelRunnerBase:
             trace_record["mailbox_payload_consumed_payload_ids"] = list(payload_consume_plan.consumed_payload_ids)
             trace_record["mailbox_payload_invalidated_payload_ids"] = list(payload_consume_plan.invalidated_payload_ids)
             trace_record["mailbox_payload_lifecycle_before"] = payload_consume_plan.mailbox_state_before
+            continue_after_commit = bool(getattr(self.global_config, "stspec_continue_after_mailbox_commit", False))
+            trace_record["stspec_continue_after_mailbox_commit_enabled"] = continue_after_commit
             commit_result = run_mailbox_verify_commit_probe(
                 commit_plan,
                 exec_seqs,
@@ -1552,6 +1586,10 @@ class ModelRunnerBase:
                 payload_consume_plan=payload_consume_plan,
                 mailbox=self.stspec_mailbox,
                 next_pipeline_plan_id=int(getattr(step_plan, "plan_id", 0) or 0) + 1,
+                continue_after_commit=continue_after_commit,
+                continuation_context={
+                    "active_seq_ids": [int(seq.seq_id) for seq in exec_seqs if not bool(getattr(seq, "is_finished", False))],
+                },
             )
             trace_record["mailbox_verify_commit_attempted"] = bool(commit_result.attempted)
             trace_record["mailbox_verify_commit_success"] = bool(commit_result.success)
@@ -1592,7 +1630,22 @@ class ModelRunnerBase:
             trace_record["next_pipeline_step_attempted"] = bool(commit_result.next_pipeline_step_attempted)
             trace_record["next_pipeline_step_success"] = bool(commit_result.next_pipeline_step_success)
             trace_record["next_pipeline_step_error"] = commit_result.next_pipeline_step_error
+            trace_record["next_pipeline_step_error_kind"] = commit_result.next_pipeline_step_error_kind
             trace_record["next_pipeline_plan_id"] = commit_result.next_pipeline_plan_id
+            trace_record["next_pipeline_target_home_batch_id"] = commit_result.next_pipeline_target_home_batch_id
+            trace_record["next_pipeline_draft_home_batch_id"] = commit_result.next_pipeline_draft_home_batch_id
+            trace_record["next_pipeline_actual_target_seq_ids"] = list(commit_result.next_pipeline_actual_target_seq_ids)
+            trace_record["next_pipeline_actual_draft_seq_ids"] = list(commit_result.next_pipeline_actual_draft_seq_ids)
+            trace_record["previous_committed_plan_id"] = commit_result.previous_committed_plan_id
+            trace_record["previous_consumed_payload_ids"] = list(commit_result.previous_consumed_payload_ids)
+            trace_record["previous_invalidated_payload_ids"] = list(commit_result.previous_invalidated_payload_ids)
+            trace_record["duplicate_payload_consume_after_continue"] = bool(commit_result.duplicate_payload_consume_after_continue)
+            trace_record["pipeline_state_after_commit_valid"] = bool(commit_result.pipeline_state_after_commit_valid)
+            trace_record["scheduler_state_after_commit_valid"] = bool(commit_result.scheduler_state_after_commit_valid)
+            trace_record["breadth_only_step_count"] = int(commit_result.breadth_only_step_count)
+            trace_record["breadth_only_completed"] = bool(commit_result.breadth_only_completed)
+            trace_record["breadth_only_completion_reason"] = commit_result.breadth_only_completion_reason
+            trace_record["next_pipeline_step_skipped_non_owner"] = bool(commit_result.next_pipeline_step_skipped_non_owner)
             trace_record["mailbox_verify_commit_rollback_attempted"] = bool(commit_result.rollback_attempted)
             trace_record["mailbox_verify_commit_rollback_success"] = bool(commit_result.rollback_success)
             trace_record["mailbox_verify_commit_skipped_non_owner"] = bool(commit_result.skipped_non_owner)

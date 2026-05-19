@@ -146,6 +146,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "stspec_kv_sync_mode": args.stspec_kv_sync_mode,
         "stspec_disable_mailbox_forward_commit": args.stspec_disable_mailbox_forward_commit,
         "stspec_mailbox_commit_probe": args.stspec_mailbox_commit_probe,
+        "stspec_continue_after_mailbox_commit": args.stspec_continue_after_mailbox_commit,
     }
 
     # Try new named-path style with gamma.
@@ -2474,6 +2475,11 @@ def main() -> None:
         "--stspec-mailbox-commit-probe",
         action="store_true",
         help="Enable guarded V4M mailbox verify Sequence commit/rollback probe in real-probe mode.",
+    )
+    parser.add_argument(
+        "--stspec-continue-after-mailbox-commit",
+        action="store_true",
+        help="Enable V4P continuation metadata after mailbox commit/consume succeeds.",
     )
 
     parser.add_argument(
