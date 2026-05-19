@@ -692,22 +692,25 @@ def map_target_forward_output_rows_to_seq_offsets(
     output_shape: Iterable[int] | None = None,
 ) -> list[JsonDict]:
     rows: list[JsonDict] = []
-    output_rows = None
     if output_shape is not None:
         shape = list(output_shape)
         output_rows = int(shape[0]) if shape else 0
-        if output_rows < int(verification_input.total_tokens):
+        if output_rows != int(verification_input.total_tokens):
             raise RuntimeError(
-                "Target forward mailbox output has fewer rows than input tokens: "
-                f"output_shape={shape}, total_tokens={verification_input.total_tokens}"
+                "Target forward mailbox output row count does not match input tokens: "
+                f"output_shape={shape}, total_tokens={verification_input.total_tokens}; "
+                "next_required_feature=target_forward_output_normalization"
             )
     for seq_id, offset, length in zip(verification_input.seq_ids, verification_input.offsets, verification_input.per_seq_lengths):
+        row_start = int(offset)
+        row_end = row_start + int(length)
         rows.append({
             "seq_id": int(seq_id),
             "offset": int(offset),
             "length": int(length),
-            "row_start": int(offset),
-            "row_end": int(offset) + int(length),
+            "row_start": row_start,
+            "row_end": row_end,
+            "token_range": [row_start, row_end],
         })
     return rows
 
@@ -716,9 +719,11 @@ def interpret_target_forward_from_mailbox_output(
     verification_input: TargetForwardFromMailboxInput,
     output_shape: Iterable[int] | None = None,
 ) -> list[JsonDict]:
-    map_target_forward_output_rows_to_seq_offsets(verification_input, output_shape)
-    raise TargetForwardMailboxError(
-        "target forward from mailbox succeeded, but output interpretation is not implemented",
-        next_required_feature="target_forward_from_mailbox_output_interpretation",
-        error_kind="target_forward_from_mailbox_output_interpretation_not_implemented",
-    )
+    """V4K metadata-level output interpretation scaffold.
+
+    This validates that output rows map exactly onto mailbox token offsets and
+    returns the per-seq row ranges.  Accept/reject application remains guarded
+    by the caller's mailbox_verify_apply_path boundary.
+    """
+
+    return map_target_forward_output_rows_to_seq_offsets(verification_input, output_shape)

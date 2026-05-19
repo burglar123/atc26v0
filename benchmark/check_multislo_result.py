@@ -177,6 +177,11 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     verification_input_from_mailbox_success_count = 0
     verification_input_from_mailbox_error_count = 0
     target_forward_from_mailbox_input_built_count = 0
+    target_forward_mailbox_context_build_count = 0
+    target_forward_mailbox_context_success_count = 0
+    target_forward_mailbox_context_error_count = 0
+    target_forward_mailbox_slot_mapping_available_count = 0
+    target_forward_mailbox_cannot_run_reasons = set()
     mailbox_kv_sync_plan_built_count = 0
     kv_state_sync_check_attempt_count = 0
     kv_state_sync_check_success_count = 0
@@ -185,15 +190,68 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     target_forward_from_mailbox_attempt_count = 0
     target_forward_from_mailbox_success_count = 0
     target_forward_from_mailbox_error_count = 0
+    target_forward_output_normalization_attempt_count = 0
+    target_forward_output_normalization_success_count = 0
+    target_forward_output_normalization_error_count = 0
+    target_forward_output_none_expected_count = 0
+    target_forward_output_none_unexpected_count = 0
+    target_forward_output_owner_ranks = set()
+    target_tp_owner_rows = 0
+    mailbox_payload_availability_rows = 0
+    target_tp_skipped_non_owner_count = 0
+    mailbox_payload_envelope_available_count = 0
+    mailbox_payload_token_ids_available_count = 0
+    mailbox_payload_tensor_available_count = 0
+    mailbox_payload_missing_reasons = set()
+    mailbox_missing_payload_count = 0
+    mailbox_verify_apply_path_count = 0
+    output_interpretation_skipped_non_owner_count = 0
+    mailbox_verify_apply_skipped_non_owner_count = 0
     output_interpretation_attempt_count = 0
     output_interpretation_success_count = 0
     output_interpretation_error_count = 0
     mailbox_verify_apply_attempt_count = 0
     mailbox_verify_apply_success_count = 0
     mailbox_verify_apply_error_count = 0
+    mailbox_verify_apply_plan_built_count = 0
+    mailbox_verify_apply_probe_success_count = 0
+    mailbox_verify_token_decision_attempt_count = 0
+    mailbox_verify_token_decision_success_count = 0
+    mailbox_verify_total_accepted_tokens_count = 0
+    mailbox_verify_total_rejected_tokens_count = 0
+    mailbox_verify_invalidated_payload_count = 0
     mailbox_forward_state_mutation_attempt_count = 0
     mailbox_forward_state_mutation_committed_count = 0
     mailbox_forward_state_mutation_rollback_success_count = 0
+    mailbox_verify_commit_attempt_count = 0
+    mailbox_verify_commit_success_count = 0
+    sequence_state_commit_success_count = 0
+    kv_commit_plan_built_count = 0
+    kv_commit_attempt_count = 0
+    kv_commit_success_count = 0
+    kv_commit_shadow_only_count = 0
+    kv_commit_error_count = 0
+    kv_commit_error_kinds = set()
+    kv_commit_rollback_attempt_count = 0
+    kv_commit_rollback_success_count = 0
+    kv_commit_skipped_non_owner_count = 0
+    mailbox_payload_consume_plan_built_count = 0
+    mailbox_payload_consume_attempt_count = 0
+    mailbox_payload_consume_success_count = 0
+    mailbox_payload_consume_error_count = 0
+    mailbox_payload_invalidate_attempt_count = 0
+    mailbox_payload_invalidate_success_count = 0
+    mailbox_payload_invalidate_error_count = 0
+    mailbox_payload_duplicate_consume_count = 0
+    mailbox_payload_consume_rollback_attempt_count = 0
+    mailbox_payload_consume_rollback_success_count = 0
+    mailbox_payload_consume_skipped_non_owner_count = 0
+    mailbox_payload_invalidate_skipped_non_owner_count = 0
+    next_pipeline_step_attempt_count = 0
+    next_pipeline_step_success_count = 0
+    mailbox_verify_commit_rollback_attempt_count = 0
+    mailbox_verify_commit_rollback_success_count = 0
+    mailbox_verify_commit_skipped_non_owner_count = 0
     illegal_legacy_fallback_count = 0
     raw_mailbox_transport_send_rows = 0
     raw_mailbox_transport_recv_rows = 0
@@ -224,6 +282,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "target_consume_from_mailbox_attempted",
                 "stspec_pipeline_phase",
                 "mailbox_payload_tensor_transport_attempted",
+                "mailbox_verify_commit_attempted",
+                "sequence_state_commit_attempted",
+                "kv_commit_plan_built",
+                "kv_commit_attempted",
+                "mailbox_payload_consume_plan_built",
+                "mailbox_payload_consume_attempted",
+                "next_pipeline_step_attempted",
+                "mailbox_verify_commit_attempt_count",
             )
         )
         if not has_plan:
@@ -433,6 +499,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         verification_input_from_mailbox_success_count += int(row.get("verification_input_from_mailbox_success_count") or 0)
         verification_input_from_mailbox_error_count += int(row.get("verification_input_from_mailbox_error_count") or 0)
         target_forward_from_mailbox_input_built_count += int(row.get("target_forward_from_mailbox_input_built_count") or 0)
+        target_forward_mailbox_context_build_count += int(row.get("target_forward_mailbox_context_build_count") or 0)
+        target_forward_mailbox_context_success_count += int(row.get("target_forward_mailbox_context_success_count") or 0)
+        target_forward_mailbox_context_error_count += int(row.get("target_forward_mailbox_context_error_count") or 0)
+        target_forward_mailbox_slot_mapping_available_count += int(row.get("target_forward_mailbox_slot_mapping_available_count") or 0)
+        for value in values_from_mapping(row.get("target_forward_mailbox_cannot_run_reasons")):
+            if value:
+                target_forward_mailbox_cannot_run_reasons.add(value)
         mailbox_kv_sync_plan_built_count += int(row.get("mailbox_kv_sync_plan_built_count") or 0)
         kv_state_sync_check_attempt_count += int(row.get("kv_state_sync_check_attempt_count") or 0)
         kv_state_sync_check_success_count += int(row.get("kv_state_sync_check_success_count") or 0)
@@ -443,15 +516,74 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         target_forward_from_mailbox_attempt_count += int(row.get("target_forward_from_mailbox_attempt_count") or 0)
         target_forward_from_mailbox_success_count += int(row.get("target_forward_from_mailbox_success_count") or 0)
         target_forward_from_mailbox_error_count += int(row.get("target_forward_from_mailbox_error_count") or 0)
+        target_forward_output_normalization_attempt_count += int(row.get("target_forward_output_normalization_attempt_count") or 0)
+        target_forward_output_normalization_success_count += int(row.get("target_forward_output_normalization_success_count") or 0)
+        target_forward_output_normalization_error_count += int(row.get("target_forward_output_normalization_error_count") or 0)
+        target_forward_output_none_expected_count += int(row.get("target_forward_output_none_expected_count") or 0)
+        target_forward_output_none_unexpected_count += int(row.get("target_forward_output_none_unexpected_count") or 0)
+        target_tp_owner_rows += int(row.get("target_tp_owner_rows") or 0)
+        mailbox_payload_availability_rows += int(row.get("mailbox_payload_availability_rows") or 0)
+        target_tp_skipped_non_owner_count += int(row.get("target_tp_skipped_non_owner_count") or 0)
+        mailbox_payload_envelope_available_count += int(row.get("mailbox_payload_envelope_available_count") or 0)
+        mailbox_payload_token_ids_available_count += int(row.get("mailbox_payload_token_ids_available_count") or 0)
+        mailbox_payload_tensor_available_count += int(row.get("mailbox_payload_tensor_available_count") or 0)
+        for value in values_from_mapping(row.get("mailbox_payload_missing_reasons")):
+            if value:
+                mailbox_payload_missing_reasons.add(value)
+        mailbox_missing_payload_count += int(row.get("mailbox_missing_payload_count") or 0)
+        mailbox_verify_apply_path_count += int(row.get("mailbox_verify_apply_path_count") or 0)
+        output_interpretation_skipped_non_owner_count += int(row.get("output_interpretation_skipped_non_owner_count") or 0)
+        mailbox_verify_apply_skipped_non_owner_count += int(row.get("mailbox_verify_apply_skipped_non_owner_count") or 0)
+        for value in values_from_mapping(row.get("target_forward_output_owner_ranks") or row.get("target_tp_owner_ranks_seen")):
+            if value is not None:
+                target_forward_output_owner_ranks.add(value)
         output_interpretation_attempt_count += int(row.get("output_interpretation_attempt_count") or 0)
         output_interpretation_success_count += int(row.get("output_interpretation_success_count") or 0)
         output_interpretation_error_count += int(row.get("output_interpretation_error_count") or 0)
         mailbox_verify_apply_attempt_count += int(row.get("mailbox_verify_apply_attempt_count") or 0)
         mailbox_verify_apply_success_count += int(row.get("mailbox_verify_apply_success_count") or 0)
         mailbox_verify_apply_error_count += int(row.get("mailbox_verify_apply_error_count") or 0)
+        mailbox_verify_apply_plan_built_count += int(row.get("mailbox_verify_apply_plan_built_count") or 0)
+        mailbox_verify_apply_probe_success_count += int(row.get("mailbox_verify_apply_probe_success_count") or 0)
+        mailbox_verify_token_decision_attempt_count += int(row.get("mailbox_verify_token_decision_attempt_count") or 0)
+        mailbox_verify_token_decision_success_count += int(row.get("mailbox_verify_token_decision_success_count") or 0)
+        mailbox_verify_total_accepted_tokens_count += int(row.get("mailbox_verify_total_accepted_tokens") or 0)
+        mailbox_verify_total_rejected_tokens_count += int(row.get("mailbox_verify_total_rejected_tokens") or 0)
+        mailbox_verify_invalidated_payload_count += int(row.get("mailbox_verify_invalidated_payload_count") or 0)
         mailbox_forward_state_mutation_attempt_count += int(row.get("mailbox_forward_state_mutation_attempt_count") or 0)
-        mailbox_forward_state_mutation_committed_count += int(row.get("mailbox_forward_state_mutation_committed_count") or 0)
+        mailbox_forward_state_mutation_committed_count += int(row.get("mailbox_forward_state_mutation_committed_count") or row.get("mailbox_forward_state_mutation_commit_count") or 0)
         mailbox_forward_state_mutation_rollback_success_count += int(row.get("mailbox_forward_state_mutation_rollback_success_count") or 0)
+        mailbox_verify_commit_attempt_count += int(row.get("mailbox_verify_commit_attempt_count") or 0)
+        mailbox_verify_commit_success_count += int(row.get("mailbox_verify_commit_success_count") or 0)
+        sequence_state_commit_success_count += int(row.get("sequence_state_commit_success_count") or 0)
+        kv_commit_plan_built_count += int(row.get("kv_commit_plan_built_count") or 0)
+        kv_commit_attempt_count += int(row.get("kv_commit_attempt_count") or 0)
+        kv_commit_success_count += int(row.get("kv_commit_success_count") or 0)
+        kv_commit_shadow_only_count += int(row.get("kv_commit_shadow_only_count") or 0)
+        kv_commit_error_count += int(row.get("kv_commit_error_count") or 0)
+        for value in values_from_mapping(row.get("kv_commit_error_kinds")):
+            if value:
+                kv_commit_error_kinds.add(value)
+        kv_commit_rollback_attempt_count += int(row.get("kv_commit_rollback_attempt_count") or 0)
+        kv_commit_rollback_success_count += int(row.get("kv_commit_rollback_success_count") or 0)
+        kv_commit_skipped_non_owner_count += int(row.get("kv_commit_skipped_non_owner_count") or 0)
+        mailbox_payload_consume_plan_built_count += int(row.get("mailbox_payload_consume_plan_built_count") or 0)
+        mailbox_payload_consume_attempt_count += int(row.get("mailbox_payload_consume_attempt_count") or 0)
+        mailbox_payload_consume_success_count += int(row.get("mailbox_payload_consume_success_count") or 0)
+        mailbox_payload_consume_error_count += int(row.get("mailbox_payload_consume_error_count") or 0)
+        mailbox_payload_invalidate_attempt_count += int(row.get("mailbox_payload_invalidate_attempt_count") or 0)
+        mailbox_payload_invalidate_success_count += int(row.get("mailbox_payload_invalidate_success_count") or 0)
+        mailbox_payload_invalidate_error_count += int(row.get("mailbox_payload_invalidate_error_count") or 0)
+        mailbox_payload_duplicate_consume_count += int(row.get("mailbox_payload_duplicate_consume_count") or 0)
+        mailbox_payload_consume_rollback_attempt_count += int(row.get("mailbox_payload_consume_rollback_attempt_count") or 0)
+        mailbox_payload_consume_rollback_success_count += int(row.get("mailbox_payload_consume_rollback_success_count") or 0)
+        mailbox_payload_consume_skipped_non_owner_count += int(row.get("mailbox_payload_consume_skipped_non_owner_count") or 0)
+        mailbox_payload_invalidate_skipped_non_owner_count += int(row.get("mailbox_payload_invalidate_skipped_non_owner_count") or 0)
+        next_pipeline_step_attempt_count += int(row.get("next_pipeline_step_attempt_count") or 0)
+        next_pipeline_step_success_count += int(row.get("next_pipeline_step_success_count") or 0)
+        mailbox_verify_commit_rollback_attempt_count += int(row.get("mailbox_verify_commit_rollback_attempt_count") or 0)
+        mailbox_verify_commit_rollback_success_count += int(row.get("mailbox_verify_commit_rollback_success_count") or 0)
+        mailbox_verify_commit_skipped_non_owner_count += int(row.get("mailbox_verify_commit_skipped_non_owner_count") or 0)
         illegal_legacy_fallback_count += int(row.get("illegal_legacy_fallback_count") or 0)
         if row.get("mailbox_warmup_skip"):
             mailbox_warmup_skip_count += 1
@@ -472,6 +604,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             verification_input_from_mailbox_error_count += 1
         if row.get("target_forward_from_mailbox_input_built"):
             target_forward_from_mailbox_input_built_count += 1
+        if row.get("target_forward_mailbox_context_build_attempted"):
+            target_forward_mailbox_context_build_count += 1
+        if row.get("target_forward_mailbox_context_build_success"):
+            target_forward_mailbox_context_success_count += 1
+        if row.get("target_forward_mailbox_context_error"):
+            target_forward_mailbox_context_error_count += 1
+        if row.get("target_forward_mailbox_slot_mapping_available"):
+            target_forward_mailbox_slot_mapping_available_count += 1
+        if row.get("target_forward_mailbox_cannot_run_reason"):
+            target_forward_mailbox_cannot_run_reasons.add(row.get("target_forward_mailbox_cannot_run_reason"))
         if row.get("mailbox_kv_sync_plan_built"):
             mailbox_kv_sync_plan_built_count += 1
         if row.get("kv_state_sync_error_kind"):
@@ -488,6 +630,40 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             target_forward_from_mailbox_success_count += 1
         if row.get("target_forward_from_mailbox_error"):
             target_forward_from_mailbox_error_count += 1
+        if row.get("target_forward_output_normalization_attempted"):
+            target_forward_output_normalization_attempt_count += 1
+        if row.get("target_forward_output_normalization_success"):
+            target_forward_output_normalization_success_count += 1
+        if row.get("target_forward_output_normalization_error"):
+            target_forward_output_normalization_error_count += 1
+        if row.get("target_forward_output_none_expected"):
+            target_forward_output_none_expected_count += 1
+        if row.get("target_forward_output_none_unexpected"):
+            target_forward_output_none_unexpected_count += 1
+        if row.get("target_forward_output_owner_rank") is not None:
+            target_forward_output_owner_ranks.add(row.get("target_forward_output_owner_rank"))
+        if "target_tp_is_output_owner" in row:
+            target_tp_owner_rows += 1
+        if any(key in row for key in ("mailbox_payload_envelope_available", "mailbox_payload_token_ids_available", "mailbox_payload_tensor_available")):
+            mailbox_payload_availability_rows += 1
+        if row.get("target_tp_skipped_non_owner"):
+            target_tp_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_envelope_available"):
+            mailbox_payload_envelope_available_count += 1
+        if row.get("mailbox_payload_token_ids_available"):
+            mailbox_payload_token_ids_available_count += 1
+        if row.get("mailbox_payload_tensor_available"):
+            mailbox_payload_tensor_available_count += 1
+        if row.get("mailbox_payload_missing_reason"):
+            mailbox_payload_missing_reasons.add(row.get("mailbox_payload_missing_reason"))
+        if row.get("mailbox_error_kind") == "mailbox_missing_payload":
+            mailbox_missing_payload_count += 1
+        if row.get("next_required_feature") == "mailbox_verify_apply_path":
+            mailbox_verify_apply_path_count += 1
+        if row.get("output_interpretation_skipped_non_owner"):
+            output_interpretation_skipped_non_owner_count += 1
+        if row.get("mailbox_verify_apply_skipped_non_owner"):
+            mailbox_verify_apply_skipped_non_owner_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_attempted"):
             output_interpretation_attempt_count += 1
         if row.get("target_forward_from_mailbox_output_interpretation_success"):
@@ -500,12 +676,81 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             mailbox_verify_apply_success_count += 1
         if row.get("mailbox_verify_apply_error"):
             mailbox_verify_apply_error_count += 1
+        if row.get("mailbox_verify_apply_plan_built"):
+            mailbox_verify_apply_plan_built_count += 1
+        if row.get("mailbox_verify_apply_probe_success"):
+            mailbox_verify_apply_probe_success_count += 1
+        if row.get("mailbox_verify_token_decision_attempted"):
+            mailbox_verify_token_decision_attempt_count += 1
+        if row.get("mailbox_verify_token_decision_success"):
+            mailbox_verify_token_decision_success_count += 1
+        mailbox_verify_total_accepted_tokens_count += int(row.get("mailbox_verify_total_accepted_tokens") or 0)
+        mailbox_verify_total_rejected_tokens_count += int(row.get("mailbox_verify_total_rejected_tokens") or 0)
+        mailbox_verify_invalidated_payload_count += int(row.get("mailbox_verify_invalidated_payload_count") or 0)
         if row.get("mailbox_forward_state_mutation_attempted"):
             mailbox_forward_state_mutation_attempt_count += 1
         if row.get("mailbox_forward_state_mutation_committed"):
             mailbox_forward_state_mutation_committed_count += 1
         if row.get("mailbox_forward_state_mutation_rollback_success"):
             mailbox_forward_state_mutation_rollback_success_count += 1
+        if row.get("mailbox_verify_commit_attempted"):
+            mailbox_verify_commit_attempt_count += 1
+        if row.get("mailbox_verify_commit_success"):
+            mailbox_verify_commit_success_count += 1
+        if row.get("sequence_state_commit_success"):
+            sequence_state_commit_success_count += 1
+        if row.get("kv_commit_plan_built"):
+            kv_commit_plan_built_count += 1
+        if row.get("kv_commit_attempted"):
+            kv_commit_attempt_count += 1
+        if row.get("kv_commit_success"):
+            kv_commit_success_count += 1
+        if row.get("kv_commit_shadow_only"):
+            kv_commit_shadow_only_count += 1
+        if row.get("kv_commit_error"):
+            kv_commit_error_count += 1
+        if row.get("kv_commit_error_kind"):
+            kv_commit_error_kinds.add(row.get("kv_commit_error_kind"))
+        if row.get("kv_commit_rollback_attempted"):
+            kv_commit_rollback_attempt_count += 1
+        if row.get("kv_commit_rollback_success"):
+            kv_commit_rollback_success_count += 1
+        if row.get("kv_commit_skipped_non_owner"):
+            kv_commit_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_consume_plan_built"):
+            mailbox_payload_consume_plan_built_count += 1
+        if row.get("mailbox_payload_consume_attempted"):
+            mailbox_payload_consume_attempt_count += 1
+        if row.get("mailbox_payload_consume_success"):
+            mailbox_payload_consume_success_count += 1
+        if row.get("mailbox_payload_consume_error"):
+            mailbox_payload_consume_error_count += 1
+        if row.get("mailbox_payload_invalidate_attempted"):
+            mailbox_payload_invalidate_attempt_count += 1
+        if row.get("mailbox_payload_invalidate_success"):
+            mailbox_payload_invalidate_success_count += 1
+        if row.get("mailbox_payload_invalidate_error"):
+            mailbox_payload_invalidate_error_count += 1
+        if row.get("mailbox_payload_duplicate_consume_detected"):
+            mailbox_payload_duplicate_consume_count += 1
+        if row.get("mailbox_payload_consume_rollback_attempted"):
+            mailbox_payload_consume_rollback_attempt_count += 1
+        if row.get("mailbox_payload_consume_rollback_success"):
+            mailbox_payload_consume_rollback_success_count += 1
+        if row.get("mailbox_payload_consume_skipped_non_owner"):
+            mailbox_payload_consume_skipped_non_owner_count += 1
+        if row.get("mailbox_payload_invalidate_skipped_non_owner"):
+            mailbox_payload_invalidate_skipped_non_owner_count += 1
+        if row.get("next_pipeline_step_attempted"):
+            next_pipeline_step_attempt_count += 1
+        if row.get("next_pipeline_step_success"):
+            next_pipeline_step_success_count += 1
+        if row.get("mailbox_verify_commit_rollback_attempted"):
+            mailbox_verify_commit_rollback_attempt_count += 1
+        if row.get("mailbox_verify_commit_rollback_success"):
+            mailbox_verify_commit_rollback_success_count += 1
+        if row.get("mailbox_verify_commit_skipped_non_owner"):
+            mailbox_verify_commit_skipped_non_owner_count += 1
         if row.get("illegal_legacy_fallback"):
             illegal_legacy_fallback_count += 1
         if row.get("next_required_feature"):
@@ -614,6 +859,11 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "verification_input_from_mailbox_success_count": verification_input_from_mailbox_success_count,
         "verification_input_from_mailbox_error_count": verification_input_from_mailbox_error_count,
         "target_forward_from_mailbox_input_built_count": target_forward_from_mailbox_input_built_count,
+        "target_forward_mailbox_context_build_count": target_forward_mailbox_context_build_count,
+        "target_forward_mailbox_context_success_count": target_forward_mailbox_context_success_count,
+        "target_forward_mailbox_context_error_count": target_forward_mailbox_context_error_count,
+        "target_forward_mailbox_slot_mapping_available_count": target_forward_mailbox_slot_mapping_available_count,
+        "target_forward_mailbox_cannot_run_reasons": sorted(target_forward_mailbox_cannot_run_reasons, key=str),
         "mailbox_kv_sync_plan_built_count": mailbox_kv_sync_plan_built_count,
         "kv_state_sync_check_attempt_count": kv_state_sync_check_attempt_count,
         "kv_state_sync_check_success_count": kv_state_sync_check_success_count,
@@ -622,15 +872,70 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "target_forward_from_mailbox_attempt_count": target_forward_from_mailbox_attempt_count,
         "target_forward_from_mailbox_success_count": target_forward_from_mailbox_success_count,
         "target_forward_from_mailbox_error_count": target_forward_from_mailbox_error_count,
+        "target_forward_output_normalization_attempt_count": target_forward_output_normalization_attempt_count,
+        "target_forward_output_normalization_success_count": target_forward_output_normalization_success_count,
+        "target_forward_output_normalization_error_count": target_forward_output_normalization_error_count,
+        "target_forward_output_none_expected_count": target_forward_output_none_expected_count,
+        "target_forward_output_none_unexpected_count": target_forward_output_none_unexpected_count,
+        "target_forward_output_owner_ranks": sorted(target_forward_output_owner_ranks, key=str),
+        "target_tp_owner_ranks_seen": sorted(target_forward_output_owner_ranks, key=str),
+        "target_tp_owner_rows": target_tp_owner_rows,
+        "mailbox_payload_availability_rows": mailbox_payload_availability_rows,
+        "target_tp_skipped_non_owner_count": target_tp_skipped_non_owner_count,
+        "mailbox_payload_envelope_available_count": mailbox_payload_envelope_available_count,
+        "mailbox_payload_token_ids_available_count": mailbox_payload_token_ids_available_count,
+        "mailbox_payload_tensor_available_count": mailbox_payload_tensor_available_count,
+        "mailbox_payload_missing_reasons": sorted(mailbox_payload_missing_reasons, key=str),
+        "mailbox_missing_payload_count": mailbox_missing_payload_count,
+        "mailbox_verify_apply_path_count": mailbox_verify_apply_path_count,
+        "output_interpretation_skipped_non_owner_count": output_interpretation_skipped_non_owner_count,
+        "mailbox_verify_apply_skipped_non_owner_count": mailbox_verify_apply_skipped_non_owner_count,
         "output_interpretation_attempt_count": output_interpretation_attempt_count,
         "output_interpretation_success_count": output_interpretation_success_count,
         "output_interpretation_error_count": output_interpretation_error_count,
         "mailbox_verify_apply_attempt_count": mailbox_verify_apply_attempt_count,
         "mailbox_verify_apply_success_count": mailbox_verify_apply_success_count,
         "mailbox_verify_apply_error_count": mailbox_verify_apply_error_count,
+        "mailbox_verify_apply_plan_built_count": mailbox_verify_apply_plan_built_count,
+        "mailbox_verify_apply_probe_success_count": mailbox_verify_apply_probe_success_count,
+        "mailbox_verify_token_decision_attempt_count": mailbox_verify_token_decision_attempt_count,
+        "mailbox_verify_token_decision_success_count": mailbox_verify_token_decision_success_count,
+        "mailbox_verify_total_accepted_tokens": mailbox_verify_total_accepted_tokens_count,
+        "mailbox_verify_total_rejected_tokens": mailbox_verify_total_rejected_tokens_count,
+        "mailbox_verify_invalidated_payload_count": mailbox_verify_invalidated_payload_count,
         "mailbox_forward_state_mutation_attempt_count": mailbox_forward_state_mutation_attempt_count,
         "mailbox_forward_state_mutation_committed_count": mailbox_forward_state_mutation_committed_count,
+        "mailbox_forward_state_mutation_commit_count": mailbox_forward_state_mutation_committed_count,
         "mailbox_forward_state_mutation_rollback_success_count": mailbox_forward_state_mutation_rollback_success_count,
+        "mailbox_verify_commit_attempt_count": mailbox_verify_commit_attempt_count,
+        "mailbox_verify_commit_success_count": mailbox_verify_commit_success_count,
+        "sequence_state_commit_success_count": sequence_state_commit_success_count,
+        "kv_commit_plan_built_count": kv_commit_plan_built_count,
+        "kv_commit_attempt_count": kv_commit_attempt_count,
+        "kv_commit_success_count": kv_commit_success_count,
+        "kv_commit_shadow_only_count": kv_commit_shadow_only_count,
+        "kv_commit_error_count": kv_commit_error_count,
+        "kv_commit_error_kinds": sorted(kv_commit_error_kinds, key=str),
+        "kv_commit_rollback_attempt_count": kv_commit_rollback_attempt_count,
+        "kv_commit_rollback_success_count": kv_commit_rollback_success_count,
+        "kv_commit_skipped_non_owner_count": kv_commit_skipped_non_owner_count,
+        "mailbox_payload_consume_plan_built_count": mailbox_payload_consume_plan_built_count,
+        "mailbox_payload_consume_attempt_count": mailbox_payload_consume_attempt_count,
+        "mailbox_payload_consume_success_count": mailbox_payload_consume_success_count,
+        "mailbox_payload_consume_error_count": mailbox_payload_consume_error_count,
+        "mailbox_payload_invalidate_attempt_count": mailbox_payload_invalidate_attempt_count,
+        "mailbox_payload_invalidate_success_count": mailbox_payload_invalidate_success_count,
+        "mailbox_payload_invalidate_error_count": mailbox_payload_invalidate_error_count,
+        "mailbox_payload_duplicate_consume_count": mailbox_payload_duplicate_consume_count,
+        "mailbox_payload_consume_rollback_attempt_count": mailbox_payload_consume_rollback_attempt_count,
+        "mailbox_payload_consume_rollback_success_count": mailbox_payload_consume_rollback_success_count,
+        "mailbox_payload_consume_skipped_non_owner_count": mailbox_payload_consume_skipped_non_owner_count,
+        "mailbox_payload_invalidate_skipped_non_owner_count": mailbox_payload_invalidate_skipped_non_owner_count,
+        "next_pipeline_step_attempt_count": next_pipeline_step_attempt_count,
+        "next_pipeline_step_success_count": next_pipeline_step_success_count,
+        "mailbox_verify_commit_rollback_attempt_count": mailbox_verify_commit_rollback_attempt_count,
+        "mailbox_verify_commit_rollback_success_count": mailbox_verify_commit_rollback_success_count,
+        "mailbox_verify_commit_skipped_non_owner_count": mailbox_verify_commit_skipped_non_owner_count,
         "illegal_legacy_fallback_count": illegal_legacy_fallback_count,
         "raw_mailbox_transport_send_rows": raw_mailbox_transport_send_rows,
         "raw_mailbox_transport_recv_rows": raw_mailbox_transport_recv_rows,
@@ -881,6 +1186,11 @@ def summarize(path: Path) -> int:
     print(f"verification input from mailbox successes: {plan_summary['verification_input_from_mailbox_success_count']}")
     print(f"verification input from mailbox errors: {plan_summary['verification_input_from_mailbox_error_count']}")
     print(f"target forward input built count: {plan_summary['target_forward_from_mailbox_input_built_count']}")
+    print(f"target forward mailbox context build attempts: {plan_summary['target_forward_mailbox_context_build_count']}")
+    print(f"target forward mailbox context successes: {plan_summary['target_forward_mailbox_context_success_count']}")
+    print(f"target forward mailbox context errors: {plan_summary['target_forward_mailbox_context_error_count']}")
+    print(f"target forward mailbox slot mapping available count: {plan_summary['target_forward_mailbox_slot_mapping_available_count']}")
+    print(f"target forward mailbox cannot-run reasons: {plan_summary['target_forward_mailbox_cannot_run_reasons']}")
     print(f"KV sync plan built count: {plan_summary['mailbox_kv_sync_plan_built_count']}")
     print(f"KV sync check attempts: {plan_summary['kv_state_sync_check_attempt_count']}")
     print(f"KV sync check successes: {plan_summary['kv_state_sync_check_success_count']}")
@@ -889,15 +1199,68 @@ def summarize(path: Path) -> int:
     print(f"target forward from mailbox attempts: {plan_summary['target_forward_from_mailbox_attempt_count']}")
     print(f"target forward from mailbox successes: {plan_summary['target_forward_from_mailbox_success_count']}")
     print(f"target forward from mailbox errors: {plan_summary['target_forward_from_mailbox_error_count']}")
+    print(f"target forward output normalization attempts: {plan_summary['target_forward_output_normalization_attempt_count']}")
+    print(f"target forward output normalization successes: {plan_summary['target_forward_output_normalization_success_count']}")
+    print(f"target forward output normalization errors: {plan_summary['target_forward_output_normalization_error_count']}")
+    print(f"target forward output owner ranks seen: {plan_summary['target_forward_output_owner_ranks']}")
+    print(f"target TP owner rows: {plan_summary['target_tp_owner_rows']}")
+    print(f"mailbox payload availability rows: {plan_summary['mailbox_payload_availability_rows']}")
+    print(f"target TP non-owner skip count: {plan_summary['target_tp_skipped_non_owner_count']}")
+    print(f"mailbox payload envelope available count: {plan_summary['mailbox_payload_envelope_available_count']}")
+    print(f"mailbox payload token ids available count: {plan_summary['mailbox_payload_token_ids_available_count']}")
+    print(f"mailbox payload tensor available count: {plan_summary['mailbox_payload_tensor_available_count']}")
+    print(f"mailbox payload missing reasons: {plan_summary['mailbox_payload_missing_reasons']}")
+    print(f"mailbox_missing_payload count: {plan_summary['mailbox_missing_payload_count']}")
+    print(f"mailbox_verify_apply_path count: {plan_summary['mailbox_verify_apply_path_count']}")
+    print(f"target forward output none expected count: {plan_summary['target_forward_output_none_expected_count']}")
+    print(f"target forward output none unexpected count: {plan_summary['target_forward_output_none_unexpected_count']}")
+    print(f"output interpretation skipped non-owner count: {plan_summary['output_interpretation_skipped_non_owner_count']}")
+    print(f"mailbox verify apply skipped non-owner count: {plan_summary['mailbox_verify_apply_skipped_non_owner_count']}")
     print(f"output interpretation attempts: {plan_summary['output_interpretation_attempt_count']}")
     print(f"output interpretation successes: {plan_summary['output_interpretation_success_count']}")
     print(f"output interpretation errors: {plan_summary['output_interpretation_error_count']}")
     print(f"mailbox verify apply attempts: {plan_summary['mailbox_verify_apply_attempt_count']}")
     print(f"mailbox verify apply successes: {plan_summary['mailbox_verify_apply_success_count']}")
     print(f"mailbox verify apply errors: {plan_summary['mailbox_verify_apply_error_count']}")
+    print(f"mailbox verify apply plan built count: {plan_summary['mailbox_verify_apply_plan_built_count']}")
+    print(f"mailbox verify apply no-commit probe successes: {plan_summary['mailbox_verify_apply_probe_success_count']}")
+    print(f"mailbox verify token decision attempts: {plan_summary['mailbox_verify_token_decision_attempt_count']}")
+    print(f"mailbox verify token decision successes: {plan_summary['mailbox_verify_token_decision_success_count']}")
+    print(f"mailbox verify accepted tokens: {plan_summary['mailbox_verify_total_accepted_tokens']}")
+    print(f"mailbox verify rejected tokens: {plan_summary['mailbox_verify_total_rejected_tokens']}")
+    print(f"mailbox verify invalidated payload count: {plan_summary['mailbox_verify_invalidated_payload_count']}")
     print(f"mailbox forward state mutation attempts: {plan_summary['mailbox_forward_state_mutation_attempt_count']}")
     print(f"mailbox forward state mutation commits: {plan_summary['mailbox_forward_state_mutation_committed_count']}")
     print(f"mailbox forward state mutation rollback successes: {plan_summary['mailbox_forward_state_mutation_rollback_success_count']}")
+    print(f"mailbox verify commit attempts: {plan_summary['mailbox_verify_commit_attempt_count']}")
+    print(f"mailbox verify commit successes: {plan_summary['mailbox_verify_commit_success_count']}")
+    print(f"sequence state commit successes: {plan_summary['sequence_state_commit_success_count']}")
+    print(f"KV commit plans built: {plan_summary['kv_commit_plan_built_count']}")
+    print(f"KV commit attempts: {plan_summary['kv_commit_attempt_count']}")
+    print(f"KV commit successes: {plan_summary['kv_commit_success_count']}")
+    print(f"KV commit shadow-only count: {plan_summary['kv_commit_shadow_only_count']}")
+    print(f"KV commit errors: {plan_summary['kv_commit_error_count']}")
+    print(f"KV commit error kinds: {plan_summary['kv_commit_error_kinds']}")
+    print(f"KV commit rollback attempts: {plan_summary['kv_commit_rollback_attempt_count']}")
+    print(f"KV commit rollback successes: {plan_summary['kv_commit_rollback_success_count']}")
+    print(f"KV commit skipped non-owner count: {plan_summary['kv_commit_skipped_non_owner_count']}")
+    print(f"mailbox payload consume plans built: {plan_summary['mailbox_payload_consume_plan_built_count']}")
+    print(f"mailbox payload consume attempts: {plan_summary['mailbox_payload_consume_attempt_count']}")
+    print(f"mailbox payload consume successes: {plan_summary['mailbox_payload_consume_success_count']}")
+    print(f"mailbox payload consume errors: {plan_summary['mailbox_payload_consume_error_count']}")
+    print(f"mailbox payload invalidate attempts: {plan_summary['mailbox_payload_invalidate_attempt_count']}")
+    print(f"mailbox payload invalidate successes: {plan_summary['mailbox_payload_invalidate_success_count']}")
+    print(f"mailbox payload invalidate errors: {plan_summary['mailbox_payload_invalidate_error_count']}")
+    print(f"mailbox payload duplicate consume count: {plan_summary['mailbox_payload_duplicate_consume_count']}")
+    print(f"mailbox payload consume rollback attempts: {plan_summary['mailbox_payload_consume_rollback_attempt_count']}")
+    print(f"mailbox payload consume rollback successes: {plan_summary['mailbox_payload_consume_rollback_success_count']}")
+    print(f"mailbox payload consume skipped non-owner count: {plan_summary['mailbox_payload_consume_skipped_non_owner_count']}")
+    print(f"mailbox payload invalidate skipped non-owner count: {plan_summary['mailbox_payload_invalidate_skipped_non_owner_count']}")
+    print(f"next pipeline step attempts: {plan_summary['next_pipeline_step_attempt_count']}")
+    print(f"next pipeline step successes: {plan_summary['next_pipeline_step_success_count']}")
+    print(f"mailbox verify commit rollback attempts: {plan_summary['mailbox_verify_commit_rollback_attempt_count']}")
+    print(f"mailbox verify commit rollback successes: {plan_summary['mailbox_verify_commit_rollback_success_count']}")
+    print(f"mailbox verify commit skipped non-owner count: {plan_summary['mailbox_verify_commit_skipped_non_owner_count']}")
     print(f"illegal legacy fallback count: {plan_summary['illegal_legacy_fallback_count']}")
     print(f"raw rows with mailbox_transport_send_attempted: {plan_summary['raw_mailbox_transport_send_rows']}")
     print(f"raw rows with mailbox_transport_recv_attempted: {plan_summary['raw_mailbox_transport_recv_rows']}")

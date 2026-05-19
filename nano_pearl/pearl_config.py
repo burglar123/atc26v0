@@ -100,6 +100,8 @@ class PEARLConfig:
     stspec_kv_sync_probe: bool = True
     stspec_kv_sync_mode: str = "metadata_only"
     stspec_disable_mailbox_forward_commit: bool = True
+    stspec_mailbox_commit_probe: bool = False
+    stspec_continue_after_mailbox_commit: bool = False
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -153,6 +155,8 @@ class PEARLConfig:
         logger.info(f"STSpec_KV_Sync_Probe={self.stspec_kv_sync_probe}")
         logger.info(f"STSpec_KV_Sync_Mode={self.stspec_kv_sync_mode}")
         logger.info(f"STSpec_Disable_Mailbox_Forward_Commit={self.stspec_disable_mailbox_forward_commit}")
+        logger.info(f"STSpec_Mailbox_Commit_Probe={self.stspec_mailbox_commit_probe}")
+        logger.info(f"STSpec_Continue_After_Mailbox_Commit={self.stspec_continue_after_mailbox_commit}")
         if (
             self.enable_stspec_two_batch_execution
             and not self.stspec_two_batch_dryrun
