@@ -201,6 +201,23 @@ class MailboxVerifyCommitResult:
     mailbox_state_after_second_step_valid: bool = False
     request_completion_check_attempted: bool = False
     request_completion_check_success: bool = False
+    request_completion_reason: str | None = None
+    active_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    finished_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    unfinished_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    max_tokens_reached_seq_ids: list[int] = field(default_factory=list)
+    eos_reached_seq_ids: list[int] = field(default_factory=list)
+    mailbox_pending_payload_ids_at_completion: list[str] = field(default_factory=list)
+    mailbox_consumed_payload_ids_at_completion: list[str] = field(default_factory=list)
+    scheduler_active_seq_ids_at_completion: list[int] = field(default_factory=list)
+    sequence_state_completion_valid: bool = False
+    scheduler_state_completion_valid: bool = False
+    mailbox_state_completion_valid: bool = False
+    request_completion_error: str | None = None
+    request_completion_error_kind: str | None = None
+    result_finalization_attempted: bool = False
+    result_finalization_success: bool = False
+    result_finalization_error: str | None = None
     second_step_rollback_attempted: bool = False
     second_step_rollback_success: bool = True
     breadth_only_completed: bool = False
@@ -347,6 +364,23 @@ class MailboxPayloadConsumeResult:
     mailbox_state_after_second_step_valid: bool = False
     request_completion_check_attempted: bool = False
     request_completion_check_success: bool = False
+    request_completion_reason: str | None = None
+    active_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    finished_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    unfinished_seq_ids_at_completion_check: list[int] = field(default_factory=list)
+    max_tokens_reached_seq_ids: list[int] = field(default_factory=list)
+    eos_reached_seq_ids: list[int] = field(default_factory=list)
+    mailbox_pending_payload_ids_at_completion: list[str] = field(default_factory=list)
+    mailbox_consumed_payload_ids_at_completion: list[str] = field(default_factory=list)
+    scheduler_active_seq_ids_at_completion: list[int] = field(default_factory=list)
+    sequence_state_completion_valid: bool = False
+    scheduler_state_completion_valid: bool = False
+    mailbox_state_completion_valid: bool = False
+    request_completion_error: str | None = None
+    request_completion_error_kind: str | None = None
+    result_finalization_attempted: bool = False
+    result_finalization_success: bool = False
+    result_finalization_error: str | None = None
     second_step_rollback_attempted: bool = False
     second_step_rollback_success: bool = True
     breadth_only_completed: bool = False
@@ -1131,6 +1165,23 @@ def run_mailbox_payload_consume_probe(
             request_completion_check_success=bool(continuation.get("request_completion_check_success")),
             second_step_rollback_attempted=bool(continuation.get("second_step_rollback_attempted")),
             second_step_rollback_success=bool(continuation.get("second_step_rollback_success", True)),
+            request_completion_reason=continuation.get("request_completion_reason"),
+            active_seq_ids_at_completion_check=list(continuation.get("active_seq_ids_at_completion_check") or []),
+            finished_seq_ids_at_completion_check=list(continuation.get("finished_seq_ids_at_completion_check") or []),
+            unfinished_seq_ids_at_completion_check=list(continuation.get("unfinished_seq_ids_at_completion_check") or []),
+            max_tokens_reached_seq_ids=list(continuation.get("max_tokens_reached_seq_ids") or []),
+            eos_reached_seq_ids=list(continuation.get("eos_reached_seq_ids") or []),
+            mailbox_pending_payload_ids_at_completion=list(continuation.get("mailbox_pending_payload_ids_at_completion") or []),
+            mailbox_consumed_payload_ids_at_completion=list(continuation.get("mailbox_consumed_payload_ids_at_completion") or []),
+            scheduler_active_seq_ids_at_completion=list(continuation.get("scheduler_active_seq_ids_at_completion") or []),
+            sequence_state_completion_valid=bool(continuation.get("sequence_state_completion_valid")),
+            scheduler_state_completion_valid=bool(continuation.get("scheduler_state_completion_valid")),
+            mailbox_state_completion_valid=bool(continuation.get("mailbox_state_completion_valid")),
+            request_completion_error=continuation.get("request_completion_error"),
+            request_completion_error_kind=continuation.get("request_completion_error_kind"),
+            result_finalization_attempted=bool(continuation.get("result_finalization_attempted")),
+            result_finalization_success=bool(continuation.get("result_finalization_success")),
+            result_finalization_error=continuation.get("result_finalization_error"),
             breadth_only_completed=bool(continuation.get("breadth_only_completed")),
             breadth_only_completion_reason=continuation.get("breadth_only_completion_reason"),
         )
@@ -1595,6 +1646,7 @@ def _build_next_pipeline_continuation_metadata(
         next_draft = context.get("next_draft_home_batch_id", current_target)
     committed_seq_ids = [int(seq_id) for seq_id in consume_plan.seq_ids]
     active_seq_ids = [int(seq_id) for seq_id in context.get("active_seq_ids", consume_plan.seq_ids) or []]
+    scheduler_active_seq_ids = [int(seq_id) for seq_id in context.get("scheduler_active_seq_ids", active_seq_ids) or []]
     available_payload_ids = sorted(
         [str(payload_id) for payload_id, row in mailbox_state_after.items() if isinstance(row, dict) and str(row.get("lifecycle_state")) == "available"],
         key=str,
@@ -1639,6 +1691,23 @@ def _build_next_pipeline_continuation_metadata(
         "mailbox_state_after_second_step_valid": not duplicate_after_continue,
         "request_completion_check_attempted": False,
         "request_completion_check_success": False,
+        "request_completion_reason": None,
+        "active_seq_ids_at_completion_check": [],
+        "finished_seq_ids_at_completion_check": [],
+        "unfinished_seq_ids_at_completion_check": [],
+        "max_tokens_reached_seq_ids": [],
+        "eos_reached_seq_ids": [],
+        "mailbox_pending_payload_ids_at_completion": [],
+        "mailbox_consumed_payload_ids_at_completion": list(consume_plan.consumed_payload_ids),
+        "scheduler_active_seq_ids_at_completion": list(scheduler_active_seq_ids),
+        "sequence_state_completion_valid": True,
+        "scheduler_state_completion_valid": True,
+        "mailbox_state_completion_valid": not duplicate_after_continue,
+        "request_completion_error": None,
+        "request_completion_error_kind": None,
+        "result_finalization_attempted": False,
+        "result_finalization_success": False,
+        "result_finalization_error": None,
         "second_step_rollback_attempted": False,
         "second_step_rollback_success": True,
         "breadth_only_step_count": 1,
@@ -1648,7 +1717,6 @@ def _build_next_pipeline_continuation_metadata(
     }
     if not continue_after_commit:
         return metadata
-    scheduler_active_seq_ids = [int(seq_id) for seq_id in context.get("scheduler_active_seq_ids", active_seq_ids) or []]
     if sorted(active_seq_ids) != sorted(scheduler_active_seq_ids):
         metadata.update(
             {
@@ -1657,7 +1725,7 @@ def _build_next_pipeline_continuation_metadata(
                 "second_step_state_error_kind": "scheduler_state_after_second_step",
                 "scheduler_state_after_second_step_valid": False,
                 "next_pipeline_step_error_kind": "scheduler_state_after_second_step",
-                "next_required_feature": "scheduler_state_after_second_step",
+                "next_required_feature": "scheduler_state_after_breadth_only_completion",
                 "breadth_only_step_count": 2,
             }
         )
@@ -1678,7 +1746,14 @@ def _build_next_pipeline_continuation_metadata(
                 "active_seq_ids_after_second_step": [],
                 "breadth_only_completed": len(pending_payload_ids) == 0,
                 "breadth_only_completion_reason": "all_requests_finished" if len(pending_payload_ids) == 0 else "pending_mailbox_payload_after_second_step",
-                "next_required_feature": "end_to_end_breadth_only_completion" if len(pending_payload_ids) == 0 else "pipeline_drain_after_second_step",
+                "request_completion_reason": "all_requests_finished" if len(pending_payload_ids) == 0 else "mailbox_pending_payloads",
+                "mailbox_pending_payload_ids_at_completion": list(pending_payload_ids),
+                "active_seq_ids_at_completion_check": [],
+                "finished_seq_ids_at_completion_check": list(committed_seq_ids),
+                "unfinished_seq_ids_at_completion_check": [],
+                "result_finalization_attempted": len(pending_payload_ids) == 0,
+                "result_finalization_success": len(pending_payload_ids) == 0,
+                "next_required_feature": "end_to_end_breadth_only_completion" if len(pending_payload_ids) == 0 else "mailbox_drain_after_breadth_only_completion",
             }
         )
         return metadata
@@ -1688,7 +1763,7 @@ def _build_next_pipeline_continuation_metadata(
         {
             "next_pipeline_step_success": True,
             "next_pipeline_step_error": "second-step state validated; continuation requires request completion drain",
-            "next_pipeline_step_error_kind": "request_completion_after_breadth_only_step",
+            "next_pipeline_step_error_kind": "active_request_continuation_after_breadth_only_step",
             "next_pipeline_actual_target_seq_ids": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
             "next_pipeline_actual_draft_seq_ids": list(active_seq_ids),
             "second_step_state_check_success": True,
@@ -1696,10 +1771,17 @@ def _build_next_pipeline_continuation_metadata(
             "active_seq_ids_after_second_step": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
             "repeated_verify_after_commit_detected": repeated_verify_after_commit,
             "request_completion_check_attempted": True,
+            "request_completion_check_success": True,
+            "request_completion_reason": "active_requests_remaining",
+            "active_seq_ids_at_completion_check": list(active_seq_ids),
+            "finished_seq_ids_at_completion_check": [],
+            "unfinished_seq_ids_at_completion_check": list(active_seq_ids),
+            "mailbox_pending_payload_ids_at_completion": list(available_payload_ids),
+            "result_finalization_attempted": False,
             "breadth_only_step_count": 2,
             "breadth_only_completed": False,
             "breadth_only_completion_reason": "second_step_metadata_built",
-            "next_required_feature": "mailbox_payload_after_second_step" if any(seq_id for seq_id in active_seq_ids if seq_id not in committed) else "request_completion_after_breadth_only_step",
+            "next_required_feature": "active_request_continuation_after_breadth_only_step" if any(seq_id for seq_id in active_seq_ids if seq_id not in committed) else "result_finalization_after_breadth_only_completion",
         }
     )
     return metadata

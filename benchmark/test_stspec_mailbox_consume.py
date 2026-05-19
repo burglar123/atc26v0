@@ -258,8 +258,11 @@ def test_continue_after_commit_missing_payload_advances_diagnostic():
     assert result.success is True
     assert result.second_step_state_check_attempted is True
     assert result.second_step_state_check_success is True
-    assert result.next_required_feature in {"mailbox_payload_after_second_step", "request_completion_after_breadth_only_step"}
-    assert result.next_pipeline_step_error_kind == "request_completion_after_breadth_only_step"
+    assert result.next_required_feature in {
+        "active_request_continuation_after_breadth_only_step",
+        "result_finalization_after_breadth_only_completion",
+    }
+    assert result.next_pipeline_step_error_kind == "active_request_continuation_after_breadth_only_step"
 
 
 def test_continue_after_commit_all_finished_sets_breadth_completed():
