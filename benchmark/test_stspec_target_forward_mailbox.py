@@ -172,11 +172,12 @@ def test_output_row_to_seq_offset_mapping_scaffold_and_interpretation_guard():
     mapping = map_target_forward_output_rows_to_seq_offsets(target_input, output_shape=[5, 32000])
 
     assert mapping == [
-        {"seq_id": 1, "offset": 0, "length": 1, "row_start": 0, "row_end": 1},
-        {"seq_id": 3, "offset": 1, "length": 4, "row_start": 1, "row_end": 5},
+        {"seq_id": 1, "offset": 0, "length": 1, "row_start": 0, "row_end": 1, "token_range": [0, 1]},
+        {"seq_id": 3, "offset": 1, "length": 4, "row_start": 1, "row_end": 5, "token_range": [1, 5]},
     ]
-    with pytest.raises(RuntimeError, match="output interpretation is not implemented"):
-        interpret_target_forward_from_mailbox_output(target_input, output_shape=[5, 32000])
+    interpretation = interpret_target_forward_from_mailbox_output(target_input, output_shape=[5, 32000])
+    assert interpretation == mapping
+    json.dumps(interpretation, sort_keys=True)
 
 
 def test_illegal_legacy_fallback_detection():

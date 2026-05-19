@@ -40,6 +40,23 @@ class MailboxKey:
 
 
 @dataclass(frozen=True)
+class MailboxPayloadLifecycle:
+    payload_id: str
+    home_batch_id: int | str | None
+    seq_id: int
+    source_plan_id: int | None
+    source_draft_home_batch_id: int | str | None
+    consumed_by_plan_id: int | None = None
+    invalidated_by_plan_id: int | None = None
+    consumed_token_count: int = 0
+    invalidated_token_count: int = 0
+    lifecycle_state: str = "available"
+
+    def to_dict(self) -> JsonDict:
+        return _jsonable(asdict(self))
+
+
+@dataclass(frozen=True)
 class MailboxPayload:
     plan_id: int | None
     producer_role: str | None
@@ -64,8 +81,17 @@ class MailboxPayload:
     def key(self) -> MailboxKey:
         return MailboxKey(self.home_batch_id, int(self.seq_id))
 
+    @property
+    def payload_id(self) -> str:
+        payload_id = self.metadata.get("payload_id") if isinstance(self.metadata, dict) else None
+        if payload_id is not None:
+            return str(payload_id)
+        return f"{self.home_batch_id}:{self.seq_id}:{self.offset}:{self.per_seq_length}"
+
     def to_dict(self) -> JsonDict:
-        return _jsonable(asdict(self))
+        data = _jsonable(asdict(self))
+        data["payload_id"] = self.payload_id
+        return data
 
 
 @dataclass(frozen=True)
@@ -113,6 +139,8 @@ class STSpecPayloadMailbox:
     def __init__(self, *, overwrite: bool = False):
         self.overwrite = bool(overwrite)
         self._payloads: dict[MailboxKey, MailboxPayload] = {}
+        self._lifecycle_by_key: dict[MailboxKey, MailboxPayloadLifecycle] = {}
+        self._lifecycle_by_payload_id: dict[str, MailboxPayloadLifecycle] = {}
         self._put_count = 0
         self._duplicate_put_count = 0
         self._pop_count = 0
@@ -153,6 +181,16 @@ class STSpecPayloadMailbox:
                     },
                 )
             self._payloads[key] = payload
+            lifecycle = MailboxPayloadLifecycle(
+                payload_id=payload.payload_id,
+                home_batch_id=payload.home_batch_id,
+                seq_id=int(payload.seq_id),
+                source_plan_id=payload.plan_id,
+                source_draft_home_batch_id=payload.draft_home_batch_id,
+                lifecycle_state="available",
+            )
+            self._lifecycle_by_key[key] = lifecycle
+            self._lifecycle_by_payload_id[payload.payload_id] = lifecycle
             self._put_count += 1
             keys.append(key)
         return keys
@@ -169,8 +207,10 @@ class STSpecPayloadMailbox:
         payloads: list[MailboxPayload] = []
         missing: list[int] = []
         for seq_id in requested:
-            payload = self._payloads.get(MailboxKey(home_batch_id, seq_id))
-            if payload is None:
+            key = MailboxKey(home_batch_id, seq_id)
+            payload = self._payloads.get(key)
+            lifecycle = self._lifecycle_by_key.get(key)
+            if payload is None or lifecycle is None or lifecycle.lifecycle_state != "available":
                 missing.append(seq_id)
             else:
                 payloads.append(payload)
@@ -193,7 +233,13 @@ class STSpecPayloadMailbox:
         result = self.get_payloads(home_batch_id, seq_ids, plan_id=plan_id, consumer_role=consumer_role)
         if result.success:
             for seq_id in result.requested_seq_ids:
-                self._payloads.pop(MailboxKey(home_batch_id, seq_id), None)
+                key = MailboxKey(home_batch_id, seq_id)
+                payload = self._payloads.pop(key, None)
+                lifecycle = self._lifecycle_by_key.pop(key, None)
+                if payload is not None:
+                    self._lifecycle_by_payload_id.pop(payload.payload_id, None)
+                elif lifecycle is not None:
+                    self._lifecycle_by_payload_id.pop(lifecycle.payload_id, None)
                 self._pop_count += 1
         return result
 
@@ -201,17 +247,142 @@ class STSpecPayloadMailbox:
         finished = {int(seq_id) for seq_id in seq_ids}
         keys = [key for key in self._payloads if key.seq_id in finished]
         for key in keys:
-            self._payloads.pop(key, None)
+            payload = self._payloads.pop(key, None)
+            lifecycle = self._lifecycle_by_key.pop(key, None)
+            if payload is not None:
+                self._lifecycle_by_payload_id.pop(payload.payload_id, None)
+            elif lifecycle is not None:
+                self._lifecycle_by_payload_id.pop(lifecycle.payload_id, None)
         return len(keys)
 
     def available_home_batch_ids(self) -> list[int | str | None]:
-        return sorted({key.home_batch_id for key in self._payloads}, key=lambda value: str(value))
+        return sorted(
+            {key.home_batch_id for key, lifecycle in self._lifecycle_by_key.items() if lifecycle.lifecycle_state == "available"},
+            key=lambda value: str(value),
+        )
 
     def available_seq_ids_by_batch(self) -> dict[str, list[int]]:
         by_batch: dict[str, list[int]] = {}
-        for key in self._payloads:
-            by_batch.setdefault(str(key.home_batch_id), []).append(int(key.seq_id))
+        for key, lifecycle in self._lifecycle_by_key.items():
+            if lifecycle.lifecycle_state == "available":
+                by_batch.setdefault(str(key.home_batch_id), []).append(int(key.seq_id))
         return {batch: sorted(seq_ids) for batch, seq_ids in sorted(by_batch.items())}
+
+    def lifecycle_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for lifecycle in self._lifecycle_by_payload_id.values():
+            counts[lifecycle.lifecycle_state] = counts.get(lifecycle.lifecycle_state, 0) + 1
+        return counts
+
+    def lifecycle_snapshot(self, payload_ids: Iterable[str] | None = None) -> dict[str, JsonDict]:
+        if payload_ids is None:
+            items = self._lifecycle_by_payload_id.items()
+        else:
+            requested = [str(payload_id) for payload_id in payload_ids]
+            items = ((payload_id, self._lifecycle_by_payload_id.get(payload_id)) for payload_id in requested)
+        snapshot: dict[str, JsonDict] = {}
+        for payload_id, lifecycle in items:
+            if lifecycle is None:
+                snapshot[str(payload_id)] = {"payload_id": str(payload_id), "lifecycle_state": "missing"}
+            else:
+                snapshot[str(payload_id)] = lifecycle.to_dict()
+        return snapshot
+
+    def restore_lifecycle_snapshot(self, snapshot: dict[str, JsonDict]) -> bool:
+        try:
+            for payload_id, state in snapshot.items():
+                key = None
+                for candidate, lifecycle in self._lifecycle_by_key.items():
+                    if lifecycle.payload_id == payload_id:
+                        key = candidate
+                        break
+                if state.get("lifecycle_state") == "missing":
+                    if key is not None:
+                        lifecycle = self._lifecycle_by_key.pop(key)
+                        self._lifecycle_by_payload_id.pop(lifecycle.payload_id, None)
+                    continue
+                lifecycle = MailboxPayloadLifecycle(
+                    payload_id=str(state.get("payload_id", payload_id)),
+                    home_batch_id=state.get("home_batch_id"),
+                    seq_id=int(state.get("seq_id")),
+                    source_plan_id=state.get("source_plan_id"),
+                    source_draft_home_batch_id=state.get("source_draft_home_batch_id"),
+                    consumed_by_plan_id=state.get("consumed_by_plan_id"),
+                    invalidated_by_plan_id=state.get("invalidated_by_plan_id"),
+                    consumed_token_count=int(state.get("consumed_token_count") or 0),
+                    invalidated_token_count=int(state.get("invalidated_token_count") or 0),
+                    lifecycle_state=str(state.get("lifecycle_state", "available")),
+                )
+                if key is None:
+                    key = MailboxKey(lifecycle.home_batch_id, lifecycle.seq_id)
+                self._lifecycle_by_key[key] = lifecycle
+                self._lifecycle_by_payload_id[lifecycle.payload_id] = lifecycle
+            return True
+        except Exception:
+            return False
+
+    def apply_payload_lifecycle(
+        self,
+        *,
+        plan_id: int | None,
+        target_home_batch_id: int | str | None,
+        consumed_token_count_by_payload_id: dict[str, int],
+        invalidated_token_count_by_payload_id: dict[str, int],
+    ) -> dict[str, JsonDict]:
+        payload_ids = sorted(set(consumed_token_count_by_payload_id) | set(invalidated_token_count_by_payload_id), key=str)
+        updated: dict[str, JsonDict] = {}
+        for payload_id in payload_ids:
+            lifecycle = self._lifecycle_by_payload_id.get(str(payload_id))
+            if lifecycle is None:
+                raise STSpecMailboxError(
+                    "Mailbox payload lifecycle missing during consume/invalidate",
+                    kind="mailbox_payload_lifecycle_missing",
+                    context={"payload_id": payload_id, "plan_id": plan_id},
+                )
+            if lifecycle.home_batch_id != target_home_batch_id:
+                raise STSpecMailboxError(
+                    "Mailbox payload lifecycle home_batch_id mismatch during consume/invalidate",
+                    kind="mailbox_payload_lifecycle_home_batch_mismatch",
+                    context={
+                        "payload_id": payload_id,
+                        "payload_home_batch_id": lifecycle.home_batch_id,
+                        "target_home_batch_id": target_home_batch_id,
+                        "plan_id": plan_id,
+                    },
+                )
+            if lifecycle.lifecycle_state != "available":
+                duplicate = MailboxPayloadLifecycle(
+                    **{
+                        **lifecycle.to_dict(),
+                        "lifecycle_state": "duplicate_consume_error",
+                    }
+                )
+                self._lifecycle_by_payload_id[str(payload_id)] = duplicate
+                self._lifecycle_by_key[MailboxKey(duplicate.home_batch_id, duplicate.seq_id)] = duplicate
+                raise STSpecMailboxError(
+                    "Duplicate mailbox payload consume/invalidate",
+                    kind="duplicate_consume_error",
+                    context={"payload_id": payload_id, "plan_id": plan_id, "state": lifecycle.lifecycle_state},
+                )
+            consumed = int(consumed_token_count_by_payload_id.get(str(payload_id), 0) or 0)
+            invalidated = int(invalidated_token_count_by_payload_id.get(str(payload_id), 0) or 0)
+            new_state = "invalidated" if invalidated > 0 else "consumed"
+            new_lifecycle = MailboxPayloadLifecycle(
+                payload_id=lifecycle.payload_id,
+                home_batch_id=lifecycle.home_batch_id,
+                seq_id=lifecycle.seq_id,
+                source_plan_id=lifecycle.source_plan_id,
+                source_draft_home_batch_id=lifecycle.source_draft_home_batch_id,
+                consumed_by_plan_id=plan_id if consumed > 0 else lifecycle.consumed_by_plan_id,
+                invalidated_by_plan_id=plan_id if invalidated > 0 else lifecycle.invalidated_by_plan_id,
+                consumed_token_count=consumed,
+                invalidated_token_count=invalidated,
+                lifecycle_state=new_state,
+            )
+            self._lifecycle_by_payload_id[str(payload_id)] = new_lifecycle
+            self._lifecycle_by_key[MailboxKey(new_lifecycle.home_batch_id, new_lifecycle.seq_id)] = new_lifecycle
+            updated[str(payload_id)] = new_lifecycle.to_dict()
+        return updated
 
     def stats(self) -> JsonDict:
         return {
@@ -219,6 +390,7 @@ class STSpecPayloadMailbox:
             "put_count": self._put_count,
             "pop_count": self._pop_count,
             "duplicate_put_count": self._duplicate_put_count,
+            "lifecycle_counts": self.lifecycle_counts(),
             "available_home_batch_ids": self.available_home_batch_ids(),
             "available_seq_ids_by_batch": self.available_seq_ids_by_batch(),
         }
