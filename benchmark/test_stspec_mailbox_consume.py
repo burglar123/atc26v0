@@ -169,6 +169,25 @@ def test_active_continuation_new_plan_can_reuse_stale_home_seq_key():
     assert result.payloads[0].payload_id == second.payload_id
 
 
+def test_same_plan_same_payload_after_stale_is_idempotent_skip():
+    mailbox = STSpecPayloadMailbox()
+    first = v4u_payload(0, [101], plan_id=8)
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.mark_payloads_stale([first.payload_id], plan_id=8, reason="draft_transport_envelope_recorded")
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    assert mailbox.stats()["duplicate_put_idempotent_skip_count"] == 1
+
+
+def test_same_plan_different_payload_after_stale_is_conflict():
+    mailbox = STSpecPayloadMailbox()
+    first = v4u_payload(0, [101], plan_id=8)
+    second = v4u_payload(0, [202], plan_id=8)
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.mark_payloads_stale([first.payload_id], plan_id=8, reason="draft_transport_envelope_recorded")
+    with pytest.raises(mailbox_mod.STSpecMailboxError, match="duplicate_put_conflict"):
+        mailbox.put_payloads(0, [second], plan_id=8, producer_role="draft")
+
+
 def test_outstanding_available_payload_context_blocks_new_plan_before_put():
     mailbox = STSpecPayloadMailbox()
     existing = v4u_payload(0, [101], plan_id=4)

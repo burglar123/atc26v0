@@ -225,6 +225,27 @@ class STSpecPayloadMailbox:
                             "lifecycle_state": lifecycle_state,
                         },
                     )
+                if existing.plan_id == payload.plan_id:
+                    self._duplicate_put_count += 1
+                    if self._payloads_equivalent(existing, payload):
+                        self._duplicate_put_idempotent_skip_count += 1
+                        keys.append(key)
+                        continue
+                    self._duplicate_put_conflict_count += 1
+                    raise STSpecMailboxError(
+                        "Conflicting duplicate ST-Spec mailbox payload put",
+                        kind="duplicate_put_conflict",
+                        context={
+                            "home_batch_id": home_batch_id,
+                            "seq_id": payload.seq_id,
+                            "plan_id": plan_id,
+                            "producer_role": producer_role,
+                            "existing_plan_id": existing.plan_id,
+                            "existing_payload_id": existing.payload_id,
+                            "incoming_payload_id": payload.payload_id,
+                            "lifecycle_state": lifecycle_state,
+                        },
+                    )
                 if lifecycle_state not in {"consumed", "invalidated", "stale"}:
                     self._duplicate_put_count += 1
                     self._duplicate_put_conflict_count += 1

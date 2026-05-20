@@ -253,6 +253,32 @@ def test_stale_producer_payload_allows_later_plan_for_same_home_seq():
     assert result.payloads[0].payload_id == second.payload_id
 
 
+def test_same_plan_stale_same_payload_is_idempotent_skip_in_mailbox():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    first = mailbox_payload(plan_id=8, token_ids=[101])
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.mark_payloads_stale([first.payload_id], plan_id=8, reason="draft_transport_envelope_recorded")
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    stats = mailbox.stats()
+    assert stats["duplicate_put_count"] == 1
+    assert stats["duplicate_put_idempotent_skip_count"] == 1
+    assert stats["put_count"] == 1
+
+
+def test_same_plan_stale_different_payload_is_conflict_in_mailbox():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    first = mailbox_payload(plan_id=8, token_ids=[101])
+    second = mailbox_payload(plan_id=8, token_ids=[202])
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.mark_payloads_stale([first.payload_id], plan_id=8, reason="draft_transport_envelope_recorded")
+    try:
+        mailbox.put_payloads(0, [second], plan_id=8, producer_role="draft")
+    except mailbox_mod.STSpecMailboxError as exc:
+        assert exc.kind == "duplicate_put_conflict"
+    else:
+        raise AssertionError("same-plan different payload should fail")
+
+
 def test_draft_mailbox_route_guards_outstanding_available_before_put():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
@@ -265,6 +291,16 @@ def test_draft_mailbox_route_guards_outstanding_available_before_put():
     assert guard_call in record_source
     assert record_source.index(guard_call) < record_source.index(put_call)
     assert stale_call in record_source
+    assert "mailbox_payload_record_guard_hit" in source
+    assert "mailbox_payload_put_skipped" in source
+
+
+def test_draft_mailbox_record_guard_resets_at_generation_boundaries():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    assert "def _reset_draft_mailbox_record_guard" in source
+    assert source.count("self._reset_draft_mailbox_record_guard()") >= 4
 
 
 def main() -> None:
@@ -282,7 +318,10 @@ def main() -> None:
     test_available_payload_context_reports_semantic_conflict_before_put()
     test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_seq()
     test_stale_producer_payload_allows_later_plan_for_same_home_seq()
+    test_same_plan_stale_same_payload_is_idempotent_skip_in_mailbox()
+    test_same_plan_stale_different_payload_is_conflict_in_mailbox()
     test_draft_mailbox_route_guards_outstanding_available_before_put()
+    test_draft_mailbox_record_guard_resets_at_generation_boundaries()
 
 
 if __name__ == "__main__":

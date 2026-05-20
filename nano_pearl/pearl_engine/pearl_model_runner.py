@@ -2,6 +2,8 @@ import pickle
 import torch
 import time
 import random
+import hashlib
+import json
 from abc import abstractmethod
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -103,6 +105,7 @@ class ModelRunnerBase:
     """
     def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
         initialize_v4t_active_continuation_runner_state(self)
+        self._reset_draft_mailbox_record_guard()
         self.rank = rank
         self.event = event
         self.is_draft = rank in config.draft_config.devices
@@ -729,10 +732,16 @@ class ModelRunnerBase:
             "mailbox_put_seq_ids": [],
             "mailbox_payload_put_attempted": False,
             "mailbox_payload_put_success": False,
+            "mailbox_payload_put_skipped": False,
             "mailbox_payload_duplicate_put_detected": False,
             "mailbox_payload_duplicate_put_idempotent_skip": False,
             "mailbox_payload_duplicate_put_conflict": False,
             "mailbox_payload_duplicate_put_context": {},
+            "mailbox_payload_put_key": None,
+            "mailbox_payload_put_payload_hash": None,
+            "mailbox_payload_record_guard_hit": False,
+            "mailbox_payload_record_guard_size": 0,
+            "mailbox_payload_recorded_plan_ids": [],
             "mailbox_payload_outstanding_available_detected": False,
             "mailbox_payload_outstanding_context": {},
             "mailbox_payload_existing_plan_id": None,
@@ -1028,10 +1037,16 @@ class ModelRunnerBase:
             "mailbox_verify_commit_skipped_non_owner",
             "mailbox_payload_put_attempted",
             "mailbox_payload_put_success",
+            "mailbox_payload_put_skipped",
             "mailbox_payload_duplicate_put_detected",
             "mailbox_payload_duplicate_put_idempotent_skip",
             "mailbox_payload_duplicate_put_conflict",
             "mailbox_payload_duplicate_put_context",
+            "mailbox_payload_put_key",
+            "mailbox_payload_put_payload_hash",
+            "mailbox_payload_record_guard_hit",
+            "mailbox_payload_record_guard_size",
+            "mailbox_payload_recorded_plan_ids",
             "mailbox_payload_outstanding_available_detected",
             "mailbox_payload_outstanding_context",
             "mailbox_payload_existing_plan_id",
@@ -1179,6 +1194,22 @@ class ModelRunnerBase:
 
     def _mailbox_available_seq_ids_by_batch(self) -> dict[str, list[int]]:
         return self.stspec_mailbox.available_seq_ids_by_batch()
+
+    def _reset_draft_mailbox_record_guard(self) -> None:
+        self.stspec_draft_mailbox_record_guard: dict[tuple, dict] = {}
+
+    @staticmethod
+    def _draft_mailbox_payload_hash(payload: MailboxPayload) -> str:
+        encoded = json.dumps(payload.to_dict(), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _draft_mailbox_recorded_plan_ids(self) -> list[int]:
+        plan_ids = {
+            int(key[0])
+            for key in getattr(self, "stspec_draft_mailbox_record_guard", {})
+            if key and key[0] is not None
+        }
+        return sorted(plan_ids)
 
     def _stspec_kv_sync_probe_enabled(self, step_plan: StepPlan | None) -> bool:
         return bool(
@@ -2492,6 +2523,84 @@ class ModelRunnerBase:
             "next_required_feature=mailbox_payload_after_active_continuation"
         )
 
+    def _record_draft_mailbox_guard_skip_or_conflict(
+        self,
+        *,
+        trace_record: dict,
+        step_plan: StepPlan,
+        payloads: list[MailboxPayload],
+    ) -> bool:
+        guard = getattr(self, "stspec_draft_mailbox_record_guard", None)
+        if guard is None:
+            self._reset_draft_mailbox_record_guard()
+            guard = self.stspec_draft_mailbox_record_guard
+
+        payload_hashes = [self._draft_mailbox_payload_hash(payload) for payload in payloads]
+        put_keys = [
+            (payload.plan_id, payload.home_batch_id, payload.seq_id, payload.producer_role)
+            for payload in payloads
+        ]
+        trace_record["mailbox_payload_put_key"] = [list(key) for key in put_keys]
+        trace_record["mailbox_payload_put_payload_hash"] = payload_hashes
+        trace_record["mailbox_payload_record_guard_size"] = len(guard)
+        trace_record["mailbox_payload_recorded_plan_ids"] = self._draft_mailbox_recorded_plan_ids()
+
+        for payload, payload_hash, key in zip(payloads, payload_hashes, put_keys):
+            existing = guard.get(key)
+            if existing is None:
+                continue
+            trace_record["mailbox_payload_record_guard_hit"] = True
+            context = {
+                "plan_id": payload.plan_id,
+                "home_batch_id": payload.home_batch_id,
+                "seq_id": payload.seq_id,
+                "producer_role": payload.producer_role,
+                "payload_id": payload.payload_id,
+                "payload_hash": payload_hash,
+                "existing_payload_id": existing.get("payload_id"),
+                "existing_payload_hash": existing.get("payload_hash"),
+            }
+            if existing.get("payload_hash") == payload_hash:
+                trace_record["mailbox_payload_put_success"] = False
+                trace_record["mailbox_payload_put_skipped"] = True
+                trace_record["mailbox_payload_duplicate_put_detected"] = True
+                trace_record["mailbox_payload_duplicate_put_idempotent_skip"] = True
+                trace_record["mailbox_payload_duplicate_put_conflict"] = False
+                trace_record["mailbox_payload_duplicate_put_context"] = context
+                trace_record["mailbox_put_count"] = 0
+                return True
+            trace_record["mailbox_payload_put_success"] = False
+            trace_record["mailbox_payload_put_skipped"] = False
+            trace_record["mailbox_payload_duplicate_put_detected"] = True
+            trace_record["mailbox_payload_duplicate_put_idempotent_skip"] = False
+            trace_record["mailbox_payload_duplicate_put_conflict"] = True
+            trace_record["mailbox_payload_duplicate_put_context"] = context
+            raise STSpecMailboxError(
+                "Conflicting repeated draft mailbox payload recording",
+                kind="duplicate_put_conflict",
+                context=context,
+            )
+        return False
+
+    def _remember_draft_mailbox_recorded_payloads(self, payloads: list[MailboxPayload]) -> None:
+        guard = getattr(self, "stspec_draft_mailbox_record_guard", None)
+        if guard is None:
+            self._reset_draft_mailbox_record_guard()
+            guard = self.stspec_draft_mailbox_record_guard
+        for payload in payloads:
+            key = (payload.plan_id, payload.home_batch_id, payload.seq_id, payload.producer_role)
+            guard[key] = {
+                "payload_id": payload.payload_id,
+                "payload_hash": self._draft_mailbox_payload_hash(payload),
+            }
+        # Keep this probe-only cache bounded while preserving recent plan retry detection.
+        if len(guard) > 1024:
+            recent_plan_ids = sorted({key[0] for key in guard if key[0] is not None})[-32:]
+            keep_plans = set(recent_plan_ids)
+            self.stspec_draft_mailbox_record_guard = {
+                key: value for key, value in guard.items() if key[0] in keep_plans
+            }
+
     def _record_draft_mailbox_payloads(
         self,
         trace_record: dict | None,
@@ -2533,6 +2642,12 @@ class ModelRunnerBase:
         trace_record["mailbox_payload_put_plan_id"] = step_plan.plan_id
         trace_record["mailbox_payload_put_seq_ids"] = [payload.seq_id for payload in payloads]
         trace_record["mailbox_payload_put_home_batch_ids"] = [payload.home_batch_id for payload in payloads]
+        if self._record_draft_mailbox_guard_skip_or_conflict(
+            trace_record=trace_record,
+            step_plan=step_plan,
+            payloads=payloads,
+        ):
+            return
         self._guard_outstanding_draft_mailbox_payloads(
             trace_record=trace_record,
             step_plan=step_plan,
@@ -2576,6 +2691,9 @@ class ModelRunnerBase:
                 next_required_feature="mailbox_payload_tensor_transport",
             )
             raise
+        self._remember_draft_mailbox_recorded_payloads(payloads)
+        trace_record["mailbox_payload_record_guard_size"] = len(self.stspec_draft_mailbox_record_guard)
+        trace_record["mailbox_payload_recorded_plan_ids"] = self._draft_mailbox_recorded_plan_ids()
         after_stats = self.stspec_mailbox.stats() if hasattr(self.stspec_mailbox, "stats") else {}
         trace_record["mailbox_put_success"] = True
         trace_record["mailbox_payload_put_success"] = True
@@ -2814,6 +2932,7 @@ class ModelRunnerBase:
         """
         self.active_decode_ready_mode = True
         reset_v4t_active_continuation_runner_state(self)
+        self._reset_draft_mailbox_record_guard()
         dist.barrier()
         self.prefill()
         self._mark_decode_ready()
@@ -2847,6 +2966,7 @@ class ModelRunnerBase:
         self._set_execution_mode("parallel_pearl")
         self.active_decode_ready_mode = True
         reset_v4t_active_continuation_runner_state(self)
+        self._reset_draft_mailbox_record_guard()
         dist.barrier()
         self._mark_decode_started()
         torch.cuda.synchronize()
@@ -2866,6 +2986,7 @@ class ModelRunnerBase:
         """Decode-only serialized-PEARL approximation after prepare_decode_ready()."""
         self._set_execution_mode("serialized_pearl")
         self.active_decode_ready_mode = True
+        self._reset_draft_mailbox_record_guard()
         dist.barrier()
         self._mark_decode_started()
         torch.cuda.synchronize()
@@ -2903,6 +3024,7 @@ class ModelRunnerBase:
     def pearl_generate(self):
         self._set_execution_mode("parallel_pearl")
         reset_v4t_active_continuation_runner_state(self)
+        self._reset_draft_mailbox_record_guard()
         dist.barrier()
         torch.cuda.synchronize()
         start_time = time.time()
@@ -2975,6 +3097,7 @@ class ModelRunnerBase:
         speculative decoding.
         """
         self._set_execution_mode("serialized_pearl")
+        self._reset_draft_mailbox_record_guard()
         dist.barrier()
         torch.cuda.synchronize()
         start_time = time.time()
