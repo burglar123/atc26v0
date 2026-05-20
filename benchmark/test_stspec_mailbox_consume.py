@@ -95,6 +95,68 @@ def payload(seq_id: int, tokens: list[int], *, home_batch_id=1, offset=0, target
     )
 
 
+def v4u_payload(seq_id: int, tokens: list[int], *, plan_id=8, home_batch_id=0):
+    return MailboxPayload(
+        plan_id=plan_id,
+        producer_role="draft",
+        producer_home_batch_id=home_batch_id,
+        target_home_batch_id=home_batch_id,
+        draft_home_batch_id=home_batch_id,
+        seq_id=seq_id,
+        request_id=f"r{seq_id}",
+        home_batch_id=home_batch_id,
+        gamma=4,
+        layout_kind="variable_offsets",
+        protocol_version=1,
+        draft_token_ids=list(tokens),
+        per_seq_length=len(tokens),
+        offset=0,
+        logical_step=plan_id,
+        producer_actual_exec_seq_ids=[seq_id],
+        producer_draft_message_seq_ids=[seq_id],
+        metadata={"payload_id": f"{plan_id}:{home_batch_id}:{seq_id}:0:{len(tokens)}"},
+    )
+
+
+def test_duplicate_put_same_available_payload_is_idempotent_skip():
+    mailbox = STSpecPayloadMailbox()
+    first = v4u_payload(0, [101], plan_id=8)
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    stats = mailbox.stats()
+    assert stats["duplicate_put_count"] == 1
+    assert stats["duplicate_put_idempotent_skip_count"] == 1
+    assert stats["duplicate_put_conflict_count"] == 0
+    assert stats["put_count"] == 1
+
+
+def test_duplicate_put_same_key_different_payload_is_conflict():
+    mailbox = STSpecPayloadMailbox()
+    mailbox.put_payloads(0, [v4u_payload(0, [101], plan_id=8)], plan_id=8, producer_role="draft")
+    with pytest.raises(mailbox_mod.STSpecMailboxError, match="duplicate_put_conflict"):
+        mailbox.put_payloads(0, [v4u_payload(0, [202], plan_id=8)], plan_id=8, producer_role="draft")
+    stats = mailbox.stats()
+    assert stats["duplicate_put_conflict_count"] == 1
+
+
+def test_active_continuation_new_plan_can_reuse_consumed_home_seq_key():
+    mailbox = STSpecPayloadMailbox()
+    first = v4u_payload(0, [101], plan_id=8)
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.apply_payload_lifecycle(
+        plan_id=8,
+        target_home_batch_id=0,
+        consumed_token_count_by_payload_id={first.payload_id: 1},
+        invalidated_token_count_by_payload_id={},
+    )
+    second = v4u_payload(0, [202], plan_id=9)
+    mailbox.put_payloads(0, [second], plan_id=9, producer_role="draft")
+    result = mailbox.get_payloads(0, [0], plan_id=9, consumer_role="target")
+    assert result.success is True
+    assert result.payloads[0].payload_id == second.payload_id
+    assert mailbox.stats()["put_count"] == 2
+
+
 def make_mailbox():
     mailbox = STSpecPayloadMailbox()
     mailbox.put_payloads(1, [payload(1, [101], offset=0), payload(3, [301, 302, 303, 304], offset=1)])

@@ -475,6 +475,9 @@ PLAN_REQUEST_FIELDS = [
     "variable_offsets_validation_error_count",
     "cross_batch_routing_error_count",
     "mailbox_put_count",
+    "mailbox_payload_duplicate_put_count",
+    "mailbox_payload_duplicate_put_idempotent_skip_count",
+    "mailbox_payload_duplicate_put_conflict_count",
     "mailbox_get_hit_count",
     "mailbox_get_miss_count",
     "mailbox_missing_count",
@@ -793,6 +796,9 @@ def aggregate_low_level_traces(
         variable_offsets_validation_error_count = 0
         cross_batch_routing_error_count = 0
         mailbox_put_count = 0
+        mailbox_payload_duplicate_put_count = 0
+        mailbox_payload_duplicate_put_idempotent_skip_count = 0
+        mailbox_payload_duplicate_put_conflict_count = 0
         mailbox_get_hit_count = 0
         mailbox_get_miss_count = 0
         mailbox_missing_count = 0
@@ -1032,6 +1038,12 @@ def aggregate_low_level_traces(
             if e.get("cross_batch_routing_error"):
                 cross_batch_routing_error_count += 1
             mailbox_put_count += int(e.get("mailbox_put_count") or 0)
+            if e.get("mailbox_payload_duplicate_put_detected"):
+                mailbox_payload_duplicate_put_count += 1
+            if e.get("mailbox_payload_duplicate_put_idempotent_skip"):
+                mailbox_payload_duplicate_put_idempotent_skip_count += 1
+            if e.get("mailbox_payload_duplicate_put_conflict"):
+                mailbox_payload_duplicate_put_conflict_count += 1
             mailbox_get_hit_count += int(e.get("mailbox_get_hit_count") or 0)
             mailbox_get_miss_count += int(e.get("mailbox_get_miss_count") or 0)
             mailbox_missing_count += len(e.get("mailbox_missing_seq_ids") or [])
@@ -1450,6 +1462,9 @@ def aggregate_low_level_traces(
         row["variable_offsets_validation_error_count"] = variable_offsets_validation_error_count
         row["cross_batch_routing_error_count"] = cross_batch_routing_error_count
         row["mailbox_put_count"] = mailbox_put_count
+        row["mailbox_payload_duplicate_put_count"] = mailbox_payload_duplicate_put_count
+        row["mailbox_payload_duplicate_put_idempotent_skip_count"] = mailbox_payload_duplicate_put_idempotent_skip_count
+        row["mailbox_payload_duplicate_put_conflict_count"] = mailbox_payload_duplicate_put_conflict_count
         row["mailbox_get_hit_count"] = mailbox_get_hit_count
         row["mailbox_get_miss_count"] = mailbox_get_miss_count
         row["mailbox_missing_count"] = mailbox_missing_count
@@ -2518,6 +2533,11 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "kv_commit_rollback_attempt_count": row.get("kv_commit_rollback_attempt_count"),
         "kv_commit_rollback_success_count": row.get("kv_commit_rollback_success_count"),
         "kv_commit_skipped_non_owner_count": row.get("kv_commit_skipped_non_owner_count"),
+        "mailbox_payload_duplicate_put_count": row.get("mailbox_payload_duplicate_put_count"),
+        "mailbox_payload_duplicate_put_idempotent_skip_count": row.get(
+            "mailbox_payload_duplicate_put_idempotent_skip_count"
+        ),
+        "mailbox_payload_duplicate_put_conflict_count": row.get("mailbox_payload_duplicate_put_conflict_count"),
         "mailbox_payload_consume_plan_built_count": row.get("mailbox_payload_consume_plan_built_count"),
         "mailbox_payload_consume_attempt_count": row.get("mailbox_payload_consume_attempt_count"),
         "mailbox_payload_consume_success_count": row.get("mailbox_payload_consume_success_count"),

@@ -24,6 +24,7 @@ engine_pkg.__path__ = [os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine")]
 sys.modules[engine_pkg_name] = engine_pkg
 
 apply_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_verify_apply")
+mailbox_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox")
 
 
 def commit_result(**overrides):
@@ -147,6 +148,80 @@ def test_target_mailbox_route_wires_active_diagnostic_before_generic_raise():
     assert '"active_request_continuation_limit_reached"' in source[source.index(active_branch) : source.index(generic_raise)]
 
 
+def mailbox_payload(
+    *,
+    plan_id: int,
+    seq_id: int = 0,
+    home_batch_id: int = 0,
+    token_ids=None,
+):
+    token_ids = [11] if token_ids is None else list(token_ids)
+    return mailbox_mod.MailboxPayload(
+        plan_id=plan_id,
+        producer_role="draft",
+        producer_home_batch_id=home_batch_id,
+        target_home_batch_id=home_batch_id,
+        draft_home_batch_id=home_batch_id,
+        seq_id=seq_id,
+        request_id=seq_id,
+        home_batch_id=home_batch_id,
+        gamma=4,
+        layout_kind="variable_offsets",
+        protocol_version=1,
+        draft_token_ids=token_ids,
+        per_seq_length=len(token_ids),
+        offset=0,
+        logical_step=plan_id,
+        metadata={"payload_id": f"{plan_id}:{home_batch_id}:{seq_id}:0:{len(token_ids)}"},
+    )
+
+
+def test_same_available_payload_duplicate_put_is_idempotent_skip():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    payload = mailbox_payload(plan_id=8, token_ids=[101])
+    mailbox.put_payloads(0, [payload], plan_id=8, producer_role="draft")
+    mailbox.put_payloads(0, [payload], plan_id=8, producer_role="draft")
+    stats = mailbox.stats()
+    assert stats["duplicate_put_count"] == 1
+    assert stats["duplicate_put_idempotent_skip_count"] == 1
+    assert stats["duplicate_put_conflict_count"] == 0
+    assert stats["put_count"] == 1
+
+
+def test_same_key_different_available_payload_hard_fails_as_conflict():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    mailbox.put_payloads(0, [mailbox_payload(plan_id=8, token_ids=[101])], plan_id=8, producer_role="draft")
+    try:
+        mailbox.put_payloads(0, [mailbox_payload(plan_id=8, token_ids=[202])], plan_id=8, producer_role="draft")
+    except mailbox_mod.STSpecMailboxError as exc:
+        assert exc.kind == "duplicate_put_conflict"
+        assert exc.context["home_batch_id"] == 0
+        assert exc.context["seq_id"] == 0
+        assert exc.context["plan_id"] == 8
+    else:
+        raise AssertionError("conflicting duplicate put should fail")
+
+
+def test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_seq():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    first = mailbox_payload(plan_id=8, token_ids=[101])
+    mailbox.put_payloads(0, [first], plan_id=8, producer_role="draft")
+    mailbox.apply_payload_lifecycle(
+        plan_id=8,
+        target_home_batch_id=0,
+        consumed_token_count_by_payload_id={first.payload_id: 1},
+        invalidated_token_count_by_payload_id={},
+    )
+    second = mailbox_payload(plan_id=9, token_ids=[202])
+    mailbox.put_payloads(0, [second], plan_id=9, producer_role="draft")
+    result = mailbox.get_payloads(0, [0], plan_id=9, consumer_role="target")
+    assert result.success is True
+    assert result.payloads[0].payload_id == second.payload_id
+    stats = mailbox.stats()
+    assert stats["duplicate_put_count"] == 0
+    assert stats["put_count"] == 2
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -157,6 +232,9 @@ def main() -> None:
     test_pending_mailbox_payload_gets_drain_diagnostic()
     test_active_diagnostic_uses_fallback_seq_ids()
     test_target_mailbox_route_wires_active_diagnostic_before_generic_raise()
+    test_same_available_payload_duplicate_put_is_idempotent_skip()
+    test_same_key_different_available_payload_hard_fails_as_conflict()
+    test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_seq()
 
 
 if __name__ == "__main__":

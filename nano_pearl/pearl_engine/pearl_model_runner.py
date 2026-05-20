@@ -8,7 +8,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from nano_pearl.utils.pearl_logger import logger
 from nano_pearl.pearl_config import PEARLConfig
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from nano_pearl.models import model_dict
 from nano_pearl.utils.loader import load_model
 from nano_pearl.pearl_config import TPParams
@@ -725,6 +725,15 @@ class ModelRunnerBase:
             "mailbox_put_count": 0,
             "mailbox_put_home_batch_id": None,
             "mailbox_put_seq_ids": [],
+            "mailbox_payload_put_attempted": False,
+            "mailbox_payload_put_success": False,
+            "mailbox_payload_duplicate_put_detected": False,
+            "mailbox_payload_duplicate_put_idempotent_skip": False,
+            "mailbox_payload_duplicate_put_conflict": False,
+            "mailbox_payload_duplicate_put_context": {},
+            "mailbox_payload_put_plan_id": None,
+            "mailbox_payload_put_seq_ids": [],
+            "mailbox_payload_put_home_batch_ids": [],
             "mailbox_get_attempted": False,
             "mailbox_get_success": False,
             "mailbox_get_hit_count": 0,
@@ -1006,6 +1015,15 @@ class ModelRunnerBase:
             "mailbox_verify_commit_rollback_attempted",
             "mailbox_verify_commit_rollback_success",
             "mailbox_verify_commit_skipped_non_owner",
+            "mailbox_payload_put_attempted",
+            "mailbox_payload_put_success",
+            "mailbox_payload_duplicate_put_detected",
+            "mailbox_payload_duplicate_put_idempotent_skip",
+            "mailbox_payload_duplicate_put_conflict",
+            "mailbox_payload_duplicate_put_context",
+            "mailbox_payload_put_plan_id",
+            "mailbox_payload_put_seq_ids",
+            "mailbox_payload_put_home_batch_ids",
         ):
             record.pop(key, None)
 
@@ -2420,11 +2438,30 @@ class ModelRunnerBase:
             logical_step=step_plan.plan_id,
             metadata={"mailbox_locality": "diagnostic_local"},
         )
+        payloads = [
+            replace(
+                payload,
+                metadata={
+                    **dict(payload.metadata or {}),
+                    "source_plan_id": step_plan.plan_id,
+                    "payload_id": (
+                        f"{step_plan.plan_id}:{payload.home_batch_id}:"
+                        f"{payload.seq_id}:{payload.offset}:{payload.per_seq_length}"
+                    ),
+                },
+            )
+            for payload in payloads
+        ]
         trace_record["stspec_mailbox_transport_enabled"] = True
         trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
         trace_record["mailbox_put_attempted"] = True
+        trace_record["mailbox_payload_put_attempted"] = True
         trace_record["mailbox_put_home_batch_id"] = step_plan.draft_home_batch_id
         trace_record["mailbox_put_seq_ids"] = [payload.seq_id for payload in payloads]
+        trace_record["mailbox_payload_put_plan_id"] = step_plan.plan_id
+        trace_record["mailbox_payload_put_seq_ids"] = [payload.seq_id for payload in payloads]
+        trace_record["mailbox_payload_put_home_batch_ids"] = [payload.home_batch_id for payload in payloads]
+        before_stats = self.stspec_mailbox.stats() if hasattr(self.stspec_mailbox, "stats") else {}
         try:
             self.stspec_mailbox.put_payloads(
                 step_plan.draft_home_batch_id,
@@ -2449,7 +2486,12 @@ class ModelRunnerBase:
             )
         except STSpecMailboxError as exc:
             trace_record["mailbox_put_success"] = False
+            trace_record["mailbox_payload_put_success"] = False
             trace_record["mailbox_put_count"] = 0
+            trace_record["mailbox_payload_duplicate_put_detected"] = str(exc.kind).startswith("duplicate_put")
+            trace_record["mailbox_payload_duplicate_put_idempotent_skip"] = False
+            trace_record["mailbox_payload_duplicate_put_conflict"] = exc.kind == "duplicate_put_conflict"
+            trace_record["mailbox_payload_duplicate_put_context"] = dict(exc.context)
             self._record_mailbox_error(
                 trace_record,
                 kind=exc.kind,
@@ -2457,8 +2499,21 @@ class ModelRunnerBase:
                 next_required_feature="mailbox_payload_tensor_transport",
             )
             raise
+        after_stats = self.stspec_mailbox.stats() if hasattr(self.stspec_mailbox, "stats") else {}
         trace_record["mailbox_put_success"] = True
-        trace_record["mailbox_put_count"] = len(payloads)
+        trace_record["mailbox_payload_put_success"] = True
+        put_delta = int(after_stats.get("put_count", 0) or 0) - int(before_stats.get("put_count", 0) or 0)
+        trace_record["mailbox_put_count"] = put_delta
+        idempotent_skips = int(after_stats.get("duplicate_put_idempotent_skip_count", 0) or 0) - int(
+            before_stats.get("duplicate_put_idempotent_skip_count", 0) or 0
+        )
+        duplicate_puts = int(after_stats.get("duplicate_put_count", 0) or 0) - int(
+            before_stats.get("duplicate_put_count", 0) or 0
+        )
+        trace_record["mailbox_payload_duplicate_put_detected"] = duplicate_puts > 0
+        trace_record["mailbox_payload_duplicate_put_idempotent_skip"] = idempotent_skips > 0
+        trace_record["mailbox_payload_duplicate_put_conflict"] = False
+        trace_record["mailbox_payload_duplicate_put_context"] = {}
         if step_plan.stspec_pipeline_phase == STSpecPipelinePhase.WARMUP_DRAFT_ONLY.value:
             trace_record["warmup_draft_payload_produced"] = True
             trace_record["pipeline_phase_advanced"] = True

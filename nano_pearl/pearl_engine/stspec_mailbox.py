@@ -143,7 +143,13 @@ class STSpecPayloadMailbox:
         self._lifecycle_by_payload_id: dict[str, MailboxPayloadLifecycle] = {}
         self._put_count = 0
         self._duplicate_put_count = 0
+        self._duplicate_put_idempotent_skip_count = 0
+        self._duplicate_put_conflict_count = 0
         self._pop_count = 0
+
+    @staticmethod
+    def _payloads_equivalent(left: MailboxPayload, right: MailboxPayload) -> bool:
+        return left.to_dict() == right.to_dict()
 
     def put_payloads(
         self,
@@ -169,17 +175,47 @@ class STSpecPayloadMailbox:
                 )
             key = payload.key
             if key in self._payloads and not self.overwrite:
-                self._duplicate_put_count += 1
-                raise STSpecMailboxError(
-                    "Duplicate ST-Spec mailbox payload put",
-                    kind="duplicate_put",
-                    context={
-                        "home_batch_id": home_batch_id,
-                        "seq_id": payload.seq_id,
-                        "plan_id": plan_id,
-                        "producer_role": producer_role,
-                    },
-                )
+                existing = self._payloads[key]
+                lifecycle = self._lifecycle_by_key.get(key)
+                lifecycle_state = lifecycle.lifecycle_state if lifecycle is not None else "missing"
+                if lifecycle_state == "available":
+                    self._duplicate_put_count += 1
+                    if self._payloads_equivalent(existing, payload):
+                        self._duplicate_put_idempotent_skip_count += 1
+                        keys.append(key)
+                        continue
+                    self._duplicate_put_conflict_count += 1
+                    raise STSpecMailboxError(
+                        "Conflicting duplicate ST-Spec mailbox payload put",
+                        kind="duplicate_put_conflict",
+                        context={
+                            "home_batch_id": home_batch_id,
+                            "seq_id": payload.seq_id,
+                            "plan_id": plan_id,
+                            "producer_role": producer_role,
+                            "existing_plan_id": existing.plan_id,
+                            "existing_payload_id": existing.payload_id,
+                            "incoming_payload_id": payload.payload_id,
+                            "lifecycle_state": lifecycle_state,
+                        },
+                    )
+                if lifecycle_state not in {"consumed", "invalidated"}:
+                    self._duplicate_put_count += 1
+                    self._duplicate_put_conflict_count += 1
+                    raise STSpecMailboxError(
+                        "Inconsistent duplicate ST-Spec mailbox payload put",
+                        kind="duplicate_put_conflict",
+                        context={
+                            "home_batch_id": home_batch_id,
+                            "seq_id": payload.seq_id,
+                            "plan_id": plan_id,
+                            "producer_role": producer_role,
+                            "existing_plan_id": existing.plan_id,
+                            "existing_payload_id": existing.payload_id,
+                            "incoming_payload_id": payload.payload_id,
+                            "lifecycle_state": lifecycle_state,
+                        },
+                    )
             self._payloads[key] = payload
             lifecycle = MailboxPayloadLifecycle(
                 payload_id=payload.payload_id,
@@ -390,6 +426,8 @@ class STSpecPayloadMailbox:
             "put_count": self._put_count,
             "pop_count": self._pop_count,
             "duplicate_put_count": self._duplicate_put_count,
+            "duplicate_put_idempotent_skip_count": self._duplicate_put_idempotent_skip_count,
+            "duplicate_put_conflict_count": self._duplicate_put_conflict_count,
             "lifecycle_counts": self.lifecycle_counts(),
             "available_home_batch_ids": self.available_home_batch_ids(),
             "available_seq_ids_by_batch": self.available_seq_ids_by_batch(),

@@ -154,6 +154,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_routing_error_count = 0
     mailbox_error_kinds = set()
     raw_mailbox_put_rows = 0
+    mailbox_payload_duplicate_put_count = 0
+    mailbox_payload_duplicate_put_idempotent_skip_count = 0
+    mailbox_payload_duplicate_put_conflict_count = 0
     raw_mailbox_get_rows = 0
     raw_mailbox_success_rows = 0
     raw_mailbox_missing_seq_count = 0
@@ -452,12 +455,25 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             cross_batch_routing_error_count += 1
         cross_batch_routing_error_count += int(row.get("cross_batch_routing_error_count") or 0)
         mailbox_put_count += int(row.get("mailbox_put_count") or 0)
+        mailbox_payload_duplicate_put_count += int(row.get("mailbox_payload_duplicate_put_count") or 0)
+        mailbox_payload_duplicate_put_idempotent_skip_count += int(
+            row.get("mailbox_payload_duplicate_put_idempotent_skip_count") or 0
+        )
+        mailbox_payload_duplicate_put_conflict_count += int(
+            row.get("mailbox_payload_duplicate_put_conflict_count") or 0
+        )
         mailbox_get_hit_count += int(row.get("mailbox_get_hit_count") or 0)
         mailbox_get_miss_count += int(row.get("mailbox_get_miss_count") or 0)
         mailbox_warmup_miss_count += int(row.get("mailbox_warmup_miss_count") or 0)
         mailbox_routing_error_count += int(row.get("mailbox_routing_error_count") or 0)
         if row.get("mailbox_put_attempted"):
             raw_mailbox_put_rows += 1
+        if row.get("mailbox_payload_duplicate_put_detected"):
+            mailbox_payload_duplicate_put_count += 1
+        if row.get("mailbox_payload_duplicate_put_idempotent_skip"):
+            mailbox_payload_duplicate_put_idempotent_skip_count += 1
+        if row.get("mailbox_payload_duplicate_put_conflict"):
+            mailbox_payload_duplicate_put_conflict_count += 1
         if row.get("mailbox_get_attempted"):
             raw_mailbox_get_rows += 1
         if row.get("mailbox_get_success") or row.get("mailbox_put_success"):
@@ -923,6 +939,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_routing_error_count": mailbox_routing_error_count,
         "mailbox_error_kinds": sorted(mailbox_error_kinds, key=str),
         "raw_mailbox_put_rows": raw_mailbox_put_rows,
+        "mailbox_payload_duplicate_put_count": mailbox_payload_duplicate_put_count,
+        "mailbox_payload_duplicate_put_idempotent_skip_count": mailbox_payload_duplicate_put_idempotent_skip_count,
+        "mailbox_payload_duplicate_put_conflict_count": mailbox_payload_duplicate_put_conflict_count,
         "raw_mailbox_get_rows": raw_mailbox_get_rows,
         "raw_mailbox_success_rows": raw_mailbox_success_rows,
         "raw_mailbox_missing_seq_count": raw_mailbox_missing_seq_count,
@@ -1270,6 +1289,12 @@ def summarize(path: Path) -> int:
     print(f"mailbox routing error count: {plan_summary['mailbox_routing_error_count']}")
     print(f"mailbox_error_kinds: {plan_summary['mailbox_error_kinds']}")
     print(f"raw mailbox put rows: {plan_summary['raw_mailbox_put_rows']}")
+    print(f"mailbox payload duplicate put count: {plan_summary['mailbox_payload_duplicate_put_count']}")
+    print(
+        "mailbox payload duplicate put idempotent skip count: "
+        f"{plan_summary['mailbox_payload_duplicate_put_idempotent_skip_count']}"
+    )
+    print(f"mailbox payload duplicate put conflict count: {plan_summary['mailbox_payload_duplicate_put_conflict_count']}")
     print(f"raw mailbox get rows: {plan_summary['raw_mailbox_get_rows']}")
     print(f"raw mailbox success rows: {plan_summary['raw_mailbox_success_rows']}")
     print(f"raw mailbox missing seq count: {plan_summary['raw_mailbox_missing_seq_count']}")
