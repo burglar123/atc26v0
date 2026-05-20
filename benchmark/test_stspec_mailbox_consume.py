@@ -157,6 +157,30 @@ def test_active_continuation_new_plan_can_reuse_consumed_home_seq_key():
     assert mailbox.stats()["put_count"] == 2
 
 
+def test_active_continuation_new_plan_can_reuse_stale_home_seq_key():
+    mailbox = STSpecPayloadMailbox()
+    first = v4u_payload(0, [101], plan_id=4)
+    mailbox.put_payloads(0, [first], plan_id=4, producer_role="draft")
+    mailbox.mark_payloads_stale([first.payload_id], plan_id=4, reason="draft_transport_envelope_recorded")
+    second = v4u_payload(0, [202], plan_id=8)
+    mailbox.put_payloads(0, [second], plan_id=8, producer_role="draft")
+    result = mailbox.get_payloads(0, [0], plan_id=8, consumer_role="target")
+    assert result.success is True
+    assert result.payloads[0].payload_id == second.payload_id
+
+
+def test_outstanding_available_payload_context_blocks_new_plan_before_put():
+    mailbox = STSpecPayloadMailbox()
+    existing = v4u_payload(0, [101], plan_id=4)
+    incoming = v4u_payload(0, [202], plan_id=8)
+    mailbox.put_payloads(0, [existing], plan_id=4, producer_role="draft")
+    contexts = mailbox.available_payload_contexts_for([incoming])
+    assert contexts[0]["existing_plan_id"] == 4
+    assert contexts[0]["incoming_plan_id"] == 8
+    assert contexts[0]["same_payload"] is False
+    assert contexts[0]["lifecycle_state"] == "available"
+
+
 def make_mailbox():
     mailbox = STSpecPayloadMailbox()
     mailbox.put_payloads(1, [payload(1, [101], offset=0), payload(3, [301, 302, 303, 304], offset=1)])

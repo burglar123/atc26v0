@@ -202,6 +202,19 @@ def test_same_key_different_available_payload_hard_fails_as_conflict():
         raise AssertionError("conflicting duplicate put should fail")
 
 
+def test_available_payload_context_reports_semantic_conflict_before_put():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    existing = mailbox_payload(plan_id=4, token_ids=[101])
+    incoming = mailbox_payload(plan_id=8, token_ids=[202])
+    mailbox.put_payloads(0, [existing], plan_id=4, producer_role="draft")
+    contexts = mailbox.available_payload_contexts_for([incoming])
+    assert len(contexts) == 1
+    assert contexts[0]["same_payload"] is False
+    assert contexts[0]["existing_plan_id"] == 4
+    assert contexts[0]["incoming_plan_id"] == 8
+    assert contexts[0]["lifecycle_state"] == "available"
+
+
 def test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_seq():
     mailbox = mailbox_mod.STSpecPayloadMailbox()
     first = mailbox_payload(plan_id=8, token_ids=[101])
@@ -222,6 +235,38 @@ def test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_se
     assert stats["put_count"] == 2
 
 
+def test_stale_producer_payload_allows_later_plan_for_same_home_seq():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    first = mailbox_payload(plan_id=4, token_ids=[101])
+    mailbox.put_payloads(0, [first], plan_id=4, producer_role="draft")
+    stale = mailbox.mark_payloads_stale(
+        [first.payload_id],
+        plan_id=4,
+        reason="draft_transport_envelope_recorded",
+    )
+    assert stale[first.payload_id]["lifecycle_state"] == "stale"
+    second = mailbox_payload(plan_id=8, token_ids=[202])
+    assert mailbox.available_payload_contexts_for([second]) == []
+    mailbox.put_payloads(0, [second], plan_id=8, producer_role="draft")
+    result = mailbox.get_payloads(0, [0], plan_id=8, consumer_role="target")
+    assert result.success is True
+    assert result.payloads[0].payload_id == second.payload_id
+
+
+def test_draft_mailbox_route_guards_outstanding_available_before_put():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    guard_call = "self._guard_outstanding_draft_mailbox_payloads("
+    put_call = "self.stspec_mailbox.put_payloads("
+    stale_call = "self.stspec_mailbox.mark_payloads_stale("
+    record_start = source.index("def _record_draft_mailbox_payloads")
+    record_source = source[record_start:]
+    assert guard_call in record_source
+    assert record_source.index(guard_call) < record_source.index(put_call)
+    assert stale_call in record_source
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -234,7 +279,10 @@ def main() -> None:
     test_target_mailbox_route_wires_active_diagnostic_before_generic_raise()
     test_same_available_payload_duplicate_put_is_idempotent_skip()
     test_same_key_different_available_payload_hard_fails_as_conflict()
+    test_available_payload_context_reports_semantic_conflict_before_put()
     test_consumed_lifecycle_allows_new_active_continuation_plan_for_same_home_seq()
+    test_stale_producer_payload_allows_later_plan_for_same_home_seq()
+    test_draft_mailbox_route_guards_outstanding_available_before_put()
 
 
 if __name__ == "__main__":

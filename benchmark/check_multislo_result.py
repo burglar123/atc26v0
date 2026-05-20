@@ -157,6 +157,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_payload_duplicate_put_count = 0
     mailbox_payload_duplicate_put_idempotent_skip_count = 0
     mailbox_payload_duplicate_put_conflict_count = 0
+    mailbox_payload_outstanding_available_count = 0
     raw_mailbox_get_rows = 0
     raw_mailbox_success_rows = 0
     raw_mailbox_missing_seq_count = 0
@@ -263,6 +264,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_attempt_count = 0
     active_continuation_success_count = 0
     active_continuation_limit_reached_count = 0
+    active_continuation_skipped_due_to_outstanding_payload_count = 0
     active_request_continuation_error_count = 0
     active_request_continuation_error_kinds = set()
     terminal_verify_tuple_attempt_count = 0
@@ -462,6 +464,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         mailbox_payload_duplicate_put_conflict_count += int(
             row.get("mailbox_payload_duplicate_put_conflict_count") or 0
         )
+        mailbox_payload_outstanding_available_count += int(row.get("mailbox_payload_outstanding_available_count") or 0)
         mailbox_get_hit_count += int(row.get("mailbox_get_hit_count") or 0)
         mailbox_get_miss_count += int(row.get("mailbox_get_miss_count") or 0)
         mailbox_warmup_miss_count += int(row.get("mailbox_warmup_miss_count") or 0)
@@ -474,6 +477,8 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             mailbox_payload_duplicate_put_idempotent_skip_count += 1
         if row.get("mailbox_payload_duplicate_put_conflict"):
             mailbox_payload_duplicate_put_conflict_count += 1
+        if row.get("mailbox_payload_outstanding_available_detected"):
+            mailbox_payload_outstanding_available_count += 1
         if row.get("mailbox_get_attempted"):
             raw_mailbox_get_rows += 1
         if row.get("mailbox_get_success") or row.get("mailbox_put_success"):
@@ -630,6 +635,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_attempt_count += int(row.get("active_continuation_attempt_count") or 0)
         active_continuation_success_count += int(row.get("active_continuation_success_count") or 0)
         active_continuation_limit_reached_count += int(row.get("active_continuation_limit_reached_count") or 0)
+        active_continuation_skipped_due_to_outstanding_payload_count += int(
+            row.get("active_continuation_skipped_due_to_outstanding_payload_count") or 0
+        )
         active_request_continuation_error_count += int(row.get("active_request_continuation_error_count") or 0)
         for value in values_from_mapping(row.get("active_request_continuation_error_kinds")):
             if value:
@@ -831,6 +839,8 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_success_count += 1
         if row.get("active_continuation_limit_reached"):
             active_continuation_limit_reached_count += 1
+        if row.get("active_continuation_skipped_due_to_outstanding_payload"):
+            active_continuation_skipped_due_to_outstanding_payload_count += 1
         if row.get("active_request_continuation_error"):
             active_request_continuation_error_count += 1
         if row.get("active_request_continuation_error_kind"):
@@ -942,6 +952,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_payload_duplicate_put_count": mailbox_payload_duplicate_put_count,
         "mailbox_payload_duplicate_put_idempotent_skip_count": mailbox_payload_duplicate_put_idempotent_skip_count,
         "mailbox_payload_duplicate_put_conflict_count": mailbox_payload_duplicate_put_conflict_count,
+        "mailbox_payload_outstanding_available_count": mailbox_payload_outstanding_available_count,
         "raw_mailbox_get_rows": raw_mailbox_get_rows,
         "raw_mailbox_success_rows": raw_mailbox_success_rows,
         "raw_mailbox_missing_seq_count": raw_mailbox_missing_seq_count,
@@ -1050,6 +1061,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_attempt_count": active_continuation_attempt_count,
         "active_continuation_success_count": active_continuation_success_count,
         "active_continuation_limit_reached_count": active_continuation_limit_reached_count,
+        "active_continuation_skipped_due_to_outstanding_payload_count": active_continuation_skipped_due_to_outstanding_payload_count,
         "active_request_continuation_error_count": active_request_continuation_error_count,
         "active_request_continuation_error_kinds": sorted(active_request_continuation_error_kinds, key=str),
         "terminal_verify_tuple_attempt_count": terminal_verify_tuple_attempt_count,
@@ -1295,6 +1307,7 @@ def summarize(path: Path) -> int:
         f"{plan_summary['mailbox_payload_duplicate_put_idempotent_skip_count']}"
     )
     print(f"mailbox payload duplicate put conflict count: {plan_summary['mailbox_payload_duplicate_put_conflict_count']}")
+    print(f"mailbox payload outstanding available count: {plan_summary['mailbox_payload_outstanding_available_count']}")
     print(f"raw mailbox get rows: {plan_summary['raw_mailbox_get_rows']}")
     print(f"raw mailbox success rows: {plan_summary['raw_mailbox_success_rows']}")
     print(f"raw mailbox missing seq count: {plan_summary['raw_mailbox_missing_seq_count']}")
@@ -1401,6 +1414,10 @@ def summarize(path: Path) -> int:
     print(f"active continuation attempts: {plan_summary['active_continuation_attempt_count']}")
     print(f"active continuation successes: {plan_summary['active_continuation_success_count']}")
     print(f"active continuation limit reached count: {plan_summary['active_continuation_limit_reached_count']}")
+    print(
+        "active continuation skipped due to outstanding payload count: "
+        f"{plan_summary['active_continuation_skipped_due_to_outstanding_payload_count']}"
+    )
     print(f"active continuation errors: {plan_summary['active_request_continuation_error_count']}")
     print(f"active continuation error kinds: {plan_summary['active_request_continuation_error_kinds']}")
     print(f"terminal verify tuple attempts: {plan_summary['terminal_verify_tuple_attempt_count']}")

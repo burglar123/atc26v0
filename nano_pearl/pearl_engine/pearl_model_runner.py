@@ -677,6 +677,8 @@ class ModelRunnerBase:
             "active_continuation_limit_reached": False,
             "active_continuation_error": None,
             "active_continuation_error_kind": None,
+            "active_continuation_skipped_due_to_outstanding_payload": False,
+            "active_continuation_plan_id": None,
             "active_request_continuation_error": None,
             "active_request_continuation_error_kind": None,
             "finalized_after_active_continuation": False,
@@ -731,6 +733,13 @@ class ModelRunnerBase:
             "mailbox_payload_duplicate_put_idempotent_skip": False,
             "mailbox_payload_duplicate_put_conflict": False,
             "mailbox_payload_duplicate_put_context": {},
+            "mailbox_payload_outstanding_available_detected": False,
+            "mailbox_payload_outstanding_context": {},
+            "mailbox_payload_existing_plan_id": None,
+            "mailbox_payload_incoming_plan_id": None,
+            "mailbox_payload_existing_payload_id": None,
+            "mailbox_payload_incoming_payload_id": None,
+            "mailbox_payload_lifecycle_state": None,
             "mailbox_payload_put_plan_id": None,
             "mailbox_payload_put_seq_ids": [],
             "mailbox_payload_put_home_batch_ids": [],
@@ -1007,6 +1016,8 @@ class ModelRunnerBase:
             "active_continuation_limit_reached",
             "active_continuation_error",
             "active_continuation_error_kind",
+            "active_continuation_skipped_due_to_outstanding_payload",
+            "active_continuation_plan_id",
             "active_request_continuation_error",
             "active_request_continuation_error_kind",
             "finalized_after_active_continuation",
@@ -1021,6 +1032,13 @@ class ModelRunnerBase:
             "mailbox_payload_duplicate_put_idempotent_skip",
             "mailbox_payload_duplicate_put_conflict",
             "mailbox_payload_duplicate_put_context",
+            "mailbox_payload_outstanding_available_detected",
+            "mailbox_payload_outstanding_context",
+            "mailbox_payload_existing_plan_id",
+            "mailbox_payload_incoming_plan_id",
+            "mailbox_payload_existing_payload_id",
+            "mailbox_payload_incoming_payload_id",
+            "mailbox_payload_lifecycle_state",
             "mailbox_payload_put_plan_id",
             "mailbox_payload_put_seq_ids",
             "mailbox_payload_put_home_batch_ids",
@@ -1529,6 +1547,7 @@ class ModelRunnerBase:
             fallback_active_seq_ids=[int(seq.seq_id) for seq in exec_seqs if not bool(getattr(seq, "is_finished", False))],
         )
         trace_record.update(metadata)
+        trace_record["active_continuation_plan_id"] = getattr(commit_result, "next_pipeline_plan_id", None)
         if not metadata.get("active_continuation_attempted"):
             return False
         if not metadata.get("active_continuation_success"):
@@ -2420,6 +2439,59 @@ class ModelRunnerBase:
             f"next_required_feature={next_feature}"
         )
 
+    def _guard_outstanding_draft_mailbox_payloads(
+        self,
+        *,
+        trace_record: dict,
+        step_plan: StepPlan,
+        payloads: list[MailboxPayload],
+    ) -> None:
+        contexts = self.stspec_mailbox.available_payload_contexts_for(payloads)
+        conflicts = [context for context in contexts if not bool(context.get("same_payload"))]
+        if not conflicts:
+            if contexts:
+                trace_record["mailbox_payload_duplicate_put_detected"] = True
+                trace_record["mailbox_payload_duplicate_put_idempotent_skip"] = True
+                trace_record["mailbox_payload_outstanding_available_detected"] = True
+                trace_record["mailbox_payload_outstanding_context"] = dict(contexts[0])
+            return
+
+        context = dict(conflicts[0])
+        message = "outstanding mailbox payload remains before next draft production"
+        trace_record["mailbox_payload_put_success"] = False
+        trace_record["mailbox_put_success"] = False
+        trace_record["mailbox_payload_duplicate_put_detected"] = True
+        trace_record["mailbox_payload_duplicate_put_conflict"] = True
+        trace_record["mailbox_payload_duplicate_put_context"] = dict(context)
+        trace_record["mailbox_payload_outstanding_available_detected"] = True
+        trace_record["mailbox_payload_outstanding_context"] = dict(context)
+        trace_record["mailbox_payload_existing_plan_id"] = context.get("existing_plan_id")
+        trace_record["mailbox_payload_incoming_plan_id"] = context.get("incoming_plan_id")
+        trace_record["mailbox_payload_existing_payload_id"] = context.get("existing_payload_id")
+        trace_record["mailbox_payload_incoming_payload_id"] = context.get("incoming_payload_id")
+        trace_record["mailbox_payload_lifecycle_state"] = context.get("lifecycle_state")
+        trace_record["active_continuation_skipped_due_to_outstanding_payload"] = True
+        trace_record["active_continuation_plan_id"] = step_plan.plan_id
+        trace_record["active_continuation_attempted"] = bool(
+            getattr(self.global_config, "stspec_continue_after_mailbox_commit", False)
+        )
+        trace_record["active_continuation_success"] = False
+        trace_record["active_continuation_error"] = message
+        trace_record["active_continuation_error_kind"] = "mailbox_payload_after_active_continuation"
+        trace_record["active_request_continuation_error"] = message
+        trace_record["active_request_continuation_error_kind"] = "mailbox_payload_after_active_continuation"
+        self._record_mailbox_error(
+            trace_record,
+            kind="mailbox_payload_after_active_continuation",
+            message=message,
+            next_required_feature="mailbox_payload_after_active_continuation",
+        )
+        raise RuntimeError(
+            f"{message}; home_batch_id={context.get('home_batch_id')}, seq_id={context.get('seq_id')}, "
+            f"existing_plan_id={context.get('existing_plan_id')}, incoming_plan_id={context.get('incoming_plan_id')}; "
+            "next_required_feature=mailbox_payload_after_active_continuation"
+        )
+
     def _record_draft_mailbox_payloads(
         self,
         trace_record: dict | None,
@@ -2461,6 +2533,11 @@ class ModelRunnerBase:
         trace_record["mailbox_payload_put_plan_id"] = step_plan.plan_id
         trace_record["mailbox_payload_put_seq_ids"] = [payload.seq_id for payload in payloads]
         trace_record["mailbox_payload_put_home_batch_ids"] = [payload.home_batch_id for payload in payloads]
+        self._guard_outstanding_draft_mailbox_payloads(
+            trace_record=trace_record,
+            step_plan=step_plan,
+            payloads=payloads,
+        )
         before_stats = self.stspec_mailbox.stats() if hasattr(self.stspec_mailbox, "stats") else {}
         try:
             self.stspec_mailbox.put_payloads(
@@ -2526,6 +2603,11 @@ class ModelRunnerBase:
         trace_record["mailbox_transport_error"] = None
         trace_record["mailbox_transport_error_kind"] = None
         trace_record["mailbox_transport_envelope_digest"] = envelope.digest()
+        self.stspec_mailbox.mark_payloads_stale(
+            [payload.payload_id for payload in payloads],
+            plan_id=step_plan.plan_id,
+            reason="draft_transport_envelope_recorded",
+        )
         trace_record["next_required_feature"] = "target_consume_from_mailbox"
         self._trace_mailbox_availability(trace_record)
 

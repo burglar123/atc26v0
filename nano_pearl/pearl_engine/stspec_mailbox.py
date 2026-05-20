@@ -151,6 +151,32 @@ class STSpecPayloadMailbox:
     def _payloads_equivalent(left: MailboxPayload, right: MailboxPayload) -> bool:
         return left.to_dict() == right.to_dict()
 
+    def available_payload_context_for(self, payload: MailboxPayload) -> JsonDict | None:
+        """Return context for an available payload already occupying ``payload.key``."""
+        existing = self._payloads.get(payload.key)
+        lifecycle = self._lifecycle_by_key.get(payload.key)
+        if existing is None or lifecycle is None or lifecycle.lifecycle_state != "available":
+            return None
+        return {
+            "home_batch_id": payload.home_batch_id,
+            "seq_id": payload.seq_id,
+            "producer_role": payload.producer_role,
+            "existing_plan_id": existing.plan_id,
+            "incoming_plan_id": payload.plan_id,
+            "existing_payload_id": existing.payload_id,
+            "incoming_payload_id": payload.payload_id,
+            "lifecycle_state": lifecycle.lifecycle_state,
+            "same_payload": self._payloads_equivalent(existing, payload),
+        }
+
+    def available_payload_contexts_for(self, payloads: Iterable[MailboxPayload]) -> list[JsonDict]:
+        contexts: list[JsonDict] = []
+        for payload in payloads:
+            context = self.available_payload_context_for(payload)
+            if context is not None:
+                contexts.append(context)
+        return contexts
+
     def put_payloads(
         self,
         home_batch_id: int | str | None,
@@ -199,7 +225,7 @@ class STSpecPayloadMailbox:
                             "lifecycle_state": lifecycle_state,
                         },
                     )
-                if lifecycle_state not in {"consumed", "invalidated"}:
+                if lifecycle_state not in {"consumed", "invalidated", "stale"}:
                     self._duplicate_put_count += 1
                     self._duplicate_put_conflict_count += 1
                     raise STSpecMailboxError(
@@ -230,6 +256,42 @@ class STSpecPayloadMailbox:
             self._put_count += 1
             keys.append(key)
         return keys
+
+    def mark_payloads_stale(
+        self,
+        payload_ids: Iterable[str],
+        *,
+        plan_id: int | None = None,
+        reason: str | None = None,
+    ) -> dict[str, JsonDict]:
+        updated: dict[str, JsonDict] = {}
+        for payload_id in [str(item) for item in payload_ids]:
+            lifecycle = self._lifecycle_by_payload_id.get(payload_id)
+            if lifecycle is None:
+                raise STSpecMailboxError(
+                    "Mailbox payload lifecycle missing during stale mark",
+                    kind="mailbox_payload_lifecycle_missing",
+                    context={"payload_id": payload_id, "plan_id": plan_id, "reason": reason},
+                )
+            if lifecycle.lifecycle_state != "available":
+                updated[payload_id] = lifecycle.to_dict()
+                continue
+            new_lifecycle = MailboxPayloadLifecycle(
+                payload_id=lifecycle.payload_id,
+                home_batch_id=lifecycle.home_batch_id,
+                seq_id=lifecycle.seq_id,
+                source_plan_id=lifecycle.source_plan_id,
+                source_draft_home_batch_id=lifecycle.source_draft_home_batch_id,
+                consumed_by_plan_id=lifecycle.consumed_by_plan_id,
+                invalidated_by_plan_id=lifecycle.invalidated_by_plan_id,
+                consumed_token_count=lifecycle.consumed_token_count,
+                invalidated_token_count=lifecycle.invalidated_token_count,
+                lifecycle_state="stale",
+            )
+            self._lifecycle_by_payload_id[payload_id] = new_lifecycle
+            self._lifecycle_by_key[MailboxKey(new_lifecycle.home_batch_id, new_lifecycle.seq_id)] = new_lifecycle
+            updated[payload_id] = new_lifecycle.to_dict()
+        return updated
 
     def get_payloads(
         self,

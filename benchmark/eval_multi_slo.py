@@ -478,6 +478,7 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_payload_duplicate_put_count",
     "mailbox_payload_duplicate_put_idempotent_skip_count",
     "mailbox_payload_duplicate_put_conflict_count",
+    "mailbox_payload_outstanding_available_count",
     "mailbox_get_hit_count",
     "mailbox_get_miss_count",
     "mailbox_missing_count",
@@ -567,6 +568,7 @@ PLAN_REQUEST_FIELDS = [
     "active_continuation_seq_ids",
     "active_continuation_reasons",
     "active_continuation_limit_reached_count",
+    "active_continuation_skipped_due_to_outstanding_payload_count",
     "active_request_continuation_error_count",
     "active_request_continuation_error_kinds",
     "finalized_after_active_continuation_count",
@@ -799,6 +801,7 @@ def aggregate_low_level_traces(
         mailbox_payload_duplicate_put_count = 0
         mailbox_payload_duplicate_put_idempotent_skip_count = 0
         mailbox_payload_duplicate_put_conflict_count = 0
+        mailbox_payload_outstanding_available_count = 0
         mailbox_get_hit_count = 0
         mailbox_get_miss_count = 0
         mailbox_missing_count = 0
@@ -914,6 +917,7 @@ def aggregate_low_level_traces(
         active_continuation_seq_ids: List[Any] = []
         active_continuation_reasons: List[str] = []
         active_continuation_limit_reached_count = 0
+        active_continuation_skipped_due_to_outstanding_payload_count = 0
         active_request_continuation_error_count = 0
         active_request_continuation_error_kinds: List[str] = []
         finalized_after_active_continuation_count = 0
@@ -1044,6 +1048,8 @@ def aggregate_low_level_traces(
                 mailbox_payload_duplicate_put_idempotent_skip_count += 1
             if e.get("mailbox_payload_duplicate_put_conflict"):
                 mailbox_payload_duplicate_put_conflict_count += 1
+            if e.get("mailbox_payload_outstanding_available_detected"):
+                mailbox_payload_outstanding_available_count += 1
             mailbox_get_hit_count += int(e.get("mailbox_get_hit_count") or 0)
             mailbox_get_miss_count += int(e.get("mailbox_get_miss_count") or 0)
             mailbox_missing_count += len(e.get("mailbox_missing_seq_ids") or [])
@@ -1261,6 +1267,8 @@ def aggregate_low_level_traces(
             append_unique(active_continuation_reasons, e.get("active_continuation_reason"))
             if e.get("active_continuation_limit_reached"):
                 active_continuation_limit_reached_count += 1
+            if e.get("active_continuation_skipped_due_to_outstanding_payload"):
+                active_continuation_skipped_due_to_outstanding_payload_count += 1
             if e.get("active_request_continuation_error"):
                 active_request_continuation_error_count += 1
             append_unique(active_request_continuation_error_kinds, e.get("active_request_continuation_error_kind"))
@@ -1465,6 +1473,7 @@ def aggregate_low_level_traces(
         row["mailbox_payload_duplicate_put_count"] = mailbox_payload_duplicate_put_count
         row["mailbox_payload_duplicate_put_idempotent_skip_count"] = mailbox_payload_duplicate_put_idempotent_skip_count
         row["mailbox_payload_duplicate_put_conflict_count"] = mailbox_payload_duplicate_put_conflict_count
+        row["mailbox_payload_outstanding_available_count"] = mailbox_payload_outstanding_available_count
         row["mailbox_get_hit_count"] = mailbox_get_hit_count
         row["mailbox_get_miss_count"] = mailbox_get_miss_count
         row["mailbox_missing_count"] = mailbox_missing_count
@@ -1599,6 +1608,7 @@ def aggregate_low_level_traces(
         if active_continuation_reasons:
             row["active_continuation_reasons"] = active_continuation_reasons
         row["active_continuation_limit_reached_count"] = active_continuation_limit_reached_count
+        row["active_continuation_skipped_due_to_outstanding_payload_count"] = active_continuation_skipped_due_to_outstanding_payload_count
         row["active_request_continuation_error_count"] = active_request_continuation_error_count
         if active_request_continuation_error_kinds:
             row["active_request_continuation_error_kinds"] = active_request_continuation_error_kinds
@@ -2538,6 +2548,7 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
             "mailbox_payload_duplicate_put_idempotent_skip_count"
         ),
         "mailbox_payload_duplicate_put_conflict_count": row.get("mailbox_payload_duplicate_put_conflict_count"),
+        "mailbox_payload_outstanding_available_count": row.get("mailbox_payload_outstanding_available_count"),
         "mailbox_payload_consume_plan_built_count": row.get("mailbox_payload_consume_plan_built_count"),
         "mailbox_payload_consume_attempt_count": row.get("mailbox_payload_consume_attempt_count"),
         "mailbox_payload_consume_success_count": row.get("mailbox_payload_consume_success_count"),
@@ -2571,6 +2582,9 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "active_continuation_seq_ids": row.get("active_continuation_seq_ids"),
         "active_continuation_reasons": row.get("active_continuation_reasons"),
         "active_continuation_limit_reached_count": row.get("active_continuation_limit_reached_count"),
+        "active_continuation_skipped_due_to_outstanding_payload_count": row.get(
+            "active_continuation_skipped_due_to_outstanding_payload_count"
+        ),
         "active_request_continuation_error_count": row.get("active_request_continuation_error_count"),
         "active_request_continuation_error_kinds": row.get("active_request_continuation_error_kinds"),
         "finalized_after_active_continuation_count": row.get("finalized_after_active_continuation_count"),
