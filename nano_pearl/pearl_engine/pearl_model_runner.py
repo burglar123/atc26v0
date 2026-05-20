@@ -678,6 +678,17 @@ class ModelRunnerBase:
             "active_continuation_seq_ids": [],
             "active_continuation_reason": None,
             "active_continuation_limit_reached": False,
+            "stspec_active_continuation_max_steps": int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2)),
+            "active_continuation_no_progress": False,
+            "active_continuation_remaining_seq_ids": [],
+            "active_continuation_remaining_output_tokens_by_seq": {},
+            "active_continuation_pending_payload_ids": [],
+            "active_continuation_latest_plan_id": None,
+            "active_continuation_plan_id_history": [],
+            "active_continuation_progress_by_step": [],
+            "active_continuation_completion_rechecked": False,
+            "active_continuation_finalization_attempted": False,
+            "active_continuation_finalization_success": False,
             "active_continuation_error": None,
             "active_continuation_error_kind": None,
             "active_continuation_skipped_due_to_outstanding_payload": False,
@@ -1023,6 +1034,17 @@ class ModelRunnerBase:
             "active_continuation_seq_ids",
             "active_continuation_reason",
             "active_continuation_limit_reached",
+            "stspec_active_continuation_max_steps",
+            "active_continuation_no_progress",
+            "active_continuation_remaining_seq_ids",
+            "active_continuation_remaining_output_tokens_by_seq",
+            "active_continuation_pending_payload_ids",
+            "active_continuation_latest_plan_id",
+            "active_continuation_plan_id_history",
+            "active_continuation_progress_by_step",
+            "active_continuation_completion_rechecked",
+            "active_continuation_finalization_attempted",
+            "active_continuation_finalization_success",
             "active_continuation_error",
             "active_continuation_error_kind",
             "active_continuation_skipped_due_to_outstanding_payload",
@@ -1559,6 +1581,109 @@ class ModelRunnerBase:
         trace_record["next_required_feature"] = "end_to_end_breadth_only_completion"
         return True
 
+    def _build_v4v_active_continuation_snapshot(
+        self,
+        *,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        commit_result,
+        active_seq_ids: list[int],
+        step_count: int,
+        max_steps: int,
+    ) -> dict:
+        active_set = {int(seq_id) for seq_id in active_seq_ids}
+        output_tokens_by_seq = {
+            int(seq.seq_id): int(getattr(seq, "num_completion_tokens", 0) or 0)
+            for seq in exec_seqs
+            if int(seq.seq_id) in active_set
+        }
+        pending_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
+        consumed_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_consumed_payload_ids", []) or []]
+        invalidated_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_invalidated_payload_ids", []) or []]
+        accepted_lengths = dict(getattr(getattr(commit_result, "plan", None), "accepted_lengths_by_seq", {}) or {})
+        total_accepted = int(getattr(commit_result, "total_accepted_tokens", 0) or 0)
+        if not total_accepted and accepted_lengths:
+            total_accepted = sum(int(value or 0) for value in accepted_lengths.values())
+        return {
+            "step_count": int(step_count),
+            "max_steps": int(max_steps),
+            "plan_id": int(getattr(step_plan, "plan_id", 0) or 0),
+            "next_plan_id": getattr(commit_result, "next_pipeline_plan_id", None),
+            "remaining_seq_ids": sorted(active_set),
+            "remaining_output_tokens_by_seq": {str(key): value for key, value in output_tokens_by_seq.items()},
+            "pending_payload_ids": pending_payload_ids,
+            "consumed_payload_ids": consumed_payload_ids,
+            "invalidated_payload_ids": invalidated_payload_ids,
+            "total_accepted_tokens": total_accepted,
+            "finished_seq_ids": list(getattr(commit_result, "finished_seq_ids_at_completion_check", []) or []),
+            "breadth_only_completed": bool(getattr(commit_result, "breadth_only_completed", False)),
+        }
+
+    def _classify_v4v_active_continuation_progress(self, snapshot: dict) -> tuple[bool, dict]:
+        previous = getattr(self, "stspec_active_continuation_last_snapshot", None)
+        progress_reasons: list[str] = []
+        if previous is None:
+            progress_reasons.append("initial_active_continuation_snapshot")
+        else:
+            if int(snapshot.get("plan_id") or 0) > int(previous.get("plan_id") or 0):
+                progress_reasons.append("plan_id_advanced")
+            current_tokens = snapshot.get("remaining_output_tokens_by_seq") or {}
+            previous_tokens = previous.get("remaining_output_tokens_by_seq") or {}
+            for seq_id, token_count in current_tokens.items():
+                if int(token_count or 0) > int(previous_tokens.get(seq_id, 0) or 0):
+                    progress_reasons.append("output_token_increased")
+                    break
+            if int(snapshot.get("total_accepted_tokens") or 0) > 0:
+                progress_reasons.append("accepted_token_progress")
+            if set(snapshot.get("finished_seq_ids") or []) - set(previous.get("finished_seq_ids") or []):
+                progress_reasons.append("sequence_finished")
+            if set(snapshot.get("consumed_payload_ids") or []) - set(previous.get("consumed_payload_ids") or []):
+                progress_reasons.append("payload_consumed")
+            if set(snapshot.get("invalidated_payload_ids") or []) - set(previous.get("invalidated_payload_ids") or []):
+                progress_reasons.append("payload_invalidated")
+        snapshot = dict(snapshot)
+        snapshot["progress_reasons"] = progress_reasons
+        snapshot["made_progress"] = bool(progress_reasons)
+        substantive_progress = [reason for reason in progress_reasons if reason != "plan_id_advanced"]
+        no_progress = (
+            previous is not None
+            and not substantive_progress
+            and bool(snapshot.get("remaining_seq_ids"))
+        )
+        return no_progress, snapshot
+
+    def _remember_v4v_active_continuation_progress(self, snapshot: dict) -> None:
+        self.stspec_active_continuation_last_snapshot = dict(snapshot)
+        history = list(getattr(self, "stspec_active_continuation_plan_id_history", []) or [])
+        plan_id = snapshot.get("plan_id")
+        if plan_id is not None:
+            history.append(int(plan_id))
+        self.stspec_active_continuation_plan_id_history = history[-64:]
+        progress = list(getattr(self, "stspec_active_continuation_progress_by_step", []) or [])
+        progress.append(dict(snapshot))
+        self.stspec_active_continuation_progress_by_step = progress[-64:]
+
+    def _record_v4v_active_continuation_snapshot(self, trace_record: dict, snapshot: dict, *, max_steps: int) -> None:
+        trace_record["stspec_active_continuation_max_steps"] = int(max_steps)
+        trace_record["active_continuation_remaining_seq_ids"] = list(snapshot.get("remaining_seq_ids") or [])
+        trace_record["active_continuation_remaining_output_tokens_by_seq"] = dict(
+            snapshot.get("remaining_output_tokens_by_seq") or {}
+        )
+        trace_record["active_continuation_pending_payload_ids"] = list(snapshot.get("pending_payload_ids") or [])
+        trace_record["active_continuation_latest_plan_id"] = snapshot.get("plan_id")
+        trace_record["active_continuation_plan_id_history"] = list(
+            getattr(self, "stspec_active_continuation_plan_id_history", []) or []
+        )
+        if snapshot.get("plan_id") is not None:
+            trace_record["active_continuation_plan_id_history"].append(snapshot.get("plan_id"))
+        trace_record["active_continuation_progress_by_step"] = list(
+            getattr(self, "stspec_active_continuation_progress_by_step", []) or []
+        ) + [dict(snapshot)]
+        trace_record["active_continuation_completion_rechecked"] = True
+        trace_record["active_continuation_finalization_attempted"] = bool(trace_record.get("result_finalization_attempted"))
+        trace_record["active_continuation_finalization_success"] = bool(trace_record.get("result_finalization_success"))
+        trace_record["active_continuation_no_progress"] = bool(trace_record.get("active_continuation_no_progress", False))
+
     def _try_continue_v4t_active_requests(
         self,
         exec_seqs: list[Sequence],
@@ -1571,16 +1696,40 @@ class ModelRunnerBase:
             return False
         if not bool(getattr(output, "output_owner", False)):
             return False
+        max_steps = int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2))
+        step_count = self.stspec_active_continuation_step_count + 1
         metadata = build_v4t_active_continuation_metadata(
             commit_result,
-            max_steps=int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2)),
-            step_count=self.stspec_active_continuation_step_count + 1,
+            max_steps=max_steps,
+            step_count=step_count,
             fallback_active_seq_ids=[int(seq.seq_id) for seq in exec_seqs if not bool(getattr(seq, "is_finished", False))],
         )
         trace_record.update(metadata)
+        progress_snapshot = self._build_v4v_active_continuation_snapshot(
+            exec_seqs=exec_seqs,
+            step_plan=step_plan,
+            commit_result=commit_result,
+            active_seq_ids=list(metadata.get("active_continuation_seq_ids") or []),
+            step_count=step_count,
+            max_steps=max_steps,
+        )
+        no_progress, progress_snapshot = self._classify_v4v_active_continuation_progress(progress_snapshot)
+        self._record_v4v_active_continuation_snapshot(trace_record, progress_snapshot, max_steps=max_steps)
         trace_record["active_continuation_plan_id"] = getattr(commit_result, "next_pipeline_plan_id", None)
         if not metadata.get("active_continuation_attempted"):
             return False
+        if no_progress:
+            trace_record["active_continuation_success"] = False
+            trace_record["active_continuation_no_progress"] = True
+            trace_record["active_continuation_error"] = "active continuation made no observable progress"
+            trace_record["active_continuation_error_kind"] = "active_request_continuation_no_progress"
+            trace_record["active_request_continuation_error"] = "active continuation made no observable progress"
+            trace_record["active_request_continuation_error_kind"] = "active_request_continuation_no_progress"
+            trace_record["next_required_feature"] = "active_request_continuation_no_progress"
+            raise RuntimeError(
+                "V4T active request continuation failed; error=active continuation made no observable progress; "
+                "next_required_feature=active_request_continuation_no_progress"
+            )
         if not metadata.get("active_continuation_success"):
             next_feature = metadata.get("next_required_feature") or "active_request_continuation_limit_reached"
             trace_record["next_required_feature"] = next_feature
@@ -1633,6 +1782,8 @@ class ModelRunnerBase:
             ) from exc
         self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
         self.stspec_active_continuation_step_count += 1
+        self._remember_v4v_active_continuation_progress(progress_snapshot)
+        self._record_v4v_active_continuation_snapshot(trace_record, progress_snapshot, max_steps=max_steps)
         trace_record["evaluator_return_attempted"] = True
         trace_record["evaluator_return_success"] = True
         trace_record["evaluator_return_error"] = None

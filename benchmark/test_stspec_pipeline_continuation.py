@@ -56,11 +56,20 @@ def test_fake_runner_state_initializes_and_resets():
     runner = SimpleNamespace()
     apply_mod.initialize_v4t_active_continuation_runner_state(runner)
     assert runner.stspec_active_continuation_step_count == 0
+    assert runner.stspec_active_continuation_last_snapshot is None
+    assert runner.stspec_active_continuation_plan_id_history == []
+    assert runner.stspec_active_continuation_progress_by_step == []
     runner.stspec_active_continuation_step_count = 2
+    runner.stspec_active_continuation_last_snapshot = {"plan_id": 4}
+    runner.stspec_active_continuation_plan_id_history = [4]
+    runner.stspec_active_continuation_progress_by_step = [{"plan_id": 4}]
     apply_mod.initialize_v4t_active_continuation_runner_state(runner)
     assert runner.stspec_active_continuation_step_count == 2
     apply_mod.reset_v4t_active_continuation_runner_state(runner)
     assert runner.stspec_active_continuation_step_count == 0
+    assert runner.stspec_active_continuation_last_snapshot is None
+    assert runner.stspec_active_continuation_plan_id_history == []
+    assert runner.stspec_active_continuation_progress_by_step == []
 
 
 def test_active_continuation_max_step_reached():
@@ -70,6 +79,14 @@ def test_active_continuation_max_step_reached():
     assert metadata["active_continuation_limit_reached"] is True
     assert metadata["active_continuation_error_kind"] == "active_request_continuation_limit_reached"
     assert metadata["next_required_feature"] == "active_request_continuation_limit_reached"
+
+
+def test_active_continuation_allows_multiple_steps_before_limit():
+    metadata = apply_mod.build_v4t_active_continuation_metadata(commit_result(), max_steps=8, step_count=3)
+    assert metadata["active_continuation_attempted"] is True
+    assert metadata["active_continuation_success"] is True
+    assert metadata["active_continuation_step_count"] == 3
+    assert metadata["next_required_feature"] == "active_request_continuation_handoff"
 
 
 def test_duplicate_consume_detection():
@@ -303,10 +320,27 @@ def test_draft_mailbox_record_guard_resets_at_generation_boundaries():
     assert source.count("self._reset_draft_mailbox_record_guard()") >= 4
 
 
+def test_active_continuation_trace_has_v4v_progress_fields():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    for needle in (
+        "active_continuation_no_progress",
+        "active_request_continuation_no_progress",
+        "active_continuation_remaining_output_tokens_by_seq",
+        "active_continuation_plan_id_history",
+        "active_continuation_progress_by_step",
+        "_build_v4v_active_continuation_snapshot",
+        "_classify_v4v_active_continuation_progress",
+    ):
+        assert needle in source
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
     test_active_continuation_max_step_reached()
+    test_active_continuation_allows_multiple_steps_before_limit()
     test_duplicate_consume_detection()
     test_repeated_verify_detection()
     test_no_active_seq_skips_continuation()
@@ -322,6 +356,7 @@ def main() -> None:
     test_same_plan_stale_different_payload_is_conflict_in_mailbox()
     test_draft_mailbox_route_guards_outstanding_available_before_put()
     test_draft_mailbox_record_guard_resets_at_generation_boundaries()
+    test_active_continuation_trace_has_v4v_progress_fields()
 
 
 if __name__ == "__main__":

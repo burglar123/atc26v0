@@ -47,10 +47,22 @@ def initialize_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_step_count = int(
         getattr(runner, "stspec_active_continuation_step_count", 0) or 0
     )
+    runner.stspec_active_continuation_last_snapshot = getattr(
+        runner, "stspec_active_continuation_last_snapshot", None
+    )
+    runner.stspec_active_continuation_plan_id_history = list(
+        getattr(runner, "stspec_active_continuation_plan_id_history", []) or []
+    )
+    runner.stspec_active_continuation_progress_by_step = list(
+        getattr(runner, "stspec_active_continuation_progress_by_step", []) or []
+    )
 
 
 def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_step_count = 0
+    runner.stspec_active_continuation_last_snapshot = None
+    runner.stspec_active_continuation_plan_id_history = []
+    runner.stspec_active_continuation_progress_by_step = []
 
 
 def _getattr_bool(obj: Any, name: str, default: bool = False) -> bool:
