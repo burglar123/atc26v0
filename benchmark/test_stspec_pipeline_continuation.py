@@ -118,6 +118,35 @@ def test_pending_mailbox_payload_gets_drain_diagnostic():
     assert metadata["next_required_feature"] == "mailbox_payload_after_active_continuation"
 
 
+def test_active_diagnostic_uses_fallback_seq_ids():
+    metadata = apply_mod.build_v4t_active_continuation_metadata(
+        commit_result(
+            unfinished_seq_ids_at_completion_check=[],
+            active_seq_ids_at_completion_check=[],
+            scheduler_active_seq_ids_at_completion=[],
+        ),
+        max_steps=1,
+        step_count=1,
+        fallback_active_seq_ids=[7],
+    )
+    assert metadata["active_continuation_attempted"] is True
+    assert metadata["active_continuation_seq_ids"] == [7]
+    assert metadata["active_continuation_success"] is True
+
+
+def test_target_mailbox_route_wires_active_diagnostic_before_generic_raise():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    active_branch = 'current_next_required == "active_request_continuation_after_breadth_only_step"'
+    continue_call = "self._try_continue_v4t_active_requests(exec_seqs, step_plan, trace_record, commit_result, output)"
+    generic_raise = "mailbox verify guarded commit probe reached next explicit diagnostic"
+    assert active_branch in source
+    assert source.index(active_branch) < source.index(generic_raise)
+    assert source.index(continue_call) < source.index(generic_raise)
+    assert '"active_request_continuation_limit_reached"' in source[source.index(active_branch) : source.index(generic_raise)]
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -126,6 +155,8 @@ def main() -> None:
     test_repeated_verify_detection()
     test_no_active_seq_skips_continuation()
     test_pending_mailbox_payload_gets_drain_diagnostic()
+    test_active_diagnostic_uses_fallback_seq_ids()
+    test_target_mailbox_route_wires_active_diagnostic_before_generic_raise()
 
 
 if __name__ == "__main__":

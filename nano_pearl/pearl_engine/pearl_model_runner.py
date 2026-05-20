@@ -1490,6 +1490,7 @@ class ModelRunnerBase:
             commit_result,
             max_steps=int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2)),
             step_count=self.stspec_active_continuation_step_count + 1,
+            fallback_active_seq_ids=[int(seq.seq_id) for seq in exec_seqs if not bool(getattr(seq, "is_finished", False))],
         )
         trace_record.update(metadata)
         if not metadata.get("active_continuation_attempted"):
@@ -2092,9 +2093,20 @@ class ModelRunnerBase:
                 )
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
                 return True
-            if self._try_continue_v4t_active_requests(exec_seqs, step_plan, trace_record, commit_result, output):
-                return True
+            current_next_required = (
+                trace_record.get("next_required_feature")
+                or commit_result.next_required_feature
+                or "next_pipeline_step_after_mailbox_commit"
+            )
+            if current_next_required == "active_request_continuation_after_breadth_only_step":
+                if self._try_continue_v4t_active_requests(exec_seqs, step_plan, trace_record, commit_result, output):
+                    return True
+                if trace_record.get("next_required_feature") == "active_request_continuation_after_breadth_only_step":
+                    trace_record["next_required_feature"] = "active_request_continuation_limit_reached"
+                current_next_required = trace_record.get("next_required_feature") or "active_request_continuation_limit_reached"
             trace_record["next_required_feature"] = commit_result.next_required_feature or "next_pipeline_step_after_mailbox_commit"
+            if current_next_required != "active_request_continuation_after_breadth_only_step":
+                trace_record["next_required_feature"] = current_next_required
             if trace_record["next_required_feature"] == "result_finalization_after_breadth_only_completion":
                 trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
             message = "mailbox verify guarded commit probe reached next explicit diagnostic"

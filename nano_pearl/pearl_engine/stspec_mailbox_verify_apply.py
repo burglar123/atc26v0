@@ -312,6 +312,7 @@ def build_v4t_active_continuation_metadata(
     *,
     max_steps: int = 1,
     step_count: int = 1,
+    fallback_active_seq_ids: Iterable[int] | None = None,
 ) -> JsonDict:
     """Classify active-request continuation state after a breadth-only commit.
 
@@ -331,6 +332,8 @@ def build_v4t_active_continuation_metadata(
             )
         }
     )
+    if not active_seq_ids and getattr(commit_result, "next_required_feature", None) == "active_request_continuation_after_breadth_only_step":
+        active_seq_ids = sorted({int(seq_id) for seq_id in (fallback_active_seq_ids or [])})
     pending_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
     duplicate_consume = bool(getattr(commit_result, "duplicate_payload_consume_after_continue", False))
     repeated_verify = bool(getattr(commit_result, "repeated_verify_after_commit_detected", False))
