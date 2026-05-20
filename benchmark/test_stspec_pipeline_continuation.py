@@ -51,11 +51,23 @@ def test_unfinished_requests_attempt_active_continuation():
     assert metadata["next_required_feature"] == "active_request_continuation_handoff"
 
 
+def test_fake_runner_state_initializes_and_resets():
+    runner = SimpleNamespace()
+    apply_mod.initialize_v4t_active_continuation_runner_state(runner)
+    assert runner.stspec_active_continuation_step_count == 0
+    runner.stspec_active_continuation_step_count = 2
+    apply_mod.initialize_v4t_active_continuation_runner_state(runner)
+    assert runner.stspec_active_continuation_step_count == 2
+    apply_mod.reset_v4t_active_continuation_runner_state(runner)
+    assert runner.stspec_active_continuation_step_count == 0
+
+
 def test_active_continuation_max_step_reached():
     metadata = apply_mod.build_v4t_active_continuation_metadata(commit_result(), max_steps=1, step_count=2)
     assert metadata["active_continuation_attempted"] is True
     assert metadata["active_continuation_success"] is False
     assert metadata["active_continuation_limit_reached"] is True
+    assert metadata["active_continuation_error_kind"] == "active_request_continuation_limit_reached"
     assert metadata["next_required_feature"] == "active_request_continuation_limit_reached"
 
 
@@ -108,6 +120,7 @@ def test_pending_mailbox_payload_gets_drain_diagnostic():
 
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
+    test_fake_runner_state_initializes_and_resets()
     test_active_continuation_max_step_reached()
     test_duplicate_consume_detection()
     test_repeated_verify_detection()

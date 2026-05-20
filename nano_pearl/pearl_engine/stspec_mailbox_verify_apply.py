@@ -41,6 +41,18 @@ V4S_COMPLETION_SNAPSHOT_FIELDS = (
 )
 
 
+def initialize_v4t_active_continuation_runner_state(runner: Any) -> None:
+    """Ensure runner-local V4T active continuation state exists."""
+
+    runner.stspec_active_continuation_step_count = int(
+        getattr(runner, "stspec_active_continuation_step_count", 0) or 0
+    )
+
+
+def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
+    runner.stspec_active_continuation_step_count = 0
+
+
 def _getattr_bool(obj: Any, name: str, default: bool = False) -> bool:
     return bool(getattr(obj, name, default))
 
@@ -333,6 +345,8 @@ def build_v4t_active_continuation_metadata(
         or getattr(commit_result, "breadth_only_completion_reason", None)
         or "active_requests_remaining",
         "active_continuation_limit_reached": False,
+        "active_continuation_error": None,
+        "active_continuation_error_kind": None,
         "active_request_continuation_error": None,
         "active_request_continuation_error_kind": None,
         "breadth_only_step_count": int(getattr(commit_result, "breadth_only_step_count", 0) or 0) + (1 if active_seq_ids else 0),
@@ -346,6 +360,8 @@ def build_v4t_active_continuation_metadata(
             {
                 "active_request_continuation_error": "duplicate mailbox payload consume detected after continuation",
                 "active_request_continuation_error_kind": "duplicate_payload_consume_after_continue",
+                "active_continuation_error": "duplicate mailbox payload consume detected after continuation",
+                "active_continuation_error_kind": "duplicate_payload_consume_after_continue",
                 "next_required_feature": "mailbox_state_after_active_continuation",
             }
         )
@@ -355,6 +371,8 @@ def build_v4t_active_continuation_metadata(
             {
                 "active_request_continuation_error": "repeated verify detected after committed payload",
                 "active_request_continuation_error_kind": "repeated_verify_after_commit_detected",
+                "active_continuation_error": "repeated verify detected after committed payload",
+                "active_continuation_error_kind": "repeated_verify_after_commit_detected",
                 "next_required_feature": "scheduler_state_after_active_continuation",
             }
         )
@@ -364,6 +382,8 @@ def build_v4t_active_continuation_metadata(
             {
                 "active_request_continuation_error": "mailbox payloads remain pending before active continuation",
                 "active_request_continuation_error_kind": "mailbox_payload_after_active_continuation",
+                "active_continuation_error": "mailbox payloads remain pending before active continuation",
+                "active_continuation_error_kind": "mailbox_payload_after_active_continuation",
                 "next_required_feature": "mailbox_payload_after_active_continuation",
             }
         )
@@ -374,6 +394,8 @@ def build_v4t_active_continuation_metadata(
                 "active_continuation_limit_reached": True,
                 "active_request_continuation_error": "active continuation max steps reached",
                 "active_request_continuation_error_kind": "active_request_continuation_limit_reached",
+                "active_continuation_error": "active continuation max steps reached",
+                "active_continuation_error_kind": "active_request_continuation_limit_reached",
                 "next_required_feature": "active_request_continuation_limit_reached",
             }
         )

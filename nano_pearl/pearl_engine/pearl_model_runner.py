@@ -85,6 +85,8 @@ from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     build_mailbox_verify_result,
     can_enter_v4s_result_finalization,
     extract_target_token_ids_from_logits,
+    initialize_v4t_active_continuation_runner_state,
+    reset_v4t_active_continuation_runner_state,
     run_mailbox_verify_apply_no_commit_probe,
     run_mailbox_verify_commit_probe,
 )
@@ -99,6 +101,7 @@ class ModelRunnerBase:
     we will define a controller to control the sub-processes and shared memory.
     """
     def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
+        initialize_v4t_active_continuation_runner_state(self)
         self.rank = rank
         self.event = event
         self.is_draft = rank in config.draft_config.devices
@@ -118,7 +121,6 @@ class ModelRunnerBase:
         if self.gamma == -1:
             self.auto_set_gamma()
         self.init_shared_memory()
-        self.stspec_active_continuation_step_count = 0
         
     def init_dist(self):
         """
@@ -658,6 +660,8 @@ class ModelRunnerBase:
             "active_continuation_seq_ids": [],
             "active_continuation_reason": None,
             "active_continuation_limit_reached": False,
+            "active_continuation_error": None,
+            "active_continuation_error_kind": None,
             "active_request_continuation_error": None,
             "active_request_continuation_error_kind": None,
             "finalized_after_active_continuation": False,
@@ -963,6 +967,8 @@ class ModelRunnerBase:
             "active_continuation_seq_ids",
             "active_continuation_reason",
             "active_continuation_limit_reached",
+            "active_continuation_error",
+            "active_continuation_error_kind",
             "active_request_continuation_error",
             "active_request_continuation_error_kind",
             "finalized_after_active_continuation",
@@ -1464,7 +1470,7 @@ class ModelRunnerBase:
         trace_record["result_finalization_error_kind"] = None
         trace_record["breadth_only_completed"] = True
         trace_record["finalized_after_active_continuation"] = self.stspec_active_continuation_step_count > 0
-        self.stspec_active_continuation_step_count = 0
+        reset_v4t_active_continuation_runner_state(self)
         trace_record["next_required_feature"] = "end_to_end_breadth_only_completion"
         return True
 
@@ -1491,6 +1497,8 @@ class ModelRunnerBase:
         if not metadata.get("active_continuation_success"):
             next_feature = metadata.get("next_required_feature") or "active_request_continuation_limit_reached"
             trace_record["next_required_feature"] = next_feature
+            trace_record["active_continuation_error"] = metadata.get("active_request_continuation_error")
+            trace_record["active_continuation_error_kind"] = metadata.get("active_request_continuation_error_kind")
             raise RuntimeError(
                 f"V4T active request continuation failed; error={metadata.get('active_request_continuation_error')}; "
                 f"next_required_feature={next_feature}"
@@ -1499,6 +1507,8 @@ class ModelRunnerBase:
             verify_rows = self._build_v4t_active_verify_rows(exec_seqs, commit_result)
         except Exception as exc:
             trace_record["active_continuation_success"] = False
+            trace_record["active_continuation_error"] = str(exc)
+            trace_record["active_continuation_error_kind"] = "evaluator_return_after_breadth_only_completion"
             trace_record["active_request_continuation_error"] = str(exc)
             trace_record["active_request_continuation_error_kind"] = "evaluator_return_after_breadth_only_completion"
             trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
@@ -1510,6 +1520,8 @@ class ModelRunnerBase:
         trace_record["result_finalization_error"] = None
         trace_record["result_finalization_error_kind"] = None
         trace_record["active_continuation_success"] = True
+        trace_record["active_continuation_error"] = None
+        trace_record["active_continuation_error_kind"] = None
         trace_record["active_request_continuation_error"] = None
         trace_record["active_request_continuation_error_kind"] = None
         trace_record["next_required_feature"] = "active_request_continuation_handoff"
@@ -2589,7 +2601,7 @@ class ModelRunnerBase:
         self.scheduler.clear()
         self.trace_records.clear()
         self.active_decode_ready_mode = False
-        self.stspec_active_continuation_step_count = 0
+        reset_v4t_active_continuation_runner_state(self)
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -2601,6 +2613,7 @@ class ModelRunnerBase:
         The evaluator should start timing only after this method returns.
         """
         self.active_decode_ready_mode = True
+        reset_v4t_active_continuation_runner_state(self)
         dist.barrier()
         self.prefill()
         self._mark_decode_ready()
@@ -2633,6 +2646,7 @@ class ModelRunnerBase:
         """Decode-only parallel PEARL after prepare_decode_ready()."""
         self._set_execution_mode("parallel_pearl")
         self.active_decode_ready_mode = True
+        reset_v4t_active_continuation_runner_state(self)
         dist.barrier()
         self._mark_decode_started()
         torch.cuda.synchronize()
@@ -2688,6 +2702,7 @@ class ModelRunnerBase:
 
     def pearl_generate(self):
         self._set_execution_mode("parallel_pearl")
+        reset_v4t_active_continuation_runner_state(self)
         dist.barrier()
         torch.cuda.synchronize()
         start_time = time.time()
@@ -2998,6 +3013,7 @@ class DraftModelRunner(ModelRunnerBase):
 class TargetModelRunner(ModelRunnerBase):
     def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
         super().__init__(config, rank, event, control_event)
+        initialize_v4t_active_continuation_runner_state(self)
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         """
