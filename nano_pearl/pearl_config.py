@@ -102,6 +102,7 @@ class PEARLConfig:
     stspec_disable_mailbox_forward_commit: bool = True
     stspec_mailbox_commit_probe: bool = False
     stspec_continue_after_mailbox_commit: bool = False
+    stspec_active_continuation_max_steps: int = 2
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -157,6 +158,7 @@ class PEARLConfig:
         logger.info(f"STSpec_Disable_Mailbox_Forward_Commit={self.stspec_disable_mailbox_forward_commit}")
         logger.info(f"STSpec_Mailbox_Commit_Probe={self.stspec_mailbox_commit_probe}")
         logger.info(f"STSpec_Continue_After_Mailbox_Commit={self.stspec_continue_after_mailbox_commit}")
+        logger.info(f"STSpec_Active_Continuation_Max_Steps={self.stspec_active_continuation_max_steps}")
         if (
             self.enable_stspec_two_batch_execution
             and not self.stspec_two_batch_dryrun

@@ -76,6 +76,7 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
+    build_v4t_active_continuation_metadata,
     build_v4s_result_finalization_metadata,
     build_mailbox_kv_commit_plan,
     build_mailbox_payload_consume_plan,
@@ -117,6 +118,7 @@ class ModelRunnerBase:
         if self.gamma == -1:
             self.auto_set_gamma()
         self.init_shared_memory()
+        self.stspec_active_continuation_step_count = 0
         
     def init_dist(self):
         """
@@ -650,6 +652,15 @@ class ModelRunnerBase:
             "v4s_terminal_verify_broadcast_attempted": False,
             "v4s_terminal_verify_broadcast_success": False,
             "v4s_terminal_verify_broadcast_error": None,
+            "active_continuation_attempted": False,
+            "active_continuation_success": False,
+            "active_continuation_step_count": 0,
+            "active_continuation_seq_ids": [],
+            "active_continuation_reason": None,
+            "active_continuation_limit_reached": False,
+            "active_request_continuation_error": None,
+            "active_request_continuation_error_kind": None,
+            "finalized_after_active_continuation": False,
             "second_step_rollback_attempted": False,
             "second_step_rollback_success": False,
             "next_pipeline_step_skipped_non_owner": False,
@@ -946,6 +957,15 @@ class ModelRunnerBase:
             "v4s_terminal_verify_broadcast_attempted",
             "v4s_terminal_verify_broadcast_success",
             "v4s_terminal_verify_broadcast_error",
+            "active_continuation_attempted",
+            "active_continuation_success",
+            "active_continuation_step_count",
+            "active_continuation_seq_ids",
+            "active_continuation_reason",
+            "active_continuation_limit_reached",
+            "active_request_continuation_error",
+            "active_request_continuation_error_kind",
+            "finalized_after_active_continuation",
             "second_step_rollback_attempted",
             "second_step_rollback_success",
             "mailbox_verify_commit_rollback_attempted",
@@ -1302,6 +1322,28 @@ class ModelRunnerBase:
             finish.append(1)
         return [acc, rollout, revise_token, finish]
 
+    def _build_v4t_active_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
+        if commit_result.plan is None:
+            raise RuntimeError("V4T active continuation requires a mailbox commit plan")
+        acc: list[int] = []
+        rollout: list[int] = []
+        revise_token: list[int] = []
+        finish: list[int] = []
+        for seq in exec_seqs:
+            seq_id = int(seq.seq_id)
+            accepted_len = int(commit_result.plan.accepted_lengths_by_seq.get(seq_id, 0) or 0)
+            expected_len = 1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma)
+            if accepted_len != expected_len:
+                raise RuntimeError(
+                    "V4T active continuation cannot represent partial accepted length with current PEARL verify tuple; "
+                    f"seq_id={seq_id}, accepted_len={accepted_len}, expected_len={expected_len}"
+                )
+            acc.append(1)
+            rollout.append(0)
+            revise_token.append(-1)
+            finish.append(0)
+        return [acc, rollout, revise_token, finish]
+
     def _participate_v4s_terminal_verify_broadcast(
         self,
         exec_seqs: list[Sequence],
@@ -1398,6 +1440,8 @@ class ModelRunnerBase:
         if not metadata.get("result_finalization_success"):
             next_feature = metadata.get("next_required_feature") or "evaluator_return_after_breadth_only_completion"
             trace_record["next_required_feature"] = next_feature
+            if next_feature == "active_request_continuation_after_breadth_only_step":
+                return False
             raise RuntimeError(
                 f"V4S result finalization failed; error={metadata.get('result_finalization_error')}; "
                 f"next_required_feature={next_feature}"
@@ -1419,7 +1463,56 @@ class ModelRunnerBase:
         trace_record["result_finalization_error"] = None
         trace_record["result_finalization_error_kind"] = None
         trace_record["breadth_only_completed"] = True
+        trace_record["finalized_after_active_continuation"] = self.stspec_active_continuation_step_count > 0
+        self.stspec_active_continuation_step_count = 0
         trace_record["next_required_feature"] = "end_to_end_breadth_only_completion"
+        return True
+
+    def _try_continue_v4t_active_requests(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+        commit_result,
+        output,
+    ) -> bool:
+        if not self._v4s_real_probe_finalization_mode(step_plan):
+            return False
+        if not bool(getattr(output, "output_owner", False)):
+            return False
+        metadata = build_v4t_active_continuation_metadata(
+            commit_result,
+            max_steps=int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2)),
+            step_count=self.stspec_active_continuation_step_count + 1,
+        )
+        trace_record.update(metadata)
+        if not metadata.get("active_continuation_attempted"):
+            return False
+        if not metadata.get("active_continuation_success"):
+            next_feature = metadata.get("next_required_feature") or "active_request_continuation_limit_reached"
+            trace_record["next_required_feature"] = next_feature
+            raise RuntimeError(
+                f"V4T active request continuation failed; error={metadata.get('active_request_continuation_error')}; "
+                f"next_required_feature={next_feature}"
+            )
+        try:
+            verify_rows = self._build_v4t_active_verify_rows(exec_seqs, commit_result)
+        except Exception as exc:
+            trace_record["active_continuation_success"] = False
+            trace_record["active_request_continuation_error"] = str(exc)
+            trace_record["active_request_continuation_error_kind"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
+            raise RuntimeError(
+                f"{exc}; next_required_feature=evaluator_return_after_breadth_only_completion"
+            ) from exc
+        self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
+        self.stspec_active_continuation_step_count += 1
+        trace_record["result_finalization_error"] = None
+        trace_record["result_finalization_error_kind"] = None
+        trace_record["active_continuation_success"] = True
+        trace_record["active_request_continuation_error"] = None
+        trace_record["active_request_continuation_error_kind"] = None
+        trace_record["next_required_feature"] = "active_request_continuation_handoff"
         return True
 
     def _try_v4s_non_owner_terminal_verify_noop(
@@ -1987,6 +2080,8 @@ class ModelRunnerBase:
                 )
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
                 return True
+            if self._try_continue_v4t_active_requests(exec_seqs, step_plan, trace_record, commit_result, output):
+                return True
             trace_record["next_required_feature"] = commit_result.next_required_feature or "next_pipeline_step_after_mailbox_commit"
             if trace_record["next_required_feature"] == "result_finalization_after_breadth_only_completion":
                 trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
@@ -2494,6 +2589,7 @@ class ModelRunnerBase:
         self.scheduler.clear()
         self.trace_records.clear()
         self.active_decode_ready_mode = False
+        self.stspec_active_continuation_step_count = 0
         dist.barrier()
 
     def prepare_decode_ready(self):

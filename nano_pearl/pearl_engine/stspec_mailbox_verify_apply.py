@@ -295,6 +295,98 @@ def build_v4s_result_finalization_metadata(
     return metadata
 
 
+def build_v4t_active_continuation_metadata(
+    commit_result: Any,
+    *,
+    max_steps: int = 1,
+    step_count: int = 1,
+) -> JsonDict:
+    """Classify active-request continuation state after a breadth-only commit.
+
+    This helper is intentionally metadata-only.  The runner uses it to decide
+    whether it can hand the current verified span back to the existing PEARL
+    draft-side receiver, or whether it must fail with a more specific V4T
+    diagnostic.
+    """
+
+    active_seq_ids = sorted(
+        {
+            int(seq_id)
+            for seq_id in (
+                list(getattr(commit_result, "unfinished_seq_ids_at_completion_check", []) or [])
+                + list(getattr(commit_result, "active_seq_ids_at_completion_check", []) or [])
+                + list(getattr(commit_result, "scheduler_active_seq_ids_at_completion", []) or [])
+            )
+        }
+    )
+    pending_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
+    duplicate_consume = bool(getattr(commit_result, "duplicate_payload_consume_after_continue", False))
+    repeated_verify = bool(getattr(commit_result, "repeated_verify_after_commit_detected", False))
+    max_steps = int(max_steps)
+    step_count = int(step_count)
+    metadata: JsonDict = {
+        "active_continuation_attempted": bool(active_seq_ids),
+        "active_continuation_success": False,
+        "active_continuation_step_count": step_count if active_seq_ids else 0,
+        "active_continuation_seq_ids": list(active_seq_ids),
+        "active_continuation_reason": getattr(commit_result, "request_completion_reason", None)
+        or getattr(commit_result, "breadth_only_completion_reason", None)
+        or "active_requests_remaining",
+        "active_continuation_limit_reached": False,
+        "active_request_continuation_error": None,
+        "active_request_continuation_error_kind": None,
+        "breadth_only_step_count": int(getattr(commit_result, "breadth_only_step_count", 0) or 0) + (1 if active_seq_ids else 0),
+        "finalized_after_active_continuation": False,
+        "next_required_feature": getattr(commit_result, "next_required_feature", None),
+    }
+    if not active_seq_ids:
+        return metadata
+    if duplicate_consume:
+        metadata.update(
+            {
+                "active_request_continuation_error": "duplicate mailbox payload consume detected after continuation",
+                "active_request_continuation_error_kind": "duplicate_payload_consume_after_continue",
+                "next_required_feature": "mailbox_state_after_active_continuation",
+            }
+        )
+        return metadata
+    if repeated_verify:
+        metadata.update(
+            {
+                "active_request_continuation_error": "repeated verify detected after committed payload",
+                "active_request_continuation_error_kind": "repeated_verify_after_commit_detected",
+                "next_required_feature": "scheduler_state_after_active_continuation",
+            }
+        )
+        return metadata
+    if pending_payload_ids:
+        metadata.update(
+            {
+                "active_request_continuation_error": "mailbox payloads remain pending before active continuation",
+                "active_request_continuation_error_kind": "mailbox_payload_after_active_continuation",
+                "next_required_feature": "mailbox_payload_after_active_continuation",
+            }
+        )
+        return metadata
+    if step_count > max_steps:
+        metadata.update(
+            {
+                "active_continuation_limit_reached": True,
+                "active_request_continuation_error": "active continuation max steps reached",
+                "active_request_continuation_error_kind": "active_request_continuation_limit_reached",
+                "next_required_feature": "active_request_continuation_limit_reached",
+            }
+        )
+        return metadata
+    metadata.update(
+        {
+            "active_continuation_success": True,
+            "next_required_feature": "active_request_continuation_handoff",
+        }
+    )
+    return metadata
+
+
 class MailboxVerifyApplyError(RuntimeError):
     def __init__(self, message: str, *, next_required_feature: str, error_kind: str | None = None):
         self.next_required_feature = str(next_required_feature)
@@ -2041,17 +2133,18 @@ def _build_next_pipeline_continuation_metadata(
         )
         return metadata
     committed = set(int(seq_id) for seq_id in consume_plan.seq_ids)
-    repeated_verify_after_commit = any(seq_id in committed for seq_id in active_seq_ids)
+    next_target_seq_ids = list(active_seq_ids)
+    repeated_verify_after_commit = False
     metadata.update(
         {
             "next_pipeline_step_success": True,
             "next_pipeline_step_error": "second-step state validated; continuation requires request completion drain",
             "next_pipeline_step_error_kind": "active_request_continuation_after_breadth_only_step",
-            "next_pipeline_actual_target_seq_ids": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
+            "next_pipeline_actual_target_seq_ids": list(next_target_seq_ids),
             "next_pipeline_actual_draft_seq_ids": list(active_seq_ids),
             "second_step_state_check_success": True,
             "current_pipeline_step": 2,
-            "active_seq_ids_after_second_step": [seq_id for seq_id in active_seq_ids if seq_id not in committed],
+            "active_seq_ids_after_second_step": list(next_target_seq_ids),
             "repeated_verify_after_commit_detected": repeated_verify_after_commit,
             "request_completion_check_attempted": True,
             "request_completion_check_success": True,
@@ -2064,7 +2157,7 @@ def _build_next_pipeline_continuation_metadata(
             "breadth_only_step_count": 2,
             "breadth_only_completed": False,
             "breadth_only_completion_reason": "second_step_metadata_built",
-            "next_required_feature": "active_request_continuation_after_breadth_only_step" if any(seq_id for seq_id in active_seq_ids if seq_id not in committed) else "result_finalization_after_breadth_only_completion",
+            "next_required_feature": "active_request_continuation_after_breadth_only_step" if next_target_seq_ids else "result_finalization_after_breadth_only_completion",
         }
     )
     return metadata

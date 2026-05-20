@@ -147,6 +147,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "stspec_disable_mailbox_forward_commit": args.stspec_disable_mailbox_forward_commit,
         "stspec_mailbox_commit_probe": args.stspec_mailbox_commit_probe,
         "stspec_continue_after_mailbox_commit": args.stspec_continue_after_mailbox_commit,
+        "stspec_active_continuation_max_steps": args.stspec_active_continuation_max_steps,
     }
 
     # Try new named-path style with gamma.
@@ -557,6 +558,15 @@ PLAN_REQUEST_FIELDS = [
     "v4s_finalization_invalid_fields",
     "v4s_completion_gate_reasons",
     "v4s_completion_gate_snapshot",
+    "active_continuation_attempt_count",
+    "active_continuation_success_count",
+    "active_continuation_step_count",
+    "active_continuation_seq_ids",
+    "active_continuation_reasons",
+    "active_continuation_limit_reached_count",
+    "active_request_continuation_error_count",
+    "active_request_continuation_error_kinds",
+    "finalized_after_active_continuation_count",
     "breadth_only_completed_count",
     "finalized_request_ids",
     "finalized_seq_ids",
@@ -880,6 +890,15 @@ def aggregate_low_level_traces(
         v4s_finalization_invalid_fields: List[str] = []
         v4s_completion_gate_reasons: List[str] = []
         v4s_completion_gate_snapshot: Dict[str, Any] = {}
+        active_continuation_attempt_count = 0
+        active_continuation_success_count = 0
+        active_continuation_step_count = 0
+        active_continuation_seq_ids: List[Any] = []
+        active_continuation_reasons: List[str] = []
+        active_continuation_limit_reached_count = 0
+        active_request_continuation_error_count = 0
+        active_request_continuation_error_kinds: List[str] = []
+        finalized_after_active_continuation_count = 0
         breadth_only_completed_count = 0
         finalized_request_ids: List[Any] = []
         finalized_seq_ids: List[Any] = []
@@ -1193,6 +1212,24 @@ def aggregate_low_level_traces(
             snapshot = e.get("v4s_completion_gate_snapshot")
             if isinstance(snapshot, dict):
                 v4s_completion_gate_snapshot = snapshot
+            if e.get("active_continuation_attempted"):
+                active_continuation_attempt_count += 1
+            if e.get("active_continuation_success"):
+                active_continuation_success_count += 1
+            active_continuation_step_count = max(
+                active_continuation_step_count,
+                int(e.get("active_continuation_step_count") or 0),
+            )
+            for value in e.get("active_continuation_seq_ids") or []:
+                append_unique(active_continuation_seq_ids, value)
+            append_unique(active_continuation_reasons, e.get("active_continuation_reason"))
+            if e.get("active_continuation_limit_reached"):
+                active_continuation_limit_reached_count += 1
+            if e.get("active_request_continuation_error"):
+                active_request_continuation_error_count += 1
+            append_unique(active_request_continuation_error_kinds, e.get("active_request_continuation_error_kind"))
+            if e.get("finalized_after_active_continuation"):
+                finalized_after_active_continuation_count += 1
             if e.get("breadth_only_completed"):
                 breadth_only_completed_count += 1
             for value in e.get("finalized_request_ids") or []:
@@ -1491,6 +1528,18 @@ def aggregate_low_level_traces(
             row["v4s_completion_gate_reasons"] = v4s_completion_gate_reasons
         if v4s_completion_gate_snapshot:
             row["v4s_completion_gate_snapshot"] = v4s_completion_gate_snapshot
+        row["active_continuation_attempt_count"] = active_continuation_attempt_count
+        row["active_continuation_success_count"] = active_continuation_success_count
+        row["active_continuation_step_count"] = active_continuation_step_count
+        if active_continuation_seq_ids:
+            row["active_continuation_seq_ids"] = active_continuation_seq_ids
+        if active_continuation_reasons:
+            row["active_continuation_reasons"] = active_continuation_reasons
+        row["active_continuation_limit_reached_count"] = active_continuation_limit_reached_count
+        row["active_request_continuation_error_count"] = active_request_continuation_error_count
+        if active_request_continuation_error_kinds:
+            row["active_request_continuation_error_kinds"] = active_request_continuation_error_kinds
+        row["finalized_after_active_continuation_count"] = finalized_after_active_continuation_count
         row["breadth_only_completed_count"] = breadth_only_completed_count
         if finalized_request_ids:
             row["finalized_request_ids"] = finalized_request_ids
@@ -2430,6 +2479,15 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "v4s_finalization_invalid_fields": row.get("v4s_finalization_invalid_fields"),
         "v4s_completion_gate_reasons": row.get("v4s_completion_gate_reasons"),
         "v4s_completion_gate_snapshot": row.get("v4s_completion_gate_snapshot"),
+        "active_continuation_attempt_count": row.get("active_continuation_attempt_count"),
+        "active_continuation_success_count": row.get("active_continuation_success_count"),
+        "active_continuation_step_count": row.get("active_continuation_step_count"),
+        "active_continuation_seq_ids": row.get("active_continuation_seq_ids"),
+        "active_continuation_reasons": row.get("active_continuation_reasons"),
+        "active_continuation_limit_reached_count": row.get("active_continuation_limit_reached_count"),
+        "active_request_continuation_error_count": row.get("active_request_continuation_error_count"),
+        "active_request_continuation_error_kinds": row.get("active_request_continuation_error_kinds"),
+        "finalized_after_active_continuation_count": row.get("finalized_after_active_continuation_count"),
         "breadth_only_completed_count": row.get("breadth_only_completed_count"),
         "finalized_request_ids": row.get("finalized_request_ids"),
         "finalized_seq_ids": row.get("finalized_seq_ids"),
@@ -2578,6 +2636,12 @@ def main() -> None:
         "--stspec-continue-after-mailbox-commit",
         action="store_true",
         help="Enable V4P continuation metadata after mailbox commit/consume succeeds.",
+    )
+    parser.add_argument(
+        "--stspec-active-continuation-max-steps",
+        type=int,
+        default=2,
+        help="Probe-only upper bound for V4T active request continuation handoffs.",
     )
 
     parser.add_argument(
