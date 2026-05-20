@@ -76,11 +76,13 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 )
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
+    build_v4s_result_finalization_metadata,
     build_mailbox_kv_commit_plan,
     build_mailbox_payload_consume_plan,
     build_mailbox_verify_apply_plan,
     build_mailbox_verify_commit_plan,
     build_mailbox_verify_result,
+    can_enter_v4s_result_finalization,
     extract_target_token_ids_from_logits,
     run_mailbox_verify_apply_no_commit_probe,
     run_mailbox_verify_commit_probe,
@@ -633,6 +635,16 @@ class ModelRunnerBase:
             "result_finalization_attempted": False,
             "result_finalization_success": False,
             "result_finalization_error": None,
+            "result_finalization_error_kind": None,
+            "result_finalization_skipped_non_owner": False,
+            "finalized_request_ids": [],
+            "finalized_seq_ids": [],
+            "finalized_output_token_counts": {},
+            "finalized_output_text_available": False,
+            "finalized_trace_rows": 0,
+            "v4s_terminal_verify_broadcast_attempted": False,
+            "v4s_terminal_verify_broadcast_success": False,
+            "v4s_terminal_verify_broadcast_error": None,
             "second_step_rollback_attempted": False,
             "second_step_rollback_success": False,
             "next_pipeline_step_skipped_non_owner": False,
@@ -897,6 +909,33 @@ class ModelRunnerBase:
             "mailbox_state_after_second_step_valid",
             "request_completion_check_attempted",
             "request_completion_check_success",
+            "request_completion_reason",
+            "active_seq_ids_at_completion_check",
+            "finished_seq_ids_at_completion_check",
+            "unfinished_seq_ids_at_completion_check",
+            "max_tokens_reached_seq_ids",
+            "eos_reached_seq_ids",
+            "mailbox_pending_payload_ids_at_completion",
+            "mailbox_consumed_payload_ids_at_completion",
+            "scheduler_active_seq_ids_at_completion",
+            "sequence_state_completion_valid",
+            "scheduler_state_completion_valid",
+            "mailbox_state_completion_valid",
+            "request_completion_error",
+            "request_completion_error_kind",
+            "result_finalization_attempted",
+            "result_finalization_success",
+            "result_finalization_error",
+            "result_finalization_error_kind",
+            "result_finalization_skipped_non_owner",
+            "finalized_request_ids",
+            "finalized_seq_ids",
+            "finalized_output_token_counts",
+            "finalized_output_text_available",
+            "finalized_trace_rows",
+            "v4s_terminal_verify_broadcast_attempted",
+            "v4s_terminal_verify_broadcast_success",
+            "v4s_terminal_verify_broadcast_error",
             "second_step_rollback_attempted",
             "second_step_rollback_success",
             "mailbox_verify_commit_rollback_attempted",
@@ -1222,13 +1261,176 @@ class ModelRunnerBase:
             "next_required_feature=strict_mailbox_target_seq_routing"
         )
 
+    def _v4s_real_probe_finalization_mode(self, step_plan: StepPlan | None = None) -> bool:
+        return bool(
+            step_plan is not None
+            and self._is_stspec_real_probe_enabled(step_plan)
+            and getattr(self.global_config, "stspec_mailbox_commit_probe", False)
+            and getattr(self.global_config, "stspec_continue_after_mailbox_commit", False)
+            and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
+        )
+
+    def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
+        if commit_result.plan is None:
+            raise RuntimeError("V4S terminal verify requires a mailbox commit plan")
+        acc: list[int] = []
+        rollout: list[int] = []
+        revise_token: list[int] = []
+        finish: list[int] = []
+        for seq in exec_seqs:
+            seq_id = int(seq.seq_id)
+            accepted_len = int(commit_result.plan.accepted_lengths_by_seq.get(seq_id, 0) or 0)
+            expected_len = 1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma)
+            if accepted_len != expected_len:
+                raise RuntimeError(
+                    "V4S terminal verify cannot represent finalized accepted length with current PEARL verify tuple; "
+                    f"seq_id={seq_id}, accepted_len={accepted_len}, expected_len={expected_len}"
+                )
+            acc.append(1)
+            rollout.append(0)
+            revise_token.append(-1)
+            finish.append(1)
+        return [acc, rollout, revise_token, finish]
+
+    def _participate_v4s_terminal_verify_broadcast(
+        self,
+        exec_seqs: list[Sequence],
+        trace_record: dict,
+        *,
+        verify_rows: list[list[int]] | None = None,
+    ) -> None:
+        trace_record["v4s_terminal_verify_broadcast_attempted"] = True
+        try:
+            num_to_be_verified_tokens = sum(1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma) for seq in exec_seqs)
+            num_next_round_input = int(self.gamma) * len(exec_seqs)
+            msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            if self.rank == self.global_config.target_config.master_rank and verify_rows is not None:
+                verify_res = torch.tensor(verify_rows, dtype=torch.int64, device="cuda")
+            else:
+                verify_res = torch.zeros((4, len(exec_seqs)), dtype=torch.int64, device="cuda")
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+            trace_record["v4s_terminal_verify_broadcast_success"] = True
+            trace_record["v4s_terminal_verify_broadcast_error"] = None
+        except Exception as exc:
+            trace_record["v4s_terminal_verify_broadcast_success"] = False
+            trace_record["v4s_terminal_verify_broadcast_error"] = str(exc)
+            trace_record["result_finalization_error"] = str(exc)
+            trace_record["result_finalization_error_kind"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
+            raise
+
+    def _scheduler_active_seq_ids_excluding_finalized(self, finalized_seq_ids: list[int]) -> list[int]:
+        finalized = {int(seq_id) for seq_id in finalized_seq_ids}
+        return [int(seq.seq_id) for seq in self.scheduler.running if int(seq.seq_id) not in finalized]
+
+    def _mailbox_available_payload_ids(self) -> list[str]:
+        if not hasattr(self.stspec_mailbox, "lifecycle_snapshot"):
+            return []
+        snapshot = self.stspec_mailbox.lifecycle_snapshot()
+        return sorted(
+            [
+                str(payload_id)
+                for payload_id, row in snapshot.items()
+                if isinstance(row, dict) and str(row.get("lifecycle_state")) == "available"
+            ],
+            key=str,
+        )
+
+    def _finalize_v4s_scheduler_state(
+        self,
+        exec_seqs: list[Sequence],
+        finalized_seq_ids: list[int],
+    ) -> None:
+        finalized = {int(seq_id) for seq_id in finalized_seq_ids}
+        now = time.time()
+        for seq in list(exec_seqs):
+            if int(seq.seq_id) not in finalized:
+                continue
+            if hasattr(seq, "finish_ts") and getattr(seq, "finish_ts", None) is None:
+                seq.finish_ts = now
+            if not bool(getattr(seq, "is_finished", False)):
+                seq.mark_finished(record_finish_ts=False)
+            if hasattr(seq, "num_acc_tokens") and isinstance(seq.num_acc_tokens, list) and not seq.num_acc_tokens:
+                seq.num_acc_tokens.append(int(getattr(seq, "cur_acc_tokens", 0) or 0))
+            if seq in self.scheduler.running:
+                self.scheduler.running.remove(seq)
+            if seq not in self.scheduler.finished:
+                self.scheduler.finished.append(seq)
+
+    def _try_finalize_v4s_result(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+        commit_result,
+        output,
+    ) -> bool:
+        is_output_owner = bool(getattr(output, "output_owner", False))
+        if not can_enter_v4s_result_finalization(
+            commit_result,
+            self.global_config,
+            is_output_owner=is_output_owner,
+        ):
+            return False
+
+        finalized_seq_ids = [int(seq_id) for seq_id in commit_result.finished_seq_ids_at_completion_check or commit_result.committed_seq_ids]
+        scheduler_active = self._scheduler_active_seq_ids_excluding_finalized(finalized_seq_ids)
+        mailbox_pending = self._mailbox_available_payload_ids()
+        metadata = build_v4s_result_finalization_metadata(
+            commit_result,
+            exec_seqs,
+            is_output_owner=is_output_owner,
+            scheduler_active_seq_ids=scheduler_active,
+            mailbox_pending_payload_ids=mailbox_pending,
+        )
+        trace_record.update(metadata)
+        if not metadata.get("result_finalization_success"):
+            next_feature = metadata.get("next_required_feature") or "evaluator_return_after_breadth_only_completion"
+            trace_record["next_required_feature"] = next_feature
+            raise RuntimeError(
+                f"V4S result finalization failed; error={metadata.get('result_finalization_error')}; "
+                f"next_required_feature={next_feature}"
+            )
+
+        try:
+            verify_rows = self._build_v4s_terminal_verify_rows(exec_seqs, commit_result)
+        except Exception as exc:
+            trace_record["result_finalization_success"] = False
+            trace_record["result_finalization_error"] = str(exc)
+            trace_record["result_finalization_error_kind"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
+            raise RuntimeError(
+                f"{exc}; next_required_feature=evaluator_return_after_breadth_only_completion"
+            ) from exc
+        self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
+        self._finalize_v4s_scheduler_state(exec_seqs, list(metadata.get("finalized_seq_ids") or []))
+        trace_record["result_finalization_success"] = True
+        trace_record["result_finalization_error"] = None
+        trace_record["result_finalization_error_kind"] = None
+        trace_record["breadth_only_completed"] = True
+        trace_record["next_required_feature"] = "end_to_end_breadth_only_completion"
+        return True
+
+    def _try_v4s_non_owner_terminal_verify_noop(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+    ) -> bool:
+        if not self._v4s_real_probe_finalization_mode(step_plan):
+            return False
+        trace_record["result_finalization_skipped_non_owner"] = True
+        self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=None)
+        return True
+
     def _run_target_forward_from_mailbox_input(
         self,
         verification_input,
         exec_seqs: list[Sequence],
         step_plan: StepPlan,
         trace_record: dict,
-    ) -> None:
+    ) -> bool:
         exec_seq_ids = [int(seq.seq_id) for seq in exec_seqs]
         input_seq_ids = [int(seq_id) for seq_id in verification_input.seq_ids]
         scheduled_seq_ids = [int(seq_id) for seq_id in step_plan.scheduled_seq_ids]
@@ -1482,7 +1684,7 @@ class ModelRunnerBase:
             trace_record["target_forward_from_mailbox_output_interpretation_success"] = False
             trace_record["mailbox_verify_apply_attempted"] = False
             trace_record["mailbox_verify_apply_success"] = False
-            return
+            return self._try_v4s_non_owner_terminal_verify_noop(exec_seqs, step_plan, trace_record)
         if not output.can_interpret:
             trace_record["target_forward_output_normalization_error"] = output.error_message
             trace_record["target_forward_output_normalization_error_kind"] = output.error_kind
@@ -1755,6 +1957,7 @@ class ModelRunnerBase:
             trace_record["result_finalization_attempted"] = bool(commit_result.result_finalization_attempted)
             trace_record["result_finalization_success"] = bool(commit_result.result_finalization_success)
             trace_record["result_finalization_error"] = commit_result.result_finalization_error
+            trace_record["result_finalization_error_kind"] = getattr(commit_result, "result_finalization_error_kind", None)
             trace_record["second_step_rollback_attempted"] = commit_result.second_step_rollback_attempted
             trace_record["second_step_rollback_success"] = commit_result.second_step_rollback_success
             trace_record["next_pipeline_step_skipped_non_owner"] = bool(commit_result.next_pipeline_step_skipped_non_owner)
@@ -1764,7 +1967,7 @@ class ModelRunnerBase:
             if commit_result.kv_commit_skipped_non_owner:
                 trace_record["kv_commit_skipped_non_owner"] = True
             if commit_result.skipped_non_owner:
-                return
+                return False
             if not commit_result.success:
                 trace_record["next_required_feature"] = commit_result.next_required_feature or "mailbox_commit_rollback_validation"
                 raise RuntimeError(
@@ -1772,7 +1975,11 @@ class ModelRunnerBase:
                     f"target_seq_ids={input_seq_ids}, error={commit_result.error_message}; "
                     f"next_required_feature={trace_record['next_required_feature']}"
                 )
+            if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
+                return True
             trace_record["next_required_feature"] = commit_result.next_required_feature or "next_pipeline_step_after_mailbox_commit"
+            if trace_record["next_required_feature"] == "result_finalization_after_breadth_only_completion":
+                trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
             message = "mailbox verify guarded commit probe reached next explicit diagnostic"
             trace_record["mailbox_verify_commit_error"] = message
             raise RuntimeError(f"{message}; next_required_feature={trace_record['next_required_feature']}")
@@ -1786,6 +1993,7 @@ class ModelRunnerBase:
                 trace_record["kv_commit_error_kind"] = exc.error_kind
             trace_record["next_required_feature"] = exc.next_required_feature
             raise RuntimeError(str(exc)) from exc
+        return False
 
     def _prepare_stspec_mailbox_route(
         self,
@@ -1793,7 +2001,7 @@ class ModelRunnerBase:
         runner_role: str,
         trace_record: dict,
         exec_seqs: list[Sequence] | None = None,
-    ) -> None:
+    ) -> bool:
         """V4E mailbox transport/consume preflight for real variable-offset probes.
 
         Draft runners now continue to produce a validated mailbox transport
@@ -1803,7 +2011,7 @@ class ModelRunnerBase:
         construction from mailbox payloads is not wired yet.
         """
         if not self._stspec_mailbox_enabled(step_plan):
-            return
+            return False
         trace_record["stspec_mailbox_enabled"] = True
         trace_record["stspec_mailbox_transport_enabled"] = True
         trace_record["mailbox_transport_mode"] = self._mailbox_transport_mode()
@@ -1815,7 +2023,7 @@ class ModelRunnerBase:
             trace_record["mailbox_transport_send_attempted"] = False
             trace_record["mailbox_transport_send_seq_ids"] = list(step_plan.actual_draft_exec_seq_ids)
             trace_record["mailbox_transport_send_home_batch_id"] = step_plan.draft_home_batch_id
-            return
+            return False
 
         trace_record["mailbox_transport_recv_attempted"] = True
         trace_record["mailbox_transport_recv_success"] = False
@@ -1916,7 +2124,7 @@ class ModelRunnerBase:
                     trace_record["mailbox_verify_commit_skipped_non_owner"] = True
                     trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_unavailable_on_non_owner"
                     trace_record["target_forward_output_none_expected"] = True
-                    return
+                    return False
                 message = "ST-Spec mailbox payload tensor unavailable on output owner rank"
                 trace_record["target_consume_from_mailbox_success"] = False
                 trace_record["target_consume_from_mailbox_error"] = message
@@ -1942,13 +2150,12 @@ class ModelRunnerBase:
             trace_record["verification_input_from_mailbox_seq_ids"] = list(verification_input.seq_ids)
             trace_record["verification_input_from_mailbox_total_tokens"] = int(verification_input.total_tokens)
             trace_record["verification_input_from_mailbox_error"] = None
-            self._run_target_forward_from_mailbox_input(
+            return self._run_target_forward_from_mailbox_input(
                 verification_input,
                 exec_seqs or [],
                 step_plan,
                 trace_record,
             )
-            return
 
         error_kind, next_feature, warmup_miss = classify_mailbox_miss(
             target_home_batch_id=step_plan.target_home_batch_id,
@@ -1966,7 +2173,7 @@ class ModelRunnerBase:
                 trace_record["mailbox_verify_apply_skipped_non_owner"] = True
                 trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_unavailable_on_non_owner"
                 trace_record["target_forward_output_none_expected"] = True
-                return
+                return False
             error_kind, next_feature, warmup_miss = "mailbox_payload_tensor_backend_unavailable", "mailbox_payload_tensor_backend", False
             trace_record["mailbox_payload_missing_reason"] = "mailbox_payload_tensor_backend_unavailable"
         if warmup_miss and should_skip_target_for_warmup(
@@ -1986,7 +2193,7 @@ class ModelRunnerBase:
                 next_required_feature="verification_input_from_mailbox",
                 warmup_miss=True,
             )
-            return
+            return False
         elif warmup_miss:
             message = "ST-Spec mailbox warmup miss for target batch; pipeline warmup schedule is required"
         else:
@@ -2721,7 +2928,9 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
-        self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record, exec_seqs)
+        if self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record, exec_seqs):
+            self._mark_trace_end(trace_record)
+            return
         if trace_record.get("target_verify_skipped_for_warmup"):
             self._mark_trace_end(trace_record)
             return
@@ -2750,7 +2959,9 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "serialized_verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "serialized_verify", trace_record)
-        self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record, exec_seqs)
+        if self._prepare_stspec_mailbox_route(step_plan, "serialized_verify", trace_record, exec_seqs):
+            self._mark_trace_end(trace_record)
+            return
         if trace_record.get("target_verify_skipped_for_warmup"):
             self._mark_trace_end(trace_record)
             return

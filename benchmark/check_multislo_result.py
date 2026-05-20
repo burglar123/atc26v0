@@ -252,6 +252,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     mailbox_verify_commit_rollback_attempt_count = 0
     mailbox_verify_commit_rollback_success_count = 0
     mailbox_verify_commit_skipped_non_owner_count = 0
+    result_finalization_attempt_count = 0
+    result_finalization_success_count = 0
+    result_finalization_error_count = 0
+    result_finalization_error_kinds = set()
+    result_finalization_skipped_non_owner_count = 0
+    breadth_only_completed_count = 0
+    finalized_trace_rows = 0
     illegal_legacy_fallback_count = 0
     raw_mailbox_transport_send_rows = 0
     raw_mailbox_transport_recv_rows = 0
@@ -584,6 +591,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         mailbox_verify_commit_rollback_attempt_count += int(row.get("mailbox_verify_commit_rollback_attempt_count") or 0)
         mailbox_verify_commit_rollback_success_count += int(row.get("mailbox_verify_commit_rollback_success_count") or 0)
         mailbox_verify_commit_skipped_non_owner_count += int(row.get("mailbox_verify_commit_skipped_non_owner_count") or 0)
+        result_finalization_attempt_count += int(row.get("result_finalization_attempt_count") or 0)
+        result_finalization_success_count += int(row.get("result_finalization_success_count") or 0)
+        result_finalization_error_count += int(row.get("result_finalization_error_count") or 0)
+        for value in values_from_mapping(row.get("result_finalization_error_kinds")):
+            if value:
+                result_finalization_error_kinds.add(value)
+        result_finalization_skipped_non_owner_count += int(row.get("result_finalization_skipped_non_owner_count") or 0)
+        breadth_only_completed_count += int(row.get("breadth_only_completed_count") or 0)
+        finalized_trace_rows += int(row.get("finalized_trace_rows") or 0)
         illegal_legacy_fallback_count += int(row.get("illegal_legacy_fallback_count") or 0)
         if row.get("mailbox_warmup_skip"):
             mailbox_warmup_skip_count += 1
@@ -751,6 +767,19 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             mailbox_verify_commit_rollback_success_count += 1
         if row.get("mailbox_verify_commit_skipped_non_owner"):
             mailbox_verify_commit_skipped_non_owner_count += 1
+        if row.get("result_finalization_attempted"):
+            result_finalization_attempt_count += 1
+        if row.get("result_finalization_success"):
+            result_finalization_success_count += 1
+        if row.get("result_finalization_error"):
+            result_finalization_error_count += 1
+        if row.get("result_finalization_error_kind"):
+            result_finalization_error_kinds.add(row.get("result_finalization_error_kind"))
+        if row.get("result_finalization_skipped_non_owner"):
+            result_finalization_skipped_non_owner_count += 1
+        if row.get("breadth_only_completed"):
+            breadth_only_completed_count += 1
+        finalized_trace_rows += int(row.get("finalized_trace_rows") or 0)
         if row.get("illegal_legacy_fallback"):
             illegal_legacy_fallback_count += 1
         if row.get("next_required_feature"):
@@ -936,6 +965,13 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mailbox_verify_commit_rollback_attempt_count": mailbox_verify_commit_rollback_attempt_count,
         "mailbox_verify_commit_rollback_success_count": mailbox_verify_commit_rollback_success_count,
         "mailbox_verify_commit_skipped_non_owner_count": mailbox_verify_commit_skipped_non_owner_count,
+        "result_finalization_attempt_count": result_finalization_attempt_count,
+        "result_finalization_success_count": result_finalization_success_count,
+        "result_finalization_error_count": result_finalization_error_count,
+        "result_finalization_error_kinds": sorted(result_finalization_error_kinds, key=str),
+        "result_finalization_skipped_non_owner_count": result_finalization_skipped_non_owner_count,
+        "breadth_only_completed_count": breadth_only_completed_count,
+        "finalized_trace_rows": finalized_trace_rows,
         "illegal_legacy_fallback_count": illegal_legacy_fallback_count,
         "raw_mailbox_transport_send_rows": raw_mailbox_transport_send_rows,
         "raw_mailbox_transport_recv_rows": raw_mailbox_transport_recv_rows,
@@ -1261,6 +1297,13 @@ def summarize(path: Path) -> int:
     print(f"mailbox verify commit rollback attempts: {plan_summary['mailbox_verify_commit_rollback_attempt_count']}")
     print(f"mailbox verify commit rollback successes: {plan_summary['mailbox_verify_commit_rollback_success_count']}")
     print(f"mailbox verify commit skipped non-owner count: {plan_summary['mailbox_verify_commit_skipped_non_owner_count']}")
+    print(f"result finalization attempts: {plan_summary['result_finalization_attempt_count']}")
+    print(f"result finalization successes: {plan_summary['result_finalization_success_count']}")
+    print(f"result finalization errors: {plan_summary['result_finalization_error_count']}")
+    print(f"result finalization error kinds: {plan_summary['result_finalization_error_kinds']}")
+    print(f"result finalization skipped non-owner count: {plan_summary['result_finalization_skipped_non_owner_count']}")
+    print(f"breadth-only completed count: {plan_summary['breadth_only_completed_count']}")
+    print(f"finalized trace rows: {plan_summary['finalized_trace_rows']}")
     print(f"illegal legacy fallback count: {plan_summary['illegal_legacy_fallback_count']}")
     print(f"raw rows with mailbox_transport_send_attempted: {plan_summary['raw_mailbox_transport_send_rows']}")
     print(f"raw rows with mailbox_transport_recv_attempted: {plan_summary['raw_mailbox_transport_recv_rows']}")

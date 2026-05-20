@@ -15,6 +15,174 @@ from typing import Any, Iterable
 
 JsonDict = dict[str, Any]
 
+V4S_RESULT_FINALIZATION_FEATURES = {
+    "result_finalization_after_breadth_only_completion",
+    "end_to_end_breadth_only_completion",
+}
+
+
+def _getattr_bool(obj: Any, name: str, default: bool = False) -> bool:
+    return bool(getattr(obj, name, default))
+
+
+def can_enter_v4s_result_finalization(
+    commit_result: Any,
+    config: Any,
+    *,
+    is_output_owner: bool,
+) -> bool:
+    """Return True only for the guarded V4S breadth-only finalization path."""
+
+    next_required = getattr(commit_result, "next_required_feature", None)
+    completion_marker = bool(
+        getattr(commit_result, "result_finalization_attempted", False)
+        or getattr(commit_result, "breadth_only_completed", False)
+        or next_required in V4S_RESULT_FINALIZATION_FEATURES
+    )
+    return bool(
+        _getattr_bool(config, "enable_stspec_two_batch_execution")
+        and not _getattr_bool(config, "stspec_two_batch_dryrun", True)
+        and _getattr_bool(config, "stspec_two_batch_probe")
+        and _getattr_bool(config, "stspec_mailbox_commit_probe")
+        and _getattr_bool(config, "stspec_continue_after_mailbox_commit")
+        and getattr(config, "pearl_protocol_layout", None) == "variable_offsets"
+        and bool(is_output_owner)
+        and getattr(commit_result, "success", False)
+        and completion_marker
+    )
+
+
+def build_v4s_result_finalization_metadata(
+    commit_result: Any,
+    seqs: Iterable[Any],
+    *,
+    is_output_owner: bool,
+    scheduler_active_seq_ids: Iterable[int] | None = None,
+    mailbox_pending_payload_ids: Iterable[str] | None = None,
+) -> JsonDict:
+    """Build JSON-safe result-finalization metadata from V4R completion state.
+
+    V4S intentionally treats ``commit_result`` completion fields as the source of
+    truth, then uses scheduler/mailbox snapshots only as consistency checks.
+    """
+
+    seq_list = list(seqs)
+    seq_by_id = {int(getattr(seq, "seq_id")): seq for seq in seq_list}
+    metadata: JsonDict = {
+        "result_finalization_attempted": False,
+        "result_finalization_success": False,
+        "result_finalization_error": None,
+        "result_finalization_error_kind": None,
+        "result_finalization_skipped_non_owner": False,
+        "finalized_request_ids": [],
+        "finalized_seq_ids": [],
+        "finalized_output_token_counts": {},
+        "finalized_output_text_available": False,
+        "finalized_trace_rows": 0,
+        "next_required_feature": getattr(commit_result, "next_required_feature", None),
+    }
+    if not is_output_owner:
+        metadata["result_finalization_skipped_non_owner"] = True
+        return metadata
+
+    metadata["result_finalization_attempted"] = True
+    if not bool(getattr(commit_result, "request_completion_check_attempted", False)):
+        metadata.update(
+            {
+                "result_finalization_error": "request completion check did not run before result finalization",
+                "result_finalization_error_kind": "request_completion_check_missing",
+                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if not bool(getattr(commit_result, "request_completion_check_success", False)):
+        metadata.update(
+            {
+                "result_finalization_error": getattr(commit_result, "request_completion_error", None)
+                or "request completion check failed before result finalization",
+                "result_finalization_error_kind": getattr(commit_result, "request_completion_error_kind", None)
+                or "request_completion_check_failed",
+                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if not bool(getattr(commit_result, "breadth_only_completed", False)):
+        metadata.update(
+            {
+                "result_finalization_error": "breadth-only completion metadata is not complete",
+                "result_finalization_error_kind": "breadth_only_not_completed",
+                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+            }
+        )
+        return metadata
+
+    unfinished = [int(seq_id) for seq_id in getattr(commit_result, "unfinished_seq_ids_at_completion_check", []) or []]
+    pending = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
+    scheduler_active = [int(seq_id) for seq_id in scheduler_active_seq_ids or []]
+    mailbox_pending = [str(payload_id) for payload_id in mailbox_pending_payload_ids or []]
+    if unfinished or scheduler_active:
+        metadata.update(
+            {
+                "result_finalization_error": "unfinished requests remain at result finalization",
+                "result_finalization_error_kind": "unfinished_requests_at_finalization",
+                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if pending or mailbox_pending:
+        metadata.update(
+            {
+                "result_finalization_error": "pending mailbox payloads remain at result finalization",
+                "result_finalization_error_kind": "pending_mailbox_payloads_at_finalization",
+                "next_required_feature": "result_trace_export_after_breadth_only_completion",
+            }
+        )
+        return metadata
+
+    finalized_seq_ids = [int(seq_id) for seq_id in getattr(commit_result, "finished_seq_ids_at_completion_check", []) or []]
+    if not finalized_seq_ids:
+        finalized_seq_ids = [int(seq_id) for seq_id in getattr(commit_result, "committed_seq_ids", []) or []]
+    missing_seq_ids = [seq_id for seq_id in finalized_seq_ids if seq_id not in seq_by_id]
+    if missing_seq_ids:
+        metadata.update(
+            {
+                "result_finalization_error": f"finalized sequence state missing: seq_ids={missing_seq_ids}",
+                "result_finalization_error_kind": "finalized_sequence_state_missing",
+                "next_required_feature": "result_text_assembly_after_breadth_only_completion",
+            }
+        )
+        return metadata
+
+    request_ids: list[Any] = []
+    output_counts: dict[int, int] = {}
+    for seq_id in finalized_seq_ids:
+        seq = seq_by_id[seq_id]
+        request_ids.append(getattr(seq, "request_id", seq_id))
+        token_ids = list(getattr(seq, "token_ids", []) or [])
+        prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        if len(token_ids) < prompt_tokens:
+            metadata.update(
+                {
+                    "result_finalization_error": f"finalized token state is shorter than prompt: seq_id={seq_id}",
+                    "result_finalization_error_kind": "finalized_token_state_invalid",
+                    "next_required_feature": "result_text_assembly_after_breadth_only_completion",
+                }
+            )
+            return metadata
+        output_counts[seq_id] = max(len(token_ids) - prompt_tokens, 0)
+
+    metadata.update(
+        {
+            "result_finalization_success": True,
+            "finalized_request_ids": request_ids,
+            "finalized_seq_ids": finalized_seq_ids,
+            "finalized_output_token_counts": output_counts,
+            "finalized_trace_rows": len(finalized_seq_ids),
+            "next_required_feature": "end_to_end_breadth_only_completion",
+        }
+    )
+    return metadata
+
 
 class MailboxVerifyApplyError(RuntimeError):
     def __init__(self, message: str, *, next_required_feature: str, error_kind: str | None = None):

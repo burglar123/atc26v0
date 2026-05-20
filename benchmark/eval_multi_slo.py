@@ -547,6 +547,16 @@ PLAN_REQUEST_FIELDS = [
     "mailbox_verify_commit_rollback_attempt_count",
     "mailbox_verify_commit_rollback_success_count",
     "mailbox_verify_commit_skipped_non_owner_count",
+    "result_finalization_attempt_count",
+    "result_finalization_success_count",
+    "result_finalization_error_count",
+    "result_finalization_error_kinds",
+    "result_finalization_skipped_non_owner_count",
+    "breadth_only_completed_count",
+    "finalized_request_ids",
+    "finalized_seq_ids",
+    "finalized_output_token_counts",
+    "finalized_trace_rows",
     "illegal_legacy_fallback_count",
     "next_required_features",
     "variable_draft_message_seen_count",
@@ -855,6 +865,16 @@ def aggregate_low_level_traces(
         mailbox_verify_commit_rollback_attempt_count = 0
         mailbox_verify_commit_rollback_success_count = 0
         mailbox_verify_commit_skipped_non_owner_count = 0
+        result_finalization_attempt_count = 0
+        result_finalization_success_count = 0
+        result_finalization_error_count = 0
+        result_finalization_error_kinds: List[str] = []
+        result_finalization_skipped_non_owner_count = 0
+        breadth_only_completed_count = 0
+        finalized_request_ids: List[Any] = []
+        finalized_seq_ids: List[Any] = []
+        finalized_output_token_counts: Dict[str, Any] = {}
+        finalized_trace_rows = 0
         illegal_legacy_fallback_count = 0
         next_required_features: List[str] = []
         variable_draft_message_seen_count = 0
@@ -1144,6 +1164,25 @@ def aggregate_low_level_traces(
                 mailbox_verify_commit_rollback_success_count += 1
             if e.get("mailbox_verify_commit_skipped_non_owner"):
                 mailbox_verify_commit_skipped_non_owner_count += 1
+            if e.get("result_finalization_attempted"):
+                result_finalization_attempt_count += 1
+            if e.get("result_finalization_success"):
+                result_finalization_success_count += 1
+            if e.get("result_finalization_error"):
+                result_finalization_error_count += 1
+            append_unique(result_finalization_error_kinds, e.get("result_finalization_error_kind"))
+            if e.get("result_finalization_skipped_non_owner"):
+                result_finalization_skipped_non_owner_count += 1
+            if e.get("breadth_only_completed"):
+                breadth_only_completed_count += 1
+            for value in e.get("finalized_request_ids") or []:
+                append_unique(finalized_request_ids, value)
+            for value in e.get("finalized_seq_ids") or []:
+                append_unique(finalized_seq_ids, value)
+            counts = e.get("finalized_output_token_counts")
+            if isinstance(counts, dict):
+                finalized_output_token_counts.update({str(k): v for k, v in counts.items()})
+            finalized_trace_rows += int(e.get("finalized_trace_rows") or 0)
             if e.get("illegal_legacy_fallback"):
                 illegal_legacy_fallback_count += 1
             append_unique(next_required_features, e.get("next_required_feature"))
@@ -1416,6 +1455,20 @@ def aggregate_low_level_traces(
         row["mailbox_verify_commit_rollback_attempt_count"] = mailbox_verify_commit_rollback_attempt_count
         row["mailbox_verify_commit_rollback_success_count"] = mailbox_verify_commit_rollback_success_count
         row["mailbox_verify_commit_skipped_non_owner_count"] = mailbox_verify_commit_skipped_non_owner_count
+        row["result_finalization_attempt_count"] = result_finalization_attempt_count
+        row["result_finalization_success_count"] = result_finalization_success_count
+        row["result_finalization_error_count"] = result_finalization_error_count
+        if result_finalization_error_kinds:
+            row["result_finalization_error_kinds"] = result_finalization_error_kinds
+        row["result_finalization_skipped_non_owner_count"] = result_finalization_skipped_non_owner_count
+        row["breadth_only_completed_count"] = breadth_only_completed_count
+        if finalized_request_ids:
+            row["finalized_request_ids"] = finalized_request_ids
+        if finalized_seq_ids:
+            row["finalized_seq_ids"] = finalized_seq_ids
+        if finalized_output_token_counts:
+            row["finalized_output_token_counts"] = finalized_output_token_counts
+        row["finalized_trace_rows"] = finalized_trace_rows
         row["illegal_legacy_fallback_count"] = illegal_legacy_fallback_count
         if next_required_features:
             row["next_required_features"] = next_required_features
@@ -2337,6 +2390,16 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "mailbox_verify_commit_rollback_attempt_count": row.get("mailbox_verify_commit_rollback_attempt_count"),
         "mailbox_verify_commit_rollback_success_count": row.get("mailbox_verify_commit_rollback_success_count"),
         "mailbox_verify_commit_skipped_non_owner_count": row.get("mailbox_verify_commit_skipped_non_owner_count"),
+        "result_finalization_attempt_count": row.get("result_finalization_attempt_count"),
+        "result_finalization_success_count": row.get("result_finalization_success_count"),
+        "result_finalization_error_count": row.get("result_finalization_error_count"),
+        "result_finalization_error_kinds": row.get("result_finalization_error_kinds"),
+        "result_finalization_skipped_non_owner_count": row.get("result_finalization_skipped_non_owner_count"),
+        "breadth_only_completed_count": row.get("breadth_only_completed_count"),
+        "finalized_request_ids": row.get("finalized_request_ids"),
+        "finalized_seq_ids": row.get("finalized_seq_ids"),
+        "finalized_output_token_counts": row.get("finalized_output_token_counts"),
+        "finalized_trace_rows": row.get("finalized_trace_rows"),
         "illegal_legacy_fallback_count": row.get("illegal_legacy_fallback_count"),
         "next_required_features": row.get("next_required_features"),
         "variable_draft_message_seen_count": row.get("variable_draft_message_seen_count"),
