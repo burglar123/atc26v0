@@ -552,6 +552,11 @@ PLAN_REQUEST_FIELDS = [
     "result_finalization_error_count",
     "result_finalization_error_kinds",
     "result_finalization_skipped_non_owner_count",
+    "v4s_finalization_metadata_complete",
+    "v4s_finalization_missing_fields",
+    "v4s_finalization_invalid_fields",
+    "v4s_completion_gate_reasons",
+    "v4s_completion_gate_snapshot",
     "breadth_only_completed_count",
     "finalized_request_ids",
     "finalized_seq_ids",
@@ -870,6 +875,11 @@ def aggregate_low_level_traces(
         result_finalization_error_count = 0
         result_finalization_error_kinds: List[str] = []
         result_finalization_skipped_non_owner_count = 0
+        v4s_finalization_metadata_complete_values: List[bool] = []
+        v4s_finalization_missing_fields: List[str] = []
+        v4s_finalization_invalid_fields: List[str] = []
+        v4s_completion_gate_reasons: List[str] = []
+        v4s_completion_gate_snapshot: Dict[str, Any] = {}
         breadth_only_completed_count = 0
         finalized_request_ids: List[Any] = []
         finalized_seq_ids: List[Any] = []
@@ -1173,6 +1183,16 @@ def aggregate_low_level_traces(
             append_unique(result_finalization_error_kinds, e.get("result_finalization_error_kind"))
             if e.get("result_finalization_skipped_non_owner"):
                 result_finalization_skipped_non_owner_count += 1
+            if e.get("v4s_finalization_metadata_complete") is not None:
+                v4s_finalization_metadata_complete_values.append(bool(e.get("v4s_finalization_metadata_complete")))
+            for value in e.get("v4s_finalization_missing_fields") or []:
+                append_unique(v4s_finalization_missing_fields, value)
+            for value in e.get("v4s_finalization_invalid_fields") or []:
+                append_unique(v4s_finalization_invalid_fields, value)
+            append_unique(v4s_completion_gate_reasons, e.get("v4s_completion_gate_reason"))
+            snapshot = e.get("v4s_completion_gate_snapshot")
+            if isinstance(snapshot, dict):
+                v4s_completion_gate_snapshot = snapshot
             if e.get("breadth_only_completed"):
                 breadth_only_completed_count += 1
             for value in e.get("finalized_request_ids") or []:
@@ -1461,6 +1481,16 @@ def aggregate_low_level_traces(
         if result_finalization_error_kinds:
             row["result_finalization_error_kinds"] = result_finalization_error_kinds
         row["result_finalization_skipped_non_owner_count"] = result_finalization_skipped_non_owner_count
+        if v4s_finalization_metadata_complete_values:
+            row["v4s_finalization_metadata_complete"] = any(v4s_finalization_metadata_complete_values)
+        if v4s_finalization_missing_fields:
+            row["v4s_finalization_missing_fields"] = v4s_finalization_missing_fields
+        if v4s_finalization_invalid_fields:
+            row["v4s_finalization_invalid_fields"] = v4s_finalization_invalid_fields
+        if v4s_completion_gate_reasons:
+            row["v4s_completion_gate_reasons"] = v4s_completion_gate_reasons
+        if v4s_completion_gate_snapshot:
+            row["v4s_completion_gate_snapshot"] = v4s_completion_gate_snapshot
         row["breadth_only_completed_count"] = breadth_only_completed_count
         if finalized_request_ids:
             row["finalized_request_ids"] = finalized_request_ids
@@ -2395,6 +2425,11 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "result_finalization_error_count": row.get("result_finalization_error_count"),
         "result_finalization_error_kinds": row.get("result_finalization_error_kinds"),
         "result_finalization_skipped_non_owner_count": row.get("result_finalization_skipped_non_owner_count"),
+        "v4s_finalization_metadata_complete": row.get("v4s_finalization_metadata_complete"),
+        "v4s_finalization_missing_fields": row.get("v4s_finalization_missing_fields"),
+        "v4s_finalization_invalid_fields": row.get("v4s_finalization_invalid_fields"),
+        "v4s_completion_gate_reasons": row.get("v4s_completion_gate_reasons"),
+        "v4s_completion_gate_snapshot": row.get("v4s_completion_gate_snapshot"),
         "breadth_only_completed_count": row.get("breadth_only_completed_count"),
         "finalized_request_ids": row.get("finalized_request_ids"),
         "finalized_seq_ids": row.get("finalized_seq_ids"),

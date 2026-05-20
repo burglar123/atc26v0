@@ -57,7 +57,12 @@ def commit_result(**overrides):
         "result_finalization_attempted": True,
         "next_required_feature": "result_finalization_after_breadth_only_completion",
         "unfinished_seq_ids_at_completion_check": [],
+        "active_seq_ids_at_completion_check": [],
+        "scheduler_active_seq_ids_at_completion": [],
         "mailbox_pending_payload_ids_at_completion": [],
+        "sequence_state_completion_valid": True,
+        "scheduler_state_completion_valid": True,
+        "mailbox_state_completion_valid": True,
         "finished_seq_ids_at_completion_check": [1, 3],
         "committed_seq_ids": [1, 3],
         "request_completion_error": None,
@@ -89,6 +94,20 @@ def test_completed_commit_result_enters_finalization():
     assert metadata["finalized_seq_ids"] == [1, 3]
     assert metadata["finalized_output_token_counts"] == {1: 1, 3: 2}
     assert metadata["next_required_feature"] == "end_to_end_breadth_only_completion"
+    assert metadata["v4s_finalization_metadata_complete"] is True
+    assert metadata["v4s_completion_gate_snapshot"]["request_completion_check_success"] is True
+
+
+def test_completion_metadata_can_infer_breadth_completion():
+    metadata = apply_mod.build_v4s_result_finalization_metadata(
+        commit_result(breadth_only_completed=False, breadth_only_completion_reason=None),
+        seqs(),
+        is_output_owner=True,
+        scheduler_active_seq_ids=[],
+        mailbox_pending_payload_ids=[],
+    )
+    assert metadata["result_finalization_success"] is True
+    assert metadata["v4s_completion_gate_reason"] == "completion_metadata_proves_breadth_only_complete"
 
 
 def test_active_request_does_not_finalize():
@@ -101,7 +120,20 @@ def test_active_request_does_not_finalize():
     )
     assert metadata["result_finalization_success"] is False
     assert metadata["result_finalization_error_kind"] == "unfinished_requests_at_finalization"
-    assert metadata["next_required_feature"] == "scheduler_drain_after_breadth_only_completion"
+    assert metadata["next_required_feature"] == "active_request_continuation_after_breadth_only_step"
+
+
+def test_invalid_scheduler_state_gets_specific_diagnostic():
+    metadata = apply_mod.build_v4s_result_finalization_metadata(
+        commit_result(scheduler_state_completion_valid=False),
+        seqs(),
+        is_output_owner=True,
+        scheduler_active_seq_ids=[],
+        mailbox_pending_payload_ids=[],
+    )
+    assert metadata["result_finalization_success"] is False
+    assert metadata["result_finalization_error_kind"] == "scheduler_state_completion_invalid"
+    assert metadata["next_required_feature"] == "scheduler_state_after_breadth_only_completion"
 
 
 def test_non_owner_skips_finalization():
@@ -157,7 +189,9 @@ def test_normal_and_dryrun_do_not_trigger_finalization():
 
 def main() -> None:
     test_completed_commit_result_enters_finalization()
+    test_completion_metadata_can_infer_breadth_completion()
     test_active_request_does_not_finalize()
+    test_invalid_scheduler_state_gets_specific_diagnostic()
     test_non_owner_skips_finalization()
     test_missing_output_tokens_gives_text_assembly_diagnostic()
     test_finalized_metadata_json_serializable()

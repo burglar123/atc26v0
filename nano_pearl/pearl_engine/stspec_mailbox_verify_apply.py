@@ -20,9 +20,44 @@ V4S_RESULT_FINALIZATION_FEATURES = {
     "end_to_end_breadth_only_completion",
 }
 
+V4S_COMPLETION_SNAPSHOT_FIELDS = (
+    "success",
+    "next_required_feature",
+    "request_completion_check_attempted",
+    "request_completion_check_success",
+    "request_completion_reason",
+    "breadth_only_completed",
+    "breadth_only_completion_reason",
+    "result_finalization_attempted",
+    "result_finalization_success",
+    "active_seq_ids_at_completion_check",
+    "finished_seq_ids_at_completion_check",
+    "unfinished_seq_ids_at_completion_check",
+    "scheduler_active_seq_ids_at_completion",
+    "mailbox_pending_payload_ids_at_completion",
+    "sequence_state_completion_valid",
+    "scheduler_state_completion_valid",
+    "mailbox_state_completion_valid",
+)
+
 
 def _getattr_bool(obj: Any, name: str, default: bool = False) -> bool:
     return bool(getattr(obj, name, default))
+
+
+def _list_attr(obj: Any, name: str) -> list[Any]:
+    value = getattr(obj, name, [])
+    if value is None:
+        return []
+    return list(value)
+
+
+def v4s_completion_gate_snapshot(commit_result: Any) -> JsonDict:
+    return {field: _jsonable(getattr(commit_result, field, None)) for field in V4S_COMPLETION_SNAPSHOT_FIELDS}
+
+
+def _v4s_missing_fields(commit_result: Any) -> list[str]:
+    return [field for field in V4S_COMPLETION_SNAPSHOT_FIELDS if not hasattr(commit_result, field)]
 
 
 def can_enter_v4s_result_finalization(
@@ -74,6 +109,11 @@ def build_v4s_result_finalization_metadata(
         "result_finalization_error": None,
         "result_finalization_error_kind": None,
         "result_finalization_skipped_non_owner": False,
+        "v4s_finalization_metadata_complete": False,
+        "v4s_finalization_missing_fields": [],
+        "v4s_finalization_invalid_fields": [],
+        "v4s_completion_gate_reason": None,
+        "v4s_completion_gate_snapshot": v4s_completion_gate_snapshot(commit_result),
         "finalized_request_ids": [],
         "finalized_seq_ids": [],
         "finalized_output_token_counts": {},
@@ -86,46 +126,90 @@ def build_v4s_result_finalization_metadata(
         return metadata
 
     metadata["result_finalization_attempted"] = True
-    if not bool(getattr(commit_result, "request_completion_check_attempted", False)):
+    missing_fields = _v4s_missing_fields(commit_result)
+    invalid_fields: list[str] = []
+    request_attempted = bool(getattr(commit_result, "request_completion_check_attempted", False))
+    request_success = bool(getattr(commit_result, "request_completion_check_success", False))
+    breadth_completed = bool(getattr(commit_result, "breadth_only_completed", False))
+    unfinished = [int(seq_id) for seq_id in _list_attr(commit_result, "unfinished_seq_ids_at_completion_check")]
+    scheduler_active_at_completion = [int(seq_id) for seq_id in _list_attr(commit_result, "scheduler_active_seq_ids_at_completion")]
+    pending = [str(payload_id) for payload_id in _list_attr(commit_result, "mailbox_pending_payload_ids_at_completion")]
+    sequence_valid = bool(getattr(commit_result, "sequence_state_completion_valid", False))
+    scheduler_valid = bool(getattr(commit_result, "scheduler_state_completion_valid", False))
+    mailbox_valid = bool(getattr(commit_result, "mailbox_state_completion_valid", False))
+    if missing_fields:
+        invalid_fields.extend(missing_fields)
+    if not request_attempted:
+        invalid_fields.append("request_completion_check_attempted")
+    if not request_success:
+        invalid_fields.append("request_completion_check_success")
+    if not sequence_valid:
+        invalid_fields.append("sequence_state_completion_valid")
+    if not scheduler_valid:
+        invalid_fields.append("scheduler_state_completion_valid")
+    if not mailbox_valid:
+        invalid_fields.append("mailbox_state_completion_valid")
+    if unfinished:
+        invalid_fields.append("unfinished_seq_ids_at_completion_check")
+    if pending:
+        invalid_fields.append("mailbox_pending_payload_ids_at_completion")
+
+    scheduler_active = [int(seq_id) for seq_id in scheduler_active_seq_ids or []]
+    mailbox_pending = [str(payload_id) for payload_id in mailbox_pending_payload_ids or []]
+    if scheduler_active:
+        invalid_fields.append("scheduler_active_seq_ids_runtime")
+    if mailbox_pending:
+        invalid_fields.append("mailbox_pending_payload_ids_runtime")
+
+    completion_proven = bool(
+        request_attempted
+        and request_success
+        and not unfinished
+        and not pending
+        and sequence_valid
+        and scheduler_valid
+        and mailbox_valid
+    )
+    metadata["v4s_finalization_missing_fields"] = missing_fields
+    metadata["v4s_finalization_invalid_fields"] = sorted(set(invalid_fields), key=str)
+    metadata["v4s_finalization_metadata_complete"] = bool(completion_proven and not scheduler_active and not mailbox_pending)
+    metadata["v4s_completion_gate_reason"] = (
+        "breadth_only_completed"
+        if breadth_completed and metadata["v4s_finalization_metadata_complete"]
+        else (
+            "completion_metadata_proves_breadth_only_complete"
+            if metadata["v4s_finalization_metadata_complete"]
+            else "completion_metadata_incomplete"
+        )
+    )
+
+    if not request_attempted:
         metadata.update(
             {
                 "result_finalization_error": "request completion check did not run before result finalization",
                 "result_finalization_error_kind": "request_completion_check_missing",
-                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+                "next_required_feature": "scheduler_state_after_breadth_only_completion",
             }
         )
         return metadata
-    if not bool(getattr(commit_result, "request_completion_check_success", False)):
+    if not request_success:
         metadata.update(
             {
                 "result_finalization_error": getattr(commit_result, "request_completion_error", None)
                 or "request completion check failed before result finalization",
                 "result_finalization_error_kind": getattr(commit_result, "request_completion_error_kind", None)
                 or "request_completion_check_failed",
-                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
-            }
-        )
-        return metadata
-    if not bool(getattr(commit_result, "breadth_only_completed", False)):
-        metadata.update(
-            {
-                "result_finalization_error": "breadth-only completion metadata is not complete",
-                "result_finalization_error_kind": "breadth_only_not_completed",
-                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+                "next_required_feature": "scheduler_state_after_breadth_only_completion",
             }
         )
         return metadata
 
-    unfinished = [int(seq_id) for seq_id in getattr(commit_result, "unfinished_seq_ids_at_completion_check", []) or []]
-    pending = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
-    scheduler_active = [int(seq_id) for seq_id in scheduler_active_seq_ids or []]
-    mailbox_pending = [str(payload_id) for payload_id in mailbox_pending_payload_ids or []]
-    if unfinished or scheduler_active:
+    if unfinished or scheduler_active_at_completion or scheduler_active:
         metadata.update(
             {
                 "result_finalization_error": "unfinished requests remain at result finalization",
                 "result_finalization_error_kind": "unfinished_requests_at_finalization",
-                "next_required_feature": "scheduler_drain_after_breadth_only_completion",
+                "next_required_feature": "active_request_continuation_after_breadth_only_step",
             }
         )
         return metadata
@@ -134,7 +218,34 @@ def build_v4s_result_finalization_metadata(
             {
                 "result_finalization_error": "pending mailbox payloads remain at result finalization",
                 "result_finalization_error_kind": "pending_mailbox_payloads_at_finalization",
-                "next_required_feature": "result_trace_export_after_breadth_only_completion",
+                "next_required_feature": "mailbox_state_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if not sequence_valid:
+        metadata.update(
+            {
+                "result_finalization_error": "sequence completion state is invalid at result finalization",
+                "result_finalization_error_kind": "sequence_state_completion_invalid",
+                "next_required_feature": "sequence_state_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if not scheduler_valid:
+        metadata.update(
+            {
+                "result_finalization_error": "scheduler completion state is invalid at result finalization",
+                "result_finalization_error_kind": "scheduler_state_completion_invalid",
+                "next_required_feature": "scheduler_state_after_breadth_only_completion",
+            }
+        )
+        return metadata
+    if not mailbox_valid:
+        metadata.update(
+            {
+                "result_finalization_error": "mailbox completion state is invalid at result finalization",
+                "result_finalization_error_kind": "mailbox_state_completion_invalid",
+                "next_required_feature": "mailbox_state_after_breadth_only_completion",
             }
         )
         return metadata
