@@ -412,6 +412,101 @@ def build_v4t_active_continuation_metadata(
     return metadata
 
 
+def build_terminal_verify_tuple_rows(
+    commit_plan: Any,
+    seqs: Iterable[Any],
+    *,
+    gamma: int,
+) -> tuple[list[list[int]], JsonDict]:
+    """Build PEARL verify rows for breadth-only terminal/continuation handoff.
+
+    Existing draft receivers interpret ``acc=0`` plus ``rollout`` as a partial
+    or zero accept and require a revise token.  The revise token must come from
+    the target decision at the first rejected position, not from the rejected
+    draft token.
+    """
+
+    seq_list = list(seqs)
+    gamma = int(gamma)
+    seq_ids = [int(getattr(seq, "seq_id")) for seq in seq_list]
+    expected_lengths: dict[int, int] = {}
+    accepted_lengths: dict[int, int] = {}
+    rejected_lengths: dict[int, int] = {}
+    acc: list[int] = []
+    rollout: list[int] = []
+    revise_token: list[int] = []
+    finish: list[int] = []
+    target_by_seq = getattr(commit_plan, "target_token_ids_by_seq", {}) or {}
+    for seq in seq_list:
+        seq_id = int(getattr(seq, "seq_id"))
+        expected_len = 1 if bool(getattr(seq, "pre_verify", False)) else gamma
+        accepted_len = int(getattr(commit_plan, "accepted_lengths_by_seq", {}).get(seq_id, 0) or 0)
+        if accepted_len < 0 or accepted_len > expected_len:
+            metadata = {
+                "terminal_verify_tuple_attempted": True,
+                "terminal_verify_tuple_success": False,
+                "terminal_verify_tuple_error": (
+                    f"accepted length out of range for terminal verify tuple: "
+                    f"seq_id={seq_id}, accepted_len={accepted_len}, expected_len={expected_len}"
+                ),
+                "terminal_verify_tuple_error_kind": "terminal_verify_tuple_partial_accept_after_breadth_only",
+                "terminal_verify_partial_accept_supported": True,
+                "terminal_verify_zero_accept_supported": True,
+                "terminal_verify_seq_ids": seq_ids,
+                "terminal_verify_expected_lengths_by_seq": expected_lengths,
+                "terminal_verify_accepted_lengths_by_seq": accepted_lengths,
+                "terminal_verify_rejected_lengths_by_seq": rejected_lengths,
+                "next_required_feature": "terminal_verify_tuple_partial_accept_after_breadth_only",
+            }
+            return [[], [], [], []], metadata
+        rejected_len = expected_len - accepted_len
+        expected_lengths[seq_id] = expected_len
+        accepted_lengths[seq_id] = accepted_len
+        rejected_lengths[seq_id] = rejected_len
+        if rejected_len == 0:
+            acc.append(1)
+            rollout.append(0)
+            revise_token.append(-1)
+        else:
+            target_tokens = [int(token) for token in target_by_seq.get(seq_id, []) or []]
+            if accepted_len >= len(target_tokens):
+                metadata = {
+                    "terminal_verify_tuple_attempted": True,
+                    "terminal_verify_tuple_success": False,
+                    "terminal_verify_tuple_error": (
+                        f"target revise token unavailable for terminal verify tuple: "
+                        f"seq_id={seq_id}, accepted_len={accepted_len}, target_len={len(target_tokens)}"
+                    ),
+                    "terminal_verify_tuple_error_kind": "draft_verify_receiver_partial_accept_after_breadth_only",
+                    "terminal_verify_partial_accept_supported": True,
+                    "terminal_verify_zero_accept_supported": True,
+                    "terminal_verify_seq_ids": seq_ids,
+                    "terminal_verify_expected_lengths_by_seq": expected_lengths,
+                    "terminal_verify_accepted_lengths_by_seq": accepted_lengths,
+                    "terminal_verify_rejected_lengths_by_seq": rejected_lengths,
+                    "next_required_feature": "draft_verify_receiver_partial_accept_after_breadth_only",
+                }
+                return [[], [], [], []], metadata
+            acc.append(0)
+            rollout.append(gamma if expected_len == 1 else rejected_len)
+            revise_token.append(int(target_tokens[accepted_len]))
+        finish.append(0)
+    metadata = {
+        "terminal_verify_tuple_attempted": True,
+        "terminal_verify_tuple_success": True,
+        "terminal_verify_tuple_error": None,
+        "terminal_verify_tuple_error_kind": None,
+        "terminal_verify_partial_accept_supported": True,
+        "terminal_verify_zero_accept_supported": True,
+        "terminal_verify_seq_ids": seq_ids,
+        "terminal_verify_expected_lengths_by_seq": expected_lengths,
+        "terminal_verify_accepted_lengths_by_seq": accepted_lengths,
+        "terminal_verify_rejected_lengths_by_seq": rejected_lengths,
+        "next_required_feature": None,
+    }
+    return [acc, rollout, revise_token, finish], metadata
+
+
 class MailboxVerifyApplyError(RuntimeError):
     def __init__(self, message: str, *, next_required_feature: str, error_kind: str | None = None):
         self.next_required_feature = str(next_required_feature)
@@ -498,6 +593,7 @@ class MailboxVerifyCommitPlan:
     accepted_token_ids_by_seq: dict[int, list[int]]
     rejected_seq_ids: list[int]
     rejected_token_ids_by_seq: dict[int, list[int]]
+    target_token_ids_by_seq: dict[int, list[int]]
     invalidated_payload_ids: list[str]
     mailbox_payloads_to_consume: list[str]
     mailbox_payloads_to_invalidate: list[str]
@@ -1124,6 +1220,7 @@ def build_mailbox_verify_commit_plan(
         accepted_token_ids_by_seq=dict(apply_plan.accepted_token_ids_by_seq),
         rejected_seq_ids=rejected_seq_ids,
         rejected_token_ids_by_seq=dict(apply_plan.rejected_token_ids_by_seq),
+        target_token_ids_by_seq=dict(verify_result.target_token_ids_by_seq),
         invalidated_payload_ids=invalidated_payload_ids,
         mailbox_payloads_to_consume=list(apply_plan.mailbox_payloads_to_consume),
         mailbox_payloads_to_invalidate=list(apply_plan.mailbox_payloads_to_invalidate),

@@ -262,6 +262,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_limit_reached_count = 0
     active_request_continuation_error_count = 0
     active_request_continuation_error_kinds = set()
+    terminal_verify_tuple_attempt_count = 0
+    terminal_verify_tuple_success_count = 0
+    terminal_verify_tuple_error_count = 0
+    terminal_verify_tuple_error_kinds = set()
+    evaluator_return_attempt_count = 0
+    evaluator_return_success_count = 0
+    evaluator_return_error_count = 0
+    evaluator_return_error_kinds = set()
     breadth_only_completed_count = 0
     finalized_trace_rows = 0
     illegal_legacy_fallback_count = 0
@@ -610,6 +618,18 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         for value in values_from_mapping(row.get("active_request_continuation_error_kinds")):
             if value:
                 active_request_continuation_error_kinds.add(value)
+        terminal_verify_tuple_attempt_count += int(row.get("terminal_verify_tuple_attempt_count") or 0)
+        terminal_verify_tuple_success_count += int(row.get("terminal_verify_tuple_success_count") or 0)
+        terminal_verify_tuple_error_count += int(row.get("terminal_verify_tuple_error_count") or 0)
+        for value in values_from_mapping(row.get("terminal_verify_tuple_error_kinds")):
+            if value:
+                terminal_verify_tuple_error_kinds.add(value)
+        evaluator_return_attempt_count += int(row.get("evaluator_return_attempt_count") or 0)
+        evaluator_return_success_count += int(row.get("evaluator_return_success_count") or 0)
+        evaluator_return_error_count += int(row.get("evaluator_return_error_count") or 0)
+        for value in values_from_mapping(row.get("evaluator_return_error_kinds")):
+            if value:
+                evaluator_return_error_kinds.add(value)
         breadth_only_completed_count += int(row.get("breadth_only_completed_count") or 0)
         finalized_trace_rows += int(row.get("finalized_trace_rows") or 0)
         illegal_legacy_fallback_count += int(row.get("illegal_legacy_fallback_count") or 0)
@@ -799,6 +819,22 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_request_continuation_error_count += 1
         if row.get("active_request_continuation_error_kind"):
             active_request_continuation_error_kinds.add(row.get("active_request_continuation_error_kind"))
+        if row.get("terminal_verify_tuple_attempted"):
+            terminal_verify_tuple_attempt_count += 1
+        if row.get("terminal_verify_tuple_success"):
+            terminal_verify_tuple_success_count += 1
+        if row.get("terminal_verify_tuple_error"):
+            terminal_verify_tuple_error_count += 1
+        if row.get("terminal_verify_tuple_error_kind"):
+            terminal_verify_tuple_error_kinds.add(row.get("terminal_verify_tuple_error_kind"))
+        if row.get("evaluator_return_attempted"):
+            evaluator_return_attempt_count += 1
+        if row.get("evaluator_return_success"):
+            evaluator_return_success_count += 1
+        if row.get("evaluator_return_error"):
+            evaluator_return_error_count += 1
+        if row.get("evaluator_return_error_kind"):
+            evaluator_return_error_kinds.add(row.get("evaluator_return_error_kind"))
         if row.get("breadth_only_completed"):
             breadth_only_completed_count += 1
         finalized_trace_rows += int(row.get("finalized_trace_rows") or 0)
@@ -997,6 +1033,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_limit_reached_count": active_continuation_limit_reached_count,
         "active_request_continuation_error_count": active_request_continuation_error_count,
         "active_request_continuation_error_kinds": sorted(active_request_continuation_error_kinds, key=str),
+        "terminal_verify_tuple_attempt_count": terminal_verify_tuple_attempt_count,
+        "terminal_verify_tuple_success_count": terminal_verify_tuple_success_count,
+        "terminal_verify_tuple_error_count": terminal_verify_tuple_error_count,
+        "terminal_verify_tuple_error_kinds": sorted(terminal_verify_tuple_error_kinds, key=str),
+        "evaluator_return_attempt_count": evaluator_return_attempt_count,
+        "evaluator_return_success_count": evaluator_return_success_count,
+        "evaluator_return_error_count": evaluator_return_error_count,
+        "evaluator_return_error_kinds": sorted(evaluator_return_error_kinds, key=str),
         "breadth_only_completed_count": breadth_only_completed_count,
         "finalized_trace_rows": finalized_trace_rows,
         "illegal_legacy_fallback_count": illegal_legacy_fallback_count,
@@ -1334,6 +1378,14 @@ def summarize(path: Path) -> int:
     print(f"active continuation limit reached count: {plan_summary['active_continuation_limit_reached_count']}")
     print(f"active continuation errors: {plan_summary['active_request_continuation_error_count']}")
     print(f"active continuation error kinds: {plan_summary['active_request_continuation_error_kinds']}")
+    print(f"terminal verify tuple attempts: {plan_summary['terminal_verify_tuple_attempt_count']}")
+    print(f"terminal verify tuple successes: {plan_summary['terminal_verify_tuple_success_count']}")
+    print(f"terminal verify tuple errors: {plan_summary['terminal_verify_tuple_error_count']}")
+    print(f"terminal verify tuple error kinds: {plan_summary['terminal_verify_tuple_error_kinds']}")
+    print(f"evaluator return attempts: {plan_summary['evaluator_return_attempt_count']}")
+    print(f"evaluator return successes: {plan_summary['evaluator_return_success_count']}")
+    print(f"evaluator return errors: {plan_summary['evaluator_return_error_count']}")
+    print(f"evaluator return error kinds: {plan_summary['evaluator_return_error_kinds']}")
     print(f"breadth-only completed count: {plan_summary['breadth_only_completed_count']}")
     print(f"finalized trace rows: {plan_summary['finalized_trace_rows']}")
     print(f"illegal legacy fallback count: {plan_summary['illegal_legacy_fallback_count']}")

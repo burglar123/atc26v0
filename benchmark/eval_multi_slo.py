@@ -567,6 +567,18 @@ PLAN_REQUEST_FIELDS = [
     "active_request_continuation_error_count",
     "active_request_continuation_error_kinds",
     "finalized_after_active_continuation_count",
+    "terminal_verify_tuple_attempt_count",
+    "terminal_verify_tuple_success_count",
+    "terminal_verify_tuple_error_count",
+    "terminal_verify_tuple_error_kinds",
+    "terminal_verify_seq_ids",
+    "terminal_verify_expected_lengths_by_seq",
+    "terminal_verify_accepted_lengths_by_seq",
+    "terminal_verify_rejected_lengths_by_seq",
+    "evaluator_return_attempt_count",
+    "evaluator_return_success_count",
+    "evaluator_return_error_count",
+    "evaluator_return_error_kinds",
     "breadth_only_completed_count",
     "finalized_request_ids",
     "finalized_seq_ids",
@@ -899,6 +911,18 @@ def aggregate_low_level_traces(
         active_request_continuation_error_count = 0
         active_request_continuation_error_kinds: List[str] = []
         finalized_after_active_continuation_count = 0
+        terminal_verify_tuple_attempt_count = 0
+        terminal_verify_tuple_success_count = 0
+        terminal_verify_tuple_error_count = 0
+        terminal_verify_tuple_error_kinds: List[str] = []
+        terminal_verify_seq_ids: List[Any] = []
+        terminal_verify_expected_lengths_by_seq: Dict[str, Any] = {}
+        terminal_verify_accepted_lengths_by_seq: Dict[str, Any] = {}
+        terminal_verify_rejected_lengths_by_seq: Dict[str, Any] = {}
+        evaluator_return_attempt_count = 0
+        evaluator_return_success_count = 0
+        evaluator_return_error_count = 0
+        evaluator_return_error_kinds: List[str] = []
         breadth_only_completed_count = 0
         finalized_request_ids: List[Any] = []
         finalized_seq_ids: List[Any] = []
@@ -1230,6 +1254,30 @@ def aggregate_low_level_traces(
             append_unique(active_request_continuation_error_kinds, e.get("active_request_continuation_error_kind"))
             if e.get("finalized_after_active_continuation"):
                 finalized_after_active_continuation_count += 1
+            if e.get("terminal_verify_tuple_attempted"):
+                terminal_verify_tuple_attempt_count += 1
+            if e.get("terminal_verify_tuple_success"):
+                terminal_verify_tuple_success_count += 1
+            if e.get("terminal_verify_tuple_error"):
+                terminal_verify_tuple_error_count += 1
+            append_unique(terminal_verify_tuple_error_kinds, e.get("terminal_verify_tuple_error_kind"))
+            for value in e.get("terminal_verify_seq_ids") or []:
+                append_unique(terminal_verify_seq_ids, value)
+            for dst, key in (
+                (terminal_verify_expected_lengths_by_seq, "terminal_verify_expected_lengths_by_seq"),
+                (terminal_verify_accepted_lengths_by_seq, "terminal_verify_accepted_lengths_by_seq"),
+                (terminal_verify_rejected_lengths_by_seq, "terminal_verify_rejected_lengths_by_seq"),
+            ):
+                value = e.get(key)
+                if isinstance(value, dict):
+                    dst.update({str(k): v for k, v in value.items()})
+            if e.get("evaluator_return_attempted"):
+                evaluator_return_attempt_count += 1
+            if e.get("evaluator_return_success"):
+                evaluator_return_success_count += 1
+            if e.get("evaluator_return_error"):
+                evaluator_return_error_count += 1
+            append_unique(evaluator_return_error_kinds, e.get("evaluator_return_error_kind"))
             if e.get("breadth_only_completed"):
                 breadth_only_completed_count += 1
             for value in e.get("finalized_request_ids") or []:
@@ -1540,6 +1588,24 @@ def aggregate_low_level_traces(
         if active_request_continuation_error_kinds:
             row["active_request_continuation_error_kinds"] = active_request_continuation_error_kinds
         row["finalized_after_active_continuation_count"] = finalized_after_active_continuation_count
+        row["terminal_verify_tuple_attempt_count"] = terminal_verify_tuple_attempt_count
+        row["terminal_verify_tuple_success_count"] = terminal_verify_tuple_success_count
+        row["terminal_verify_tuple_error_count"] = terminal_verify_tuple_error_count
+        if terminal_verify_tuple_error_kinds:
+            row["terminal_verify_tuple_error_kinds"] = terminal_verify_tuple_error_kinds
+        if terminal_verify_seq_ids:
+            row["terminal_verify_seq_ids"] = terminal_verify_seq_ids
+        if terminal_verify_expected_lengths_by_seq:
+            row["terminal_verify_expected_lengths_by_seq"] = terminal_verify_expected_lengths_by_seq
+        if terminal_verify_accepted_lengths_by_seq:
+            row["terminal_verify_accepted_lengths_by_seq"] = terminal_verify_accepted_lengths_by_seq
+        if terminal_verify_rejected_lengths_by_seq:
+            row["terminal_verify_rejected_lengths_by_seq"] = terminal_verify_rejected_lengths_by_seq
+        row["evaluator_return_attempt_count"] = evaluator_return_attempt_count
+        row["evaluator_return_success_count"] = evaluator_return_success_count
+        row["evaluator_return_error_count"] = evaluator_return_error_count
+        if evaluator_return_error_kinds:
+            row["evaluator_return_error_kinds"] = evaluator_return_error_kinds
         row["breadth_only_completed_count"] = breadth_only_completed_count
         if finalized_request_ids:
             row["finalized_request_ids"] = finalized_request_ids
@@ -2488,6 +2554,18 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "active_request_continuation_error_count": row.get("active_request_continuation_error_count"),
         "active_request_continuation_error_kinds": row.get("active_request_continuation_error_kinds"),
         "finalized_after_active_continuation_count": row.get("finalized_after_active_continuation_count"),
+        "terminal_verify_tuple_attempt_count": row.get("terminal_verify_tuple_attempt_count"),
+        "terminal_verify_tuple_success_count": row.get("terminal_verify_tuple_success_count"),
+        "terminal_verify_tuple_error_count": row.get("terminal_verify_tuple_error_count"),
+        "terminal_verify_tuple_error_kinds": row.get("terminal_verify_tuple_error_kinds"),
+        "terminal_verify_seq_ids": row.get("terminal_verify_seq_ids"),
+        "terminal_verify_expected_lengths_by_seq": row.get("terminal_verify_expected_lengths_by_seq"),
+        "terminal_verify_accepted_lengths_by_seq": row.get("terminal_verify_accepted_lengths_by_seq"),
+        "terminal_verify_rejected_lengths_by_seq": row.get("terminal_verify_rejected_lengths_by_seq"),
+        "evaluator_return_attempt_count": row.get("evaluator_return_attempt_count"),
+        "evaluator_return_success_count": row.get("evaluator_return_success_count"),
+        "evaluator_return_error_count": row.get("evaluator_return_error_count"),
+        "evaluator_return_error_kinds": row.get("evaluator_return_error_kinds"),
         "breadth_only_completed_count": row.get("breadth_only_completed_count"),
         "finalized_request_ids": row.get("finalized_request_ids"),
         "finalized_seq_ids": row.get("finalized_seq_ids"),

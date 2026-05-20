@@ -87,6 +87,7 @@ from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     extract_target_token_ids_from_logits,
     initialize_v4t_active_continuation_runner_state,
     reset_v4t_active_continuation_runner_state,
+    build_terminal_verify_tuple_rows,
     run_mailbox_verify_apply_no_commit_probe,
     run_mailbox_verify_commit_probe,
 )
@@ -654,6 +655,20 @@ class ModelRunnerBase:
             "v4s_terminal_verify_broadcast_attempted": False,
             "v4s_terminal_verify_broadcast_success": False,
             "v4s_terminal_verify_broadcast_error": None,
+            "terminal_verify_tuple_attempted": False,
+            "terminal_verify_tuple_success": False,
+            "terminal_verify_tuple_error": None,
+            "terminal_verify_tuple_error_kind": None,
+            "terminal_verify_partial_accept_supported": False,
+            "terminal_verify_zero_accept_supported": False,
+            "terminal_verify_seq_ids": [],
+            "terminal_verify_expected_lengths_by_seq": {},
+            "terminal_verify_accepted_lengths_by_seq": {},
+            "terminal_verify_rejected_lengths_by_seq": {},
+            "evaluator_return_attempted": False,
+            "evaluator_return_success": False,
+            "evaluator_return_error": None,
+            "evaluator_return_error_kind": None,
             "active_continuation_attempted": False,
             "active_continuation_success": False,
             "active_continuation_step_count": 0,
@@ -961,6 +976,20 @@ class ModelRunnerBase:
             "v4s_terminal_verify_broadcast_attempted",
             "v4s_terminal_verify_broadcast_success",
             "v4s_terminal_verify_broadcast_error",
+            "terminal_verify_tuple_attempted",
+            "terminal_verify_tuple_success",
+            "terminal_verify_tuple_error",
+            "terminal_verify_tuple_error_kind",
+            "terminal_verify_partial_accept_supported",
+            "terminal_verify_zero_accept_supported",
+            "terminal_verify_seq_ids",
+            "terminal_verify_expected_lengths_by_seq",
+            "terminal_verify_accepted_lengths_by_seq",
+            "terminal_verify_rejected_lengths_by_seq",
+            "evaluator_return_attempted",
+            "evaluator_return_success",
+            "evaluator_return_error",
+            "evaluator_return_error_kind",
             "active_continuation_attempted",
             "active_continuation_success",
             "active_continuation_step_count",
@@ -1309,46 +1338,17 @@ class ModelRunnerBase:
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
             raise RuntimeError("V4S terminal verify requires a mailbox commit plan")
-        acc: list[int] = []
-        rollout: list[int] = []
-        revise_token: list[int] = []
-        finish: list[int] = []
-        for seq in exec_seqs:
-            seq_id = int(seq.seq_id)
-            accepted_len = int(commit_result.plan.accepted_lengths_by_seq.get(seq_id, 0) or 0)
-            expected_len = 1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma)
-            if accepted_len != expected_len:
-                raise RuntimeError(
-                    "V4S terminal verify cannot represent finalized accepted length with current PEARL verify tuple; "
-                    f"seq_id={seq_id}, accepted_len={accepted_len}, expected_len={expected_len}"
-                )
-            acc.append(1)
-            rollout.append(0)
-            revise_token.append(-1)
-            finish.append(1)
-        return [acc, rollout, revise_token, finish]
+        verify_rows, metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+        if not metadata.get("terminal_verify_tuple_success"):
+            raise RuntimeError(str(metadata.get("terminal_verify_tuple_error")))
+        verify_rows[3] = [1 for _ in exec_seqs]
+        return verify_rows
 
-    def _build_v4t_active_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
+    def _build_v4t_active_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> tuple[list[list[int]], dict]:
         if commit_result.plan is None:
             raise RuntimeError("V4T active continuation requires a mailbox commit plan")
-        acc: list[int] = []
-        rollout: list[int] = []
-        revise_token: list[int] = []
-        finish: list[int] = []
-        for seq in exec_seqs:
-            seq_id = int(seq.seq_id)
-            accepted_len = int(commit_result.plan.accepted_lengths_by_seq.get(seq_id, 0) or 0)
-            expected_len = 1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma)
-            if accepted_len != expected_len:
-                raise RuntimeError(
-                    "V4T active continuation cannot represent partial accepted length with current PEARL verify tuple; "
-                    f"seq_id={seq_id}, accepted_len={accepted_len}, expected_len={expected_len}"
-                )
-            acc.append(1)
-            rollout.append(0)
-            revise_token.append(-1)
-            finish.append(0)
-        return [acc, rollout, revise_token, finish]
+        verify_rows, metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+        return verify_rows, metadata
 
     def _participate_v4s_terminal_verify_broadcast(
         self,
@@ -1454,17 +1454,35 @@ class ModelRunnerBase:
             )
 
         try:
-            verify_rows = self._build_v4s_terminal_verify_rows(exec_seqs, commit_result)
+            if commit_result.plan is None:
+                raise RuntimeError("V4S terminal verify requires a mailbox commit plan")
+            verify_rows, tuple_metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+            trace_record.update(tuple_metadata)
+            if not tuple_metadata.get("terminal_verify_tuple_success"):
+                raise RuntimeError(str(tuple_metadata.get("terminal_verify_tuple_error")))
+            verify_rows[3] = [1 for _ in exec_seqs]
         except Exception as exc:
             trace_record["result_finalization_success"] = False
             trace_record["result_finalization_error"] = str(exc)
-            trace_record["result_finalization_error_kind"] = "evaluator_return_after_breadth_only_completion"
-            trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["result_finalization_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["terminal_verify_tuple_attempted"] = True
+            trace_record["terminal_verify_tuple_success"] = False
+            trace_record["terminal_verify_tuple_error"] = str(exc)
+            trace_record["terminal_verify_tuple_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["evaluator_return_attempted"] = True
+            trace_record["evaluator_return_success"] = False
+            trace_record["evaluator_return_error"] = str(exc)
+            trace_record["evaluator_return_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["next_required_feature"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
             raise RuntimeError(
-                f"{exc}; next_required_feature=evaluator_return_after_breadth_only_completion"
+                f"{exc}; next_required_feature=terminal_verify_tuple_partial_accept_after_breadth_only"
             ) from exc
         self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
         self._finalize_v4s_scheduler_state(exec_seqs, list(metadata.get("finalized_seq_ids") or []))
+        trace_record["evaluator_return_attempted"] = True
+        trace_record["evaluator_return_success"] = True
+        trace_record["evaluator_return_error"] = None
+        trace_record["evaluator_return_error_kind"] = None
         trace_record["result_finalization_success"] = True
         trace_record["result_finalization_error"] = None
         trace_record["result_finalization_error_kind"] = None
@@ -1505,19 +1523,52 @@ class ModelRunnerBase:
                 f"next_required_feature={next_feature}"
             )
         try:
-            verify_rows = self._build_v4t_active_verify_rows(exec_seqs, commit_result)
+            verify_rows, tuple_metadata = self._build_v4t_active_verify_rows(exec_seqs, commit_result)
+            trace_record.update(tuple_metadata)
+            if not tuple_metadata.get("terminal_verify_tuple_success"):
+                next_feature = tuple_metadata.get("next_required_feature") or "terminal_verify_tuple_partial_accept_after_breadth_only"
+                trace_record["active_continuation_success"] = False
+                trace_record["active_continuation_error"] = tuple_metadata.get("terminal_verify_tuple_error")
+                trace_record["active_continuation_error_kind"] = tuple_metadata.get("terminal_verify_tuple_error_kind")
+                trace_record["active_request_continuation_error"] = tuple_metadata.get("terminal_verify_tuple_error")
+                trace_record["active_request_continuation_error_kind"] = tuple_metadata.get("terminal_verify_tuple_error_kind")
+                trace_record["evaluator_return_attempted"] = True
+                trace_record["evaluator_return_success"] = False
+                trace_record["evaluator_return_error"] = tuple_metadata.get("terminal_verify_tuple_error")
+                trace_record["evaluator_return_error_kind"] = tuple_metadata.get("terminal_verify_tuple_error_kind")
+                trace_record["next_required_feature"] = next_feature
+                raise RuntimeError(
+                    f"{tuple_metadata.get('terminal_verify_tuple_error')}; next_required_feature={next_feature}"
+                )
         except Exception as exc:
+            if trace_record.get("next_required_feature") in {
+                "terminal_verify_tuple_partial_accept_after_breadth_only",
+                "draft_verify_receiver_partial_accept_after_breadth_only",
+            }:
+                raise
             trace_record["active_continuation_success"] = False
             trace_record["active_continuation_error"] = str(exc)
-            trace_record["active_continuation_error_kind"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["active_continuation_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
             trace_record["active_request_continuation_error"] = str(exc)
-            trace_record["active_request_continuation_error_kind"] = "evaluator_return_after_breadth_only_completion"
-            trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
+            trace_record["active_request_continuation_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["terminal_verify_tuple_attempted"] = True
+            trace_record["terminal_verify_tuple_success"] = False
+            trace_record["terminal_verify_tuple_error"] = str(exc)
+            trace_record["terminal_verify_tuple_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["evaluator_return_attempted"] = True
+            trace_record["evaluator_return_success"] = False
+            trace_record["evaluator_return_error"] = str(exc)
+            trace_record["evaluator_return_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            trace_record["next_required_feature"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
             raise RuntimeError(
-                f"{exc}; next_required_feature=evaluator_return_after_breadth_only_completion"
+                f"{exc}; next_required_feature=terminal_verify_tuple_partial_accept_after_breadth_only"
             ) from exc
         self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
         self.stspec_active_continuation_step_count += 1
+        trace_record["evaluator_return_attempted"] = True
+        trace_record["evaluator_return_success"] = True
+        trace_record["evaluator_return_error"] = None
+        trace_record["evaluator_return_error_kind"] = None
         trace_record["result_finalization_error"] = None
         trace_record["result_finalization_error_kind"] = None
         trace_record["active_continuation_success"] = True
