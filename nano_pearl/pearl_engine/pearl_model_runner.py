@@ -2076,9 +2076,11 @@ class ModelRunnerBase:
             msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             if self.rank == self.global_config.target_config.master_rank and verify_rows is not None:
-                verify_res = torch.tensor(verify_rows, dtype=torch.int64, device="cuda")
+                verify_rows_with_ids = list(verify_rows)
+                verify_rows_with_ids.append([int(seq.seq_id) for seq in exec_seqs])
+                verify_res = torch.tensor(verify_rows_with_ids, dtype=torch.int64, device="cuda")
             else:
-                verify_res = torch.zeros((4, len(exec_seqs)), dtype=torch.int64, device="cuda")
+                verify_res = torch.zeros((5, len(exec_seqs)), dtype=torch.int64, device="cuda")
             dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             trace_record["v4s_terminal_verify_broadcast_success"] = True
             trace_record["v4s_terminal_verify_broadcast_error"] = None
@@ -5622,11 +5624,21 @@ class DraftModelRunner(ModelRunnerBase):
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
         
-        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        verify_res = torch.zeros((5, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
-        
+
         # post-process the seqs according to the verify_res.
-        acc, rollout, revise_token, finish = verify_res.tolist()
+        # V4AB: extract seq_ids from row 4 for seq_id-based routing
+        verify_flat = verify_res.tolist()
+        acc = verify_flat[0]
+        rollout = verify_flat[1]
+        revise_token = verify_flat[2]
+        finish = verify_flat[3]
+        verify_seq_ids = verify_flat[4] if len(verify_flat) > 4 else []
+        # V4AB: build seq_id-based lookup for correction routing
+        seq_by_id = {int(s.seq_id): s for s in self.scheduler.running}
+        for s in self.scheduler.finished:
+            seq_by_id[int(s.seq_id)] = s
         if self._pearl_protocol_enabled():
             verify_message = self._encode_verify_protocol_message(
                 seqs=seqs,
@@ -5648,40 +5660,54 @@ class DraftModelRunner(ModelRunnerBase):
             acc, rollout, revise_token, finish = self._decode_verify_protocol_message(verify_message)
         accepted_lens = {}
         invalidated_lens = {}
-        for idx, seq in enumerate(seqs):
-            was_pre_verify = seq.pre_verify
+        # V4AB: apply corrections by seq_id from the broadcast, not by position
+        for idx in range(len(verify_seq_ids)):
+            target_seq_id = int(verify_seq_ids[idx])
+            target_seq = seq_by_id.get(target_seq_id)
+            if target_seq is None:
+                continue
+            was_pre_verify = target_seq.pre_verify
             accepted_len = 1 if was_pre_verify and acc[idx] else 0
             if not was_pre_verify:
                 accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
             invalidated_len = 0 if acc[idx] else rollout[idx]
-            accepted_lens[seq.seq_id] = accepted_len
-            invalidated_lens[seq.seq_id] = invalidated_len
-            seq.record_accepted(accepted_len)
-            seq.record_invalidated_predraft(invalidated_len)
+            accepted_lens[target_seq_id] = accepted_len
+            invalidated_lens[target_seq_id] = invalidated_len
+            target_seq.record_accepted(accepted_len)
+            target_seq.record_invalidated_predraft(invalidated_len)
 
             if finish[idx]:
-                seq.mark_finished()
-                self.scheduler.block_manager.deallocate(seq)
-                self.scheduler.running.remove(seq)
-                self.scheduler.finished.append(seq)
+                target_seq.mark_finished()
+                self.scheduler.block_manager.deallocate(target_seq)
+                self.scheduler.running.remove(target_seq)
+                self.scheduler.finished.append(target_seq)
                 continue
-            
-            if seq.pre_verify:
+
+            if target_seq.pre_verify:
                 if acc[idx]:
-                    seq.pre_verify = False
+                    target_seq.pre_verify = False
                 else:
-                    seq.pre_verify = True
-                    self.scheduler.rollback(seq, self.gamma)
-                    seq.append_token(revise_token[idx])
+                    target_seq.pre_verify = True
+                    self.scheduler.rollback(target_seq, self.gamma)
+                    token = int(revise_token[idx]) if idx < len(revise_token) else None
+                    if token is not None:
+                        target_seq.append_token(token)
             else:
                 if acc[idx]:
-                    seq.pre_verify = False
+                    target_seq.pre_verify = False
                 else:
-                    seq.pre_verify = True
-                    self.scheduler.rollback(seq, self.gamma)
+                    target_seq.pre_verify = True
+                    self.scheduler.rollback(target_seq, self.gamma)
                     if rollout[idx] > 1:
-                        self.scheduler.rollback(seq, rollout[idx] - 1)
-                    seq.append_token(revise_token[idx])
+                        self.scheduler.rollback(target_seq, rollout[idx] - 1)
+                    token = int(revise_token[idx]) if idx < len(revise_token) else None
+                    if token is not None:
+                        target_seq.append_token(token)
+        # Also update accepted_lens for draft-side exec_seqs (for return value compatibility)
+        for seq in seqs:
+            if seq.seq_id not in accepted_lens:
+                accepted_lens[seq.seq_id] = accepted_lens.get(seq.seq_id, 0)
+                invalidated_lens[seq.seq_id] = invalidated_lens.get(seq.seq_id, 0)
         return accepted_lens, invalidated_lens
 
 
@@ -5800,7 +5826,7 @@ class TargetModelRunner(ModelRunnerBase):
             self._validate_and_trace_pearl_protocol(trace_record, draft_message, [seq.seq_id for seq in seqs])
             to_be_verified_tokens, next_round_input = self._decode_draft_protocol_message(draft_message)
         
-        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        verify_res = torch.zeros((5, len(seqs)), dtype=torch.int64, device="cuda")
 
         if self.tp_params.local_rank == 0:
             r = torch.rand(num_to_be_verified_tokens, device="cuda")
@@ -5851,12 +5877,17 @@ class TargetModelRunner(ModelRunnerBase):
                     
                 v_idx += 1 if seq.pre_verify else self.gamma
         
-            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
-        
+            verify_seq_ids = [int(seq.seq_id) for seq in seqs]
+            verify_res = torch.tensor([acc, rollout, revise_token, finish, verify_seq_ids], dtype=torch.int64, device="cuda")
+
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
 
         # post-process the seqs according to the verify_res.
-        acc, rollout, revise_token, finish = verify_res.tolist()
+        verify_flat = verify_res.tolist()
+        acc = verify_flat[0]
+        rollout = verify_flat[1]
+        revise_token = verify_flat[2]
+        finish = verify_flat[3]
         if self._pearl_protocol_enabled():
             verify_message = self._encode_verify_protocol_message(
                 seqs=seqs,
