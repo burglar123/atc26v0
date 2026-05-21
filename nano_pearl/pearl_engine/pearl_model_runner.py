@@ -403,11 +403,15 @@ class ModelRunnerBase:
         self.active_execution_mode = execution_mode
 
     def _schedule_with_plan(self, runner_role: str):
+        skip_batch_flip = (
+            getattr(self, "stspec_active_continuation_step_count", 0) > 0
+        )
         return self.scheduler.schedule_with_plan(
             runner_role=runner_role,
             execution_mode=self.active_execution_mode,
             decode_ready_mode=self.active_decode_ready_mode,
             default_gamma=self.gamma,
+            skip_batch_flip=skip_batch_flip,
         )
 
     def _trace_schedule(
@@ -2892,6 +2896,7 @@ class ModelRunnerBase:
         output,
     ) -> bool:
         if not self._v4s_real_probe_finalization_mode(step_plan):
+            reset_v4t_active_continuation_runner_state(self)
             return False
         if not bool(getattr(output, "output_owner", False)):
             return False
@@ -2921,6 +2926,7 @@ class ModelRunnerBase:
         )
         trace_record["active_continuation_plan_id"] = getattr(commit_result, "next_pipeline_plan_id", None)
         if not metadata.get("active_continuation_attempted"):
+            reset_v4t_active_continuation_runner_state(self)
             return False
         if no_progress:
             trace_record["active_continuation_success"] = False
@@ -2932,6 +2938,7 @@ class ModelRunnerBase:
             trace_record["active_request_continuation_error"] = trace_record["active_continuation_error"]
             trace_record["active_request_continuation_error_kind"] = "active_request_continuation_no_progress"
             trace_record["next_required_feature"] = "active_request_continuation_no_progress"
+            reset_v4t_active_continuation_runner_state(self)
             raise RuntimeError(
                 f"V4T active request continuation failed; error={trace_record['active_continuation_error']}; "
                 "next_required_feature=active_request_continuation_no_progress"
@@ -2956,6 +2963,7 @@ class ModelRunnerBase:
             trace_record["active_continuation_error_kind"] = next_feature
             trace_record["active_request_continuation_error"] = error
             trace_record["active_request_continuation_error_kind"] = next_feature
+            reset_v4t_active_continuation_runner_state(self)
             raise RuntimeError(
                 f"V4T active request continuation failed; error={error}; "
                 f"next_required_feature={next_feature}"
@@ -2975,6 +2983,7 @@ class ModelRunnerBase:
                 trace_record["evaluator_return_error"] = tuple_metadata.get("terminal_verify_tuple_error")
                 trace_record["evaluator_return_error_kind"] = tuple_metadata.get("terminal_verify_tuple_error_kind")
                 trace_record["next_required_feature"] = next_feature
+                reset_v4t_active_continuation_runner_state(self)
                 raise RuntimeError(
                     f"{tuple_metadata.get('terminal_verify_tuple_error')}; next_required_feature={next_feature}"
                 )
@@ -2998,6 +3007,7 @@ class ModelRunnerBase:
             trace_record["evaluator_return_error"] = str(exc)
             trace_record["evaluator_return_error_kind"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
             trace_record["next_required_feature"] = "terminal_verify_tuple_partial_accept_after_breadth_only"
+            reset_v4t_active_continuation_runner_state(self)
             raise RuntimeError(
                 f"{exc}; next_required_feature=terminal_verify_tuple_partial_accept_after_breadth_only"
             ) from exc
@@ -3613,6 +3623,7 @@ class ModelRunnerBase:
                 )
             self._record_v4x_pending_corrections(commit_result, trace_record)
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
+                reset_v4t_active_continuation_runner_state(self)
                 return True
             current_next_required = (
                 trace_record.get("next_required_feature")
@@ -3632,6 +3643,7 @@ class ModelRunnerBase:
                 trace_record["next_required_feature"] = "evaluator_return_after_breadth_only_completion"
             message = "mailbox verify guarded commit probe reached next explicit diagnostic"
             trace_record["mailbox_verify_commit_error"] = message
+            reset_v4t_active_continuation_runner_state(self)
             raise RuntimeError(f"{message}; next_required_feature={trace_record['next_required_feature']}")
         except MailboxVerifyApplyError as exc:
             trace_record["mailbox_verify_commit_attempted"] = True
@@ -3642,6 +3654,7 @@ class ModelRunnerBase:
                 trace_record["kv_commit_error"] = str(exc)
                 trace_record["kv_commit_error_kind"] = exc.error_kind
             trace_record["next_required_feature"] = exc.next_required_feature
+            reset_v4t_active_continuation_runner_state(self)
             raise RuntimeError(str(exc)) from exc
         return False
 

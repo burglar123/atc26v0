@@ -117,6 +117,7 @@ class Scheduler:
         execution_mode: str,
         decode_ready_mode: bool,
         default_gamma: int,
+        skip_batch_flip: bool = False,
     ) -> tuple[list[Sequence], bool, StepPlan]:
         """Return the legacy schedule plus a scaffold StepPlan.
 
@@ -144,7 +145,8 @@ class Scheduler:
             pipeline_state = self.stspec_pipeline.state_for_next_decode(target_home_batch_id, draft_home_batch_id)
             self.current_target_home_batch_id = target_home_batch_id
             self.current_draft_home_batch_id = draft_home_batch_id
-            self.two_batch_shadow_step += 1
+            if not skip_batch_flip:
+                self.two_batch_shadow_step += 1
             self.stspec_pipeline.advance_after_decode()
         step_plan = build_legacy_step_plan(
             plan_id=plan_id,
