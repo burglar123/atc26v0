@@ -81,6 +81,7 @@ V4W_ZERO_ACCEPT_CORRECTION_PRIORITY = (
 )
 
 V4W_NEXT_STEP_PREFIX_PRIORITY = (
+    "active_request_continuation_next_prefix_source_stale",
     "active_request_continuation_target_correction_not_in_next_prefix",
     "active_request_continuation_target_draft_prefix_divergence",
     "active_request_continuation_kv_state_mismatch",
@@ -320,6 +321,10 @@ def build_v4w_next_step_prefix_diagnostics(progress_history: Iterable[JsonDict])
         next_kv_lens = _as_dict_mapping(next_item.get("kv_length_before_after_by_seq"))
         next_positions = _as_list_mapping(next_item.get("position_ids_by_seq"))
         next_slot_prefix_lens = _as_int_mapping(next_item.get("slot_mapping_prefix_len_by_seq"))
+        next_source_stale_by_seq = _as_bool_mapping(next_item.get("next_prefix_source_stale_by_seq"))
+        next_source_by_seq = _as_dict_mapping(next_item.get("next_prefix_source_by_seq"))
+        next_source_object_ids_by_seq = _as_int_mapping(next_item.get("next_prefix_source_object_id_by_seq"))
+        committed_object_ids_by_seq = _as_int_mapping(item.get("committed_sequence_object_id_by_seq"))
         for seq_id in _zero_accept_corrected_seq_ids(item):
             correction_tokens = [int(token) for token in corrections.get(seq_id, [])]
             current_after_tokens = [
@@ -357,9 +362,13 @@ def build_v4w_next_step_prefix_diagnostics(progress_history: Iterable[JsonDict])
             position_mismatch = bool(positions and min(positions) < current_after_len)
             slot_prefix_len = next_slot_prefix_lens.get(seq_id)
             slot_mismatch = bool(slot_prefix_len is not None and int(slot_prefix_len or 0) < current_after_len)
+            source_stale = bool(next_source_stale_by_seq.get(seq_id, False))
             feature = None
             reason = "next_prefix_aligned"
-            if not contains_correction:
+            if source_stale:
+                feature = "active_request_continuation_next_prefix_source_stale"
+                reason = "next_prefix_source_stale"
+            elif not contains_correction:
                 feature = "active_request_continuation_target_correction_not_in_next_prefix"
                 reason = "target_correction_not_in_next_prefix"
             elif draft_divergence:
@@ -386,6 +395,10 @@ def build_v4w_next_step_prefix_diagnostics(progress_history: Iterable[JsonDict])
                 "current_step_sequence_token_ids_after": current_after_tokens,
                 "next_step_prefix_token_ids": next_before_tokens,
                 "next_step_prefix_len": next_before_len,
+                "next_step_prefix_source": next_source_by_seq.get(seq_id) or {},
+                "next_step_prefix_source_object_id": next_source_object_ids_by_seq.get(seq_id),
+                "committed_sequence_object_id": committed_object_ids_by_seq.get(seq_id),
+                "next_prefix_source_stale": source_stale,
                 "next_step_contains_correction": contains_correction,
                 "target_draft_prefix_divergence": draft_divergence,
                 "kv_state_mismatch": kv_mismatch,
@@ -415,6 +428,13 @@ def build_v4w_next_step_prefix_diagnostics(progress_history: Iterable[JsonDict])
         "active_continuation_next_step_prefix_token_ids_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_token_ids"),
         "active_continuation_next_step_prefix_len_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_len"),
         "active_continuation_next_step_contains_correction_by_step": _group_v4w_rows_by_step(rows, "next_step_contains_correction"),
+        "active_continuation_next_prefix_source_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_source"),
+        "active_continuation_next_prefix_source_object_id_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_source_object_id"),
+        "active_continuation_committed_sequence_object_id_by_step": _group_v4w_rows_by_step(rows, "committed_sequence_object_id"),
+        "active_continuation_next_prefix_source_stale": any(
+            row.get("next_required_feature") == "active_request_continuation_next_prefix_source_stale"
+            for row in rows
+        ),
         "active_continuation_target_correction_not_in_next_prefix": any(
             row.get("next_required_feature") == "active_request_continuation_target_correction_not_in_next_prefix"
             for row in rows

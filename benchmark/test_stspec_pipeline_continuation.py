@@ -372,6 +372,13 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_slot_mapping_mismatch",
         "active_continuation_scheduler_sequence_state_mismatch",
         "active_continuation_next_step_prefix_source_by_step",
+        "active_continuation_next_prefix_source_by_step",
+        "active_continuation_next_prefix_source_object_id_by_step",
+        "active_continuation_committed_sequence_object_id_by_step",
+        "active_continuation_next_prefix_source_stale",
+        "active_continuation_target_correction_sync_attempted",
+        "active_continuation_target_correction_sync_success",
+        "active_continuation_target_correction_double_append",
         "active_continuation_target_prefix_token_ids_by_step",
         "active_continuation_draft_prefix_token_ids_by_step",
         "active_continuation_target_correction_available_by_step",
@@ -629,6 +636,23 @@ def test_correction_committed_but_missing_from_next_prefix_is_specific():
     assert diagnostic["active_continuation_target_correction_not_in_next_prefix"] is True
 
 
+def test_stale_next_prefix_source_is_more_specific_than_missing_correction():
+    diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(committed_sequence_object_id_by_seq={"1": 1001}),
+        _next_prefix_progress_item(
+            sequence_token_ids_before_after_by_seq={"1": {"before": [7, 101], "after": [7, 101, 222]}},
+            next_prefix_source_stale_by_seq={"1": True},
+            next_prefix_source_by_seq={"1": {"source": "target_exec_sequence", "plan_id": 12}},
+            next_prefix_source_object_id_by_seq={"1": 2002},
+        ),
+    ])
+    assert diagnostic["selected_next_required_feature"] == "active_request_continuation_next_prefix_source_stale"
+    assert diagnostic["active_continuation_next_prefix_source_stale"] is True
+    assert diagnostic["active_continuation_next_prefix_source_by_step"][0]["values"]["1"]["source"] == "target_exec_sequence"
+    assert diagnostic["active_continuation_next_prefix_source_object_id_by_step"][0]["values"] == {"1": 2002}
+    assert diagnostic["active_continuation_committed_sequence_object_id_by_step"][0]["values"] == {"1": 1001}
+
+
 def test_target_draft_prefix_divergence_is_specific():
     diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
         _zero_accept_progress_item(),
@@ -670,6 +694,12 @@ def test_runner_has_guarded_v4x_pending_correction_propagation():
     assert "self._record_v4x_pending_corrections(commit_result, trace_record)" in source
     assert "target_pending_correction_prefix" in source
     assert "active_request_continuation_scheduler_sequence_state_mismatch" in source
+    prepare_start = source.index("def _prepare_stspec_mailbox_route")
+    input_build = source.index("verification_input = build_verification_input_from_mailbox_payload", prepare_start)
+    early_propagation = source.index("self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)", prepare_start)
+    assert early_propagation < input_build
+    assert "active_request_continuation_next_prefix_source_stale" in source
+    assert "active_request_continuation_target_correction_double_append" in source
 
 
 def main() -> None:
@@ -701,6 +731,7 @@ def main() -> None:
     test_zero_accept_correction_shadow_wrong_rollback_and_export_diagnostics()
     test_zero_accept_correction_committed_allows_acceptance_fallback()
     test_correction_committed_but_missing_from_next_prefix_is_specific()
+    test_stale_next_prefix_source_is_more_specific_than_missing_correction()
     test_target_draft_prefix_divergence_is_specific()
     test_prefix_and_kv_mismatch_are_specific()
     test_next_prefix_aligned_allows_acceptance_fallback()

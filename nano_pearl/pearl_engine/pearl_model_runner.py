@@ -723,6 +723,13 @@ class ModelRunnerBase:
             "active_continuation_slot_mapping_mismatch": False,
             "active_continuation_scheduler_sequence_state_mismatch": False,
             "active_continuation_next_step_prefix_source_by_step": {},
+            "active_continuation_next_prefix_source_by_step": [],
+            "active_continuation_next_prefix_source_object_id_by_step": [],
+            "active_continuation_committed_sequence_object_id_by_step": [],
+            "active_continuation_next_prefix_source_stale": False,
+            "active_continuation_target_correction_sync_attempted": False,
+            "active_continuation_target_correction_sync_success": False,
+            "active_continuation_target_correction_double_append": False,
             "active_continuation_target_prefix_token_ids_by_step": {},
             "active_continuation_draft_prefix_token_ids_by_step": {},
             "active_continuation_pending_correction_prefix_by_seq": {},
@@ -1626,10 +1633,13 @@ class ModelRunnerBase:
         pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
         if not pending:
             return
+        trace_record["active_continuation_target_correction_sync_attempted"] = True
         seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
         applied: dict[str, dict] = {}
         inherited: dict[str, dict] = {}
         mismatches: dict[str, dict] = {}
+        stale_sources: dict[str, dict] = {}
+        double_appends: dict[str, dict] = {}
         remaining: dict[int, dict] = {}
         for seq_id, info in pending.items():
             seq_id = int(seq_id)
@@ -1642,12 +1652,25 @@ class ModelRunnerBase:
                 continue
             current_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
             expected_prefix = [int(token) for token in list(info.get("sequence_token_ids_after") or [])]
+            seq_object_id = id(seq)
+            if (
+                expected_prefix
+                and current_tokens == expected_prefix + tokens
+            ):
+                double_appends[str(seq_id)] = {
+                    "source_plan_id": info.get("source_plan_id"),
+                    "correction_token_ids": tokens,
+                    "sequence_object_id": seq_object_id,
+                }
+                remaining[seq_id] = info
+                continue
             if expected_prefix and current_tokens[: len(expected_prefix)] == expected_prefix:
                 inherited[str(seq_id)] = {
                     "source_plan_id": info.get("source_plan_id"),
                     "correction_token_ids": tokens,
                     "prefix_len": len(current_tokens),
                     "source": "target_sequence",
+                    "sequence_object_id": seq_object_id,
                 }
                 continue
             if current_tokens[-len(tokens):] == tokens:
@@ -1656,6 +1679,7 @@ class ModelRunnerBase:
                     "correction_token_ids": tokens,
                     "prefix_len": len(current_tokens),
                     "source": "target_sequence_suffix",
+                    "sequence_object_id": seq_object_id,
                 }
                 continue
             request_id = info.get("request_id")
@@ -1671,29 +1695,71 @@ class ModelRunnerBase:
             for token in tokens:
                 seq.append_token(int(token))
             after_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+            if expected_prefix and after_tokens[: len(expected_prefix)] != expected_prefix:
+                stale_sources[str(seq_id)] = {
+                    "source_plan_id": info.get("source_plan_id"),
+                    "correction_token_ids": tokens,
+                    "expected_prefix_len": len(expected_prefix),
+                    "actual_prefix_len": len(after_tokens),
+                    "sequence_object_id": seq_object_id,
+                }
             applied[str(seq_id)] = {
                 "source_plan_id": info.get("source_plan_id"),
                 "correction_token_ids": tokens,
                 "prefix_len_before": before_len,
                 "prefix_len_after": len(after_tokens),
                 "source": "target_pending_correction_prefix",
+                "sequence_object_id": seq_object_id,
             }
         self.stspec_active_continuation_pending_corrections = remaining
-        if applied or inherited or mismatches:
+        if applied or inherited or mismatches or stale_sources or double_appends:
+            trace_record["active_continuation_target_correction_sync_success"] = bool(
+                (applied or inherited) and not mismatches and not stale_sources and not double_appends
+            )
             trace_record["active_continuation_next_step_prefix_source_by_step"] = {
                 "plan_id": getattr(step_plan, "plan_id", None),
                 "applied": applied,
                 "inherited": inherited,
                 "mismatches": mismatches,
+                "stale_sources": stale_sources,
+                "double_appends": double_appends,
             }
+            trace_record["active_continuation_next_prefix_source_by_step"] = [
+                {
+                    "step_count": getattr(self, "stspec_active_continuation_step_count", 0) + 1,
+                    "plan_id": getattr(step_plan, "plan_id", None),
+                    "values": {
+                        **{seq_id: info for seq_id, info in applied.items()},
+                        **{seq_id: info for seq_id, info in inherited.items()},
+                    },
+                }
+            ]
+            trace_record["active_continuation_next_prefix_source_object_id_by_step"] = [
+                {
+                    "step_count": getattr(self, "stspec_active_continuation_step_count", 0) + 1,
+                    "plan_id": getattr(step_plan, "plan_id", None),
+                    "values": {
+                        seq_id: info.get("sequence_object_id")
+                        for seq_id, info in {**applied, **inherited}.items()
+                    },
+                }
+            ]
             trace_record["active_continuation_target_prefix_token_ids_by_step"] = {
                 str(seq.seq_id): list(getattr(seq, "token_ids", []) or [])
                 for seq in exec_seqs
                 if int(seq.seq_id) in {int(key) for key in list(applied) + list(inherited)}
             }
+            trace_record["active_continuation_next_prefix_source_stale"] = bool(stale_sources)
+            trace_record["active_continuation_target_correction_double_append"] = bool(double_appends)
         if mismatches:
             trace_record["active_continuation_scheduler_sequence_state_mismatch"] = True
             trace_record["next_required_feature"] = "active_request_continuation_scheduler_sequence_state_mismatch"
+        if stale_sources:
+            trace_record["active_continuation_next_prefix_source_stale"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_next_prefix_source_stale"
+        if double_appends:
+            trace_record["active_continuation_target_correction_double_append"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_target_correction_double_append"
 
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
@@ -1950,8 +2016,13 @@ class ModelRunnerBase:
         completion_token_export_missing_by_seq: dict[int, bool] = {}
         target_correction_commit_attempted_by_seq: dict[int, bool] = {}
         sequence_object_identity_by_seq: dict[int, int | None] = {}
+        next_prefix_source_by_seq: dict[int, dict] = {}
+        next_prefix_source_object_id_by_seq: dict[int, int | None] = {}
+        committed_sequence_object_id_by_seq: dict[int, int | None] = {}
+        next_prefix_source_stale_by_seq: dict[int, bool] = {}
         completion_token_len_before_after_by_seq: dict[int, dict[str, int]] = {}
         service_metadata_num_output_tokens_before_after_by_seq: dict[int, dict[str, int | None]] = {}
+        pending_corrections = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
         for raw_seq_id, raw_tokens in target_correction_token_ids_by_seq.items():
             seq_id = int(raw_seq_id)
             correction_tokens = [int(token) for token in list(raw_tokens or [])]
@@ -1987,6 +2058,7 @@ class ModelRunnerBase:
             completion_token_ids_by_seq[seq_id] = list(current_completion_tokens)
             current_output_len = int(getattr(seq, "num_completion_tokens", 0) or 0) if seq is not None else 0
             sequence_object_identity_by_seq[seq_id] = id(seq) if seq is not None else None
+            committed_sequence_object_id_by_seq[seq_id] = id(seq) if seq is not None else None
             completion_token_len_before_after_by_seq[seq_id] = {
                 "before": before_output_len,
                 "after": len(current_completion_tokens),
@@ -2031,6 +2103,19 @@ class ModelRunnerBase:
             target_correction_rolled_back_by_seq[seq_id] = rolled_back
             output_snapshot_mismatch_by_seq[seq_id] = output_snapshot_mismatch
             completion_token_export_missing_by_seq[seq_id] = export_missing
+        for seq_id, seq in seq_by_id.items():
+            source_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+            pending_info = pending_corrections.get(seq_id) or pending_corrections.get(str(seq_id)) or {}
+            expected_prefix = [int(token) for token in list(pending_info.get("sequence_token_ids_after") or [])]
+            next_prefix_source_by_seq[seq_id] = {
+                "source": "target_exec_sequence",
+                "plan_id": int(getattr(step_plan, "plan_id", 0) or 0),
+                "prefix_len": len(source_tokens),
+            }
+            next_prefix_source_object_id_by_seq[seq_id] = id(seq)
+            next_prefix_source_stale_by_seq[seq_id] = bool(
+                expected_prefix and source_tokens[: len(expected_prefix)] != expected_prefix
+            )
         rejected_lengths = {
             int(key): len(value or [])
             for key, value in rejected_token_ids_by_seq.items()
@@ -2111,6 +2196,18 @@ class ModelRunnerBase:
             },
             "sequence_object_identity_by_seq": {
                 str(key): value for key, value in sequence_object_identity_by_seq.items()
+            },
+            "next_prefix_source_by_seq": {
+                str(key): value for key, value in next_prefix_source_by_seq.items()
+            },
+            "next_prefix_source_object_id_by_seq": {
+                str(key): value for key, value in next_prefix_source_object_id_by_seq.items()
+            },
+            "committed_sequence_object_id_by_seq": {
+                str(key): value for key, value in committed_sequence_object_id_by_seq.items()
+            },
+            "next_prefix_source_stale_by_seq": {
+                str(key): value for key, value in next_prefix_source_stale_by_seq.items()
             },
             "completion_token_len_before_after_by_seq": {
                 str(key): value for key, value in completion_token_len_before_after_by_seq.items()
@@ -2397,7 +2494,17 @@ class ModelRunnerBase:
         trace_record["active_continuation_next_step_contains_correction_by_step"] = list(
             next_prefix_diagnostic.get("active_continuation_next_step_contains_correction_by_step") or []
         )
+        trace_record["active_continuation_next_prefix_source_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_prefix_source_by_step") or []
+        )
+        trace_record["active_continuation_next_prefix_source_object_id_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_prefix_source_object_id_by_step") or []
+        )
+        trace_record["active_continuation_committed_sequence_object_id_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_committed_sequence_object_id_by_step") or []
+        )
         for key in (
+            "active_continuation_next_prefix_source_stale",
             "active_continuation_target_correction_not_in_next_prefix",
             "active_continuation_target_draft_prefix_divergence",
             "active_continuation_kv_state_mismatch",
@@ -2596,7 +2703,17 @@ class ModelRunnerBase:
         trace_record["active_continuation_next_step_contains_correction_by_step"] = list(
             next_prefix_diagnostic.get("active_continuation_next_step_contains_correction_by_step") or []
         )
+        trace_record["active_continuation_next_prefix_source_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_prefix_source_by_step") or []
+        )
+        trace_record["active_continuation_next_prefix_source_object_id_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_prefix_source_object_id_by_step") or []
+        )
+        trace_record["active_continuation_committed_sequence_object_id_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_committed_sequence_object_id_by_step") or []
+        )
         for key in (
+            "active_continuation_next_prefix_source_stale",
             "active_continuation_target_correction_not_in_next_prefix",
             "active_continuation_target_draft_prefix_divergence",
             "active_continuation_kv_state_mismatch",
@@ -2941,6 +3058,16 @@ class ModelRunnerBase:
             raise RuntimeError(
                 "active continuation scheduler/sequence state mismatch while propagating target correction; "
                 "next_required_feature=active_request_continuation_scheduler_sequence_state_mismatch"
+            )
+        if trace_record.get("active_continuation_next_prefix_source_stale"):
+            raise RuntimeError(
+                "active continuation next-step prefix source is stale while propagating target correction; "
+                "next_required_feature=active_request_continuation_next_prefix_source_stale"
+            )
+        if trace_record.get("active_continuation_target_correction_double_append"):
+            raise RuntimeError(
+                "active continuation target correction would be double-appended; "
+                "next_required_feature=active_request_continuation_target_correction_double_append"
             )
 
         if scheduled_seq_ids != actual_target_exec_seq_ids and input_seq_ids == scheduled_seq_ids:
@@ -3566,6 +3693,23 @@ class ModelRunnerBase:
         trace_record["target_tp_skipped_non_owner"] = False
         trace_record["mailbox_payload_owner_rank"] = target_tp_role.owner_rank
         trace_record["mailbox_payload_current_rank"] = target_tp_role.current_rank
+        if exec_seqs is not None:
+            self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)
+            if trace_record.get("active_continuation_scheduler_sequence_state_mismatch"):
+                raise RuntimeError(
+                    "active continuation scheduler/sequence state mismatch while propagating target correction; "
+                    "next_required_feature=active_request_continuation_scheduler_sequence_state_mismatch"
+                )
+            if trace_record.get("active_continuation_next_prefix_source_stale"):
+                raise RuntimeError(
+                    "active continuation next-step prefix source is stale while propagating target correction; "
+                    "next_required_feature=active_request_continuation_next_prefix_source_stale"
+                )
+            if trace_record.get("active_continuation_target_correction_double_append"):
+                raise RuntimeError(
+                    "active continuation target correction would be double-appended; "
+                    "next_required_feature=active_request_continuation_target_correction_double_append"
+                )
         if (
             step_plan.stspec_pipeline_phase == STSpecPipelinePhase.STEADY_STATE.value
             and step_plan.target_home_batch_id not in self.stspec_mailbox.available_home_batch_ids()
