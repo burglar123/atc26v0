@@ -1009,6 +1009,13 @@ class ModelRunnerBase:
             "active_continuation_draft_generated_before_correction_sync": False,
             "active_continuation_draft_prefix_stale_at_generation": False,
             "active_continuation_acceptance_too_low_after_real_comparator_checked": False,
+            # V4AA: correction sync to draft side baseline
+            "active_continuation_draft_correction_sync_required_by_step": False,
+            "active_continuation_draft_correction_sync_attempted_by_step": False,
+            "active_continuation_draft_correction_sync_success_by_step": False,
+            "active_continuation_draft_generation_blocked_pending_correction": False,
+            "active_continuation_draft_kv_refresh_required": False,
+            "active_continuation_target_correction_double_append": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1700,6 +1707,12 @@ class ModelRunnerBase:
                 trace_record["active_continuation_batch_lock_acquired_by_step"] = int(
                     getattr(self, "stspec_active_continuation_step_count", 0) or 0
                 ) + 1
+            # V4AA: push pending corrections to scheduler for draft-side sync
+            scheduler_pending = dict(getattr(self.scheduler, "stspec_pending_corrections", {}) or {})
+            for seq_id, info in recorded.items():
+                scheduler_pending[int(seq_id)] = dict(info)
+            self.scheduler.stspec_pending_corrections = scheduler_pending
+            trace_record["active_continuation_draft_correction_sync_required_by_step"] = bool(recorded)
         if recorded:
             trace_record["active_continuation_pending_correction_prefix_by_seq"] = recorded
             trace_record["active_continuation_pending_correction_home_batch_ids_by_step"] = sorted({
@@ -1909,6 +1922,47 @@ class ModelRunnerBase:
         trace_record["active_continuation_schedule_forced_target_home_batch_id"] = (
             getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None)
         )
+
+    def _sync_v4aa_pending_corrections_before_draft(self) -> None:
+        """V4AA: sync target-side pending corrections to draft-side sequences.
+
+        Called at the beginning of DraftModelRunner.pearl_step(), before the gamma
+        generation loop. Reads pending corrections from the scheduler and applies
+        them to the draft runner's local Sequence objects.
+        """
+        pending = dict(getattr(self.scheduler, "stspec_pending_corrections", {}) or {})
+        if not pending:
+            return
+        applied_count = 0
+        skipped_double = 0
+        skipped_missing = 0
+        for seq_id, info in list(pending.items()):
+            seq_id = int(seq_id)
+            tokens = [int(t) for t in (info.get("correction_token_ids") or [])]
+            if not tokens:
+                continue
+            seq = None
+            for s in self.scheduler.running:
+                if int(s.seq_id) == seq_id:
+                    seq = s
+                    break
+            if seq is None:
+                for s in self.scheduler.finished:
+                    if int(s.seq_id) == seq_id:
+                        seq = s
+                        break
+            if seq is None:
+                skipped_missing += 1
+                continue
+            current_tokens = [int(t) for t in (getattr(seq, "token_ids", []) or [])]
+            if current_tokens[-len(tokens):] == tokens:
+                skipped_double += 1
+                continue
+            for token in tokens:
+                seq.append_token(int(token))
+            applied_count += 1
+        if applied_count > 0 or skipped_double > 0:
+            self.scheduler.stspec_pending_corrections.clear()
 
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
@@ -5395,6 +5449,8 @@ class DraftModelRunner(ModelRunnerBase):
         return super().prepare_decode(seqs)
     
     def pearl_step(self):
+        # V4AA: sync pending target corrections to draft side BEFORE generation
+        self._sync_v4aa_pending_corrections_before_draft()
         trace_record = None
         for _ in range(self.gamma):
             seqs, is_prefill, step_plan = self._schedule_with_plan("draft")

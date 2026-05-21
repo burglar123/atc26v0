@@ -41,6 +41,9 @@ class Scheduler:
         # callers (draft and target) must respect this lock.
         self.stspec_batch_lock_home_batch_id: int | None = None
         self.stspec_batch_lock_reason: str | None = None
+        # V4AA: pending correction sync from target to draft side.
+        # target runner pushes corrections here; draft runner pops them before generation.
+        self.stspec_pending_corrections: dict[int, dict] = {}
         self.enable_stspec_two_batch_execution = bool(
             getattr(config, "enable_stspec_two_batch_execution", False)
         )
@@ -215,6 +218,7 @@ class Scheduler:
         self.current_draft_home_batch_id = 1
         self.stspec_batch_lock_home_batch_id = None
         self.stspec_batch_lock_reason = None
+        self.stspec_pending_corrections.clear()
         self.stspec_pipeline.clear()
         self.block_manager.hash_to_block_id.clear()
         for block in self.block_manager.blocks:
