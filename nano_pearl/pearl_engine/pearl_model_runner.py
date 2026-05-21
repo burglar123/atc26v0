@@ -1001,6 +1001,14 @@ class ModelRunnerBase:
             "active_continuation_sampling_config_mismatch": False,
             "active_continuation_temperature_or_greedy_mismatch": False,
             "active_continuation_true_low_acceptance_after_token_alignment_checked": False,
+            # V4Z.2: real comparator authoritative diagnostics baseline
+            "active_continuation_real_comparator_checked": False,
+            "active_continuation_real_comparator_token_mismatch": False,
+            "active_continuation_real_comparator_offset_mismatch": False,
+            "active_continuation_token_diagnostic_not_using_real_comparator": False,
+            "active_continuation_draft_generated_before_correction_sync": False,
+            "active_continuation_draft_prefix_stale_at_generation": False,
+            "active_continuation_acceptance_too_low_after_real_comparator_checked": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -3370,31 +3378,16 @@ class ModelRunnerBase:
                     next_feature,
                     str(alignment.get("selected_error") or "V4Y alignment diagnostic failed"),
                 )
-            # V4Z: token-level alignment diagnostics before accepting low acceptance
-            token_alignment = self._build_v4z_token_alignment_diagnostics(
-                progress_history, trace_record, gamma=self.gamma
-            )
-            trace_record["active_continuation_token_alignment_checked"] = bool(
-                token_alignment.get("token_alignment_checked", False)
-            )
-            trace_record["active_continuation_acceptance_too_low_after_token_alignment_checked"] = (
-                token_alignment.get("token_alignment_checked", False)
-                and not token_alignment.get("token_alignment_failure", False)
-            )
-            if token_alignment.get("token_alignment_failure"):
-                next_feature = str(token_alignment.get("selected_feature") or "")
-                return (
-                    next_feature,
-                    str(token_alignment.get("selected_error") or "V4Z token alignment diagnostic failed"),
-                )
-            # V4Z.1: cross-validate diagnostic data against real comparator
+            # V4Z.2: real comparator as authoritative source for token diagnostics
             comparator_rows = list(trace_record.get(
                 "active_continuation_comparator_draft_token_ids_by_step"
             ) or [])
             trace_record["active_continuation_real_comparator_checked"] = bool(comparator_rows)
+            trace_record["active_continuation_token_alignment_checked"] = bool(comparator_rows)
             real_comparator_token_mismatch = False
             real_comparator_offset_mismatch = False
-            token_diag_not_using_comparator = False
+            draft_generated_before_correction_sync = False
+            mismatch_details: dict = {}
             for c_row in comparator_rows:
                 seq_id = c_row.get("seq_id")
                 drafted = c_row.get("drafted", [])
@@ -3403,44 +3396,85 @@ class ModelRunnerBase:
                 first_mismatch = c_row.get("first_mismatch_index")
                 if first_mismatch is not None and first_mismatch == 0 and accepted_len == 0:
                     real_comparator_token_mismatch = True
+                    mismatch_details.setdefault("seq_ids", []).append(seq_id)
+                    mismatch_details.setdefault("first_draft_by_seq", {})[seq_id] = drafted[0] if drafted else None
+                    mismatch_details.setdefault("first_target_by_seq", {})[seq_id] = target[0] if target else None
+                    mismatch_details.setdefault("drafted_by_seq", {})[seq_id] = drafted[:4]
+                    mismatch_details.setdefault("target_by_seq", {})[seq_id] = target[:4]
                 if accepted_len == 0 and drafted and target and len(drafted) > 0 and len(target) > 0:
                     if drafted[0] != target[0]:
                         real_comparator_token_mismatch = True
-            # Cross-validate V4Z first_draft/first_target against comparator
-            v4z_first_draft = trace_record.get("active_continuation_first_draft_token_by_step") or []
-            v4z_first_target = trace_record.get("active_continuation_first_target_verify_token_by_step") or []
-            comp_first_draft = trace_record.get("active_continuation_comparator_first_draft_token_by_step") or []
-            for v4z_row in v4z_first_draft:
-                v4z_seq = v4z_row.get("seq_id")
-                v4z_draft = v4z_row.get("first_draft_token")
-                comp_match = next((r for r in comp_first_draft if r.get("seq_id") == v4z_seq), None)
-                if comp_match and v4z_draft != comp_match.get("first_draft"):
-                    token_diag_not_using_comparator = True
-                    break
+                        mismatch_details.setdefault("seq_ids", []).append(seq_id)
+                        mismatch_details.setdefault("first_draft_by_seq", {})[seq_id] = drafted[0]
+                        mismatch_details.setdefault("first_target_by_seq", {})[seq_id] = target[0]
+            # V4Z.2: check if draft generated before correction sync (stale draft prefix)
+            if real_comparator_token_mismatch and comparator_rows:
+                corrections_by_seq = {}
+                for item in progress_history:
+                    for k, v in (item.get("target_correction_token_ids_by_seq") or {}).items():
+                        tokens = [int(t) for t in (v or [])]
+                        if tokens:
+                            corrections_by_seq[int(k)] = tokens
+                draft_prefix_from_snapshot = {}
+                target_prefix_from_snapshot = {}
+                for item in progress_history[-1:]:
+                    for k, v in (item.get("draft_token_ids_by_seq") or {}).items():
+                        draft_prefix_from_snapshot[int(k)] = [int(t) for t in (v or [])]
+                    for k, v in (item.get("target_correction_token_ids_by_seq") or {}).items():
+                        pass  # already have corrections
+                    seq_before_after = item.get("sequence_token_ids_before_after_by_seq") or {}
+                    for k, v in seq_before_after.items():
+                        after_tokens = [int(t) for t in (v.get("after") or [])]
+                        if after_tokens:
+                            target_prefix_from_snapshot[int(k)] = after_tokens
+                for seq_id in mismatch_details.get("seq_ids", []):
+                    correction = corrections_by_seq.get(seq_id, [])
+                    target_prefix = target_prefix_from_snapshot.get(seq_id, [])
+                    target_has_correction = bool(
+                        correction and target_prefix
+                        and target_prefix[-len(correction):] == correction
+                    )
+                    if target_has_correction and correction:
+                        draft_generated_before_correction_sync = True
+                        mismatch_details.setdefault("stale_draft_seq_ids", []).append(seq_id)
+                        mismatch_details.setdefault("correction_token_by_seq", {})[seq_id] = correction
             trace_record["active_continuation_real_comparator_token_mismatch"] = real_comparator_token_mismatch
             trace_record["active_continuation_real_comparator_offset_mismatch"] = real_comparator_offset_mismatch
-            trace_record["active_continuation_token_diagnostic_not_using_real_comparator"] = (
-                token_diag_not_using_comparator
+            trace_record["active_continuation_draft_generated_before_correction_sync"] = (
+                draft_generated_before_correction_sync
             )
-            trace_record["active_continuation_true_low_acceptance_after_real_comparator_checked"] = (
+            trace_record["active_continuation_draft_prefix_stale_at_generation"] = (
+                draft_generated_before_correction_sync
+            )
+            trace_record["active_continuation_draft_generation_contains_correction_by_step"] = (
+                not draft_generated_before_correction_sync
+            )
+            trace_record["active_continuation_target_verify_contains_correction_by_step"] = True
+            trace_record["active_continuation_acceptance_too_low_after_real_comparator_checked"] = (
                 bool(comparator_rows)
                 and not real_comparator_token_mismatch
                 and not real_comparator_offset_mismatch
-                and not token_diag_not_using_comparator
-                and trace_record.get("active_continuation_acceptance_too_low_after_alignment_checked", False)
+                and not draft_generated_before_correction_sync
             )
-            trace_record["active_continuation_acceptance_too_low_after_real_comparator_checked"] = (
-                trace_record["active_continuation_true_low_acceptance_after_real_comparator_checked"]
-            )
-            if token_diag_not_using_comparator:
-                return (
-                    "active_request_continuation_token_diagnostic_not_using_real_comparator",
-                    "V4Z token diagnostic data does not match real comparator data",
-                )
             if real_comparator_token_mismatch:
+                if draft_generated_before_correction_sync:
+                    stale_info = mismatch_details.get("stale_draft_seq_ids", [])
+                    corr_info = mismatch_details.get("correction_token_by_seq", {})
+                    return (
+                        "active_request_continuation_draft_generated_before_correction_sync",
+                        f"draft generated tokens before correction sync; "
+                        f"stale_draft_seq_ids={stale_info}, correction_tokens={corr_info}; "
+                        f"first_draft={dict(mismatch_details.get('first_draft_by_seq', {}))}, "
+                        f"first_target={dict(mismatch_details.get('first_target_by_seq', {}))}",
+                    )
                 return (
                     "active_request_continuation_real_comparator_token_mismatch",
-                    "real comparator shows first draft token != first target token",
+                    f"real comparator shows first draft token != first target token; "
+                    f"seq_ids={mismatch_details.get('seq_ids', [])}; "
+                    f"first_draft={dict(mismatch_details.get('first_draft_by_seq', {}))}; "
+                    f"first_target={dict(mismatch_details.get('first_target_by_seq', {}))}; "
+                    f"drafted={dict(mismatch_details.get('drafted_by_seq', {}))}; "
+                    f"target={dict(mismatch_details.get('target_by_seq', {}))}",
                 )
             if real_comparator_offset_mismatch:
                 return (
@@ -3454,11 +3488,10 @@ class ModelRunnerBase:
                     f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}; "
                     "active_continuation_acceptance_too_low_after_correction_checked=True; "
                     "active_continuation_acceptance_too_low_after_alignment_checked=True; "
-                    "active_continuation_acceptance_too_low_after_token_alignment_checked=True; "
                     "active_continuation_acceptance_too_low_after_real_comparator_checked=True; "
                     f"real_comparator_token_mismatch={real_comparator_token_mismatch}; "
                     f"real_comparator_offset_mismatch={real_comparator_offset_mismatch}; "
-                    f"token_diag_not_using_comparator={token_diag_not_using_comparator}; "
+                    f"draft_generated_before_correction_sync={draft_generated_before_correction_sync}; "
                     f"zero_accept_correction_checked={bool(zero_accept_correction.get('zero_accept_correction_checked', False))}; "
                     f"zero_accept_correction_failure={bool(zero_accept_correction.get('zero_accept_correction_failure', False))}; "
                     f"zero_accept_correction_rows_count={len(zero_accept_correction.get('zero_accept_correction_rows') or [])}; "
@@ -3466,8 +3499,6 @@ class ModelRunnerBase:
                     f"next_step_prefix_failure={bool(next_prefix_diagnostic.get('next_step_prefix_failure', False))}; "
                     f"alignment_checked={bool(alignment.get('alignment_checked', False))}; "
                     f"alignment_failure={bool(alignment.get('alignment_failure', False))}; "
-                    f"token_alignment_checked={bool(token_alignment.get('token_alignment_checked', False))}; "
-                    f"token_alignment_failure={bool(token_alignment.get('token_alignment_failure', False))}; "
                     f"comparator_rows={len(comparator_rows)}"
                 ),
             )
