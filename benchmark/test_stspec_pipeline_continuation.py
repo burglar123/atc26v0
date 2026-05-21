@@ -379,6 +379,29 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_target_correction_sync_attempted",
         "active_continuation_target_correction_sync_success",
         "active_continuation_target_correction_double_append",
+        "active_continuation_pre_draft_correction_sync_checked",
+        "active_continuation_draft_forward_started_after_sync",
+        "active_continuation_draft_forward_started_before_sync",
+        "active_continuation_correction_sync_message_sent_by_target",
+        "active_continuation_correction_sync_message_seq_ids",
+        "active_continuation_correction_sync_message_token_ids",
+        "active_continuation_correction_sync_message_plan_id",
+        "active_continuation_correction_sync_message_step_id",
+        "active_continuation_correction_sync_message_received_by_draft",
+        "active_continuation_correction_sync_apply_attempted",
+        "active_continuation_correction_sync_apply_success",
+        "active_continuation_correction_sync_ack_sent",
+        "active_continuation_correction_sync_ack_received",
+        "active_continuation_cross_runner_correction_sync_missing",
+        "active_continuation_cross_runner_correction_sync_ordering_violation",
+        "active_continuation_draft_sync_seq_not_found",
+        "active_continuation_draft_correction_apply_failed",
+        "active_continuation_batch_lock_released_before_draft_sync_ack",
+        "active_continuation_wrong_rank_consumed_correction",
+        "active_continuation_stale_correction_sync_message",
+        "active_continuation_draft_prefix_before_sync_by_step",
+        "active_continuation_draft_prefix_after_sync_by_step",
+        "active_continuation_draft_generation_allowed_after_sync",
         "active_continuation_target_prefix_token_ids_by_step",
         "active_continuation_draft_prefix_token_ids_by_step",
         "active_continuation_target_correction_available_by_step",
@@ -702,6 +725,37 @@ def test_runner_has_guarded_v4x_pending_correction_propagation():
     assert "active_request_continuation_target_correction_double_append" in source
 
 
+def test_v4ad_pre_draft_correction_sync_barrier_precedes_draft_forward():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    draft_start = source.index("class DraftModelRunner")
+    draft_pearl = source.index("def pearl_step(self):", draft_start)
+    draft_verify = source.index("def serialized_pearl_step", draft_pearl)
+    draft_pearl_source = source[draft_pearl:draft_verify]
+    barrier = "self._v4ad_pre_draft_correction_sync_barrier()"
+    prepare_decode = "input_ids, positions = self.prepare_pearl_decode(exec_seqs)"
+    run_model = "logits = self.run_model(input_ids, positions, is_prefill)"
+    assert barrier in draft_pearl_source
+    assert draft_pearl_source.index(barrier) < draft_pearl_source.index(prepare_decode)
+    assert draft_pearl_source.index(barrier) < draft_pearl_source.index(run_model)
+    assert "self._sync_v4aa_pending_corrections_before_draft()" not in draft_pearl_source
+    assert "active_continuation_draft_forward_started_after_sync" in draft_pearl_source
+    assert "active_continuation_draft_forward_started_before_sync" in draft_pearl_source
+
+
+def test_v4ad_uses_verify_group_broadcast_and_draft_ack():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    sync_source = source[source.index("def _v4ad_pre_draft_correction_sync_barrier"):]
+    assert "dist.broadcast(message, src=self.global_config.target_config.master_rank, group=self.verify_group)" in sync_source
+    assert "dist.broadcast(ack, src=self.global_config.draft_config.master_rank, group=self.verify_group)" in sync_source
+    assert "active_request_continuation_draft_sync_seq_not_found" in sync_source
+    assert "active_request_continuation_draft_correction_apply_failed" in sync_source
+    assert "self.stspec_active_continuation_pending_corrections = {}" in sync_source
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -736,6 +790,8 @@ def main() -> None:
     test_prefix_and_kv_mismatch_are_specific()
     test_next_prefix_aligned_allows_acceptance_fallback()
     test_runner_has_guarded_v4x_pending_correction_propagation()
+    test_v4ad_pre_draft_correction_sync_barrier_precedes_draft_forward()
+    test_v4ad_uses_verify_group_broadcast_and_draft_ack()
 
 
 if __name__ == "__main__":

@@ -1028,6 +1028,30 @@ class ModelRunnerBase:
             "active_continuation_correction_sync_not_visible_to_draft": False,
             "active_continuation_cross_runner_correction_sync_attempted": False,
             "active_continuation_cross_runner_correction_sync_success": False,
+            # V4AD: real pre-draft correction-sync barrier diagnostics
+            "active_continuation_pre_draft_correction_sync_checked": False,
+            "active_continuation_draft_forward_started_after_sync": False,
+            "active_continuation_draft_forward_started_before_sync": False,
+            "active_continuation_correction_sync_message_sent_by_target": False,
+            "active_continuation_correction_sync_message_seq_ids": [],
+            "active_continuation_correction_sync_message_token_ids": {},
+            "active_continuation_correction_sync_message_plan_id": None,
+            "active_continuation_correction_sync_message_step_id": None,
+            "active_continuation_correction_sync_message_received_by_draft": False,
+            "active_continuation_correction_sync_apply_attempted": False,
+            "active_continuation_correction_sync_apply_success": False,
+            "active_continuation_correction_sync_ack_sent": False,
+            "active_continuation_correction_sync_ack_received": False,
+            "active_continuation_cross_runner_correction_sync_missing": False,
+            "active_continuation_cross_runner_correction_sync_ordering_violation": False,
+            "active_continuation_draft_sync_seq_not_found": False,
+            "active_continuation_draft_correction_apply_failed": False,
+            "active_continuation_batch_lock_released_before_draft_sync_ack": False,
+            "active_continuation_wrong_rank_consumed_correction": False,
+            "active_continuation_stale_correction_sync_message": False,
+            "active_continuation_draft_prefix_before_sync_by_step": {},
+            "active_continuation_draft_prefix_after_sync_by_step": {},
+            "active_continuation_draft_generation_allowed_after_sync": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1297,6 +1321,29 @@ class ModelRunnerBase:
             "active_continuation_plan_id",
             "active_request_continuation_error",
             "active_request_continuation_error_kind",
+            "active_continuation_pre_draft_correction_sync_checked",
+            "active_continuation_draft_forward_started_after_sync",
+            "active_continuation_draft_forward_started_before_sync",
+            "active_continuation_correction_sync_message_sent_by_target",
+            "active_continuation_correction_sync_message_seq_ids",
+            "active_continuation_correction_sync_message_token_ids",
+            "active_continuation_correction_sync_message_plan_id",
+            "active_continuation_correction_sync_message_step_id",
+            "active_continuation_correction_sync_message_received_by_draft",
+            "active_continuation_correction_sync_apply_attempted",
+            "active_continuation_correction_sync_apply_success",
+            "active_continuation_correction_sync_ack_sent",
+            "active_continuation_correction_sync_ack_received",
+            "active_continuation_cross_runner_correction_sync_missing",
+            "active_continuation_cross_runner_correction_sync_ordering_violation",
+            "active_continuation_draft_sync_seq_not_found",
+            "active_continuation_draft_correction_apply_failed",
+            "active_continuation_batch_lock_released_before_draft_sync_ack",
+            "active_continuation_wrong_rank_consumed_correction",
+            "active_continuation_stale_correction_sync_message",
+            "active_continuation_draft_prefix_before_sync_by_step",
+            "active_continuation_draft_prefix_after_sync_by_step",
+            "active_continuation_draft_generation_allowed_after_sync",
             "finalized_after_active_continuation",
             "second_step_rollback_attempted",
             "second_step_rollback_success",
@@ -1743,6 +1790,8 @@ class ModelRunnerBase:
                                 "seq_id": v["seq_id"],
                                 "correction_token_ids": v["correction_token_ids"],
                                 "source_plan_id": v.get("source_plan_id"),
+                                "prefix_len_after": v.get("prefix_len_after"),
+                                "sequence_token_ids_after": v.get("sequence_token_ids_after"),
                             }
                             for k, v in recorded.items()
                         },
@@ -1992,6 +2041,8 @@ class ModelRunnerBase:
                         "seq_id": v.get("seq_id"),
                         "correction_token_ids": v.get("correction_token_ids", []),
                         "source_plan_id": v.get("source_plan_id"),
+                        "prefix_len_after": v.get("prefix_len_after"),
+                        "sequence_token_ids_after": v.get("sequence_token_ids_after"),
                     }
                 _os.remove(sync_path)
         except Exception:
@@ -2036,6 +2087,278 @@ class ModelRunnerBase:
             applied_count += 1
         if applied_count > 0 or skipped_double > 0:
             self.scheduler.stspec_pending_corrections.clear()
+
+    def _v4ad_pre_draft_sync_enabled(self) -> bool:
+        return bool(
+            getattr(self.global_config, "enable_stspec_two_batch_execution", False)
+            and not getattr(self.global_config, "stspec_two_batch_dryrun", True)
+            and getattr(self.global_config, "stspec_two_batch_probe", False)
+            and getattr(self.global_config, "stspec_mailbox_commit_probe", False)
+            and getattr(self.global_config, "stspec_continue_after_mailbox_commit", False)
+            and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
+    def _v4ad_is_draft_rank(self) -> bool:
+        return int(self.rank) in {int(rank) for rank in list(getattr(self.global_config.draft_config, "devices", []) or [])}
+
+    def _v4ad_is_target_rank(self) -> bool:
+        return int(self.rank) in {int(rank) for rank in list(getattr(self.global_config.target_config, "devices", []) or [])}
+
+    def _v4ad_sync_tensor_shape(self) -> tuple[int, int, int]:
+        max_entries = max(1, int(getattr(self.scheduler, "max_num_seqs", 1) or 1))
+        max_tokens = max(1, int(self.gamma or 1))
+        entry_width = 4 + max_tokens
+        return max_entries, max_tokens, 8 + max_entries * entry_width
+
+    def _v4ad_build_correction_sync_tensor(self) -> torch.Tensor:
+        max_entries, max_tokens, tensor_len = self._v4ad_sync_tensor_shape()
+        tensor = torch.zeros(tensor_len, dtype=torch.int64, device="cuda")
+        if int(self.rank) != int(self.global_config.target_config.master_rank):
+            return tensor
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        tensor[0] = 7401
+        tensor[1] = 1
+        tensor[2] = min(len(pending), max_entries)
+        tensor[3] = int(getattr(self, "stspec_active_continuation_step_count", 0) or 0)
+        tensor[4] = 1 if len(pending) > max_entries else 0
+        entry_width = 4 + max_tokens
+        for index, (seq_id, info) in enumerate(sorted(pending.items(), key=lambda item: int(item[0]))[:max_entries]):
+            tokens = [int(token) for token in list(info.get("correction_token_ids") or [])][:max_tokens]
+            offset = 8 + index * entry_width
+            tensor[offset] = int(seq_id)
+            tensor[offset + 1] = len(tokens)
+            tensor[offset + 2] = int(info.get("prefix_len_after") or 0)
+            tensor[offset + 3] = int(info.get("source_plan_id") or -1)
+            for token_index, token in enumerate(tokens):
+                tensor[offset + 4 + token_index] = int(token)
+        return tensor
+
+    def _v4ad_parse_correction_sync_tensor(self, tensor: torch.Tensor) -> list[dict]:
+        max_entries, max_tokens, _ = self._v4ad_sync_tensor_shape()
+        values = [int(value) for value in tensor.detach().cpu().tolist()]
+        if not values or values[0] != 7401:
+            return []
+        count = max(0, min(int(values[2]), max_entries))
+        entry_width = 4 + max_tokens
+        entries: list[dict] = []
+        for index in range(count):
+            offset = 8 + index * entry_width
+            seq_id = int(values[offset])
+            token_count = max(0, min(int(values[offset + 1]), max_tokens))
+            tokens = [int(token) for token in values[offset + 4 : offset + 4 + token_count]]
+            entries.append(
+                {
+                    "seq_id": seq_id,
+                    "correction_token_ids": tokens,
+                    "prefix_len_after": int(values[offset + 2]),
+                    "source_plan_id": int(values[offset + 3]),
+                    "step_id": int(values[3]),
+                }
+            )
+        return entries
+
+    def _v4ad_find_sequence(self, seq_id: int) -> Sequence | None:
+        for seq in list(self.scheduler.running) + list(self.scheduler.waiting) + list(self.scheduler.finished):
+            if int(seq.seq_id) == int(seq_id):
+                return seq
+        return None
+
+    def _v4ad_apply_correction_to_draft_sequence(self, seq: Sequence, entry: dict) -> tuple[bool, str, dict]:
+        tokens = [int(token) for token in list(entry.get("correction_token_ids") or [])]
+        if not tokens:
+            return True, "empty_correction", {}
+        prefix_len_after = int(entry.get("prefix_len_after") or 0)
+        prefix_len_before = max(prefix_len_after - len(tokens), 0)
+        before_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+        if len(before_tokens) >= prefix_len_after and before_tokens[prefix_len_after - len(tokens) : prefix_len_after] == tokens:
+            if len(before_tokens) > prefix_len_after:
+                self.scheduler.rollback(seq, len(before_tokens) - prefix_len_after)
+            seq.pre_verify = True
+            after_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+            return True, "already_applied", {"before": before_tokens, "after": after_tokens}
+        if len(before_tokens) < prefix_len_before:
+            return (
+                False,
+                "draft_prefix_shorter_than_target_correction_base",
+                {"before": before_tokens, "required_prefix_len": prefix_len_before},
+            )
+        if len(before_tokens) > prefix_len_before:
+            self.scheduler.rollback(seq, len(before_tokens) - prefix_len_before)
+        for token in tokens:
+            seq.append_token(int(token))
+        seq.pre_verify = True
+        after_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+        if prefix_len_after and len(after_tokens) != prefix_len_after:
+            return (
+                False,
+                "draft_prefix_len_after_sync_mismatch",
+                {"before": before_tokens, "after": after_tokens, "expected_prefix_len": prefix_len_after},
+            )
+        if after_tokens[-len(tokens):] != tokens:
+            return (
+                False,
+                "draft_correction_suffix_missing_after_apply",
+                {"before": before_tokens, "after": after_tokens, "correction_token_ids": tokens},
+            )
+        return True, "applied", {"before": before_tokens, "after": after_tokens}
+
+    def _v4ad_build_ack_tensor(self, entries: list[dict], statuses: dict[int, int]) -> torch.Tensor:
+        max_entries, _, tensor_len = self._v4ad_sync_tensor_shape()
+        tensor = torch.zeros(tensor_len, dtype=torch.int64, device="cuda")
+        if int(self.rank) != int(self.global_config.draft_config.master_rank):
+            return tensor
+        tensor[0] = 7402
+        tensor[1] = 1
+        tensor[2] = min(len(entries), max_entries)
+        tensor[3] = sum(1 for status in statuses.values() if int(status) > 0)
+        tensor[4] = sum(1 for status in statuses.values() if int(status) < 0)
+        entry_width = 4 + max(1, int(self.gamma or 1))
+        for index, entry in enumerate(entries[:max_entries]):
+            offset = 8 + index * entry_width
+            seq_id = int(entry.get("seq_id"))
+            tensor[offset] = seq_id
+            tensor[offset + 1] = int(statuses.get(seq_id, 0))
+            tensor[offset + 2] = int(entry.get("source_plan_id") or -1)
+        return tensor
+
+    def _v4ad_pre_draft_correction_sync_barrier(self) -> None:
+        if not self._v4ad_pre_draft_sync_enabled():
+            self.stspec_last_pre_draft_correction_sync_trace = {}
+            return
+        sync_trace: dict = {
+            "active_continuation_pre_draft_correction_sync_checked": True,
+            "active_continuation_cross_runner_correction_sync_attempted": True,
+            "active_continuation_correction_sync_message_sent_by_target": False,
+            "active_continuation_correction_sync_message_received_by_draft": False,
+            "active_continuation_correction_sync_apply_attempted": False,
+            "active_continuation_correction_sync_apply_success": False,
+            "active_continuation_correction_sync_ack_sent": False,
+            "active_continuation_correction_sync_ack_received": False,
+            "active_continuation_draft_generation_allowed_after_sync": False,
+            "active_continuation_draft_generation_blocked_pending_correction": False,
+            "active_continuation_cross_runner_correction_sync_missing": False,
+            "active_continuation_cross_runner_correction_sync_ordering_violation": False,
+            "active_continuation_draft_sync_seq_not_found": False,
+            "active_continuation_draft_correction_apply_failed": False,
+            "active_continuation_draft_kv_refresh_required": False,
+            "active_continuation_correction_sync_message_seq_ids": [],
+            "active_continuation_correction_sync_message_token_ids": {},
+            "active_continuation_draft_prefix_before_sync_by_step": {},
+            "active_continuation_draft_prefix_after_sync_by_step": {},
+        }
+        is_target = self._v4ad_is_target_rank()
+        is_draft = self._v4ad_is_draft_rank()
+        message = self._v4ad_build_correction_sync_tensor() if is_target else torch.zeros(
+            self._v4ad_sync_tensor_shape()[2],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        dist.broadcast(message, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        entries = self._v4ad_parse_correction_sync_tensor(message)
+        if entries:
+            sync_trace["active_continuation_correction_sync_message_seq_ids"] = [int(item["seq_id"]) for item in entries]
+            sync_trace["active_continuation_correction_sync_message_token_ids"] = {
+                str(item["seq_id"]): list(item.get("correction_token_ids") or [])
+                for item in entries
+            }
+            sync_trace["active_continuation_correction_sync_message_plan_id"] = entries[0].get("source_plan_id")
+            sync_trace["active_continuation_correction_sync_message_step_id"] = entries[0].get("step_id")
+        if is_target:
+            sync_trace["active_continuation_correction_sync_message_sent_by_target"] = bool(entries)
+        statuses: dict[int, int] = {}
+        apply_failures: dict[str, str] = {}
+        if is_draft:
+            sync_trace["active_continuation_correction_sync_message_received_by_draft"] = bool(entries)
+            sync_trace["active_continuation_correction_sync_apply_attempted"] = bool(entries)
+            for entry in entries:
+                seq_id = int(entry["seq_id"])
+                seq = self._v4ad_find_sequence(seq_id)
+                if seq is None:
+                    statuses[seq_id] = -1
+                    apply_failures[str(seq_id)] = "active_request_continuation_draft_sync_seq_not_found"
+                    sync_trace["active_continuation_draft_sync_seq_not_found"] = True
+                    continue
+                success, reason, detail = self._v4ad_apply_correction_to_draft_sequence(seq, entry)
+                sync_trace["active_continuation_draft_prefix_before_sync_by_step"][str(seq_id)] = detail.get("before", [])
+                sync_trace["active_continuation_draft_prefix_after_sync_by_step"][str(seq_id)] = detail.get(
+                    "after",
+                    list(getattr(seq, "token_ids", []) or []),
+                )
+                if success:
+                    statuses[seq_id] = 2 if reason == "already_applied" else 1
+                else:
+                    statuses[seq_id] = -2
+                    apply_failures[str(seq_id)] = reason
+                    sync_trace["active_continuation_draft_correction_apply_failed"] = True
+            sync_trace["active_continuation_correction_sync_apply_success"] = bool(
+                entries and statuses and all(status > 0 for status in statuses.values())
+            )
+            sync_trace["active_continuation_correction_sync_ack_sent"] = bool(entries)
+            sync_trace["active_continuation_cross_runner_correction_sync_success"] = bool(
+                not entries or sync_trace["active_continuation_correction_sync_apply_success"]
+            )
+            sync_trace["active_continuation_draft_generation_allowed_after_sync"] = bool(
+                not entries or sync_trace["active_continuation_correction_sync_apply_success"]
+            )
+        ack = self._v4ad_build_ack_tensor(entries, statuses)
+        dist.broadcast(ack, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        ack_values = [int(value) for value in ack.detach().cpu().tolist()]
+        if ack_values and ack_values[0] == 7402 and entries:
+            sync_trace["active_continuation_correction_sync_ack_received"] = True
+            ack_failure_count = int(ack_values[4])
+            if is_target and ack_failure_count == 0:
+                self.stspec_active_continuation_pending_corrections = {}
+                try:
+                    import os as _os, tempfile as _tempfile
+                    sync_path = _tempfile.gettempdir() + "/stspec_correction_sync.json"
+                    if _os.path.exists(sync_path):
+                        _os.remove(sync_path)
+                except Exception:
+                    pass
+                if getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None:
+                    self.scheduler.stspec_batch_lock_home_batch_id = None
+                    self.scheduler.stspec_batch_lock_reason = None
+            if ack_failure_count > 0:
+                sync_trace["active_continuation_cross_runner_correction_sync_success"] = False
+                if is_target:
+                    first_status = 0
+                    entry_width = 4 + max(1, int(self.gamma or 1))
+                    for index in range(min(len(entries), self._v4ad_sync_tensor_shape()[0])):
+                        first_status = int(ack_values[8 + index * entry_width + 1])
+                        if first_status < 0:
+                            break
+                    sync_trace["active_continuation_draft_generation_blocked_pending_correction"] = True
+                    if first_status == -1:
+                        sync_trace["active_continuation_draft_sync_seq_not_found"] = True
+                        sync_trace["next_required_feature"] = "active_request_continuation_draft_sync_seq_not_found"
+                    else:
+                        sync_trace["active_continuation_draft_correction_apply_failed"] = True
+                        sync_trace["next_required_feature"] = "active_request_continuation_draft_correction_apply_failed"
+        if entries and is_draft and not sync_trace["active_continuation_correction_sync_apply_success"]:
+            sync_trace["active_continuation_draft_generation_blocked_pending_correction"] = True
+            sync_trace["next_required_feature"] = (
+                "active_request_continuation_draft_sync_seq_not_found"
+                if sync_trace["active_continuation_draft_sync_seq_not_found"]
+                else "active_request_continuation_draft_correction_apply_failed"
+            )
+        elif entries and is_target and not sync_trace.get("active_continuation_correction_sync_ack_received"):
+            sync_trace["active_continuation_cross_runner_correction_sync_missing"] = True
+            sync_trace["next_required_feature"] = "active_request_continuation_cross_runner_correction_sync_missing"
+        self.stspec_last_pre_draft_correction_sync_trace = sync_trace
+        if sync_trace.get("next_required_feature"):
+            raise RuntimeError(
+                "V4AD pre-draft correction sync failed; "
+                f"next_required_feature={sync_trace['next_required_feature']}; "
+                f"apply_failures={apply_failures}"
+            )
+
+    def _attach_v4ad_pre_draft_sync_trace(self, trace_record: dict) -> None:
+        sync_trace = dict(getattr(self, "stspec_last_pre_draft_correction_sync_trace", {}) or {})
+        if not sync_trace:
+            return
+        trace_record.update(sync_trace)
 
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
@@ -5524,18 +5847,30 @@ class DraftModelRunner(ModelRunnerBase):
         return super().prepare_decode(seqs)
     
     def pearl_step(self):
-        # V4AA: sync pending target corrections to draft side BEFORE generation
-        self._sync_v4aa_pending_corrections_before_draft()
         trace_record = None
+        pre_draft_sync_checked = False
         for _ in range(self.gamma):
             seqs, is_prefill, step_plan = self._schedule_with_plan("draft")
             trace_record = self._trace_schedule(seqs, is_prefill, "draft", step_plan)
             exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "draft", trace_record)
             self._validate_stspec_probe_alignment(step_plan, "draft", trace_record)
+            if not pre_draft_sync_checked:
+                try:
+                    self._v4ad_pre_draft_correction_sync_barrier()
+                except RuntimeError:
+                    self._attach_v4ad_pre_draft_sync_trace(trace_record)
+                    raise
+                self._attach_v4ad_pre_draft_sync_trace(trace_record)
+                pre_draft_sync_checked = True
             self._prepare_stspec_mailbox_route(step_plan, "draft", trace_record, exec_seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(exec_seqs)
             torch.cuda.synchronize()
+            if trace_record.get("active_continuation_pre_draft_correction_sync_checked"):
+                trace_record["active_continuation_draft_forward_started_after_sync"] = bool(
+                    trace_record.get("active_continuation_draft_generation_allowed_after_sync", True)
+                )
+                trace_record["active_continuation_draft_forward_started_before_sync"] = False
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
             # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
@@ -5751,6 +6086,12 @@ class TargetModelRunner(ModelRunnerBase):
         trace_record = self._trace_schedule(seqs, is_prefill, "verify", step_plan)
         exec_seqs = self._select_exec_seqs_for_plan(seqs, step_plan, "verify", trace_record)
         self._validate_stspec_probe_alignment(step_plan, "verify", trace_record)
+        try:
+            self._v4ad_pre_draft_correction_sync_barrier()
+        except RuntimeError:
+            self._attach_v4ad_pre_draft_sync_trace(trace_record)
+            raise
+        self._attach_v4ad_pre_draft_sync_trace(trace_record)
         if self._prepare_stspec_mailbox_route(step_plan, "verify", trace_record, exec_seqs):
             self._mark_trace_end(trace_record)
             return
