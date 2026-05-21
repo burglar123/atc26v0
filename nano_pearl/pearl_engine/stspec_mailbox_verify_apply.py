@@ -76,6 +76,11 @@ def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_pending_corrections = {}
     runner.stspec_active_continuation_in_progress = False
     runner.stspec_active_continuation_reset_reason = None
+    # V4X.3: release scheduler batch lock on reset
+    scheduler = getattr(runner, "scheduler", None)
+    if scheduler is not None:
+        scheduler.stspec_batch_lock_home_batch_id = None
+        scheduler.stspec_batch_lock_reason = None
 
 
 V4W_ZERO_ACCEPT_CORRECTION_PRIORITY = (
