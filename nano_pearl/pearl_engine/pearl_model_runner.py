@@ -1016,6 +1016,18 @@ class ModelRunnerBase:
             "active_continuation_draft_generation_blocked_pending_correction": False,
             "active_continuation_draft_kv_refresh_required": False,
             "active_continuation_target_correction_double_append": False,
+            # V4AA.1: cross-process correction sync diagnostics
+            "active_continuation_target_pending_correction_written_by_rank": None,
+            "active_continuation_target_pending_correction_scheduler_object_id": None,
+            "active_continuation_target_pending_correction_seq_ids": [],
+            "active_continuation_target_pending_correction_token_ids": {},
+            "active_continuation_draft_sync_checked_by_rank": None,
+            "active_continuation_draft_sync_scheduler_object_id": None,
+            "active_continuation_draft_sync_visible_pending_seq_ids": [],
+            "active_continuation_draft_sync_visible_pending_token_ids": {},
+            "active_continuation_correction_sync_not_visible_to_draft": False,
+            "active_continuation_cross_runner_correction_sync_attempted": False,
+            "active_continuation_cross_runner_correction_sync_success": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1707,12 +1719,46 @@ class ModelRunnerBase:
                 trace_record["active_continuation_batch_lock_acquired_by_step"] = int(
                     getattr(self, "stspec_active_continuation_step_count", 0) or 0
                 ) + 1
-            # V4AA: push pending corrections to scheduler for draft-side sync
+            # V4AA.1: push pending corrections to scheduler AND cross-process file
             scheduler_pending = dict(getattr(self.scheduler, "stspec_pending_corrections", {}) or {})
             for seq_id, info in recorded.items():
                 scheduler_pending[int(seq_id)] = dict(info)
             self.scheduler.stspec_pending_corrections = scheduler_pending
+            trace_record["active_continuation_target_pending_correction_written_by_rank"] = int(self.rank)
+            trace_record["active_continuation_target_pending_correction_scheduler_object_id"] = id(self.scheduler)
+            trace_record["active_continuation_target_pending_correction_seq_ids"] = sorted(
+                int(k) for k in recorded.keys()
+            )
+            trace_record["active_continuation_target_pending_correction_token_ids"] = {
+                str(k): v.get("correction_token_ids") for k, v in recorded.items()
+            }
             trace_record["active_continuation_draft_correction_sync_required_by_step"] = bool(recorded)
+            # V4AA.1: write correction sync file for cross-process visibility
+            if recorded:
+                try:
+                    import json as _json, tempfile as _tempfile
+                    sync_data = {
+                        "pending_corrections": {
+                            str(k): {
+                                "seq_id": v["seq_id"],
+                                "correction_token_ids": v["correction_token_ids"],
+                                "source_plan_id": v.get("source_plan_id"),
+                            }
+                            for k, v in recorded.items()
+                        },
+                        "target_home_batch_id": locked_home_batch,
+                        "draft_home_batch_id": int(1 - locked_home_batch) if locked_home_batch >= 0 else None,
+                        "plan_id": getattr(plan, "plan_id", None),
+                    }
+                    sync_path = _tempfile.gettempdir() + "/stspec_correction_sync.json"
+                    with open(sync_path, "w") as f:
+                        _json.dump(sync_data, f)
+                    trace_record["active_continuation_cross_runner_correction_sync_attempted"] = True
+                    trace_record["active_continuation_cross_runner_correction_sync_success"] = True
+                except Exception as exc:
+                    trace_record["active_continuation_cross_runner_correction_sync_attempted"] = True
+                    trace_record["active_continuation_cross_runner_correction_sync_success"] = False
+                    trace_record["active_continuation_cross_runner_correction_sync_error"] = str(exc)
         if recorded:
             trace_record["active_continuation_pending_correction_prefix_by_seq"] = recorded
             trace_record["active_continuation_pending_correction_home_batch_ids_by_step"] = sorted({
@@ -1924,13 +1970,40 @@ class ModelRunnerBase:
         )
 
     def _sync_v4aa_pending_corrections_before_draft(self) -> None:
-        """V4AA: sync target-side pending corrections to draft-side sequences.
+        """V4AA.1: sync target-side pending corrections to draft-side sequences.
 
         Called at the beginning of DraftModelRunner.pearl_step(), before the gamma
-        generation loop. Reads pending corrections from the scheduler and applies
-        them to the draft runner's local Sequence objects.
+        generation loop. Reads pending corrections from the local scheduler AND
+        from the cross-process correction sync file.
         """
+        # Read from local scheduler (same-process fallback)
         pending = dict(getattr(self.scheduler, "stspec_pending_corrections", {}) or {})
+        # V4AA.1: also read from cross-process correction sync file
+        import json as _json, tempfile as _tempfile, os as _os
+        sync_path = _tempfile.gettempdir() + "/stspec_correction_sync.json"
+        file_pending: dict = {}
+        try:
+            if _os.path.exists(sync_path):
+                with open(sync_path, "r") as f:
+                    sync_data = _json.load(f)
+                raw = sync_data.get("pending_corrections", {}) or {}
+                for k, v in raw.items():
+                    file_pending[int(k)] = {
+                        "seq_id": v.get("seq_id"),
+                        "correction_token_ids": v.get("correction_token_ids", []),
+                        "source_plan_id": v.get("source_plan_id"),
+                    }
+                _os.remove(sync_path)
+        except Exception:
+            pass
+        # Merge: file data takes precedence over scheduler data
+        if file_pending:
+            for seq_id, info in file_pending.items():
+                pending[int(seq_id)] = info
+        # Diagnostic trace
+        trace_record = getattr(self, "trace_records", None)
+        if trace_record is not None:
+            pass  # trace_record handled per-step, not here
         if not pending:
             return
         applied_count = 0
