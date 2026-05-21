@@ -991,6 +991,16 @@ class ModelRunnerBase:
             "active_continuation_block_table_mismatch": False,
             "active_continuation_model_input_mismatch": False,
             "active_continuation_true_low_acceptance_after_alignment_checked": False,
+            # V4Z trace: token-level alignment diagnostics baseline
+            "active_continuation_token_alignment_checked": False,
+            "active_continuation_acceptance_too_low_after_token_alignment_checked": False,
+            "active_continuation_draft_target_token_mismatch": False,
+            "active_continuation_verify_token_offset_mismatch": False,
+            "active_continuation_target_token_source_mismatch": False,
+            "active_continuation_draft_payload_offset_mismatch": False,
+            "active_continuation_sampling_config_mismatch": False,
+            "active_continuation_temperature_or_greedy_mismatch": False,
+            "active_continuation_true_low_acceptance_after_token_alignment_checked": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -2119,6 +2129,7 @@ class ModelRunnerBase:
         accepted_token_ids_by_seq = dict(getattr(commit_plan, "accepted_token_ids_by_seq", {}) or {})
         target_correction_token_ids_by_seq = dict(getattr(commit_plan, "target_correction_token_ids_by_seq", {}) or {})
         drafted_token_ids_by_seq = dict(getattr(getattr(commit_result, "plan", None), "drafted_token_ids_by_seq", {}) or {})
+        target_token_ids_by_seq = dict(getattr(commit_plan, "target_token_ids_by_seq", {}) or {})
         seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
         sequence_state_before = getattr(commit_result, "sequence_state_before", {}) or {}
         sequence_state_after = getattr(commit_result, "sequence_state_after", {}) or {}
@@ -2351,6 +2362,9 @@ class ModelRunnerBase:
             },
             "draft_token_ids_by_seq": {
                 str(key): list(value or []) for key, value in drafted_token_ids_by_seq.items()
+            },
+            "target_token_ids_by_seq": {
+                str(key): list(value or []) for key, value in target_token_ids_by_seq.items()
             },
             "pending_payload_ids": pending_payload_ids,
             "consumed_payload_ids": consumed_payload_ids,
@@ -3007,6 +3021,183 @@ class ModelRunnerBase:
             "selected_error": selected_error,
         }
 
+    def _build_v4z_token_alignment_diagnostics(
+        self,
+        progress_history: list[dict],
+        trace_record: dict,
+        gamma: int,
+    ) -> dict:
+        """V4Z: token-level draft/target verification alignment diagnostics.
+
+        Checks per-seq, per-step: draft first token vs target verify token,
+        offsets, payload alignment, and sampling consistency.
+        """
+        rows: list[dict] = []
+        selected_feature: str | None = None
+        selected_error: str | None = None
+        for index, item in enumerate(progress_history):
+            step_count = int(item.get("step_count") or 0)
+            draft_tokens_by_seq = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (item.get("draft_token_ids_by_seq") or {}).items()
+            }
+            target_tokens_by_seq = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (item.get("target_token_ids_by_seq") or {}).items()
+            }
+            correction_tokens_by_seq = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (item.get("target_correction_token_ids_by_seq") or {}).items()
+            }
+            accepted_len_by_seq = {
+                int(k): int(v or 0)
+                for k, v in (item.get("accepted_len_by_seq") or {}).items()
+            }
+            expected_len_by_seq = {
+                int(k): int(v or 0)
+                for k, v in (item.get("expected_len_by_seq") or {}).items()
+            }
+            rejected_len_by_seq = {
+                int(k): int(v or 0)
+                for k, v in (item.get("rejected_len_by_seq") or {}).items()
+            }
+            for seq_id in sorted(set(correction_tokens_by_seq) | {k for k, v in accepted_len_by_seq.items() if v == 0}):
+                correction = correction_tokens_by_seq.get(seq_id, [])
+                accepted_len = accepted_len_by_seq.get(seq_id, 0)
+                rejected_len = rejected_len_by_seq.get(seq_id, 0)
+                expected_len = expected_len_by_seq.get(seq_id, gamma if rejected_len > 0 else 1)
+                draft_tokens = draft_tokens_by_seq.get(seq_id, [])
+                target_tokens = target_tokens_by_seq.get(seq_id, [])
+                first_draft = draft_tokens[0] if draft_tokens else None
+                first_target = target_tokens[accepted_len] if target_tokens and accepted_len < len(target_tokens) else (correction[0] if correction else None)
+                correction_token = correction[0] if correction else None
+
+                feature = None
+                reason = "token_alignment_clean"
+                # Check: draft first token vs target verify token
+                draft_target_token_mismatch = bool(
+                    first_draft is not None
+                    and first_target is not None
+                    and first_draft != first_target
+                    and accepted_len == 0
+                )
+                # Check: verify offset (accepted_len into target_tokens)
+                verify_offset_mismatch = bool(
+                    target_tokens
+                    and accepted_len >= len(target_tokens)
+                    and correction
+                )
+                # Check: target token source — correction should be at accepted_len in target_tokens
+                target_source_mismatch = bool(
+                    correction_token is not None
+                    and target_tokens
+                    and accepted_len < len(target_tokens)
+                    and target_tokens[accepted_len] != correction_token
+                )
+                # Check: draft payload offset — gamma tokens expected for non-pre-verify
+                draft_offset_mismatch = bool(
+                    expected_len > 0
+                    and len(draft_tokens) != expected_len
+                    and len(draft_tokens) > 0
+                )
+                # Check: variable_offsets — per_seq_length should match expected_len
+                variable_span_mismatch = bool(
+                    expected_len > 0
+                    and len(draft_tokens) > 0
+                    and len(draft_tokens) > expected_len
+                )
+
+                if draft_target_token_mismatch:
+                    feature = "active_request_continuation_draft_target_token_mismatch"
+                    reason = f"first_draft={first_draft}, first_target_verify={first_target}"
+                elif verify_offset_mismatch:
+                    feature = "active_request_continuation_verify_token_offset_mismatch"
+                    reason = f"accepted_len={accepted_len} >= target_len={len(target_tokens)}"
+                elif target_source_mismatch:
+                    feature = "active_request_continuation_target_token_source_mismatch"
+                    reason = f"target[{accepted_len}]={target_tokens[accepted_len] if accepted_len < len(target_tokens) else 'OOB'} != correction={correction_token}"
+                elif draft_offset_mismatch:
+                    feature = "active_request_continuation_draft_payload_offset_mismatch"
+                    reason = f"draft_len={len(draft_tokens)} != expected_len={expected_len}"
+                elif variable_span_mismatch:
+                    feature = "active_request_continuation_draft_payload_offset_mismatch"
+                    reason = f"variable_span: draft_len={len(draft_tokens)} > expected_len={expected_len}"
+
+                row = {
+                    "step_count": step_count,
+                    "seq_id": int(seq_id),
+                    "plan_id": int(item.get("plan_id") or 0),
+                    "home_batch_id": item.get("target_home_batch_id"),
+                    "accepted_len": accepted_len,
+                    "expected_len": expected_len,
+                    "rejected_len": rejected_len,
+                    "first_draft_token": first_draft,
+                    "first_target_verify_token": first_target,
+                    "correction_token": correction_token,
+                    "draft_token_ids": draft_tokens[:4],
+                    "target_token_ids": target_tokens[:4],
+                    "draft_payload_len": len(draft_tokens),
+                    "target_token_count": len(target_tokens),
+                    "draft_target_token_mismatch": draft_target_token_mismatch,
+                    "verify_token_offset_mismatch": verify_offset_mismatch,
+                    "target_token_source_mismatch": target_source_mismatch,
+                    "draft_payload_offset_mismatch": draft_offset_mismatch,
+                    "final_diagnostic_reason": reason,
+                    "next_required_feature": feature,
+                }
+                rows.append(row)
+                if feature is not None and selected_feature is None:
+                    selected_feature = feature
+                    selected_error = (
+                        f"V4Z token alignment diagnostic: {reason}; "
+                        f"seq_id={seq_id}, step_count={step_count}"
+                    )
+
+        trace_record["active_continuation_token_alignment_checked"] = bool(rows)
+        trace_record["active_continuation_token_alignment_rows"] = rows
+        for key in (
+            "active_continuation_draft_target_token_mismatch",
+            "active_continuation_verify_token_offset_mismatch",
+            "active_continuation_target_token_source_mismatch",
+            "active_continuation_draft_payload_offset_mismatch",
+            "active_continuation_sampling_config_mismatch",
+        ):
+            trace_record[key] = any(
+                row.get("next_required_feature") == key for row in rows
+            )
+        trace_record["active_continuation_true_low_acceptance_after_token_alignment_checked"] = (
+            bool(rows) and selected_feature is None
+        )
+        # Per-step trace
+        trace_record["active_continuation_first_draft_token_by_step"] = [
+            {"step_count": r["step_count"], "seq_id": r["seq_id"], "first_draft_token": r["first_draft_token"]}
+            for r in rows
+        ]
+        trace_record["active_continuation_first_target_verify_token_by_step"] = [
+            {"step_count": r["step_count"], "seq_id": r["seq_id"], "first_target_verify_token": r["first_target_verify_token"]}
+            for r in rows
+        ]
+        trace_record["active_continuation_first_mismatch_position_by_step"] = [
+            {"step_count": r["step_count"], "seq_id": r["seq_id"], "accepted_len": r["accepted_len"]}
+            for r in rows if r.get("draft_target_token_mismatch")
+        ]
+        trace_record["active_continuation_draft_payload_offset_by_step"] = [
+            {"step_count": r["step_count"], "seq_id": r["seq_id"], "draft_payload_len": r["draft_payload_len"], "expected_len": r["expected_len"]}
+            for r in rows
+        ]
+        trace_record["active_continuation_target_verify_offset_by_step"] = [
+            {"step_count": r["step_count"], "seq_id": r["seq_id"], "accepted_len": r["accepted_len"], "target_token_count": r["target_token_count"]}
+            for r in rows
+        ]
+
+        return {
+            "token_alignment_rows": rows,
+            "token_alignment_checked": bool(rows),
+            "token_alignment_failure": selected_feature is not None,
+            "selected_feature": selected_feature,
+            "selected_error": selected_error,
+        }
+
     def _classify_v4v_active_continuation_limit(
         self,
         trace_record: dict,
@@ -3179,6 +3370,23 @@ class ModelRunnerBase:
                     next_feature,
                     str(alignment.get("selected_error") or "V4Y alignment diagnostic failed"),
                 )
+            # V4Z: token-level alignment diagnostics before accepting low acceptance
+            token_alignment = self._build_v4z_token_alignment_diagnostics(
+                progress_history, trace_record, gamma=self.gamma
+            )
+            trace_record["active_continuation_token_alignment_checked"] = bool(
+                token_alignment.get("token_alignment_checked", False)
+            )
+            trace_record["active_continuation_acceptance_too_low_after_token_alignment_checked"] = (
+                token_alignment.get("token_alignment_checked", False)
+                and not token_alignment.get("token_alignment_failure", False)
+            )
+            if token_alignment.get("token_alignment_failure"):
+                next_feature = str(token_alignment.get("selected_feature") or "")
+                return (
+                    next_feature,
+                    str(token_alignment.get("selected_error") or "V4Z token alignment diagnostic failed"),
+                )
             return (
                 "active_request_continuation_acceptance_too_low",
                 (
@@ -3186,13 +3394,16 @@ class ModelRunnerBase:
                     f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}; "
                     "active_continuation_acceptance_too_low_after_correction_checked=True; "
                     "active_continuation_acceptance_too_low_after_alignment_checked=True; "
+                    "active_continuation_acceptance_too_low_after_token_alignment_checked=True; "
                     f"zero_accept_correction_checked={bool(zero_accept_correction.get('zero_accept_correction_checked', False))}; "
                     f"zero_accept_correction_failure={bool(zero_accept_correction.get('zero_accept_correction_failure', False))}; "
                     f"zero_accept_correction_rows_count={len(zero_accept_correction.get('zero_accept_correction_rows') or [])}; "
                     f"next_step_prefix_checked={bool(next_prefix_diagnostic.get('next_step_prefix_checked', False))}; "
                     f"next_step_prefix_failure={bool(next_prefix_diagnostic.get('next_step_prefix_failure', False))}; "
                     f"alignment_checked={bool(alignment.get('alignment_checked', False))}; "
-                    f"alignment_failure={bool(alignment.get('alignment_failure', False))}"
+                    f"alignment_failure={bool(alignment.get('alignment_failure', False))}; "
+                    f"token_alignment_checked={bool(token_alignment.get('token_alignment_checked', False))}; "
+                    f"token_alignment_failure={bool(token_alignment.get('token_alignment_failure', False))}"
                 ),
             )
         trace_record["active_continuation_progress_too_slow"] = True
