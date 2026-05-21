@@ -273,6 +273,11 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_steps_insufficient_count = 0
     active_continuation_reject_recovery_attempt_count = 0
     active_continuation_reject_recovery_success_count = 0
+    active_continuation_target_correction_shadow_only_count = 0
+    active_continuation_target_correction_wrong_sequence_count = 0
+    active_continuation_target_correction_rolled_back_count = 0
+    active_continuation_output_snapshot_mismatch_count = 0
+    active_continuation_completion_token_export_missing_count = 0
     active_continuation_completion_rechecked_count = 0
     active_continuation_finalization_attempt_count = 0
     active_continuation_finalization_success_count = 0
@@ -672,6 +677,21 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_reject_recovery_success_count += int(
             row.get("active_continuation_reject_recovery_success_count") or 0
         )
+        active_continuation_target_correction_shadow_only_count += int(
+            row.get("active_continuation_target_correction_shadow_only_count") or 0
+        )
+        active_continuation_target_correction_wrong_sequence_count += int(
+            row.get("active_continuation_target_correction_wrong_sequence_count") or 0
+        )
+        active_continuation_target_correction_rolled_back_count += int(
+            row.get("active_continuation_target_correction_rolled_back_count") or 0
+        )
+        active_continuation_output_snapshot_mismatch_count += int(
+            row.get("active_continuation_output_snapshot_mismatch_count") or 0
+        )
+        active_continuation_completion_token_export_missing_count += int(
+            row.get("active_continuation_completion_token_export_missing_count") or 0
+        )
         active_continuation_completion_rechecked_count += int(
             row.get("active_continuation_completion_rechecked_count") or 0
         )
@@ -899,6 +919,16 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_reject_recovery_attempt_count += 1
         if row.get("active_continuation_reject_recovery_success"):
             active_continuation_reject_recovery_success_count += 1
+        if row.get("active_continuation_target_correction_shadow_only"):
+            active_continuation_target_correction_shadow_only_count += 1
+        if row.get("active_continuation_target_correction_wrong_sequence"):
+            active_continuation_target_correction_wrong_sequence_count += 1
+        if row.get("active_continuation_target_correction_rolled_back"):
+            active_continuation_target_correction_rolled_back_count += 1
+        if row.get("active_continuation_output_snapshot_mismatch"):
+            active_continuation_output_snapshot_mismatch_count += 1
+        if row.get("active_continuation_completion_token_export_missing"):
+            active_continuation_completion_token_export_missing_count += 1
         if row.get("active_continuation_completion_rechecked"):
             active_continuation_completion_rechecked_count += 1
         if row.get("active_continuation_finalization_attempted"):
@@ -1136,6 +1166,11 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_steps_insufficient_count": active_continuation_steps_insufficient_count,
         "active_continuation_reject_recovery_attempt_count": active_continuation_reject_recovery_attempt_count,
         "active_continuation_reject_recovery_success_count": active_continuation_reject_recovery_success_count,
+        "active_continuation_target_correction_shadow_only_count": active_continuation_target_correction_shadow_only_count,
+        "active_continuation_target_correction_wrong_sequence_count": active_continuation_target_correction_wrong_sequence_count,
+        "active_continuation_target_correction_rolled_back_count": active_continuation_target_correction_rolled_back_count,
+        "active_continuation_output_snapshot_mismatch_count": active_continuation_output_snapshot_mismatch_count,
+        "active_continuation_completion_token_export_missing_count": active_continuation_completion_token_export_missing_count,
         "active_continuation_completion_rechecked_count": active_continuation_completion_rechecked_count,
         "active_continuation_finalization_attempt_count": active_continuation_finalization_attempt_count,
         "active_continuation_finalization_success_count": active_continuation_finalization_success_count,
@@ -1501,6 +1536,26 @@ def summarize(path: Path) -> int:
     print(f"active continuation steps insufficient count: {plan_summary['active_continuation_steps_insufficient_count']}")
     print(f"active continuation reject recovery attempts: {plan_summary['active_continuation_reject_recovery_attempt_count']}")
     print(f"active continuation reject recovery successes: {plan_summary['active_continuation_reject_recovery_success_count']}")
+    print(
+        "active continuation target correction shadow-only count: "
+        f"{plan_summary['active_continuation_target_correction_shadow_only_count']}"
+    )
+    print(
+        "active continuation target correction wrong-sequence count: "
+        f"{plan_summary['active_continuation_target_correction_wrong_sequence_count']}"
+    )
+    print(
+        "active continuation target correction rolled-back count: "
+        f"{plan_summary['active_continuation_target_correction_rolled_back_count']}"
+    )
+    print(
+        "active continuation output snapshot mismatch count: "
+        f"{plan_summary['active_continuation_output_snapshot_mismatch_count']}"
+    )
+    print(
+        "active continuation completion token export missing count: "
+        f"{plan_summary['active_continuation_completion_token_export_missing_count']}"
+    )
     print(f"active continuation completion rechecked count: {plan_summary['active_continuation_completion_rechecked_count']}")
     print(f"active continuation finalization attempts: {plan_summary['active_continuation_finalization_attempt_count']}")
     print(f"active continuation finalization successes: {plan_summary['active_continuation_finalization_success_count']}")

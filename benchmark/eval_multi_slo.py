@@ -963,7 +963,18 @@ def aggregate_low_level_traces(
         active_continuation_accepted_len_by_step: List[Any] = []
         active_continuation_rejected_len_by_step: List[Any] = []
         active_continuation_target_correction_token_ids_by_step: List[Any] = []
+        active_continuation_target_correction_available_by_step: List[Any] = []
         active_continuation_target_correction_committed_by_step: List[Any] = []
+        active_continuation_target_correction_commit_seq_ids: List[Any] = []
+        active_continuation_target_correction_commit_request_ids: List[Any] = []
+        active_continuation_target_correction_output_delta_by_step: List[Any] = []
+        active_continuation_target_correction_shadow_only_count = 0
+        active_continuation_target_correction_wrong_sequence_count = 0
+        active_continuation_target_correction_rolled_back_count = 0
+        active_continuation_output_snapshot_mismatch_count = 0
+        active_continuation_completion_token_export_missing_count = 0
+        active_continuation_sequence_output_len_before_after_by_step: List[Any] = []
+        active_continuation_prefix_len_before_after_by_step: List[Any] = []
         active_continuation_rejected_draft_token_ids_by_step: List[Any] = []
         active_continuation_prefix_len_by_step: List[Any] = []
         active_continuation_position_ids_by_step: List[Any] = []
@@ -1413,9 +1424,43 @@ def aggregate_low_level_traces(
                 active_continuation_target_correction_token_ids_by_step = list(
                     e.get("active_continuation_target_correction_token_ids_by_step") or []
                 )
+            if e.get("active_continuation_target_correction_available_by_step"):
+                active_continuation_target_correction_available_by_step = list(
+                    e.get("active_continuation_target_correction_available_by_step") or []
+                )
             if e.get("active_continuation_target_correction_committed_by_step"):
                 active_continuation_target_correction_committed_by_step = list(
                     e.get("active_continuation_target_correction_committed_by_step") or []
+                )
+            if e.get("active_continuation_target_correction_commit_seq_ids"):
+                active_continuation_target_correction_commit_seq_ids = list(
+                    e.get("active_continuation_target_correction_commit_seq_ids") or []
+                )
+            if e.get("active_continuation_target_correction_commit_request_ids"):
+                active_continuation_target_correction_commit_request_ids = list(
+                    e.get("active_continuation_target_correction_commit_request_ids") or []
+                )
+            if e.get("active_continuation_target_correction_output_delta_by_step"):
+                active_continuation_target_correction_output_delta_by_step = list(
+                    e.get("active_continuation_target_correction_output_delta_by_step") or []
+                )
+            if e.get("active_continuation_target_correction_shadow_only"):
+                active_continuation_target_correction_shadow_only_count += 1
+            if e.get("active_continuation_target_correction_wrong_sequence"):
+                active_continuation_target_correction_wrong_sequence_count += 1
+            if e.get("active_continuation_target_correction_rolled_back"):
+                active_continuation_target_correction_rolled_back_count += 1
+            if e.get("active_continuation_output_snapshot_mismatch"):
+                active_continuation_output_snapshot_mismatch_count += 1
+            if e.get("active_continuation_completion_token_export_missing"):
+                active_continuation_completion_token_export_missing_count += 1
+            if e.get("active_continuation_sequence_output_len_before_after_by_step"):
+                active_continuation_sequence_output_len_before_after_by_step = list(
+                    e.get("active_continuation_sequence_output_len_before_after_by_step") or []
+                )
+            if e.get("active_continuation_prefix_len_before_after_by_step"):
+                active_continuation_prefix_len_before_after_by_step = list(
+                    e.get("active_continuation_prefix_len_before_after_by_step") or []
                 )
             if e.get("active_continuation_rejected_draft_token_ids_by_step"):
                 active_continuation_rejected_draft_token_ids_by_step = list(
@@ -1848,8 +1893,25 @@ def aggregate_low_level_traces(
             row["active_continuation_rejected_len_by_step"] = active_continuation_rejected_len_by_step
         if active_continuation_target_correction_token_ids_by_step:
             row["active_continuation_target_correction_token_ids_by_step"] = active_continuation_target_correction_token_ids_by_step
+        if active_continuation_target_correction_available_by_step:
+            row["active_continuation_target_correction_available_by_step"] = active_continuation_target_correction_available_by_step
         if active_continuation_target_correction_committed_by_step:
             row["active_continuation_target_correction_committed_by_step"] = active_continuation_target_correction_committed_by_step
+        if active_continuation_target_correction_commit_seq_ids:
+            row["active_continuation_target_correction_commit_seq_ids"] = active_continuation_target_correction_commit_seq_ids
+        if active_continuation_target_correction_commit_request_ids:
+            row["active_continuation_target_correction_commit_request_ids"] = active_continuation_target_correction_commit_request_ids
+        if active_continuation_target_correction_output_delta_by_step:
+            row["active_continuation_target_correction_output_delta_by_step"] = active_continuation_target_correction_output_delta_by_step
+        row["active_continuation_target_correction_shadow_only_count"] = active_continuation_target_correction_shadow_only_count
+        row["active_continuation_target_correction_wrong_sequence_count"] = active_continuation_target_correction_wrong_sequence_count
+        row["active_continuation_target_correction_rolled_back_count"] = active_continuation_target_correction_rolled_back_count
+        row["active_continuation_output_snapshot_mismatch_count"] = active_continuation_output_snapshot_mismatch_count
+        row["active_continuation_completion_token_export_missing_count"] = active_continuation_completion_token_export_missing_count
+        if active_continuation_sequence_output_len_before_after_by_step:
+            row["active_continuation_sequence_output_len_before_after_by_step"] = active_continuation_sequence_output_len_before_after_by_step
+        if active_continuation_prefix_len_before_after_by_step:
+            row["active_continuation_prefix_len_before_after_by_step"] = active_continuation_prefix_len_before_after_by_step
         if active_continuation_rejected_draft_token_ids_by_step:
             row["active_continuation_rejected_draft_token_ids_by_step"] = active_continuation_rejected_draft_token_ids_by_step
         if active_continuation_prefix_len_by_step:

@@ -333,6 +333,11 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_progress_too_slow",
         "active_request_continuation_no_effective_token_progress",
         "active_request_continuation_acceptance_too_low",
+        "active_request_continuation_target_correction_shadow_only",
+        "active_request_continuation_target_correction_wrong_sequence",
+        "active_request_continuation_target_correction_rolled_back",
+        "active_request_continuation_output_snapshot_mismatch",
+        "active_request_continuation_completion_token_export_missing",
         "active_request_continuation_partial_batch_starvation",
         "active_request_continuation_output_not_committed",
         "active_request_continuation_completion_gate_mismatch",
@@ -343,6 +348,18 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_accepted_tokens_before_after_by_step",
         "active_continuation_zero_accept_step_count",
         "active_continuation_average_acceptance_rate",
+        "active_continuation_target_correction_available_by_step",
+        "active_continuation_target_correction_committed_by_step",
+        "active_continuation_target_correction_commit_seq_ids",
+        "active_continuation_target_correction_commit_request_ids",
+        "active_continuation_target_correction_output_delta_by_step",
+        "active_continuation_target_correction_shadow_only",
+        "active_continuation_target_correction_wrong_sequence",
+        "active_continuation_target_correction_rolled_back",
+        "active_continuation_output_snapshot_mismatch",
+        "active_continuation_completion_token_export_missing",
+        "active_continuation_sequence_output_len_before_after_by_step",
+        "active_continuation_prefix_len_before_after_by_step",
         "active_continuation_starving_seq_ids",
         "active_continuation_last_advanced_step_by_seq",
         "active_continuation_output_not_committed",
@@ -472,9 +489,12 @@ def test_zero_accept_reject_recovery_commits_target_correction_token():
     assert verify_result.accepted_lengths_by_seq == {1: 0}
     assert commit_plan.target_correction_token_ids_by_seq == {1: [999]}
     assert result.success is True
+    assert result.sequence_state_after[1]["output_token_count"] == result.sequence_state_before[1]["output_token_count"] + 1
+    assert result.sequence_state_after[1]["token_ids"][-1] == 999
     assert seqs[0].completion_token_ids == [999]
     assert 111 not in seqs[0].completion_token_ids
     assert seqs[0].trace_stats["invalidated_predraft_tokens"] == 1
+    assert seqs[0].trace_stats["accepted_tokens"] == 0
 
 
 def main() -> None:

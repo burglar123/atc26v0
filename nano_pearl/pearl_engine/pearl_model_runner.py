@@ -698,7 +698,18 @@ class ModelRunnerBase:
             "active_continuation_accepted_len_by_step": [],
             "active_continuation_rejected_len_by_step": [],
             "active_continuation_target_correction_token_ids_by_step": [],
+            "active_continuation_target_correction_available_by_step": [],
             "active_continuation_target_correction_committed_by_step": [],
+            "active_continuation_target_correction_commit_seq_ids": [],
+            "active_continuation_target_correction_commit_request_ids": [],
+            "active_continuation_target_correction_output_delta_by_step": [],
+            "active_continuation_target_correction_shadow_only": False,
+            "active_continuation_target_correction_wrong_sequence": False,
+            "active_continuation_target_correction_rolled_back": False,
+            "active_continuation_output_snapshot_mismatch": False,
+            "active_continuation_completion_token_export_missing": False,
+            "active_continuation_sequence_output_len_before_after_by_step": [],
+            "active_continuation_prefix_len_before_after_by_step": [],
             "active_continuation_rejected_draft_token_ids_by_step": [],
             "active_continuation_prefix_len_by_step": [],
             "active_continuation_position_ids_by_step": [],
@@ -1090,7 +1101,18 @@ class ModelRunnerBase:
             "active_continuation_accepted_len_by_step",
             "active_continuation_rejected_len_by_step",
             "active_continuation_target_correction_token_ids_by_step",
+            "active_continuation_target_correction_available_by_step",
             "active_continuation_target_correction_committed_by_step",
+            "active_continuation_target_correction_commit_seq_ids",
+            "active_continuation_target_correction_commit_request_ids",
+            "active_continuation_target_correction_output_delta_by_step",
+            "active_continuation_target_correction_shadow_only",
+            "active_continuation_target_correction_wrong_sequence",
+            "active_continuation_target_correction_rolled_back",
+            "active_continuation_output_snapshot_mismatch",
+            "active_continuation_completion_token_export_missing",
+            "active_continuation_sequence_output_len_before_after_by_step",
+            "active_continuation_prefix_len_before_after_by_step",
             "active_continuation_rejected_draft_token_ids_by_step",
             "active_continuation_prefix_len_by_step",
             "active_continuation_position_ids_by_step",
@@ -1727,6 +1749,84 @@ class ModelRunnerBase:
         accepted_token_ids_by_seq = dict(getattr(commit_plan, "accepted_token_ids_by_seq", {}) or {})
         target_correction_token_ids_by_seq = dict(getattr(commit_plan, "target_correction_token_ids_by_seq", {}) or {})
         drafted_token_ids_by_seq = dict(getattr(getattr(commit_result, "plan", None), "drafted_token_ids_by_seq", {}) or {})
+        seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
+        sequence_state_before = getattr(commit_result, "sequence_state_before", {}) or {}
+        sequence_state_after = getattr(commit_result, "sequence_state_after", {}) or {}
+        commit_request_ids = list(getattr(commit_plan, "request_ids", []) or [])
+        commit_request_ids_by_seq = {
+            int(seq_id): commit_request_ids[index]
+            for index, seq_id in enumerate(list(getattr(commit_plan, "seq_ids", []) or []))
+            if index < len(commit_request_ids)
+        }
+
+        def _state_for(mapping: dict, seq_id: int) -> dict:
+            return dict(mapping.get(seq_id) or mapping.get(str(seq_id)) or {})
+
+        target_correction_available_by_seq: dict[int, bool] = {}
+        target_correction_committed_by_seq: dict[int, bool] = {}
+        target_correction_output_delta_by_seq: dict[int, int] = {}
+        target_correction_commit_request_ids_by_seq: dict[int, object] = {}
+        sequence_output_len_before_after_by_seq: dict[int, dict[str, int]] = {}
+        prefix_len_before_after_by_seq: dict[int, dict[str, int]] = {}
+        target_correction_shadow_only_by_seq: dict[int, bool] = {}
+        target_correction_wrong_sequence_by_seq: dict[int, bool] = {}
+        target_correction_rolled_back_by_seq: dict[int, bool] = {}
+        output_snapshot_mismatch_by_seq: dict[int, bool] = {}
+        completion_token_export_missing_by_seq: dict[int, bool] = {}
+        for raw_seq_id, raw_tokens in target_correction_token_ids_by_seq.items():
+            seq_id = int(raw_seq_id)
+            correction_tokens = [int(token) for token in list(raw_tokens or [])]
+            target_correction_available_by_seq[seq_id] = bool(correction_tokens)
+            before_state = _state_for(sequence_state_before, seq_id)
+            after_state = _state_for(sequence_state_after, seq_id)
+            before_output_len = int(before_state.get("output_token_count") or 0)
+            after_output_len = int(after_state.get("output_token_count") or 0)
+            before_prefix_len = int(before_state.get("num_tokens") or 0)
+            after_prefix_len = int(after_state.get("num_tokens") or 0)
+            output_delta = int(after_output_len - before_output_len)
+            prefix_delta = int(after_prefix_len - before_prefix_len)
+            after_token_ids = [int(token) for token in list(after_state.get("token_ids") or [])]
+            expected_suffix = correction_tokens[-len(correction_tokens):] if correction_tokens else []
+            suffix_matches = bool(
+                correction_tokens
+                and output_delta >= len(correction_tokens)
+                and len(after_token_ids) >= len(correction_tokens)
+                and after_token_ids[-len(correction_tokens):] == expected_suffix
+            )
+            seq = seq_by_id.get(seq_id)
+            current_completion_tokens = [
+                int(token) for token in list(getattr(seq, "completion_token_ids", []) or [])
+            ] if seq is not None else []
+            current_output_len = int(getattr(seq, "num_completion_tokens", 0) or 0) if seq is not None else 0
+            commit_request_id = commit_request_ids_by_seq.get(seq_id)
+            target_correction_commit_request_ids_by_seq[seq_id] = commit_request_id
+            wrong_sequence = bool(
+                seq is None
+                or (commit_request_id is not None and getattr(seq, "request_id", None) != commit_request_id)
+                or (after_state.get("request_id") is not None and commit_request_id is not None and after_state.get("request_id") != commit_request_id)
+            )
+            committed = bool(correction_tokens and suffix_matches and output_delta >= len(correction_tokens) and not wrong_sequence)
+            export_missing = bool(
+                committed
+                and (
+                    current_output_len < after_output_len
+                    or len(current_completion_tokens) < len(correction_tokens)
+                    or current_completion_tokens[-len(correction_tokens):] != correction_tokens
+                )
+            )
+            output_snapshot_mismatch = bool(committed and seq is not None and current_output_len != after_output_len)
+            rolled_back = bool(committed and seq is not None and current_output_len < after_output_len)
+            shadow_only = bool(correction_tokens and not committed and output_delta <= 0 and prefix_delta <= 0)
+
+            target_correction_committed_by_seq[seq_id] = committed
+            target_correction_output_delta_by_seq[seq_id] = output_delta
+            sequence_output_len_before_after_by_seq[seq_id] = {"before": before_output_len, "after": after_output_len}
+            prefix_len_before_after_by_seq[seq_id] = {"before": before_prefix_len, "after": after_prefix_len}
+            target_correction_shadow_only_by_seq[seq_id] = shadow_only
+            target_correction_wrong_sequence_by_seq[seq_id] = wrong_sequence
+            target_correction_rolled_back_by_seq[seq_id] = rolled_back
+            output_snapshot_mismatch_by_seq[seq_id] = output_snapshot_mismatch
+            completion_token_export_missing_by_seq[seq_id] = export_missing
         rejected_lengths = {
             int(key): len(value or [])
             for key, value in rejected_token_ids_by_seq.items()
@@ -1762,6 +1862,39 @@ class ModelRunnerBase:
             },
             "target_correction_token_ids_by_seq": {
                 str(key): list(value or []) for key, value in target_correction_token_ids_by_seq.items()
+            },
+            "target_correction_available_by_seq": {
+                str(key): value for key, value in target_correction_available_by_seq.items()
+            },
+            "target_correction_committed_by_seq": {
+                str(key): value for key, value in target_correction_committed_by_seq.items()
+            },
+            "target_correction_commit_request_ids_by_seq": {
+                str(key): value for key, value in target_correction_commit_request_ids_by_seq.items()
+            },
+            "target_correction_output_delta_by_seq": {
+                str(key): value for key, value in target_correction_output_delta_by_seq.items()
+            },
+            "target_correction_shadow_only_by_seq": {
+                str(key): value for key, value in target_correction_shadow_only_by_seq.items()
+            },
+            "target_correction_wrong_sequence_by_seq": {
+                str(key): value for key, value in target_correction_wrong_sequence_by_seq.items()
+            },
+            "target_correction_rolled_back_by_seq": {
+                str(key): value for key, value in target_correction_rolled_back_by_seq.items()
+            },
+            "output_snapshot_mismatch_by_seq": {
+                str(key): value for key, value in output_snapshot_mismatch_by_seq.items()
+            },
+            "completion_token_export_missing_by_seq": {
+                str(key): value for key, value in completion_token_export_missing_by_seq.items()
+            },
+            "sequence_output_len_before_after_by_seq": {
+                str(key): value for key, value in sequence_output_len_before_after_by_seq.items()
+            },
+            "prefix_len_before_after_by_seq": {
+                str(key): value for key, value in prefix_len_before_after_by_seq.items()
             },
             "rejected_draft_token_ids_by_seq": {
                 str(key): list(value or []) for key, value in rejected_token_ids_by_seq.items()
@@ -1999,14 +2132,61 @@ class ModelRunnerBase:
             {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_token_ids_by_seq") or {})}
             for item in step_history
         ]
+        trace_record["active_continuation_target_correction_available_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_available_by_seq") or {})}
+            for item in step_history
+        ]
         trace_record["active_continuation_target_correction_committed_by_step"] = [
             {
                 "step_count": item.get("step_count"),
-                "values": {
-                    str(seq_id): bool(tokens) and int((item.get("output_token_delta_by_seq") or {}).get(str(seq_id), 0) or 0) > 0
-                    for seq_id, tokens in (item.get("target_correction_token_ids_by_seq") or {}).items()
-                },
+                "values": dict(item.get("target_correction_committed_by_seq") or {}),
             }
+            for item in step_history
+        ]
+        trace_record["active_continuation_target_correction_commit_seq_ids"] = sorted(
+            {
+                int(seq_id)
+                for item in step_history
+                for seq_id, committed in (item.get("target_correction_committed_by_seq") or {}).items()
+                if bool(committed)
+            }
+        )
+        trace_record["active_continuation_target_correction_commit_request_ids"] = [
+            request_id
+            for item in step_history
+            for seq_id, request_id in (item.get("target_correction_commit_request_ids_by_seq") or {}).items()
+            if bool((item.get("target_correction_committed_by_seq") or {}).get(str(seq_id)))
+        ]
+        trace_record["active_continuation_target_correction_output_delta_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_output_delta_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_target_correction_shadow_only"] = any(
+            any(bool(value) for value in (item.get("target_correction_shadow_only_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_target_correction_wrong_sequence"] = any(
+            any(bool(value) for value in (item.get("target_correction_wrong_sequence_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_target_correction_rolled_back"] = any(
+            any(bool(value) for value in (item.get("target_correction_rolled_back_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_output_snapshot_mismatch"] = any(
+            any(bool(value) for value in (item.get("output_snapshot_mismatch_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_completion_token_export_missing"] = any(
+            any(bool(value) for value in (item.get("completion_token_export_missing_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_sequence_output_len_before_after_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("sequence_output_len_before_after_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_prefix_len_before_after_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("prefix_len_before_after_by_seq") or {})}
             for item in step_history
         ]
         trace_record["active_continuation_rejected_draft_token_ids_by_step"] = [
@@ -2137,6 +2317,31 @@ class ModelRunnerBase:
                     "active continuation saw rejected spans but no target correction token was available",
                 )
             if not correction_success:
+                if trace_record.get("active_continuation_target_correction_shadow_only"):
+                    return (
+                        "active_request_continuation_target_correction_shadow_only",
+                        "active continuation target correction token was only present in shadow metadata",
+                    )
+                if trace_record.get("active_continuation_target_correction_wrong_sequence"):
+                    return (
+                        "active_request_continuation_target_correction_wrong_sequence",
+                        "active continuation target correction token was committed against the wrong Sequence",
+                    )
+                if trace_record.get("active_continuation_target_correction_rolled_back"):
+                    return (
+                        "active_request_continuation_target_correction_rolled_back",
+                        "active continuation target correction token was committed then rolled back",
+                    )
+                if trace_record.get("active_continuation_output_snapshot_mismatch"):
+                    return (
+                        "active_request_continuation_output_snapshot_mismatch",
+                        "active continuation target correction commit snapshot does not match live Sequence output",
+                    )
+                if trace_record.get("active_continuation_completion_token_export_missing"):
+                    return (
+                        "active_request_continuation_completion_token_export_missing",
+                        "active continuation target correction token reached Sequence state but was missing from completion export",
+                    )
                 return (
                     "active_request_continuation_target_correction_not_committed",
                     "active continuation target correction token was available but did not advance Sequence output",
