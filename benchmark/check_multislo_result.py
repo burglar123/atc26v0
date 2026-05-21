@@ -286,6 +286,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_prefix_len_mismatch_count = 0
     active_continuation_position_mismatch_count = 0
     active_continuation_slot_mapping_mismatch_count = 0
+    active_continuation_scheduler_sequence_state_mismatch_count = 0
     active_continuation_target_correction_shadow_only_count = 0
     active_continuation_target_correction_wrong_sequence_count = 0
     active_continuation_target_correction_rolled_back_count = 0
@@ -730,6 +731,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_slot_mapping_mismatch_count += int(
             row.get("active_continuation_slot_mapping_mismatch_count") or 0
         )
+        active_continuation_scheduler_sequence_state_mismatch_count += int(
+            row.get("active_continuation_scheduler_sequence_state_mismatch_count") or 0
+        )
         active_continuation_target_correction_shadow_only_count += int(
             row.get("active_continuation_target_correction_shadow_only_count") or 0
         )
@@ -1000,6 +1004,8 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_position_mismatch_count += 1
         if row.get("active_continuation_slot_mapping_mismatch"):
             active_continuation_slot_mapping_mismatch_count += 1
+        if row.get("active_continuation_scheduler_sequence_state_mismatch"):
+            active_continuation_scheduler_sequence_state_mismatch_count += 1
         if row.get("active_continuation_target_correction_shadow_only"):
             active_continuation_target_correction_shadow_only_count += 1
         if row.get("active_continuation_target_correction_wrong_sequence"):
@@ -1260,6 +1266,7 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_prefix_len_mismatch_count": active_continuation_prefix_len_mismatch_count,
         "active_continuation_position_mismatch_count": active_continuation_position_mismatch_count,
         "active_continuation_slot_mapping_mismatch_count": active_continuation_slot_mapping_mismatch_count,
+        "active_continuation_scheduler_sequence_state_mismatch_count": active_continuation_scheduler_sequence_state_mismatch_count,
         "active_continuation_target_correction_shadow_only_count": active_continuation_target_correction_shadow_only_count,
         "active_continuation_target_correction_wrong_sequence_count": active_continuation_target_correction_wrong_sequence_count,
         "active_continuation_target_correction_rolled_back_count": active_continuation_target_correction_rolled_back_count,
@@ -1670,6 +1677,10 @@ def summarize(path: Path) -> int:
     print(f"active continuation prefix length mismatch count: {plan_summary['active_continuation_prefix_len_mismatch_count']}")
     print(f"active continuation position mismatch count: {plan_summary['active_continuation_position_mismatch_count']}")
     print(f"active continuation slot mapping mismatch count: {plan_summary['active_continuation_slot_mapping_mismatch_count']}")
+    print(
+        "active continuation scheduler/sequence state mismatch count: "
+        f"{plan_summary['active_continuation_scheduler_sequence_state_mismatch_count']}"
+    )
     print(
         "active continuation target correction shadow-only count: "
         f"{plan_summary['active_continuation_target_correction_shadow_only_count']}"

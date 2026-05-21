@@ -370,6 +370,10 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_prefix_len_mismatch",
         "active_continuation_position_mismatch",
         "active_continuation_slot_mapping_mismatch",
+        "active_continuation_scheduler_sequence_state_mismatch",
+        "active_continuation_next_step_prefix_source_by_step",
+        "active_continuation_target_prefix_token_ids_by_step",
+        "active_continuation_draft_prefix_token_ids_by_step",
         "active_continuation_target_correction_available_by_step",
         "active_continuation_target_correction_committed_by_step",
         "active_continuation_target_correction_commit_seq_ids",
@@ -656,6 +660,18 @@ def test_next_prefix_aligned_allows_acceptance_fallback():
     assert diagnostic["active_continuation_next_step_contains_correction_by_step"][0]["values"] == {"1": True}
 
 
+def test_runner_has_guarded_v4x_pending_correction_propagation():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    assert "def _record_v4x_pending_corrections" in source
+    assert "def _propagate_v4x_pending_correction_prefix" in source
+    assert "self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)" in source
+    assert "self._record_v4x_pending_corrections(commit_result, trace_record)" in source
+    assert "target_pending_correction_prefix" in source
+    assert "active_request_continuation_scheduler_sequence_state_mismatch" in source
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -688,6 +704,7 @@ def main() -> None:
     test_target_draft_prefix_divergence_is_specific()
     test_prefix_and_kv_mismatch_are_specific()
     test_next_prefix_aligned_allows_acceptance_fallback()
+    test_runner_has_guarded_v4x_pending_correction_propagation()
 
 
 if __name__ == "__main__":

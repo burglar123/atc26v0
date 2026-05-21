@@ -984,6 +984,10 @@ def aggregate_low_level_traces(
         active_continuation_prefix_len_mismatch_count = 0
         active_continuation_position_mismatch_count = 0
         active_continuation_slot_mapping_mismatch_count = 0
+        active_continuation_scheduler_sequence_state_mismatch_count = 0
+        active_continuation_next_step_prefix_source_by_step: Dict[str, Any] = {}
+        active_continuation_target_prefix_token_ids_by_step: Dict[str, Any] = {}
+        active_continuation_draft_prefix_token_ids_by_step: Dict[str, Any] = {}
         active_continuation_target_correction_token_ids_by_step: List[Any] = []
         active_continuation_target_correction_available_by_step: List[Any] = []
         active_continuation_target_correction_committed_by_step: List[Any] = []
@@ -1506,6 +1510,20 @@ def aggregate_low_level_traces(
                 active_continuation_position_mismatch_count += 1
             if e.get("active_continuation_slot_mapping_mismatch"):
                 active_continuation_slot_mapping_mismatch_count += 1
+            if e.get("active_continuation_scheduler_sequence_state_mismatch"):
+                active_continuation_scheduler_sequence_state_mismatch_count += 1
+            if e.get("active_continuation_next_step_prefix_source_by_step"):
+                active_continuation_next_step_prefix_source_by_step = dict(
+                    e.get("active_continuation_next_step_prefix_source_by_step") or {}
+                )
+            if e.get("active_continuation_target_prefix_token_ids_by_step"):
+                active_continuation_target_prefix_token_ids_by_step = dict(
+                    e.get("active_continuation_target_prefix_token_ids_by_step") or {}
+                )
+            if e.get("active_continuation_draft_prefix_token_ids_by_step"):
+                active_continuation_draft_prefix_token_ids_by_step = dict(
+                    e.get("active_continuation_draft_prefix_token_ids_by_step") or {}
+                )
             if e.get("active_continuation_target_correction_token_ids_by_step"):
                 active_continuation_target_correction_token_ids_by_step = list(
                     e.get("active_continuation_target_correction_token_ids_by_step") or []
@@ -2010,6 +2028,13 @@ def aggregate_low_level_traces(
         row["active_continuation_prefix_len_mismatch_count"] = active_continuation_prefix_len_mismatch_count
         row["active_continuation_position_mismatch_count"] = active_continuation_position_mismatch_count
         row["active_continuation_slot_mapping_mismatch_count"] = active_continuation_slot_mapping_mismatch_count
+        row["active_continuation_scheduler_sequence_state_mismatch_count"] = active_continuation_scheduler_sequence_state_mismatch_count
+        if active_continuation_next_step_prefix_source_by_step:
+            row["active_continuation_next_step_prefix_source_by_step"] = active_continuation_next_step_prefix_source_by_step
+        if active_continuation_target_prefix_token_ids_by_step:
+            row["active_continuation_target_prefix_token_ids_by_step"] = active_continuation_target_prefix_token_ids_by_step
+        if active_continuation_draft_prefix_token_ids_by_step:
+            row["active_continuation_draft_prefix_token_ids_by_step"] = active_continuation_draft_prefix_token_ids_by_step
         if active_continuation_target_correction_token_ids_by_step:
             row["active_continuation_target_correction_token_ids_by_step"] = active_continuation_target_correction_token_ids_by_step
         if active_continuation_target_correction_available_by_step:

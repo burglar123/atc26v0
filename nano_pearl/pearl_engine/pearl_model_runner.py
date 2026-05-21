@@ -721,6 +721,11 @@ class ModelRunnerBase:
             "active_continuation_prefix_len_mismatch": False,
             "active_continuation_position_mismatch": False,
             "active_continuation_slot_mapping_mismatch": False,
+            "active_continuation_scheduler_sequence_state_mismatch": False,
+            "active_continuation_next_step_prefix_source_by_step": {},
+            "active_continuation_target_prefix_token_ids_by_step": {},
+            "active_continuation_draft_prefix_token_ids_by_step": {},
+            "active_continuation_pending_correction_prefix_by_seq": {},
             "active_continuation_target_correction_token_ids_by_step": [],
             "active_continuation_target_correction_available_by_step": [],
             "active_continuation_target_correction_committed_by_step": [],
@@ -1146,6 +1151,11 @@ class ModelRunnerBase:
             "active_continuation_prefix_len_mismatch",
             "active_continuation_position_mismatch",
             "active_continuation_slot_mapping_mismatch",
+            "active_continuation_scheduler_sequence_state_mismatch",
+            "active_continuation_next_step_prefix_source_by_step",
+            "active_continuation_target_prefix_token_ids_by_step",
+            "active_continuation_draft_prefix_token_ids_by_step",
+            "active_continuation_pending_correction_prefix_by_seq",
             "active_continuation_target_correction_token_ids_by_step",
             "active_continuation_target_correction_available_by_step",
             "active_continuation_target_correction_committed_by_step",
@@ -1567,6 +1577,123 @@ class ModelRunnerBase:
             and getattr(self.global_config, "stspec_continue_after_mailbox_commit", False)
             and self._pearl_protocol_layout() == PearlLayoutKind.VARIABLE_OFFSETS.value
         )
+
+    def _record_v4x_pending_corrections(self, commit_result, trace_record: dict) -> None:
+        plan = getattr(commit_result, "plan", None)
+        if plan is None or not bool(getattr(commit_result, "success", False)):
+            return
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        request_ids = list(getattr(plan, "request_ids", []) or [])
+        request_ids_by_seq = {
+            int(seq_id): request_ids[index]
+            for index, seq_id in enumerate(list(getattr(plan, "seq_ids", []) or []))
+            if index < len(request_ids)
+        }
+        recorded: dict[str, dict] = {}
+        for raw_seq_id, raw_tokens in dict(getattr(plan, "target_correction_token_ids_by_seq", {}) or {}).items():
+            seq_id = int(raw_seq_id)
+            tokens = [int(token) for token in list(raw_tokens or [])]
+            if not tokens:
+                continue
+            after_state = (
+                dict(getattr(commit_result, "sequence_state_after", {}) or {}).get(seq_id)
+                or dict(getattr(commit_result, "sequence_state_after", {}) or {}).get(str(seq_id))
+                or {}
+            )
+            token_ids_after = [int(token) for token in list(after_state.get("token_ids") or [])]
+            pending[seq_id] = {
+                "seq_id": seq_id,
+                "request_id": request_ids_by_seq.get(seq_id),
+                "correction_token_ids": tokens,
+                "source_plan_id": getattr(plan, "plan_id", None),
+                "sequence_token_ids_after": token_ids_after,
+                "prefix_len_after": int(after_state.get("num_tokens") or len(token_ids_after) or 0),
+                "output_token_count_after": int(after_state.get("output_token_count") or 0),
+            }
+            recorded[str(seq_id)] = dict(pending[seq_id])
+        self.stspec_active_continuation_pending_corrections = pending
+        if recorded:
+            trace_record["active_continuation_pending_correction_prefix_by_seq"] = recorded
+
+    def _propagate_v4x_pending_correction_prefix(
+        self,
+        exec_seqs: list[Sequence],
+        step_plan: StepPlan,
+        trace_record: dict,
+    ) -> None:
+        if not self._v4s_real_probe_finalization_mode(step_plan):
+            return
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        if not pending:
+            return
+        seq_by_id = {int(seq.seq_id): seq for seq in exec_seqs}
+        applied: dict[str, dict] = {}
+        inherited: dict[str, dict] = {}
+        mismatches: dict[str, dict] = {}
+        remaining: dict[int, dict] = {}
+        for seq_id, info in pending.items():
+            seq_id = int(seq_id)
+            seq = seq_by_id.get(seq_id)
+            if seq is None:
+                remaining[seq_id] = info
+                continue
+            tokens = [int(token) for token in list(info.get("correction_token_ids") or [])]
+            if not tokens:
+                continue
+            current_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+            expected_prefix = [int(token) for token in list(info.get("sequence_token_ids_after") or [])]
+            if expected_prefix and current_tokens[: len(expected_prefix)] == expected_prefix:
+                inherited[str(seq_id)] = {
+                    "source_plan_id": info.get("source_plan_id"),
+                    "correction_token_ids": tokens,
+                    "prefix_len": len(current_tokens),
+                    "source": "target_sequence",
+                }
+                continue
+            if current_tokens[-len(tokens):] == tokens:
+                inherited[str(seq_id)] = {
+                    "source_plan_id": info.get("source_plan_id"),
+                    "correction_token_ids": tokens,
+                    "prefix_len": len(current_tokens),
+                    "source": "target_sequence_suffix",
+                }
+                continue
+            request_id = info.get("request_id")
+            if request_id is not None and getattr(seq, "request_id", None) != request_id:
+                mismatches[str(seq_id)] = {
+                    "reason": "request_id_mismatch",
+                    "expected_request_id": request_id,
+                    "actual_request_id": getattr(seq, "request_id", None),
+                }
+                remaining[seq_id] = info
+                continue
+            before_len = len(current_tokens)
+            for token in tokens:
+                seq.append_token(int(token))
+            after_tokens = [int(token) for token in list(getattr(seq, "token_ids", []) or [])]
+            applied[str(seq_id)] = {
+                "source_plan_id": info.get("source_plan_id"),
+                "correction_token_ids": tokens,
+                "prefix_len_before": before_len,
+                "prefix_len_after": len(after_tokens),
+                "source": "target_pending_correction_prefix",
+            }
+        self.stspec_active_continuation_pending_corrections = remaining
+        if applied or inherited or mismatches:
+            trace_record["active_continuation_next_step_prefix_source_by_step"] = {
+                "plan_id": getattr(step_plan, "plan_id", None),
+                "applied": applied,
+                "inherited": inherited,
+                "mismatches": mismatches,
+            }
+            trace_record["active_continuation_target_prefix_token_ids_by_step"] = {
+                str(seq.seq_id): list(getattr(seq, "token_ids", []) or [])
+                for seq in exec_seqs
+                if int(seq.seq_id) in {int(key) for key in list(applied) + list(inherited)}
+            }
+        if mismatches:
+            trace_record["active_continuation_scheduler_sequence_state_mismatch"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_scheduler_sequence_state_mismatch"
 
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
@@ -2809,6 +2936,13 @@ class ModelRunnerBase:
         trace_record["target_forward_from_mailbox_input_total_tokens"] = int(verification_input.total_tokens)
         trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
 
+        self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)
+        if trace_record.get("active_continuation_scheduler_sequence_state_mismatch"):
+            raise RuntimeError(
+                "active continuation scheduler/sequence state mismatch while propagating target correction; "
+                "next_required_feature=active_request_continuation_scheduler_sequence_state_mismatch"
+            )
+
         if scheduled_seq_ids != actual_target_exec_seq_ids and input_seq_ids == scheduled_seq_ids:
             self._raise_illegal_legacy_fallback(
                 trace_record,
@@ -3350,6 +3484,7 @@ class ModelRunnerBase:
                     f"target_seq_ids={input_seq_ids}, error={commit_result.error_message}; "
                     f"next_required_feature={trace_record['next_required_feature']}"
                 )
+            self._record_v4x_pending_corrections(commit_result, trace_record)
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
                 return True
             current_next_required = (
