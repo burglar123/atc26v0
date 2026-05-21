@@ -59,6 +59,13 @@ def initialize_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_pending_corrections = dict(
         getattr(runner, "stspec_active_continuation_pending_corrections", {}) or {}
     )
+    # V4X.2 explicit continuation state
+    runner.stspec_active_continuation_in_progress = bool(
+        getattr(runner, "stspec_active_continuation_in_progress", False)
+    )
+    runner.stspec_active_continuation_reset_reason = getattr(
+        runner, "stspec_active_continuation_reset_reason", None
+    )
 
 
 def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
@@ -67,6 +74,8 @@ def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_plan_id_history = []
     runner.stspec_active_continuation_progress_by_step = []
     runner.stspec_active_continuation_pending_corrections = {}
+    runner.stspec_active_continuation_in_progress = False
+    runner.stspec_active_continuation_reset_reason = None
 
 
 V4W_ZERO_ACCEPT_CORRECTION_PRIORITY = (

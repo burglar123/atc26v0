@@ -403,9 +403,9 @@ class ModelRunnerBase:
         self.active_execution_mode = execution_mode
 
     def _schedule_with_plan(self, runner_role: str):
-        skip_batch_flip = (
-            getattr(self, "stspec_active_continuation_step_count", 0) > 0
-        )
+        in_progress = bool(getattr(self, "stspec_active_continuation_in_progress", False))
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        skip_batch_flip = bool(in_progress and pending)
         return self.scheduler.schedule_with_plan(
             runner_role=runner_role,
             execution_mode=self.active_execution_mode,
@@ -947,6 +947,21 @@ class ModelRunnerBase:
             "accepted_tokens_per_seq": dict(per_seq_zeros),
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
+            # V4X.2 trace: batch-flip suppression state at schedule time
+            "active_continuation_batch_flip_skipped_by_step": False,
+            "active_continuation_skip_batch_flip_reason_by_step": "not_in_continuation",
+            "active_continuation_two_batch_shadow_step_before_after_by_step": {
+                "before": int(getattr(self.scheduler, "two_batch_shadow_step", 0) or 0),
+            },
+            "active_continuation_target_home_batch_before_after_by_step": {
+                "step_target_home_batch_id": step_plan.target_home_batch_id,
+            },
+            "active_continuation_step_count_before_schedule": int(
+                getattr(self, "stspec_active_continuation_step_count", 0) or 0
+            ),
+            "active_continuation_in_progress_before_schedule": bool(
+                getattr(self, "stspec_active_continuation_in_progress", False)
+            ),
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1612,6 +1627,7 @@ class ModelRunnerBase:
                 or {}
             )
             token_ids_after = [int(token) for token in list(after_state.get("token_ids") or [])]
+            home_batch_id = int(getattr(plan, "target_home_batch_id", -1) or -1)
             pending[seq_id] = {
                 "seq_id": seq_id,
                 "request_id": request_ids_by_seq.get(seq_id),
@@ -1620,11 +1636,19 @@ class ModelRunnerBase:
                 "sequence_token_ids_after": token_ids_after,
                 "prefix_len_after": int(after_state.get("num_tokens") or len(token_ids_after) or 0),
                 "output_token_count_after": int(after_state.get("output_token_count") or 0),
+                "home_batch_id": home_batch_id,
             }
             recorded[str(seq_id)] = dict(pending[seq_id])
         self.stspec_active_continuation_pending_corrections = pending
+        # V4X.2: set in_progress when pending corrections exist
+        if pending:
+            self.stspec_active_continuation_in_progress = True
         if recorded:
             trace_record["active_continuation_pending_correction_prefix_by_seq"] = recorded
+            trace_record["active_continuation_pending_correction_home_batch_ids_by_step"] = sorted({
+                info.get("home_batch_id") for info in recorded.values()
+                if info.get("home_batch_id") is not None
+            })
 
     def _propagate_v4x_pending_correction_prefix(
         self,
@@ -1764,6 +1788,45 @@ class ModelRunnerBase:
         if double_appends:
             trace_record["active_continuation_target_correction_double_append"] = True
             trace_record["next_required_feature"] = "active_request_continuation_target_correction_double_append"
+        # V4X.2 trace: pending correction consumption diagnostics
+        pending_after = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        pending_before_seq_ids = sorted(int(key) for key in pending.keys())
+        pending_after_seq_ids = sorted(int(key) for key in pending_after.keys())
+        not_scheduled_seq_ids = sorted(
+            int(seq_id) for seq_id in pending_before_seq_ids
+            if int(seq_id) not in set(seq_by_id.keys())
+        )
+        trace_record["active_continuation_pending_correction_seq_ids_by_step"] = pending_before_seq_ids
+        trace_record["active_continuation_pending_correction_home_batch_ids_by_step"] = sorted({
+            info.get("home_batch_id") for info in pending.values()
+            if info.get("home_batch_id") is not None
+        })
+        trace_record["active_continuation_pending_correction_consumed_by_step"] = bool(
+            pending_before_seq_ids and not pending_after_seq_ids
+        )
+        trace_record["active_continuation_two_batch_shadow_step_before_after_by_step"] = {
+            "before": int(getattr(self.scheduler, "two_batch_shadow_step", 0) or 0),
+        }
+        trace_record["active_continuation_target_home_batch_before_after_by_step"] = {
+            "step_target_home_batch_id": getattr(step_plan, "target_home_batch_id", None),
+        }
+        trace_record["active_continuation_batch_flip_skipped_by_step"] = bool(
+            getattr(self, "stspec_active_continuation_in_progress", False)
+        )
+        trace_record["active_continuation_pending_correction_seq_not_scheduled"] = bool(not_scheduled_seq_ids)
+        if not_scheduled_seq_ids:
+            trace_record["active_continuation_pending_correction_not_scheduled_seq_ids"] = not_scheduled_seq_ids
+            current_target_batch = getattr(step_plan, "target_home_batch_id", None)
+            pending_home_batches = {
+                info.get("home_batch_id") for info in pending.values()
+                if info.get("home_batch_id") is not None
+            }
+            if current_target_batch is not None and current_target_batch not in pending_home_batches:
+                trace_record["active_continuation_batch_flip_with_pending_correction"] = True
+                trace_record["next_required_feature"] = (
+                    trace_record.get("next_required_feature")
+                    or "active_request_continuation_batch_flip_with_pending_correction"
+                )
 
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
@@ -3013,6 +3076,7 @@ class ModelRunnerBase:
             ) from exc
         self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
         self.stspec_active_continuation_step_count += 1
+        self.stspec_active_continuation_in_progress = True
         self._remember_v4v_active_continuation_progress(progress_snapshot)
         self._record_v4v_active_continuation_snapshot(
             trace_record,
@@ -3032,6 +3096,14 @@ class ModelRunnerBase:
         trace_record["active_request_continuation_error"] = None
         trace_record["active_request_continuation_error_kind"] = None
         trace_record["next_required_feature"] = "active_request_continuation_handoff"
+        # V4X.2 trace: batch-flip suppression state after continuation success
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        trace_record["active_continuation_in_progress"] = True
+        trace_record["active_continuation_step_count_before_schedule"] = self.stspec_active_continuation_step_count
+        trace_record["active_continuation_pending_correction_seq_ids_by_step"] = sorted(
+            int(key) for key in pending.keys()
+        )
+        trace_record["active_continuation_pending_correction_nonempty"] = bool(pending)
         return True
 
     def _try_v4s_non_owner_terminal_verify_noop(
@@ -3063,7 +3135,33 @@ class ModelRunnerBase:
         trace_record["target_forward_from_mailbox_input_total_tokens"] = int(verification_input.total_tokens)
         trace_record["target_forward_from_mailbox_input_shape"] = list(verification_input.input_shape)
 
+        # V4X.2 trace: pre-propagation state
+        trace_record["active_continuation_step_count_before_schedule"] = int(
+            getattr(self, "stspec_active_continuation_step_count", 0) or 0
+        )
+        trace_record["active_continuation_in_progress_before_schedule"] = bool(
+            getattr(self, "stspec_active_continuation_in_progress", False)
+        )
+        trace_record["active_continuation_batch_flip_skipped_by_step"] = bool(
+            getattr(self, "stspec_active_continuation_in_progress", False)
+        )
+        trace_record["active_continuation_skip_batch_flip_reason_by_step"] = (
+            "active_continuation_in_progress_with_pending"
+            if getattr(self, "stspec_active_continuation_in_progress", False)
+            and getattr(self, "stspec_active_continuation_pending_corrections", None)
+            else "no_active_continuation_or_no_pending"
+        )
         self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)
+        if trace_record.get("active_continuation_batch_flip_with_pending_correction"):
+            raise RuntimeError(
+                "active continuation batch flipped while pending correction exists; "
+                "next_required_feature=active_request_continuation_batch_flip_with_pending_correction"
+            )
+        if trace_record.get("active_continuation_pending_correction_seq_not_scheduled"):
+            raise RuntimeError(
+                "active continuation pending correction seq not found in scheduled exec_seqs; "
+                "next_required_feature=active_request_continuation_pending_correction_seq_not_scheduled"
+            )
         if trace_record.get("active_continuation_scheduler_sequence_state_mismatch"):
             raise RuntimeError(
                 "active continuation scheduler/sequence state mismatch while propagating target correction; "
@@ -3708,6 +3806,16 @@ class ModelRunnerBase:
         trace_record["mailbox_payload_current_rank"] = target_tp_role.current_rank
         if exec_seqs is not None:
             self._propagate_v4x_pending_correction_prefix(exec_seqs, step_plan, trace_record)
+            if trace_record.get("active_continuation_batch_flip_with_pending_correction"):
+                raise RuntimeError(
+                    "active continuation batch flipped while pending correction exists; "
+                    "next_required_feature=active_request_continuation_batch_flip_with_pending_correction"
+                )
+            if trace_record.get("active_continuation_pending_correction_seq_not_scheduled"):
+                raise RuntimeError(
+                    "active continuation pending correction seq not found in scheduled exec_seqs; "
+                    "next_required_feature=active_request_continuation_pending_correction_seq_not_scheduled"
+                )
             if trace_record.get("active_continuation_scheduler_sequence_state_mismatch"):
                 raise RuntimeError(
                     "active continuation scheduler/sequence state mismatch while propagating target correction; "
