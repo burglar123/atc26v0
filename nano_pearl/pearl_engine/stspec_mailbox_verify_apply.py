@@ -625,6 +625,7 @@ class MailboxVerifyCommitPlan:
     accepted_token_ids_by_seq: dict[int, list[int]]
     rejected_seq_ids: list[int]
     rejected_token_ids_by_seq: dict[int, list[int]]
+    target_correction_token_ids_by_seq: dict[int, list[int]]
     target_token_ids_by_seq: dict[int, list[int]]
     invalidated_payload_ids: list[str]
     mailbox_payloads_to_consume: list[str]
@@ -765,6 +766,7 @@ class MailboxKVCommitPlan:
     request_ids: list[Any]
     accepted_lengths_by_seq: dict[int, int]
     accepted_token_ids_by_seq: dict[int, list[int]]
+    target_correction_token_ids_by_seq: dict[int, list[int]]
     append_start_positions_by_seq: dict[int, int]
     append_end_positions_by_seq: dict[int, int]
     kv_positions_by_seq: dict[int, list[int]]
@@ -1157,6 +1159,7 @@ def build_mailbox_verify_commit_plan(
     *,
     commit_allowed: bool,
     commit_mode: str = "guarded_probe",
+    eos_token_id: int | list[int] | None = None,
 ) -> MailboxVerifyCommitPlan:
     """Build a guarded sequence-level commit plan from a verified apply plan."""
 
@@ -1186,6 +1189,7 @@ def build_mailbox_verify_commit_plan(
     state_before: dict[int, JsonDict] = {}
     state_after_expected: dict[int, JsonDict] = {}
     rejected_seq_ids: list[int] = []
+    correction_tokens_by_seq: dict[int, list[int]] = {}
     invalidated_payload_ids = list(apply_plan.mailbox_payloads_to_invalidate)
     for seq_id, drafted_len in zip(seq_ids, verify_result.per_seq_lengths):
         seq = seq_by_id[seq_id]
@@ -1206,6 +1210,18 @@ def build_mailbox_verify_commit_plan(
             )
         accepted_tokens = list(apply_plan.accepted_token_ids_by_seq[seq_id])
         rejected_tokens = list(apply_plan.rejected_token_ids_by_seq.get(seq_id, []))
+        target_tokens = [int(token) for token in verify_result.target_token_ids_by_seq.get(seq_id, []) or []]
+        correction_tokens: list[int] = []
+        if rejected_tokens:
+            if accepted_len >= len(target_tokens):
+                raise MailboxVerifyApplyError(
+                    f"target correction token unavailable for rejected mailbox span: "
+                    f"seq_id={seq_id}, accepted_len={accepted_len}, target_len={len(target_tokens)}",
+                    next_required_feature="active_request_continuation_target_correction_not_committed",
+                    error_kind="active_request_continuation_target_correction_not_committed",
+                )
+            correction_tokens = [int(target_tokens[accepted_len])]
+        correction_tokens_by_seq[seq_id] = list(correction_tokens)
         if len(accepted_tokens) != accepted_len:
             raise MailboxVerifyApplyError(
                 f"mailbox verify commit accepted token length mismatch for seq_id={seq_id}",
@@ -1224,7 +1240,8 @@ def build_mailbox_verify_commit_plan(
             )
         before = _sequence_snapshot(seq)
         after = dict(before)
-        token_ids = list(before.get("token_ids") or []) + accepted_tokens
+        output_tokens = accepted_tokens + correction_tokens
+        token_ids = list(before.get("token_ids") or []) + output_tokens
         trace_stats = json.loads(json.dumps(before.get("trace_stats", {}) or {}, default=str))
         if accepted_len:
             trace_stats["accepted_tokens"] = int(trace_stats.get("accepted_tokens") or 0) + accepted_len
@@ -1233,12 +1250,22 @@ def build_mailbox_verify_commit_plan(
         after.update(
             {
                 "token_ids": token_ids,
-                "num_tokens": int(before.get("num_tokens") or 0) + accepted_len,
+                "num_tokens": int(before.get("num_tokens") or 0) + len(output_tokens),
                 "last_token": token_ids[-1] if token_ids else before.get("last_token"),
                 "output_token_count": max(len(token_ids) - int(before.get("num_prompt_tokens") or 0), 0),
                 "trace_stats": trace_stats,
             }
         )
+        max_tokens = int(getattr(seq, "max_tokens", 0) or 0)
+        max_tokens_reached = max_tokens > 0 and int(after["output_token_count"]) >= max_tokens
+        eos_reached = (
+            eos_token_id is not None
+            and not bool(getattr(seq, "ignore_eos", False))
+            and any(_is_eos_token(int(token), eos_token_id) for token in output_tokens)
+        )
+        if max_tokens_reached or eos_reached:
+            after["is_finished"] = True
+            after["status_value"] = "FINISHED"
         state_before[seq_id] = before
         state_after_expected[seq_id] = after
         if rejected_tokens:
@@ -1252,6 +1279,7 @@ def build_mailbox_verify_commit_plan(
         accepted_token_ids_by_seq=dict(apply_plan.accepted_token_ids_by_seq),
         rejected_seq_ids=rejected_seq_ids,
         rejected_token_ids_by_seq=dict(apply_plan.rejected_token_ids_by_seq),
+        target_correction_token_ids_by_seq=correction_tokens_by_seq,
         target_token_ids_by_seq=dict(verify_result.target_token_ids_by_seq),
         invalidated_payload_ids=invalidated_payload_ids,
         mailbox_payloads_to_consume=list(apply_plan.mailbox_payloads_to_consume),
@@ -1318,6 +1346,8 @@ def build_mailbox_kv_commit_plan(
                 error_kind="mailbox_kv_commit_sequence_home_batch_mismatch",
             )
         accepted_len = int(commit_plan.accepted_lengths_by_seq[seq_id])
+        correction_len = len(commit_plan.target_correction_token_ids_by_seq.get(seq_id, []))
+        append_len = accepted_len + correction_len
         if accepted_len < 0 or accepted_len > int(drafted_len):
             raise MailboxVerifyApplyError(
                 f"accepted length out of range for KV commit seq_id={seq_id}: accepted_len={accepted_len}, drafted_len={drafted_len}",
@@ -1326,19 +1356,19 @@ def build_mailbox_kv_commit_plan(
             )
         before_len = len(seq) if hasattr(seq, "__len__") else int(getattr(seq, "num_tokens", 0) or 0)
         start = _sequence_output_length(seq)
-        end = start + accepted_len
-        total_end = before_len + accepted_len
+        end = start + append_len
+        total_end = before_len + append_len
         if max_model_len is not None and total_end > int(max_model_len):
             raise MailboxVerifyApplyError(
                 f"mailbox KV commit would exceed max_model_len for seq_id={seq_id}: end_len={total_end}, max_model_len={max_model_len}",
                 next_required_feature="kv_commit_rollback_validation",
                 error_kind="mailbox_kv_commit_exceeds_max_model_len",
             )
-        positions = list(verify_result.positions_by_seq.get(seq_id, []))[:accepted_len]
-        if accepted_len and len(positions) != accepted_len:
+        positions = list(verify_result.positions_by_seq.get(seq_id, []))[:append_len]
+        if append_len and len(positions) != append_len:
             positions = list(range(before_len, total_end))
-        slots = list(verify_result.kv_slot_ids_by_seq.get(seq_id, []))[:accepted_len]
-        if accepted_len and len(slots) != accepted_len:
+        slots = list(verify_result.kv_slot_ids_by_seq.get(seq_id, []))[:append_len]
+        if append_len and len(slots) != append_len:
             block_table = list(getattr(seq, "block_table", []) or [])
             if not block_table:
                 raise MailboxVerifyApplyError(
@@ -1355,7 +1385,7 @@ def build_mailbox_kv_commit_plan(
         seq_len_after[seq_id] = total_end
         kv_before = _kv_shadow_length(seq, default=before_len)
         kv_len_before[seq_id] = kv_before
-        kv_len_after[seq_id] = kv_before + accepted_len
+        kv_len_after[seq_id] = kv_before + append_len
     return MailboxKVCommitPlan(
         plan_id=commit_plan.plan_id,
         target_home_batch_id=commit_plan.target_home_batch_id,
@@ -1363,6 +1393,7 @@ def build_mailbox_kv_commit_plan(
         request_ids=list(commit_plan.request_ids),
         accepted_lengths_by_seq=dict(commit_plan.accepted_lengths_by_seq),
         accepted_token_ids_by_seq=dict(commit_plan.accepted_token_ids_by_seq),
+        target_correction_token_ids_by_seq=dict(commit_plan.target_correction_token_ids_by_seq),
         append_start_positions_by_seq=append_start,
         append_end_positions_by_seq=append_end,
         kv_positions_by_seq=kv_positions,
@@ -1434,10 +1465,12 @@ def run_mailbox_kv_commit_probe(
                     error_kind="mailbox_kv_commit_injected_failure",
                 )
             accepted_len = int(kv_commit_plan.accepted_lengths_by_seq[seq_id])
-            if accepted_len:
+            correction_len = len(kv_commit_plan.target_correction_token_ids_by_seq.get(seq_id, []))
+            append_len = accepted_len + correction_len
+            if append_len:
                 positions = list(kv_commit_plan.kv_positions_by_seq.get(seq_id, []))
                 slots = list(kv_commit_plan.kv_slots_or_blocks_by_seq.get(seq_id, []))
-                if len(positions) != accepted_len or not slots:
+                if len(positions) != append_len or not slots:
                     raise MailboxVerifyApplyError(
                         f"mailbox KV commit append mapping invalid for seq_id={seq_id}",
                         next_required_feature="kv_slot_mapping_after_mailbox_verify",
@@ -1814,6 +1847,7 @@ def run_mailbox_verify_commit_probe(
                     error_kind="mailbox_verify_commit_stale_sequence_snapshot",
                 )
             accepted_tokens = list(commit_plan.accepted_token_ids_by_seq.get(seq_id, []))
+            correction_tokens = list(commit_plan.target_correction_token_ids_by_seq.get(seq_id, []))
             if accepted_tokens:
                 if seq_id not in mutated_seq_ids:
                     mutated_seq_ids.append(seq_id)
@@ -1834,6 +1868,26 @@ def run_mailbox_verify_commit_probe(
                                 next_required_feature="mailbox_commit_rollback_validation",
                                 error_kind="mailbox_verify_commit_eos_handling_unavailable",
                             )
+            if correction_tokens:
+                if seq_id not in mutated_seq_ids:
+                    mutated_seq_ids.append(seq_id)
+                for token in correction_tokens:
+                    if not hasattr(seq, "append_token"):
+                        raise MailboxVerifyApplyError(
+                            f"mailbox verify commit Sequence cannot append target correction token: seq_id={seq_id}",
+                            next_required_feature="active_request_continuation_target_correction_not_committed",
+                            error_kind="active_request_continuation_target_correction_not_committed",
+                        )
+                    seq.append_token(int(token))
+                    if eos_token_id is not None and _is_eos_token(int(token), eos_token_id) and not bool(getattr(seq, "ignore_eos", False)):
+                        if hasattr(seq, "mark_finished"):
+                            seq.mark_finished(record_finish_ts=False)
+                        else:
+                            raise MailboxVerifyApplyError(
+                                f"mailbox verify commit correction EOS handling unavailable: seq_id={seq_id}",
+                                next_required_feature="active_request_continuation_target_correction_not_committed",
+                                error_kind="active_request_continuation_target_correction_not_committed",
+                            )
             rejected_len = len(commit_plan.rejected_token_ids_by_seq.get(seq_id, []))
             if rejected_len and hasattr(seq, "record_invalidated_predraft"):
                 if seq_id not in mutated_seq_ids:
@@ -1844,6 +1898,16 @@ def run_mailbox_verify_commit_probe(
                 if seq_id not in mutated_seq_ids:
                     mutated_seq_ids.append(seq_id)
                 seq.record_accepted(accepted_len)
+            if correction_tokens and hasattr(seq, "num_acc_tokens"):
+                current_acc = int(getattr(seq, "cur_acc_tokens", 0) or 0)
+                seq.num_acc_tokens.append(current_acc + accepted_len + 1)
+                seq.cur_acc_tokens = 0
+            elif accepted_len and hasattr(seq, "cur_acc_tokens"):
+                seq.cur_acc_tokens = int(getattr(seq, "cur_acc_tokens", 0) or 0) + accepted_len
+            max_tokens = int(getattr(seq, "max_tokens", 0) or 0)
+            if max_tokens > 0 and int(getattr(seq, "num_completion_tokens", 0) or 0) >= max_tokens:
+                if hasattr(seq, "mark_finished"):
+                    seq.mark_finished(record_finish_ts=False)
         after = {int(seq.seq_id): _sequence_snapshot(seq) for seq in seq_list}
         for seq_id in commit_plan.seq_ids:
             if not _snapshots_equal(after.get(seq_id), commit_plan.sequence_state_after_expected.get(seq_id), ignore_volatile_timestamps=True):

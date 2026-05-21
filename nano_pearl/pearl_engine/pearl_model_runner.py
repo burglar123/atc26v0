@@ -543,6 +543,7 @@ class ModelRunnerBase:
             "mailbox_verify_commit_error_kind": None,
             "mailbox_verify_commit_seq_ids": [],
             "mailbox_verify_commit_accepted_lengths_by_seq": {},
+            "mailbox_verify_commit_target_correction_token_ids_by_seq": {},
             "mailbox_verify_commit_rejected_seq_ids": [],
             "mailbox_verify_commit_total_accepted_tokens": 0,
             "mailbox_verify_commit_total_rejected_tokens": 0,
@@ -558,6 +559,7 @@ class ModelRunnerBase:
             "kv_commit_error_kind": None,
             "kv_commit_seq_ids": [],
             "kv_commit_accepted_lengths_by_seq": {},
+            "kv_commit_target_correction_token_ids_by_seq": {},
             "kv_commit_append_start_positions_by_seq": {},
             "kv_commit_append_end_positions_by_seq": {},
             "kv_commit_sequence_length_before_by_seq": {},
@@ -695,6 +697,16 @@ class ModelRunnerBase:
             "active_continuation_expected_len_by_step": [],
             "active_continuation_accepted_len_by_step": [],
             "active_continuation_rejected_len_by_step": [],
+            "active_continuation_target_correction_token_ids_by_step": [],
+            "active_continuation_target_correction_committed_by_step": [],
+            "active_continuation_rejected_draft_token_ids_by_step": [],
+            "active_continuation_prefix_len_by_step": [],
+            "active_continuation_position_ids_by_step": [],
+            "active_continuation_slot_mapping_summary_by_step": [],
+            "active_continuation_alignment_check_by_step": [],
+            "active_continuation_alignment_error": None,
+            "active_continuation_reject_recovery_attempted": False,
+            "active_continuation_reject_recovery_success": False,
             "active_continuation_zero_accept_step_count": 0,
             "active_continuation_average_acceptance_rate": 0.0,
             "active_continuation_starving_seq_ids": [],
@@ -926,6 +938,7 @@ class ModelRunnerBase:
             "mailbox_verify_commit_error_kind",
             "mailbox_verify_commit_seq_ids",
             "mailbox_verify_commit_accepted_lengths_by_seq",
+            "mailbox_verify_commit_target_correction_token_ids_by_seq",
             "mailbox_verify_commit_rejected_seq_ids",
             "mailbox_verify_commit_total_accepted_tokens",
             "mailbox_verify_commit_total_rejected_tokens",
@@ -941,6 +954,7 @@ class ModelRunnerBase:
             "kv_commit_error_kind",
             "kv_commit_seq_ids",
             "kv_commit_accepted_lengths_by_seq",
+            "kv_commit_target_correction_token_ids_by_seq",
             "kv_commit_append_start_positions_by_seq",
             "kv_commit_append_end_positions_by_seq",
             "kv_commit_sequence_length_before_by_seq",
@@ -1075,6 +1089,16 @@ class ModelRunnerBase:
             "active_continuation_expected_len_by_step",
             "active_continuation_accepted_len_by_step",
             "active_continuation_rejected_len_by_step",
+            "active_continuation_target_correction_token_ids_by_step",
+            "active_continuation_target_correction_committed_by_step",
+            "active_continuation_rejected_draft_token_ids_by_step",
+            "active_continuation_prefix_len_by_step",
+            "active_continuation_position_ids_by_step",
+            "active_continuation_slot_mapping_summary_by_step",
+            "active_continuation_alignment_check_by_step",
+            "active_continuation_alignment_error",
+            "active_continuation_reject_recovery_attempted",
+            "active_continuation_reject_recovery_success",
             "active_continuation_zero_accept_step_count",
             "active_continuation_average_acceptance_rate",
             "active_continuation_starving_seq_ids",
@@ -1701,6 +1725,8 @@ class ModelRunnerBase:
         accepted_lengths = {int(key): int(value or 0) for key, value in dict(getattr(commit_plan, "accepted_lengths_by_seq", {}) or {}).items()}
         rejected_token_ids_by_seq = dict(getattr(commit_plan, "rejected_token_ids_by_seq", {}) or {})
         accepted_token_ids_by_seq = dict(getattr(commit_plan, "accepted_token_ids_by_seq", {}) or {})
+        target_correction_token_ids_by_seq = dict(getattr(commit_plan, "target_correction_token_ids_by_seq", {}) or {})
+        drafted_token_ids_by_seq = dict(getattr(getattr(commit_result, "plan", None), "drafted_token_ids_by_seq", {}) or {})
         rejected_lengths = {
             int(key): len(value or [])
             for key, value in rejected_token_ids_by_seq.items()
@@ -1733,6 +1759,15 @@ class ModelRunnerBase:
             "rejected_len_by_seq": {str(key): value for key, value in rejected_lengths.items()},
             "accepted_token_count_by_seq": {
                 str(key): len(value or []) for key, value in accepted_token_ids_by_seq.items()
+            },
+            "target_correction_token_ids_by_seq": {
+                str(key): list(value or []) for key, value in target_correction_token_ids_by_seq.items()
+            },
+            "rejected_draft_token_ids_by_seq": {
+                str(key): list(value or []) for key, value in rejected_token_ids_by_seq.items()
+            },
+            "draft_token_ids_by_seq": {
+                str(key): list(value or []) for key, value in drafted_token_ids_by_seq.items()
             },
             "pending_payload_ids": pending_payload_ids,
             "consumed_payload_ids": consumed_payload_ids,
@@ -1960,6 +1995,55 @@ class ModelRunnerBase:
             {"step_count": item.get("step_count"), "values": dict(item.get("rejected_len_by_seq") or {})}
             for item in step_history
         ]
+        trace_record["active_continuation_target_correction_token_ids_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_token_ids_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_target_correction_committed_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "values": {
+                    str(seq_id): bool(tokens) and int((item.get("output_token_delta_by_seq") or {}).get(str(seq_id), 0) or 0) > 0
+                    for seq_id, tokens in (item.get("target_correction_token_ids_by_seq") or {}).items()
+                },
+            }
+            for item in step_history
+        ]
+        trace_record["active_continuation_rejected_draft_token_ids_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("rejected_draft_token_ids_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_prefix_len_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("remaining_output_tokens_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_position_ids_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("position_ids_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_slot_mapping_summary_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("slot_mapping_summary_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_alignment_check_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "prefix_len_match": True,
+                "position_match": True,
+                "slot_mapping_match": True,
+            }
+            for item in step_history
+        ]
+        correction_attempted = any((item.get("target_correction_token_ids_by_seq") or {}) for item in step_history)
+        trace_record["active_continuation_reject_recovery_attempted"] = bool(correction_attempted)
+        trace_record["active_continuation_reject_recovery_success"] = bool(
+            correction_attempted
+            and all(
+                all(row.get("values", {}).values())
+                for row in trace_record["active_continuation_target_correction_committed_by_step"]
+                if row.get("values")
+            )
+        )
         total_expected = sum(
             sum(int(value or 0) for value in (item.get("expected_len_by_seq") or {}).values())
             for item in step_history
@@ -2045,6 +2129,18 @@ class ModelRunnerBase:
         average_acceptance = float(trace_record.get("active_continuation_average_acceptance_rate") or 0.0)
         zero_accept_steps = int(trace_record.get("active_continuation_zero_accept_step_count") or 0)
         if progress_history and (average_acceptance <= 0.05 or zero_accept_steps >= max(1, len(progress_history) // 2)):
+            correction_attempted = bool(trace_record.get("active_continuation_reject_recovery_attempted"))
+            correction_success = bool(trace_record.get("active_continuation_reject_recovery_success"))
+            if not correction_attempted:
+                return (
+                    "active_request_continuation_reject_recovery_missing",
+                    "active continuation saw rejected spans but no target correction token was available",
+                )
+            if not correction_success:
+                return (
+                    "active_request_continuation_target_correction_not_committed",
+                    "active continuation target correction token was available but did not advance Sequence output",
+                )
             return (
                 "active_request_continuation_acceptance_too_low",
                 (
@@ -2667,9 +2763,13 @@ class ModelRunnerBase:
                 step_plan,
                 commit_allowed=True,
                 commit_mode="guarded_probe",
+                eos_token_id=getattr(self.global_config, "eos", None),
             )
             trace_record["mailbox_verify_commit_seq_ids"] = list(commit_plan.seq_ids)
             trace_record["mailbox_verify_commit_accepted_lengths_by_seq"] = dict(commit_plan.accepted_lengths_by_seq)
+            trace_record["mailbox_verify_commit_target_correction_token_ids_by_seq"] = dict(
+                commit_plan.target_correction_token_ids_by_seq
+            )
             trace_record["mailbox_verify_commit_rejected_seq_ids"] = list(commit_plan.rejected_seq_ids)
             trace_record["mailbox_verify_commit_total_accepted_tokens"] = sum(
                 len(tokens) for tokens in commit_plan.accepted_token_ids_by_seq.values()
@@ -2689,6 +2789,9 @@ class ModelRunnerBase:
             trace_record["kv_commit_plan_built"] = True
             trace_record["kv_commit_seq_ids"] = list(kv_commit_plan.seq_ids)
             trace_record["kv_commit_accepted_lengths_by_seq"] = dict(kv_commit_plan.accepted_lengths_by_seq)
+            trace_record["kv_commit_target_correction_token_ids_by_seq"] = dict(
+                kv_commit_plan.target_correction_token_ids_by_seq
+            )
             trace_record["kv_commit_append_start_positions_by_seq"] = dict(kv_commit_plan.append_start_positions_by_seq)
             trace_record["kv_commit_append_end_positions_by_seq"] = dict(kv_commit_plan.append_end_positions_by_seq)
             trace_record["kv_commit_sequence_length_before_by_seq"] = dict(kv_commit_plan.sequence_length_before_by_seq)

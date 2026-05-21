@@ -25,6 +25,7 @@ sys.modules[engine_pkg_name] = engine_pkg
 
 apply_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_verify_apply")
 mailbox_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox")
+transport_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_transport")
 
 
 def commit_result(**overrides):
@@ -397,6 +398,85 @@ def test_limit_reached_is_reclassified_to_specific_progress_diagnostic():
     assert "mailbox_payload_after_active_continuation" in source
 
 
+class RejectRecoverySeq:
+    def __init__(self):
+        self.seq_id = 1
+        self.request_id = "r1"
+        self.token_ids = [7, 101]
+        self.num_tokens = 2
+        self.num_prompt_tokens = 2
+        self.last_token = 101
+        self.block_table = [1]
+        self.home_batch_id = 0
+        self.ignore_eos = False
+        self.first_token_ts = None
+        self.finish_ts = None
+        self.is_finished = False
+        self.max_tokens = 32
+        self.num_acc_tokens = []
+        self.cur_acc_tokens = 0
+        self.trace_stats = {"scheduled_iterations": [], "accepted_tokens": 0, "invalidated_predraft_tokens": 0}
+
+    def __len__(self):
+        return self.num_tokens
+
+    @property
+    def num_completion_tokens(self):
+        return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def completion_token_ids(self):
+        return self.token_ids[self.num_prompt_tokens:]
+
+    def append_token(self, token_id: int):
+        self.token_ids.append(int(token_id))
+        self.last_token = int(token_id)
+        self.num_tokens += 1
+
+    def record_accepted(self, accepted_len: int):
+        self.trace_stats["accepted_tokens"] += int(accepted_len)
+
+    def record_invalidated_predraft(self, invalidated_len: int):
+        self.trace_stats["invalidated_predraft_tokens"] += int(invalidated_len)
+
+
+def test_zero_accept_reject_recovery_commits_target_correction_token():
+    seqs = [RejectRecoverySeq()]
+    verify_input = transport_mod.TargetForwardFromMailboxInput(
+        plan_id=12,
+        target_home_batch_id=0,
+        seq_ids=[1],
+        request_ids=["r1"],
+        input_token_ids=[111],
+        per_seq_lengths=[1],
+        offsets=[0],
+        total_tokens=1,
+        gamma=4,
+        positions=[2],
+        kv_slot_ids=[2002],
+        source_mailbox_payload_ids=["12:1:0:0:1"],
+        source_draft_plan_id=12,
+    )
+    step_plan = SimpleNamespace(plan_id=12, target_home_batch_id=0, actual_target_exec_seq_ids=[1])
+    verify_result = apply_mod.build_mailbox_verify_result(verify_input, target_token_ids=[999], output_owner_rank=0)
+    apply_plan = apply_mod.build_mailbox_verify_apply_plan(verify_result, seqs, step_plan, max_model_len=32)
+    commit_plan = apply_mod.build_mailbox_verify_commit_plan(verify_result, apply_plan, seqs, step_plan, commit_allowed=True)
+    kv_plan = apply_mod.build_mailbox_kv_commit_plan(verify_result, commit_plan, seqs, step_plan, max_model_len=32, commit_allowed=True)
+    result = apply_mod.run_mailbox_verify_commit_probe(
+        commit_plan,
+        seqs,
+        current_rank=0,
+        output_owner_rank=0,
+        kv_commit_plan=kv_plan,
+    )
+    assert verify_result.accepted_lengths_by_seq == {1: 0}
+    assert commit_plan.target_correction_token_ids_by_seq == {1: [999]}
+    assert result.success is True
+    assert seqs[0].completion_token_ids == [999]
+    assert 111 not in seqs[0].completion_token_ids
+    assert seqs[0].trace_stats["invalidated_predraft_tokens"] == 1
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -420,6 +500,7 @@ def main() -> None:
     test_active_continuation_trace_has_v4v_progress_fields()
     test_max_steps_cli_config_is_not_hard_coded_in_runner()
     test_limit_reached_is_reclassified_to_specific_progress_diagnostic()
+    test_zero_accept_reject_recovery_commits_target_correction_token()
 
 
 if __name__ == "__main__":

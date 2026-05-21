@@ -134,9 +134,11 @@ def test_partial_accept_and_all_reject_kv_plans():
     _, _, _, rejected, _ = build_plans([0, 0, 0, 0, 0])
 
     assert partial.accepted_lengths_by_seq == {1: 1, 3: 2}
-    assert partial.kv_positions_by_seq[3] == [4, 5]
+    assert partial.target_correction_token_ids_by_seq[3] == [999]
+    assert partial.kv_positions_by_seq[3] == [3, 4, 5]
     assert rejected.accepted_lengths_by_seq == {1: 0, 3: 0}
-    assert rejected.kv_positions_by_seq == {1: [], 3: []}
+    assert rejected.target_correction_token_ids_by_seq == {1: [0], 3: [0]}
+    assert rejected.kv_positions_by_seq == {1: [1], 3: [3]}
 
 
 def test_wrong_seq_id_and_home_batch_fail():

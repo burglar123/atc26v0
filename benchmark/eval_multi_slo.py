@@ -962,6 +962,16 @@ def aggregate_low_level_traces(
         active_continuation_expected_len_by_step: List[Any] = []
         active_continuation_accepted_len_by_step: List[Any] = []
         active_continuation_rejected_len_by_step: List[Any] = []
+        active_continuation_target_correction_token_ids_by_step: List[Any] = []
+        active_continuation_target_correction_committed_by_step: List[Any] = []
+        active_continuation_rejected_draft_token_ids_by_step: List[Any] = []
+        active_continuation_prefix_len_by_step: List[Any] = []
+        active_continuation_position_ids_by_step: List[Any] = []
+        active_continuation_slot_mapping_summary_by_step: List[Any] = []
+        active_continuation_alignment_check_by_step: List[Any] = []
+        active_continuation_alignment_errors: List[str] = []
+        active_continuation_reject_recovery_attempt_count = 0
+        active_continuation_reject_recovery_success_count = 0
         active_continuation_total_output_token_delta = 0
         active_continuation_total_accepted_token_delta = 0
         active_continuation_completion_rechecked_count = 0
@@ -1399,6 +1409,33 @@ def aggregate_low_level_traces(
                 active_continuation_accepted_len_by_step = list(e.get("active_continuation_accepted_len_by_step") or [])
             if e.get("active_continuation_rejected_len_by_step"):
                 active_continuation_rejected_len_by_step = list(e.get("active_continuation_rejected_len_by_step") or [])
+            if e.get("active_continuation_target_correction_token_ids_by_step"):
+                active_continuation_target_correction_token_ids_by_step = list(
+                    e.get("active_continuation_target_correction_token_ids_by_step") or []
+                )
+            if e.get("active_continuation_target_correction_committed_by_step"):
+                active_continuation_target_correction_committed_by_step = list(
+                    e.get("active_continuation_target_correction_committed_by_step") or []
+                )
+            if e.get("active_continuation_rejected_draft_token_ids_by_step"):
+                active_continuation_rejected_draft_token_ids_by_step = list(
+                    e.get("active_continuation_rejected_draft_token_ids_by_step") or []
+                )
+            if e.get("active_continuation_prefix_len_by_step"):
+                active_continuation_prefix_len_by_step = list(e.get("active_continuation_prefix_len_by_step") or [])
+            if e.get("active_continuation_position_ids_by_step"):
+                active_continuation_position_ids_by_step = list(e.get("active_continuation_position_ids_by_step") or [])
+            if e.get("active_continuation_slot_mapping_summary_by_step"):
+                active_continuation_slot_mapping_summary_by_step = list(
+                    e.get("active_continuation_slot_mapping_summary_by_step") or []
+                )
+            if e.get("active_continuation_alignment_check_by_step"):
+                active_continuation_alignment_check_by_step = list(e.get("active_continuation_alignment_check_by_step") or [])
+            append_unique(active_continuation_alignment_errors, e.get("active_continuation_alignment_error"))
+            if e.get("active_continuation_reject_recovery_attempted"):
+                active_continuation_reject_recovery_attempt_count += 1
+            if e.get("active_continuation_reject_recovery_success"):
+                active_continuation_reject_recovery_success_count += 1
             active_continuation_total_output_token_delta = max(
                 active_continuation_total_output_token_delta,
                 int(e.get("active_continuation_total_output_token_delta") or 0),
@@ -1809,6 +1846,24 @@ def aggregate_low_level_traces(
             row["active_continuation_accepted_len_by_step"] = active_continuation_accepted_len_by_step
         if active_continuation_rejected_len_by_step:
             row["active_continuation_rejected_len_by_step"] = active_continuation_rejected_len_by_step
+        if active_continuation_target_correction_token_ids_by_step:
+            row["active_continuation_target_correction_token_ids_by_step"] = active_continuation_target_correction_token_ids_by_step
+        if active_continuation_target_correction_committed_by_step:
+            row["active_continuation_target_correction_committed_by_step"] = active_continuation_target_correction_committed_by_step
+        if active_continuation_rejected_draft_token_ids_by_step:
+            row["active_continuation_rejected_draft_token_ids_by_step"] = active_continuation_rejected_draft_token_ids_by_step
+        if active_continuation_prefix_len_by_step:
+            row["active_continuation_prefix_len_by_step"] = active_continuation_prefix_len_by_step
+        if active_continuation_position_ids_by_step:
+            row["active_continuation_position_ids_by_step"] = active_continuation_position_ids_by_step
+        if active_continuation_slot_mapping_summary_by_step:
+            row["active_continuation_slot_mapping_summary_by_step"] = active_continuation_slot_mapping_summary_by_step
+        if active_continuation_alignment_check_by_step:
+            row["active_continuation_alignment_check_by_step"] = active_continuation_alignment_check_by_step
+        if active_continuation_alignment_errors:
+            row["active_continuation_alignment_errors"] = active_continuation_alignment_errors
+        row["active_continuation_reject_recovery_attempt_count"] = active_continuation_reject_recovery_attempt_count
+        row["active_continuation_reject_recovery_success_count"] = active_continuation_reject_recovery_success_count
         row["active_continuation_total_output_token_delta"] = active_continuation_total_output_token_delta
         row["active_continuation_total_accepted_token_delta"] = active_continuation_total_accepted_token_delta
         row["active_continuation_completion_rechecked_count"] = active_continuation_completion_rechecked_count

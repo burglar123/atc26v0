@@ -143,7 +143,7 @@ def test_all_accepted_commit_mutates_sequences_and_points_to_kv_next_feature():
     assert result.kv_commit_attempted is True
 
 
-def test_partial_accepted_reject_does_not_append_rejected_suffix_and_plans_invalidate():
+def test_partial_accepted_reject_appends_target_correction_and_plans_invalidate():
     _, _, commit_plan, kv_commit_plan, seqs = build_commit([101, 301, 302, 999, 999])
     result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
@@ -151,19 +151,19 @@ def test_partial_accepted_reject_does_not_append_rejected_suffix_and_plans_inval
     assert commit_plan.accepted_lengths_by_seq == {1: 1, 3: 2}
     assert commit_plan.rejected_seq_ids == [3]
     assert commit_plan.rejected_token_ids_by_seq[3] == [303, 304]
+    assert commit_plan.target_correction_token_ids_by_seq[3] == [999]
     assert commit_plan.mailbox_payloads_to_consume == ["1:1:0:1"]
     assert commit_plan.mailbox_payloads_to_invalidate == ["1:3:1:4"]
-    assert seqs[1].token_ids == [8, 9, 10, 301, 301, 302]
+    assert seqs[1].token_ids == [8, 9, 10, 301, 301, 302, 999]
 
 
-def test_all_rejected_commit_records_no_sequence_mutation():
+def test_all_rejected_commit_appends_target_correction_not_rejected_draft():
     _, _, commit_plan, kv_commit_plan, seqs = build_commit([0, 0, 0, 0, 0])
-    before = [list(seq.token_ids) for seq in seqs]
     result = run_mailbox_verify_commit_probe(commit_plan, seqs, current_rank=10, output_owner_rank=10, kv_commit_plan=kv_commit_plan)
 
     assert result.success is True
     assert commit_plan.accepted_lengths_by_seq == {1: 0, 3: 0}
-    assert [seq.token_ids for seq in seqs] == before
+    assert [seq.token_ids for seq in seqs] == [[7, 101, 0], [8, 9, 10, 301, 0]]
     assert set(commit_plan.mailbox_payloads_to_invalidate) == {"1:1:0:1", "1:3:1:4"}
 
 
