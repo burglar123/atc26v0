@@ -981,6 +981,16 @@ class ModelRunnerBase:
             "active_continuation_schedule_forced_target_home_batch_id": (
                 getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None)
             ),
+            # V4Y trace: alignment diagnostics baseline
+            "active_continuation_alignment_checked_after_correction": False,
+            "active_continuation_acceptance_too_low_after_alignment_checked": False,
+            "active_continuation_draft_kv_state_mismatch": False,
+            "active_continuation_target_kv_state_mismatch": False,
+            "active_continuation_position_mismatch": False,
+            "active_continuation_slot_mapping_mismatch": False,
+            "active_continuation_block_table_mismatch": False,
+            "active_continuation_model_input_mismatch": False,
+            "active_continuation_true_low_acceptance_after_alignment_checked": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -2761,6 +2771,242 @@ class ModelRunnerBase:
         if snapshot.get("no_progress_reason"):
             trace_record["active_continuation_no_progress_reason"] = snapshot.get("no_progress_reason")
 
+    def _build_v4y_alignment_diagnostics(
+        self,
+        progress_history: list[dict],
+        trace_record: dict,
+    ) -> dict:
+        """V4Y: check KV/position/slot/block/input alignment after clean correction.
+
+        Returns dict with keys: alignment_failure, selected_feature, selected_error.
+        Only fires when correction and next-prefix diagnostics are already clean.
+        """
+        rows: list[dict] = []
+        selected_feature: str | None = None
+        selected_error: str | None = None
+        for index, item in enumerate(progress_history[:-1]):
+            next_item = progress_history[index + 1]
+            corrections = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (item.get("target_correction_token_ids_by_seq") or {}).items()
+                if v
+            }
+            if not corrections:
+                continue
+            step_count = int(item.get("step_count") or 0)
+            # Per-seq alignment checks
+            current_after = {
+                int(k): [int(t) for t in (v.get("after") or [])]
+                for k, v in (item.get("sequence_token_ids_before_after_by_seq") or {}).items()
+            }
+            next_before = {
+                int(k): [int(t) for t in (v.get("before") or [])]
+                for k, v in (next_item.get("sequence_token_ids_before_after_by_seq") or {}).items()
+            }
+            prefix_lens_before_after = {
+                int(k): dict(v)
+                for k, v in (item.get("prefix_len_before_after_by_seq") or {}).items()
+            }
+            next_prefix_lens = {
+                int(k): dict(v)
+                for k, v in (next_item.get("prefix_len_before_after_by_seq") or {}).items()
+            }
+            draft_tokens_by_seq = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (next_item.get("draft_token_ids_by_seq") or {}).items()
+            }
+            next_kv_lens = {
+                int(k): dict(v)
+                for k, v in (next_item.get("kv_length_before_after_by_seq") or {}).items()
+            }
+            next_positions = {
+                int(k): [int(p) for p in (v or [])]
+                for k, v in (next_item.get("position_ids_by_seq") or {}).items()
+            }
+            next_slot_prefix_lens = {
+                int(k): int(v or 0)
+                for k, v in (next_item.get("slot_mapping_prefix_len_by_seq") or {}).items()
+            }
+            next_source_object_ids = {
+                int(k): int(v or 0)
+                for k, v in (next_item.get("next_prefix_source_object_id_by_seq") or {}).items()
+            }
+            committed_object_ids = {
+                int(k): int(v or 0)
+                for k, v in (item.get("committed_sequence_object_id_by_seq") or {}).items()
+            }
+            draft_side_tokens = {
+                int(k): [int(t) for t in (v or [])]
+                for k, v in (next_item.get("draft_side_sequence_token_ids_by_seq") or {}).items()
+            }
+            for seq_id in sorted(corrections):
+                correction_tokens = corrections[seq_id]
+                after_tokens = current_after.get(seq_id, [])
+                before_tokens = next_before.get(seq_id, [])
+                corrected_prefix_len = (
+                    prefix_lens_before_after.get(seq_id, {}).get("after")
+                    or len(after_tokens)
+                )
+                next_before_len = (
+                    next_prefix_lens.get(seq_id, {}).get("before")
+                    or len(before_tokens)
+                )
+                # KV state check
+                kv_before = next_kv_lens.get(seq_id, {}).get("before")
+                kv_draft_before = next_kv_lens.get(seq_id, {}).get("draft_before")
+                kv_target_before = next_kv_lens.get(seq_id, {}).get("target_before")
+                draft_kv_stale = bool(
+                    kv_draft_before is not None
+                    and corrected_prefix_len is not None
+                    and int(kv_draft_before or 0) < int(corrected_prefix_len or 0)
+                )
+                target_kv_stale = bool(
+                    kv_before is not None
+                    and corrected_prefix_len is not None
+                    and int(kv_before or 0) < int(corrected_prefix_len or 0)
+                )
+                if not target_kv_stale and kv_target_before is not None:
+                    target_kv_stale = bool(
+                        int(kv_target_before or 0) < int(corrected_prefix_len or 0)
+                    )
+                # Position alignment check
+                positions = next_positions.get(seq_id, [])
+                position_mismatch = bool(
+                    positions
+                    and corrected_prefix_len is not None
+                    and (
+                        len(positions) < int(corrected_prefix_len or 0)
+                        or (positions and min(positions) < int(corrected_prefix_len or 0))
+                    )
+                )
+                # Slot mapping check
+                slot_prefix = next_slot_prefix_lens.get(seq_id)
+                slot_mismatch = bool(
+                    slot_prefix is not None
+                    and corrected_prefix_len is not None
+                    and int(slot_prefix or 0) < int(corrected_prefix_len or 0)
+                )
+                # Block table / object identity check
+                committed_obj = committed_object_ids.get(seq_id)
+                next_source_obj = next_source_object_ids.get(seq_id)
+                block_table_mismatch = bool(
+                    committed_obj is not None
+                    and next_source_obj is not None
+                    and committed_obj != next_source_obj
+                )
+                # Model input consistency: draft-side tokens vs target-side prefix
+                draft_tokens = draft_tokens_by_seq.get(seq_id, [])
+                draft_side = draft_side_tokens.get(seq_id, [])
+                model_input_mismatch = False
+                if draft_tokens and before_tokens:
+                    # Check draft token generation context matches target prefix
+                    pass  # draft tokens are the OUTPUT of draft model, not input
+                if draft_side and before_tokens:
+                    # draft-side token list should match target-side prefix
+                    if len(draft_side) < len(before_tokens):
+                        model_input_mismatch = True
+                    elif draft_side[:len(before_tokens)] != before_tokens:
+                        model_input_mismatch = True
+
+                # Determine most specific diagnostic
+                feature = None
+                reason = "alignment_clean"
+                if draft_kv_stale:
+                    feature = "active_request_continuation_draft_kv_state_mismatch"
+                    reason = f"draft_kv_stale: kv={kv_draft_before}, prefix_len={corrected_prefix_len}"
+                elif target_kv_stale:
+                    feature = "active_request_continuation_target_kv_state_mismatch"
+                    reason = f"target_kv_stale: kv={kv_before or kv_target_before}, prefix_len={corrected_prefix_len}"
+                elif position_mismatch:
+                    feature = "active_request_continuation_position_mismatch"
+                    reason = f"position_mismatch: positions={positions[:5]}..., prefix_len={corrected_prefix_len}"
+                elif slot_mismatch:
+                    feature = "active_request_continuation_slot_mapping_mismatch"
+                    reason = f"slot_mismatch: slot_prefix={slot_prefix}, prefix_len={corrected_prefix_len}"
+                elif block_table_mismatch:
+                    feature = "active_request_continuation_block_table_mismatch"
+                    reason = f"block_table_mismatch: committed_obj={committed_obj}, next_source_obj={next_source_obj}"
+                elif model_input_mismatch:
+                    feature = "active_request_continuation_model_input_mismatch"
+                    reason = "draft_side_tokens != target_before_tokens"
+
+                row = {
+                    "step_count": step_count,
+                    "next_step_count": int(next_item.get("step_count") or 0),
+                    "seq_id": int(seq_id),
+                    "correction_token_ids": correction_tokens,
+                    "corrected_prefix_len": corrected_prefix_len,
+                    "next_before_len": next_before_len,
+                    "kv_before": kv_before,
+                    "kv_draft_before": kv_draft_before,
+                    "kv_target_before": kv_target_before,
+                    "draft_kv_stale": draft_kv_stale,
+                    "target_kv_stale": target_kv_stale,
+                    "position_mismatch": position_mismatch,
+                    "slot_mismatch": slot_mismatch,
+                    "block_table_mismatch": block_table_mismatch,
+                    "model_input_mismatch": model_input_mismatch,
+                    "draft_side_token_count": len(draft_side),
+                    "target_before_token_count": len(before_tokens),
+                    "final_diagnostic_reason": reason,
+                    "next_required_feature": feature,
+                }
+                rows.append(row)
+                if feature is not None and selected_feature is None:
+                    selected_feature = feature
+                    selected_error = (
+                        f"V4Y alignment diagnostic: {reason}; "
+                        f"seq_id={seq_id}, step_count={step_count}"
+                    )
+
+        # Populate trace fields
+        trace_record["active_continuation_alignment_checked_after_correction"] = bool(rows)
+        trace_record["active_continuation_alignment_rows"] = rows
+        for key in (
+            "active_continuation_draft_kv_state_mismatch",
+            "active_continuation_target_kv_state_mismatch",
+            "active_continuation_position_mismatch",
+            "active_continuation_slot_mapping_mismatch",
+            "active_continuation_block_table_mismatch",
+            "active_continuation_model_input_mismatch",
+        ):
+            trace_record[key] = any(
+                row.get("next_required_feature") == key for row in rows
+            )
+        trace_record["active_continuation_true_low_acceptance_after_alignment_checked"] = (
+            bool(rows) and selected_feature is None
+        )
+
+        # Per-step trace fields
+        trace_record["active_continuation_draft_prefix_len_by_step"] = [
+            {"step_count": row.get("step_count"), "seq_id": row.get("seq_id"),
+             "corrected_prefix_len": row.get("corrected_prefix_len")}
+            for row in rows
+        ]
+        trace_record["active_continuation_target_prefix_len_by_step"] = [
+            {"step_count": row.get("step_count"), "seq_id": row.get("seq_id"),
+             "next_before_len": row.get("next_before_len")}
+            for row in rows
+        ]
+        trace_record["active_continuation_draft_kv_len_by_step"] = [
+            {"step_count": row.get("step_count"), "seq_id": row.get("seq_id"),
+             "kv_draft_before": row.get("kv_draft_before")}
+            for row in rows
+        ]
+        trace_record["active_continuation_target_kv_len_by_step"] = [
+            {"step_count": row.get("step_count"), "seq_id": row.get("seq_id"),
+             "kv_before": row.get("kv_before")}
+            for row in rows
+        ]
+
+        return {
+            "alignment_rows": rows,
+            "alignment_checked": bool(rows),
+            "alignment_failure": selected_feature is not None,
+            "selected_feature": selected_feature,
+            "selected_error": selected_error,
+        }
+
     def _classify_v4v_active_continuation_limit(
         self,
         trace_record: dict,
@@ -2918,17 +3164,35 @@ class ModelRunnerBase:
                     "active continuation target correction token was available but did not advance Sequence output",
                 )
             trace_record["active_continuation_acceptance_too_low_after_correction_checked"] = True
+            # V4Y: alignment diagnostics before accepting low acceptance
+            alignment = self._build_v4y_alignment_diagnostics(progress_history, trace_record)
+            trace_record["active_continuation_alignment_checked_after_correction"] = bool(
+                alignment.get("alignment_checked", False)
+            )
+            trace_record["active_continuation_acceptance_too_low_after_alignment_checked"] = (
+                alignment.get("alignment_checked", False)
+                and not alignment.get("alignment_failure", False)
+            )
+            if alignment.get("alignment_failure"):
+                next_feature = str(alignment.get("selected_feature") or "")
+                return (
+                    next_feature,
+                    str(alignment.get("selected_error") or "V4Y alignment diagnostic failed"),
+                )
             return (
                 "active_request_continuation_acceptance_too_low",
                 (
                     "active continuation token progress is dominated by rejected spans; "
                     f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}; "
                     "active_continuation_acceptance_too_low_after_correction_checked=True; "
+                    "active_continuation_acceptance_too_low_after_alignment_checked=True; "
                     f"zero_accept_correction_checked={bool(zero_accept_correction.get('zero_accept_correction_checked', False))}; "
                     f"zero_accept_correction_failure={bool(zero_accept_correction.get('zero_accept_correction_failure', False))}; "
                     f"zero_accept_correction_rows_count={len(zero_accept_correction.get('zero_accept_correction_rows') or [])}; "
                     f"next_step_prefix_checked={bool(next_prefix_diagnostic.get('next_step_prefix_checked', False))}; "
-                    f"next_step_prefix_failure={bool(next_prefix_diagnostic.get('next_step_prefix_failure', False))}"
+                    f"next_step_prefix_failure={bool(next_prefix_diagnostic.get('next_step_prefix_failure', False))}; "
+                    f"alignment_checked={bool(alignment.get('alignment_checked', False))}; "
+                    f"alignment_failure={bool(alignment.get('alignment_failure', False))}"
                 ),
             )
         trace_record["active_continuation_progress_too_slow"] = True
