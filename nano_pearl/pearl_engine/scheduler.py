@@ -175,6 +175,7 @@ class Scheduler:
             two_batch_execution_dryrun=self.stspec_two_batch_dryrun,
             stspec_two_batch_probe=self.stspec_two_batch_probe,
             stspec_two_batch_probe_fail_fast=self.stspec_two_batch_probe_fail_fast,
+            batch_lock_active=batch_lock_active,
             stspec_pipeline_enabled=pipeline_state.enabled,
             stspec_pipeline_phase=pipeline_state.phase,
             stspec_pipeline_step=pipeline_state.step,

@@ -351,6 +351,7 @@ def build_legacy_step_plan(
     stspec_pipeline_warmup_done: bool = True,
     stspec_warmup_target_home_batch_id: int | None = None,
     stspec_warmup_draft_home_batch_id: int | None = None,
+    batch_lock_active: bool = False,
 ) -> StepPlan:
     """Wrap the existing scheduler output in a legacy-equivalent StepPlan.
 
@@ -359,6 +360,9 @@ def build_legacy_step_plan(
     keeps actual execution on legacy scheduled seqs; V4A real-probe mode records
     filtered actual exec sets so runners can validate protocol alignment and
     fail fast with a precise diagnostic before distributed communication.
+
+    V4AC: When batch_lock_active, the draft runner's actual exec seqs are
+    aligned with the target batch so corrections propagate to draft generation.
     """
     scheduled_seq_ids = [seq.seq_id for seq in seqs]
     role = role_from_runner(runner_role, is_prefill)
@@ -421,7 +425,11 @@ def build_legacy_step_plan(
     actual_draft_exec_seq_ids = list(scheduled_seq_ids)
     if real_probe_attempted and not is_prefill:
         actual_target_exec_seq_ids = list(target_batch_seq_ids)
-        actual_draft_exec_seq_ids = list(draft_home_batch_seq_ids)
+        # V4AC: during batch lock, draft generates for the locked target batch
+        if batch_lock_active:
+            actual_draft_exec_seq_ids = list(target_batch_seq_ids)
+        else:
+            actual_draft_exec_seq_ids = list(draft_home_batch_seq_ids)
 
     actual_exec_seq_ids = actual_exec_ids_for_runner(
         runner_role,
