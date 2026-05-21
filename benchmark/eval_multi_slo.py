@@ -933,13 +933,22 @@ def aggregate_low_level_traces(
         active_continuation_reasons: List[str] = []
         active_continuation_limit_reached_count = 0
         active_continuation_no_progress_count = 0
+        active_continuation_progress_too_slow_count = 0
+        active_continuation_no_progress_reasons: List[str] = []
         stspec_active_continuation_max_steps_values: List[int] = []
+        stspec_active_continuation_max_steps_effective_values: List[int] = []
+        stspec_active_continuation_max_steps_sources: List[str] = []
         active_continuation_remaining_seq_ids: List[Any] = []
         active_continuation_remaining_output_tokens_by_seq: Dict[str, Any] = {}
+        active_continuation_remaining_tokens_to_max_by_seq: Dict[str, Any] = {}
         active_continuation_pending_payload_ids: List[Any] = []
         active_continuation_latest_plan_id = None
         active_continuation_plan_id_history: List[Any] = []
+        active_continuation_home_batch_history: List[Any] = []
+        active_continuation_step_history: List[Any] = []
         active_continuation_progress_by_step: List[Any] = []
+        active_continuation_total_output_token_delta = 0
+        active_continuation_total_accepted_token_delta = 0
         active_continuation_completion_rechecked_count = 0
         active_continuation_finalization_attempt_count = 0
         active_continuation_finalization_success_count = 0
@@ -1299,21 +1308,44 @@ def aggregate_low_level_traces(
                 active_continuation_limit_reached_count += 1
             if e.get("active_continuation_no_progress"):
                 active_continuation_no_progress_count += 1
+            if e.get("active_continuation_progress_too_slow"):
+                active_continuation_progress_too_slow_count += 1
+            append_unique(active_continuation_no_progress_reasons, e.get("active_continuation_no_progress_reason"))
             if e.get("stspec_active_continuation_max_steps") is not None:
                 stspec_active_continuation_max_steps_values.append(int(e.get("stspec_active_continuation_max_steps") or 0))
+            if e.get("stspec_active_continuation_max_steps_effective") is not None:
+                stspec_active_continuation_max_steps_effective_values.append(
+                    int(e.get("stspec_active_continuation_max_steps_effective") or 0)
+                )
+            append_unique(stspec_active_continuation_max_steps_sources, e.get("stspec_active_continuation_max_steps_source"))
             for value in e.get("active_continuation_remaining_seq_ids") or []:
                 append_unique(active_continuation_remaining_seq_ids, value)
             tokens_by_seq = e.get("active_continuation_remaining_output_tokens_by_seq")
             if isinstance(tokens_by_seq, dict):
                 active_continuation_remaining_output_tokens_by_seq.update({str(k): v for k, v in tokens_by_seq.items()})
+            tokens_to_max = e.get("active_continuation_remaining_tokens_to_max_by_seq")
+            if isinstance(tokens_to_max, dict):
+                active_continuation_remaining_tokens_to_max_by_seq.update({str(k): v for k, v in tokens_to_max.items()})
             for value in e.get("active_continuation_pending_payload_ids") or []:
                 append_unique(active_continuation_pending_payload_ids, value)
             if e.get("active_continuation_latest_plan_id") is not None:
                 active_continuation_latest_plan_id = e.get("active_continuation_latest_plan_id")
             for value in e.get("active_continuation_plan_id_history") or []:
                 append_unique(active_continuation_plan_id_history, value)
+            if e.get("active_continuation_home_batch_history"):
+                active_continuation_home_batch_history = list(e.get("active_continuation_home_batch_history") or [])
+            if e.get("active_continuation_step_history"):
+                active_continuation_step_history = list(e.get("active_continuation_step_history") or [])
             if e.get("active_continuation_progress_by_step"):
                 active_continuation_progress_by_step = list(e.get("active_continuation_progress_by_step") or [])
+            active_continuation_total_output_token_delta = max(
+                active_continuation_total_output_token_delta,
+                int(e.get("active_continuation_total_output_token_delta") or 0),
+            )
+            active_continuation_total_accepted_token_delta = max(
+                active_continuation_total_accepted_token_delta,
+                int(e.get("active_continuation_total_accepted_token_delta") or 0),
+            )
             if e.get("active_continuation_completion_rechecked"):
                 active_continuation_completion_rechecked_count += 1
             if e.get("active_continuation_finalization_attempted"):
@@ -1664,20 +1696,35 @@ def aggregate_low_level_traces(
             row["active_continuation_reasons"] = active_continuation_reasons
         row["active_continuation_limit_reached_count"] = active_continuation_limit_reached_count
         row["active_continuation_no_progress_count"] = active_continuation_no_progress_count
+        row["active_continuation_progress_too_slow_count"] = active_continuation_progress_too_slow_count
+        if active_continuation_no_progress_reasons:
+            row["active_continuation_no_progress_reasons"] = active_continuation_no_progress_reasons
         if stspec_active_continuation_max_steps_values:
             row["stspec_active_continuation_max_steps"] = max(stspec_active_continuation_max_steps_values)
+        if stspec_active_continuation_max_steps_effective_values:
+            row["stspec_active_continuation_max_steps_effective"] = max(stspec_active_continuation_max_steps_effective_values)
+        if stspec_active_continuation_max_steps_sources:
+            row["stspec_active_continuation_max_steps_sources"] = stspec_active_continuation_max_steps_sources
         if active_continuation_remaining_seq_ids:
             row["active_continuation_remaining_seq_ids"] = active_continuation_remaining_seq_ids
         if active_continuation_remaining_output_tokens_by_seq:
             row["active_continuation_remaining_output_tokens_by_seq"] = active_continuation_remaining_output_tokens_by_seq
+        if active_continuation_remaining_tokens_to_max_by_seq:
+            row["active_continuation_remaining_tokens_to_max_by_seq"] = active_continuation_remaining_tokens_to_max_by_seq
         if active_continuation_pending_payload_ids:
             row["active_continuation_pending_payload_ids"] = active_continuation_pending_payload_ids
         if active_continuation_latest_plan_id is not None:
             row["active_continuation_latest_plan_id"] = active_continuation_latest_plan_id
         if active_continuation_plan_id_history:
             row["active_continuation_plan_id_history"] = active_continuation_plan_id_history
+        if active_continuation_home_batch_history:
+            row["active_continuation_home_batch_history"] = active_continuation_home_batch_history
+        if active_continuation_step_history:
+            row["active_continuation_step_history"] = active_continuation_step_history
         if active_continuation_progress_by_step:
             row["active_continuation_progress_by_step"] = active_continuation_progress_by_step
+        row["active_continuation_total_output_token_delta"] = active_continuation_total_output_token_delta
+        row["active_continuation_total_accepted_token_delta"] = active_continuation_total_accepted_token_delta
         row["active_continuation_completion_rechecked_count"] = active_continuation_completion_rechecked_count
         row["active_continuation_finalization_attempt_count"] = active_continuation_finalization_attempt_count
         row["active_continuation_finalization_success_count"] = active_continuation_finalization_success_count

@@ -679,13 +679,26 @@ class ModelRunnerBase:
             "active_continuation_reason": None,
             "active_continuation_limit_reached": False,
             "stspec_active_continuation_max_steps": int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2)),
+            "stspec_active_continuation_max_steps_effective": int(
+                getattr(self.global_config, "stspec_active_continuation_max_steps", 2)
+            ),
+            "stspec_active_continuation_max_steps_source": "config"
+            if hasattr(self.global_config, "stspec_active_continuation_max_steps")
+            else "default",
             "active_continuation_no_progress": False,
+            "active_continuation_no_progress_reason": None,
+            "active_continuation_progress_too_slow": False,
             "active_continuation_remaining_seq_ids": [],
             "active_continuation_remaining_output_tokens_by_seq": {},
             "active_continuation_pending_payload_ids": [],
             "active_continuation_latest_plan_id": None,
             "active_continuation_plan_id_history": [],
+            "active_continuation_home_batch_history": [],
+            "active_continuation_step_history": [],
             "active_continuation_progress_by_step": [],
+            "active_continuation_total_output_token_delta": 0,
+            "active_continuation_total_accepted_token_delta": 0,
+            "active_continuation_remaining_tokens_to_max_by_seq": {},
             "active_continuation_completion_rechecked": False,
             "active_continuation_finalization_attempted": False,
             "active_continuation_finalization_success": False,
@@ -1035,13 +1048,22 @@ class ModelRunnerBase:
             "active_continuation_reason",
             "active_continuation_limit_reached",
             "stspec_active_continuation_max_steps",
+            "stspec_active_continuation_max_steps_effective",
+            "stspec_active_continuation_max_steps_source",
             "active_continuation_no_progress",
+            "active_continuation_no_progress_reason",
+            "active_continuation_progress_too_slow",
             "active_continuation_remaining_seq_ids",
             "active_continuation_remaining_output_tokens_by_seq",
             "active_continuation_pending_payload_ids",
             "active_continuation_latest_plan_id",
             "active_continuation_plan_id_history",
+            "active_continuation_home_batch_history",
+            "active_continuation_step_history",
             "active_continuation_progress_by_step",
+            "active_continuation_total_output_token_delta",
+            "active_continuation_total_accepted_token_delta",
+            "active_continuation_remaining_tokens_to_max_by_seq",
             "active_continuation_completion_rechecked",
             "active_continuation_finalization_attempted",
             "active_continuation_finalization_success",
@@ -1581,6 +1603,11 @@ class ModelRunnerBase:
         trace_record["next_required_feature"] = "end_to_end_breadth_only_completion"
         return True
 
+    def _v4v_active_continuation_max_steps(self) -> tuple[int, str]:
+        if hasattr(self.global_config, "stspec_active_continuation_max_steps"):
+            return int(getattr(self.global_config, "stspec_active_continuation_max_steps")), "config"
+        return 2, "default"
+
     def _build_v4v_active_continuation_snapshot(
         self,
         *,
@@ -1597,6 +1624,16 @@ class ModelRunnerBase:
             for seq in exec_seqs
             if int(seq.seq_id) in active_set
         }
+        max_tokens_by_seq = {
+            int(seq.seq_id): int(getattr(seq, "max_tokens", 0) or 0)
+            for seq in exec_seqs
+            if int(seq.seq_id) in active_set and getattr(seq, "max_tokens", None) is not None
+        }
+        remaining_to_max_by_seq = {
+            str(seq_id): max(int(max_tokens_by_seq.get(seq_id, 0) or 0) - int(token_count or 0), 0)
+            for seq_id, token_count in output_tokens_by_seq.items()
+            if int(max_tokens_by_seq.get(seq_id, 0) or 0) > 0
+        }
         pending_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
         consumed_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_consumed_payload_ids", []) or []]
         invalidated_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_invalidated_payload_ids", []) or []]
@@ -1609,8 +1646,13 @@ class ModelRunnerBase:
             "max_steps": int(max_steps),
             "plan_id": int(getattr(step_plan, "plan_id", 0) or 0),
             "next_plan_id": getattr(commit_result, "next_pipeline_plan_id", None),
+            "target_home_batch_id": getattr(step_plan, "target_home_batch_id", None),
+            "draft_home_batch_id": getattr(step_plan, "draft_home_batch_id", None),
             "remaining_seq_ids": sorted(active_set),
+            "unfinished_seq_ids": list(getattr(commit_result, "unfinished_seq_ids_at_completion_check", []) or []),
+            "scheduler_active_seq_ids": list(getattr(commit_result, "scheduler_active_seq_ids_at_completion", []) or []),
             "remaining_output_tokens_by_seq": {str(key): value for key, value in output_tokens_by_seq.items()},
+            "remaining_tokens_to_max_by_seq": remaining_to_max_by_seq,
             "pending_payload_ids": pending_payload_ids,
             "consumed_payload_ids": consumed_payload_ids,
             "invalidated_payload_ids": invalidated_payload_ids,
@@ -1622,6 +1664,11 @@ class ModelRunnerBase:
     def _classify_v4v_active_continuation_progress(self, snapshot: dict) -> tuple[bool, dict]:
         previous = getattr(self, "stspec_active_continuation_last_snapshot", None)
         progress_reasons: list[str] = []
+        output_token_delta = 0
+        accepted_token_delta = 0
+        pending_payload_delta = 0
+        consumed_payload_delta = 0
+        invalidated_payload_delta = 0
         if previous is None:
             progress_reasons.append("initial_active_continuation_snapshot")
         else:
@@ -1629,11 +1676,20 @@ class ModelRunnerBase:
                 progress_reasons.append("plan_id_advanced")
             current_tokens = snapshot.get("remaining_output_tokens_by_seq") or {}
             previous_tokens = previous.get("remaining_output_tokens_by_seq") or {}
+            output_increased = False
             for seq_id, token_count in current_tokens.items():
-                if int(token_count or 0) > int(previous_tokens.get(seq_id, 0) or 0):
-                    progress_reasons.append("output_token_increased")
-                    break
-            if int(snapshot.get("total_accepted_tokens") or 0) > 0:
+                token_delta = int(token_count or 0) - int(previous_tokens.get(seq_id, 0) or 0)
+                output_token_delta += max(token_delta, 0)
+                if token_delta > 0:
+                    output_increased = True
+            if output_increased:
+                progress_reasons.append("output_token_increased")
+            accepted_token_delta = max(
+                int(snapshot.get("total_accepted_tokens") or 0)
+                - int(previous.get("total_accepted_tokens") or 0),
+                0,
+            )
+            if accepted_token_delta > 0:
                 progress_reasons.append("accepted_token_progress")
             if set(snapshot.get("finished_seq_ids") or []) - set(previous.get("finished_seq_ids") or []):
                 progress_reasons.append("sequence_finished")
@@ -1641,15 +1697,42 @@ class ModelRunnerBase:
                 progress_reasons.append("payload_consumed")
             if set(snapshot.get("invalidated_payload_ids") or []) - set(previous.get("invalidated_payload_ids") or []):
                 progress_reasons.append("payload_invalidated")
+            pending_payload_delta = len(previous.get("pending_payload_ids") or []) - len(snapshot.get("pending_payload_ids") or [])
+            consumed_payload_delta = len(set(snapshot.get("consumed_payload_ids") or []) - set(previous.get("consumed_payload_ids") or []))
+            invalidated_payload_delta = len(
+                set(snapshot.get("invalidated_payload_ids") or []) - set(previous.get("invalidated_payload_ids") or [])
+            )
+            if set(previous.get("remaining_seq_ids") or []) - set(snapshot.get("remaining_seq_ids") or []):
+                progress_reasons.append("unfinished_seq_count_decreased")
+            if pending_payload_delta > 0 and "payload_consumed" not in progress_reasons:
+                progress_reasons.append("pending_payload_decreased")
         snapshot = dict(snapshot)
         snapshot["progress_reasons"] = progress_reasons
         snapshot["made_progress"] = bool(progress_reasons)
+        snapshot["output_token_delta"] = int(output_token_delta)
+        snapshot["accepted_token_delta"] = int(accepted_token_delta)
+        snapshot["pending_payload_delta"] = int(pending_payload_delta)
+        snapshot["consumed_payload_delta"] = int(consumed_payload_delta)
+        snapshot["invalidated_payload_delta"] = int(invalidated_payload_delta)
+        if previous is not None:
+            snapshot["before_output_tokens_by_seq"] = dict(previous.get("remaining_output_tokens_by_seq") or {})
+            snapshot["after_output_tokens_by_seq"] = dict(snapshot.get("remaining_output_tokens_by_seq") or {})
+            snapshot["before_pending_payload_ids"] = list(previous.get("pending_payload_ids") or [])
+            snapshot["after_pending_payload_ids"] = list(snapshot.get("pending_payload_ids") or [])
+            snapshot["before_consumed_payload_ids"] = list(previous.get("consumed_payload_ids") or [])
+            snapshot["after_consumed_payload_ids"] = list(snapshot.get("consumed_payload_ids") or [])
+            snapshot["before_invalidated_payload_ids"] = list(previous.get("invalidated_payload_ids") or [])
+            snapshot["after_invalidated_payload_ids"] = list(snapshot.get("invalidated_payload_ids") or [])
+            snapshot["before_finished_seq_ids"] = list(previous.get("finished_seq_ids") or [])
+            snapshot["after_finished_seq_ids"] = list(snapshot.get("finished_seq_ids") or [])
         substantive_progress = [reason for reason in progress_reasons if reason != "plan_id_advanced"]
         no_progress = (
             previous is not None
             and not substantive_progress
             and bool(snapshot.get("remaining_seq_ids"))
         )
+        if no_progress:
+            snapshot["no_progress_reason"] = "only_plan_id_advanced" if progress_reasons else "no_observable_state_delta"
         return no_progress, snapshot
 
     def _remember_v4v_active_continuation_progress(self, snapshot: dict) -> None:
@@ -1663,26 +1746,102 @@ class ModelRunnerBase:
         progress.append(dict(snapshot))
         self.stspec_active_continuation_progress_by_step = progress[-64:]
 
-    def _record_v4v_active_continuation_snapshot(self, trace_record: dict, snapshot: dict, *, max_steps: int) -> None:
+    def _record_v4v_active_continuation_snapshot(
+        self,
+        trace_record: dict,
+        snapshot: dict,
+        *,
+        max_steps: int,
+        max_steps_source: str = "config",
+    ) -> None:
         trace_record["stspec_active_continuation_max_steps"] = int(max_steps)
+        trace_record["stspec_active_continuation_max_steps_effective"] = int(max_steps)
+        trace_record["stspec_active_continuation_max_steps_source"] = str(max_steps_source)
         trace_record["active_continuation_remaining_seq_ids"] = list(snapshot.get("remaining_seq_ids") or [])
         trace_record["active_continuation_remaining_output_tokens_by_seq"] = dict(
             snapshot.get("remaining_output_tokens_by_seq") or {}
+        )
+        trace_record["active_continuation_remaining_tokens_to_max_by_seq"] = dict(
+            snapshot.get("remaining_tokens_to_max_by_seq") or {}
         )
         trace_record["active_continuation_pending_payload_ids"] = list(snapshot.get("pending_payload_ids") or [])
         trace_record["active_continuation_latest_plan_id"] = snapshot.get("plan_id")
         trace_record["active_continuation_plan_id_history"] = list(
             getattr(self, "stspec_active_continuation_plan_id_history", []) or []
         )
-        if snapshot.get("plan_id") is not None:
+        if (
+            snapshot.get("plan_id") is not None
+            and (
+                not trace_record["active_continuation_plan_id_history"]
+                or trace_record["active_continuation_plan_id_history"][-1] != snapshot.get("plan_id")
+            )
+        ):
             trace_record["active_continuation_plan_id_history"].append(snapshot.get("plan_id"))
-        trace_record["active_continuation_progress_by_step"] = list(
+        home_batch_history = list(trace_record.get("active_continuation_home_batch_history") or [])
+        home_batch_snapshot = {
+            "step_count": snapshot.get("step_count"),
+            "target_home_batch_id": snapshot.get("target_home_batch_id"),
+            "draft_home_batch_id": snapshot.get("draft_home_batch_id"),
+        }
+        if not home_batch_history or home_batch_history[-1] != home_batch_snapshot:
+            home_batch_history.append(home_batch_snapshot)
+        trace_record["active_continuation_home_batch_history"] = home_batch_history[-64:]
+        step_history = list(
             getattr(self, "stspec_active_continuation_progress_by_step", []) or []
-        ) + [dict(snapshot)]
+        )
+        if (
+            not step_history
+            or step_history[-1].get("step_count") != snapshot.get("step_count")
+            or step_history[-1].get("plan_id") != snapshot.get("plan_id")
+        ):
+            step_history.append(dict(snapshot))
+        trace_record["active_continuation_step_history"] = step_history
+        trace_record["active_continuation_progress_by_step"] = step_history
+        trace_record["active_continuation_total_output_token_delta"] = sum(
+            int(item.get("output_token_delta") or 0) for item in step_history
+        )
+        trace_record["active_continuation_total_accepted_token_delta"] = sum(
+            int(item.get("accepted_token_delta") or 0) for item in step_history
+        )
         trace_record["active_continuation_completion_rechecked"] = True
         trace_record["active_continuation_finalization_attempted"] = bool(trace_record.get("result_finalization_attempted"))
         trace_record["active_continuation_finalization_success"] = bool(trace_record.get("result_finalization_success"))
         trace_record["active_continuation_no_progress"] = bool(trace_record.get("active_continuation_no_progress", False))
+        if snapshot.get("no_progress_reason"):
+            trace_record["active_continuation_no_progress_reason"] = snapshot.get("no_progress_reason")
+
+    def _classify_v4v_active_continuation_limit(
+        self,
+        trace_record: dict,
+        snapshot: dict,
+        *,
+        metadata: dict,
+        max_steps: int,
+    ) -> tuple[str, str]:
+        if snapshot.get("pending_payload_ids"):
+            return "mailbox_payload_after_active_continuation", "mailbox payloads remain pending after active continuation"
+        progress_history = list(trace_record.get("active_continuation_progress_by_step") or [])
+        substantive_steps = [
+            item
+            for item in progress_history
+            if any(
+                reason not in {"plan_id_advanced", "initial_active_continuation_snapshot"}
+                for reason in (item.get("progress_reasons") or [])
+            )
+        ]
+        if not substantive_steps:
+            return "active_request_continuation_no_progress", "active continuation reached max steps without observable progress"
+        trace_record["active_continuation_progress_too_slow"] = True
+        trace_record["active_continuation_remaining_tokens_to_max_by_seq"] = dict(
+            snapshot.get("remaining_tokens_to_max_by_seq") or {}
+        )
+        return (
+            "active_request_continuation_progress_too_slow",
+            (
+                "active continuation made progress but did not finish within "
+                f"{int(max_steps)} configured step(s)"
+            ),
+        )
 
     def _try_continue_v4t_active_requests(
         self,
@@ -1696,7 +1855,7 @@ class ModelRunnerBase:
             return False
         if not bool(getattr(output, "output_owner", False)):
             return False
-        max_steps = int(getattr(self.global_config, "stspec_active_continuation_max_steps", 2))
+        max_steps, max_steps_source = self._v4v_active_continuation_max_steps()
         step_count = self.stspec_active_continuation_step_count + 1
         metadata = build_v4t_active_continuation_metadata(
             commit_result,
@@ -1714,29 +1873,51 @@ class ModelRunnerBase:
             max_steps=max_steps,
         )
         no_progress, progress_snapshot = self._classify_v4v_active_continuation_progress(progress_snapshot)
-        self._record_v4v_active_continuation_snapshot(trace_record, progress_snapshot, max_steps=max_steps)
+        self._record_v4v_active_continuation_snapshot(
+            trace_record,
+            progress_snapshot,
+            max_steps=max_steps,
+            max_steps_source=max_steps_source,
+        )
         trace_record["active_continuation_plan_id"] = getattr(commit_result, "next_pipeline_plan_id", None)
         if not metadata.get("active_continuation_attempted"):
             return False
         if no_progress:
             trace_record["active_continuation_success"] = False
             trace_record["active_continuation_no_progress"] = True
-            trace_record["active_continuation_error"] = "active continuation made no observable progress"
+            no_progress_reason = progress_snapshot.get("no_progress_reason") or "no_observable_state_delta"
+            trace_record["active_continuation_no_progress_reason"] = no_progress_reason
+            trace_record["active_continuation_error"] = f"active continuation made no observable progress: {no_progress_reason}"
             trace_record["active_continuation_error_kind"] = "active_request_continuation_no_progress"
-            trace_record["active_request_continuation_error"] = "active continuation made no observable progress"
+            trace_record["active_request_continuation_error"] = trace_record["active_continuation_error"]
             trace_record["active_request_continuation_error_kind"] = "active_request_continuation_no_progress"
             trace_record["next_required_feature"] = "active_request_continuation_no_progress"
             raise RuntimeError(
-                "V4T active request continuation failed; error=active continuation made no observable progress; "
+                f"V4T active request continuation failed; error={trace_record['active_continuation_error']}; "
                 "next_required_feature=active_request_continuation_no_progress"
             )
         if not metadata.get("active_continuation_success"):
             next_feature = metadata.get("next_required_feature") or "active_request_continuation_limit_reached"
+            error = metadata.get("active_request_continuation_error")
+            if next_feature == "active_request_continuation_limit_reached":
+                next_feature, error = self._classify_v4v_active_continuation_limit(
+                    trace_record,
+                    progress_snapshot,
+                    metadata=metadata,
+                    max_steps=max_steps,
+                )
+            if next_feature == "active_request_continuation_no_progress":
+                trace_record["active_continuation_no_progress"] = True
+                trace_record["active_continuation_no_progress_reason"] = (
+                    progress_snapshot.get("no_progress_reason") or "no_substantive_progress_before_limit"
+                )
             trace_record["next_required_feature"] = next_feature
-            trace_record["active_continuation_error"] = metadata.get("active_request_continuation_error")
-            trace_record["active_continuation_error_kind"] = metadata.get("active_request_continuation_error_kind")
+            trace_record["active_continuation_error"] = error
+            trace_record["active_continuation_error_kind"] = next_feature
+            trace_record["active_request_continuation_error"] = error
+            trace_record["active_request_continuation_error_kind"] = next_feature
             raise RuntimeError(
-                f"V4T active request continuation failed; error={metadata.get('active_request_continuation_error')}; "
+                f"V4T active request continuation failed; error={error}; "
                 f"next_required_feature={next_feature}"
             )
         try:
@@ -1783,7 +1964,12 @@ class ModelRunnerBase:
         self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
         self.stspec_active_continuation_step_count += 1
         self._remember_v4v_active_continuation_progress(progress_snapshot)
-        self._record_v4v_active_continuation_snapshot(trace_record, progress_snapshot, max_steps=max_steps)
+        self._record_v4v_active_continuation_snapshot(
+            trace_record,
+            progress_snapshot,
+            max_steps=max_steps,
+            max_steps_source=max_steps_source,
+        )
         trace_record["evaluator_return_attempted"] = True
         trace_record["evaluator_return_success"] = True
         trace_record["evaluator_return_error"] = None

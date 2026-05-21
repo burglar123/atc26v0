@@ -325,15 +325,54 @@ def test_active_continuation_trace_has_v4v_progress_fields():
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
     for needle in (
+        "stspec_active_continuation_max_steps_effective",
+        "stspec_active_continuation_max_steps_source",
         "active_continuation_no_progress",
+        "active_continuation_no_progress_reason",
+        "active_continuation_progress_too_slow",
         "active_request_continuation_no_progress",
+        "active_request_continuation_progress_too_slow",
+        "active_continuation_step_history",
+        "active_continuation_home_batch_history",
+        "active_continuation_total_output_token_delta",
+        "active_continuation_total_accepted_token_delta",
         "active_continuation_remaining_output_tokens_by_seq",
+        "active_continuation_remaining_tokens_to_max_by_seq",
         "active_continuation_plan_id_history",
         "active_continuation_progress_by_step",
         "_build_v4v_active_continuation_snapshot",
         "_classify_v4v_active_continuation_progress",
+        "_classify_v4v_active_continuation_limit",
     ):
         assert needle in source
+
+
+def test_max_steps_cli_config_is_not_hard_coded_in_runner():
+    eval_path = os.path.join(REPO_ROOT, "benchmark", "eval_multi_slo.py")
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(eval_path, "r", encoding="utf-8") as f:
+        eval_source = f.read()
+    with open(runner_path, "r", encoding="utf-8") as f:
+        runner_source = f.read()
+    assert "--stspec-active-continuation-max-steps" in eval_source
+    assert '"stspec_active_continuation_max_steps": args.stspec_active_continuation_max_steps' in eval_source
+    assert "def _v4v_active_continuation_max_steps" in runner_source
+    assert 'return int(getattr(self.global_config, "stspec_active_continuation_max_steps")), "config"' in runner_source
+    assert "max_steps, max_steps_source = self._v4v_active_continuation_max_steps()" in runner_source
+
+
+def test_limit_reached_is_reclassified_to_specific_progress_diagnostic():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    limit_branch = 'next_feature == "active_request_continuation_limit_reached"'
+    classifier = "self._classify_v4v_active_continuation_limit("
+    generic_raise = "V4T active request continuation failed; error={error}"
+    assert limit_branch in source
+    assert classifier in source
+    assert source.index(limit_branch) < source.index(generic_raise)
+    assert "active_request_continuation_progress_too_slow" in source
+    assert "mailbox_payload_after_active_continuation" in source
 
 
 def main() -> None:
@@ -357,6 +396,8 @@ def main() -> None:
     test_draft_mailbox_route_guards_outstanding_available_before_put()
     test_draft_mailbox_record_guard_resets_at_generation_boundaries()
     test_active_continuation_trace_has_v4v_progress_fields()
+    test_max_steps_cli_config_is_not_hard_coded_in_runner()
+    test_limit_reached_is_reclassified_to_specific_progress_diagnostic()
 
 
 if __name__ == "__main__":
