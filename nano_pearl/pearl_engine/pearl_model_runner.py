@@ -80,6 +80,7 @@ from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
     build_v4t_active_continuation_metadata,
     build_v4w_zero_accept_correction_diagnostics,
+    build_v4w_next_step_prefix_diagnostics,
     build_v4s_result_finalization_metadata,
     build_mailbox_kv_commit_plan,
     build_mailbox_payload_consume_plan,
@@ -708,6 +709,18 @@ class ModelRunnerBase:
             "active_continuation_target_correction_missing": False,
             "active_continuation_reject_recovery_missing": False,
             "active_continuation_target_correction_not_committed": False,
+            "active_continuation_zero_accept_correction_checked": False,
+            "active_continuation_zero_accept_correction_failure": False,
+            "active_continuation_zero_accept_correction_rows_count": 0,
+            "active_continuation_next_step_prefix_token_ids_by_step": [],
+            "active_continuation_next_step_prefix_len_by_step": [],
+            "active_continuation_next_step_contains_correction_by_step": [],
+            "active_continuation_target_draft_prefix_divergence": False,
+            "active_continuation_target_correction_not_in_next_prefix": False,
+            "active_continuation_kv_state_mismatch": False,
+            "active_continuation_prefix_len_mismatch": False,
+            "active_continuation_position_mismatch": False,
+            "active_continuation_slot_mapping_mismatch": False,
             "active_continuation_target_correction_token_ids_by_step": [],
             "active_continuation_target_correction_available_by_step": [],
             "active_continuation_target_correction_committed_by_step": [],
@@ -1121,6 +1134,18 @@ class ModelRunnerBase:
             "active_continuation_target_correction_missing",
             "active_continuation_reject_recovery_missing",
             "active_continuation_target_correction_not_committed",
+            "active_continuation_zero_accept_correction_checked",
+            "active_continuation_zero_accept_correction_failure",
+            "active_continuation_zero_accept_correction_rows_count",
+            "active_continuation_next_step_prefix_token_ids_by_step",
+            "active_continuation_next_step_prefix_len_by_step",
+            "active_continuation_next_step_contains_correction_by_step",
+            "active_continuation_target_draft_prefix_divergence",
+            "active_continuation_target_correction_not_in_next_prefix",
+            "active_continuation_kv_state_mismatch",
+            "active_continuation_prefix_len_mismatch",
+            "active_continuation_position_mismatch",
+            "active_continuation_slot_mapping_mismatch",
             "active_continuation_target_correction_token_ids_by_step",
             "active_continuation_target_correction_available_by_step",
             "active_continuation_target_correction_committed_by_step",
@@ -1789,6 +1814,8 @@ class ModelRunnerBase:
         target_correction_commit_request_ids_by_seq: dict[int, object] = {}
         sequence_output_len_before_after_by_seq: dict[int, dict[str, int]] = {}
         prefix_len_before_after_by_seq: dict[int, dict[str, int]] = {}
+        sequence_token_ids_before_after_by_seq: dict[int, dict[str, list[int]]] = {}
+        completion_token_ids_by_seq: dict[int, list[int]] = {}
         target_correction_shadow_only_by_seq: dict[int, bool] = {}
         target_correction_wrong_sequence_by_seq: dict[int, bool] = {}
         target_correction_rolled_back_by_seq: dict[int, bool] = {}
@@ -1807,13 +1834,14 @@ class ModelRunnerBase:
             )
             before_state = _state_for(sequence_state_before, seq_id)
             after_state = _state_for(sequence_state_after, seq_id)
+            before_token_ids = [int(token) for token in list(before_state.get("token_ids") or [])]
+            after_token_ids = [int(token) for token in list(after_state.get("token_ids") or [])]
             before_output_len = int(before_state.get("output_token_count") or 0)
             after_output_len = int(after_state.get("output_token_count") or 0)
             before_prefix_len = int(before_state.get("num_tokens") or 0)
             after_prefix_len = int(after_state.get("num_tokens") or 0)
             output_delta = int(after_output_len - before_output_len)
             prefix_delta = int(after_prefix_len - before_prefix_len)
-            after_token_ids = [int(token) for token in list(after_state.get("token_ids") or [])]
             expected_suffix = correction_tokens[-len(correction_tokens):] if correction_tokens else []
             suffix_matches = bool(
                 correction_tokens
@@ -1825,6 +1853,11 @@ class ModelRunnerBase:
             current_completion_tokens = [
                 int(token) for token in list(getattr(seq, "completion_token_ids", []) or [])
             ] if seq is not None else []
+            sequence_token_ids_before_after_by_seq[seq_id] = {
+                "before": before_token_ids,
+                "after": after_token_ids,
+            }
+            completion_token_ids_by_seq[seq_id] = list(current_completion_tokens)
             current_output_len = int(getattr(seq, "num_completion_tokens", 0) or 0) if seq is not None else 0
             sequence_object_identity_by_seq[seq_id] = id(seq) if seq is not None else None
             completion_token_len_before_after_by_seq[seq_id] = {
@@ -1942,6 +1975,12 @@ class ModelRunnerBase:
             },
             "prefix_len_before_after_by_seq": {
                 str(key): value for key, value in prefix_len_before_after_by_seq.items()
+            },
+            "sequence_token_ids_before_after_by_seq": {
+                str(key): value for key, value in sequence_token_ids_before_after_by_seq.items()
+            },
+            "completion_token_ids_by_seq": {
+                str(key): value for key, value in completion_token_ids_by_seq.items()
             },
             "sequence_object_identity_by_seq": {
                 str(key): value for key, value in sequence_object_identity_by_seq.items()
@@ -2212,6 +2251,34 @@ class ModelRunnerBase:
         trace_record["active_continuation_target_correction_not_committed"] = bool(
             zero_accept_correction.get("active_continuation_target_correction_not_committed", False)
         )
+        trace_record["active_continuation_zero_accept_correction_checked"] = bool(
+            zero_accept_correction.get("zero_accept_correction_checked", False)
+        )
+        trace_record["active_continuation_zero_accept_correction_failure"] = bool(
+            zero_accept_correction.get("zero_accept_correction_failure", False)
+        )
+        trace_record["active_continuation_zero_accept_correction_rows_count"] = len(
+            zero_accept_correction.get("zero_accept_correction_rows") or []
+        )
+        next_prefix_diagnostic = build_v4w_next_step_prefix_diagnostics(step_history)
+        trace_record["active_continuation_next_step_prefix_token_ids_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_prefix_token_ids_by_step") or []
+        )
+        trace_record["active_continuation_next_step_prefix_len_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_prefix_len_by_step") or []
+        )
+        trace_record["active_continuation_next_step_contains_correction_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_contains_correction_by_step") or []
+        )
+        for key in (
+            "active_continuation_target_correction_not_in_next_prefix",
+            "active_continuation_target_draft_prefix_divergence",
+            "active_continuation_kv_state_mismatch",
+            "active_continuation_prefix_len_mismatch",
+            "active_continuation_position_mismatch",
+            "active_continuation_slot_mapping_mismatch",
+        ):
+            trace_record[key] = bool(next_prefix_diagnostic.get(key, False))
         trace_record["active_continuation_target_correction_token_ids_by_step"] = [
             {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_token_ids_by_seq") or {})}
             for item in step_history
@@ -2366,6 +2433,15 @@ class ModelRunnerBase:
         trace_record["active_continuation_correction_diagnostic_priority"] = list(
             zero_accept_correction.get("active_continuation_correction_diagnostic_priority") or []
         )
+        trace_record["active_continuation_zero_accept_correction_checked"] = bool(
+            zero_accept_correction.get("zero_accept_correction_checked", False)
+        )
+        trace_record["active_continuation_zero_accept_correction_failure"] = bool(
+            zero_accept_correction.get("zero_accept_correction_failure", False)
+        )
+        trace_record["active_continuation_zero_accept_correction_rows_count"] = len(
+            zero_accept_correction.get("zero_accept_correction_rows") or []
+        )
         for key in (
             "active_continuation_target_correction_missing",
             "active_continuation_reject_recovery_missing",
@@ -2382,6 +2458,31 @@ class ModelRunnerBase:
             return (
                 next_feature,
                 str(zero_accept_correction.get("selected_error") or "zero-accept correction diagnostic failed"),
+            )
+        next_prefix_diagnostic = build_v4w_next_step_prefix_diagnostics(progress_history)
+        trace_record["active_continuation_next_step_prefix_token_ids_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_prefix_token_ids_by_step") or []
+        )
+        trace_record["active_continuation_next_step_prefix_len_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_prefix_len_by_step") or []
+        )
+        trace_record["active_continuation_next_step_contains_correction_by_step"] = list(
+            next_prefix_diagnostic.get("active_continuation_next_step_contains_correction_by_step") or []
+        )
+        for key in (
+            "active_continuation_target_correction_not_in_next_prefix",
+            "active_continuation_target_draft_prefix_divergence",
+            "active_continuation_kv_state_mismatch",
+            "active_continuation_prefix_len_mismatch",
+            "active_continuation_position_mismatch",
+            "active_continuation_slot_mapping_mismatch",
+        ):
+            trace_record[key] = bool(next_prefix_diagnostic.get(key, False))
+        if next_prefix_diagnostic.get("next_step_prefix_failure"):
+            next_feature = str(next_prefix_diagnostic.get("selected_next_required_feature"))
+            return (
+                next_feature,
+                str(next_prefix_diagnostic.get("selected_error") or "zero-accept correction next-prefix diagnostic failed"),
             )
         substantive_steps = [
             item
@@ -2456,7 +2557,13 @@ class ModelRunnerBase:
                 "active_request_continuation_acceptance_too_low",
                 (
                     "active continuation token progress is dominated by rejected spans; "
-                    f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}"
+                    f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}; "
+                    "active_continuation_acceptance_too_low_after_correction_checked=True; "
+                    f"zero_accept_correction_checked={bool(zero_accept_correction.get('zero_accept_correction_checked', False))}; "
+                    f"zero_accept_correction_failure={bool(zero_accept_correction.get('zero_accept_correction_failure', False))}; "
+                    f"zero_accept_correction_rows_count={len(zero_accept_correction.get('zero_accept_correction_rows') or [])}; "
+                    f"next_step_prefix_checked={bool(next_prefix_diagnostic.get('next_step_prefix_checked', False))}; "
+                    f"next_step_prefix_failure={bool(next_prefix_diagnostic.get('next_step_prefix_failure', False))}"
                 ),
             )
         trace_record["active_continuation_progress_too_slow"] = True

@@ -358,6 +358,18 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_target_correction_missing",
         "active_continuation_reject_recovery_missing",
         "active_continuation_target_correction_not_committed",
+        "active_continuation_zero_accept_correction_checked",
+        "active_continuation_zero_accept_correction_failure",
+        "active_continuation_zero_accept_correction_rows_count",
+        "active_continuation_next_step_prefix_token_ids_by_step",
+        "active_continuation_next_step_prefix_len_by_step",
+        "active_continuation_next_step_contains_correction_by_step",
+        "active_continuation_target_draft_prefix_divergence",
+        "active_continuation_target_correction_not_in_next_prefix",
+        "active_continuation_kv_state_mismatch",
+        "active_continuation_prefix_len_mismatch",
+        "active_continuation_position_mismatch",
+        "active_continuation_slot_mapping_mismatch",
         "active_continuation_target_correction_available_by_step",
         "active_continuation_target_correction_committed_by_step",
         "active_continuation_target_correction_commit_seq_ids",
@@ -527,6 +539,8 @@ def _zero_accept_progress_item(**overrides):
         "target_correction_output_delta_by_seq": {"1": 1},
         "sequence_object_identity_by_seq": {"1": 12345},
         "sequence_output_len_before_after_by_seq": {"1": {"before": 0, "after": 1}},
+        "sequence_token_ids_before_after_by_seq": {"1": {"before": [7, 101], "after": [7, 101, 999]}},
+        "completion_token_ids_by_seq": {"1": [999]},
         "completion_token_len_before_after_by_seq": {"1": {"before": 0, "after": 1}},
         "service_metadata_num_output_tokens_before_after_by_seq": {"1": {"before": 0, "after": 1}},
     }
@@ -584,6 +598,64 @@ def test_zero_accept_correction_committed_allows_acceptance_fallback():
     assert diagnostic["active_continuation_zero_accept_correction_commit_success_by_step"][0]["values"] == {"1": True}
 
 
+def _next_prefix_progress_item(**overrides):
+    item = {
+        "step_count": 2,
+        "plan_id": 12,
+        "request_ids_by_seq": {"1": "r1"},
+        "sequence_token_ids_before_after_by_seq": {"1": {"before": [7, 101, 999], "after": [7, 101, 999, 222]}},
+        "prefix_len_before_after_by_seq": {"1": {"before": 3, "after": 4}},
+        "kv_length_before_after_by_seq": {"1": {"before": 3, "after": 4}},
+        "position_ids_by_seq": {"1": [3]},
+        "slot_mapping_prefix_len_by_seq": {"1": 3},
+    }
+    item.update(overrides)
+    return item
+
+
+def test_correction_committed_but_missing_from_next_prefix_is_specific():
+    diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(),
+        _next_prefix_progress_item(
+            sequence_token_ids_before_after_by_seq={"1": {"before": [7, 101], "after": [7, 101, 222]}},
+            prefix_len_before_after_by_seq={"1": {"before": 2, "after": 3}},
+        ),
+    ])
+    assert diagnostic["selected_next_required_feature"] == "active_request_continuation_target_correction_not_in_next_prefix"
+    assert diagnostic["active_continuation_target_correction_not_in_next_prefix"] is True
+
+
+def test_target_draft_prefix_divergence_is_specific():
+    diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(),
+        _next_prefix_progress_item(draft_side_sequence_token_ids_by_seq={"1": [7, 101]}),
+    ])
+    assert diagnostic["selected_next_required_feature"] == "active_request_continuation_target_draft_prefix_divergence"
+
+
+def test_prefix_and_kv_mismatch_are_specific():
+    prefix_diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(),
+        _next_prefix_progress_item(prefix_len_before_after_by_seq={"1": {"before": 2, "after": 4}}),
+    ])
+    assert prefix_diagnostic["selected_next_required_feature"] == "active_request_continuation_prefix_len_mismatch"
+    kv_diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(),
+        _next_prefix_progress_item(kv_length_before_after_by_seq={"1": {"before": 2, "after": 4}}),
+    ])
+    assert kv_diagnostic["selected_next_required_feature"] == "active_request_continuation_kv_state_mismatch"
+
+
+def test_next_prefix_aligned_allows_acceptance_fallback():
+    diagnostic = apply_mod.build_v4w_next_step_prefix_diagnostics([
+        _zero_accept_progress_item(),
+        _next_prefix_progress_item(),
+    ])
+    assert diagnostic["next_step_prefix_checked"] is True
+    assert diagnostic["next_step_prefix_failure"] is False
+    assert diagnostic["active_continuation_next_step_contains_correction_by_step"][0]["values"] == {"1": True}
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -612,6 +684,10 @@ def main() -> None:
     test_zero_accept_correction_available_but_not_committed_is_specific()
     test_zero_accept_correction_shadow_wrong_rollback_and_export_diagnostics()
     test_zero_accept_correction_committed_allows_acceptance_fallback()
+    test_correction_committed_but_missing_from_next_prefix_is_specific()
+    test_target_draft_prefix_divergence_is_specific()
+    test_prefix_and_kv_mismatch_are_specific()
+    test_next_prefix_aligned_allows_acceptance_fallback()
 
 
 if __name__ == "__main__":

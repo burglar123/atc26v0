@@ -972,6 +972,18 @@ def aggregate_low_level_traces(
         active_continuation_target_correction_missing_count = 0
         active_continuation_reject_recovery_missing_count = 0
         active_continuation_target_correction_not_committed_count = 0
+        active_continuation_zero_accept_correction_checked_count = 0
+        active_continuation_zero_accept_correction_failure_count = 0
+        active_continuation_zero_accept_correction_rows_count = 0
+        active_continuation_next_step_prefix_token_ids_by_step: List[Any] = []
+        active_continuation_next_step_prefix_len_by_step: List[Any] = []
+        active_continuation_next_step_contains_correction_by_step: List[Any] = []
+        active_continuation_target_draft_prefix_divergence_count = 0
+        active_continuation_target_correction_not_in_next_prefix_count = 0
+        active_continuation_kv_state_mismatch_count = 0
+        active_continuation_prefix_len_mismatch_count = 0
+        active_continuation_position_mismatch_count = 0
+        active_continuation_slot_mapping_mismatch_count = 0
         active_continuation_target_correction_token_ids_by_step: List[Any] = []
         active_continuation_target_correction_available_by_step: List[Any] = []
         active_continuation_target_correction_committed_by_step: List[Any] = []
@@ -1462,6 +1474,38 @@ def aggregate_low_level_traces(
                 active_continuation_reject_recovery_missing_count += 1
             if e.get("active_continuation_target_correction_not_committed"):
                 active_continuation_target_correction_not_committed_count += 1
+            if e.get("active_continuation_zero_accept_correction_checked"):
+                active_continuation_zero_accept_correction_checked_count += 1
+            if e.get("active_continuation_zero_accept_correction_failure"):
+                active_continuation_zero_accept_correction_failure_count += 1
+            active_continuation_zero_accept_correction_rows_count = max(
+                active_continuation_zero_accept_correction_rows_count,
+                int(e.get("active_continuation_zero_accept_correction_rows_count") or 0),
+            )
+            if e.get("active_continuation_next_step_prefix_token_ids_by_step"):
+                active_continuation_next_step_prefix_token_ids_by_step = list(
+                    e.get("active_continuation_next_step_prefix_token_ids_by_step") or []
+                )
+            if e.get("active_continuation_next_step_prefix_len_by_step"):
+                active_continuation_next_step_prefix_len_by_step = list(
+                    e.get("active_continuation_next_step_prefix_len_by_step") or []
+                )
+            if e.get("active_continuation_next_step_contains_correction_by_step"):
+                active_continuation_next_step_contains_correction_by_step = list(
+                    e.get("active_continuation_next_step_contains_correction_by_step") or []
+                )
+            if e.get("active_continuation_target_draft_prefix_divergence"):
+                active_continuation_target_draft_prefix_divergence_count += 1
+            if e.get("active_continuation_target_correction_not_in_next_prefix"):
+                active_continuation_target_correction_not_in_next_prefix_count += 1
+            if e.get("active_continuation_kv_state_mismatch"):
+                active_continuation_kv_state_mismatch_count += 1
+            if e.get("active_continuation_prefix_len_mismatch"):
+                active_continuation_prefix_len_mismatch_count += 1
+            if e.get("active_continuation_position_mismatch"):
+                active_continuation_position_mismatch_count += 1
+            if e.get("active_continuation_slot_mapping_mismatch"):
+                active_continuation_slot_mapping_mismatch_count += 1
             if e.get("active_continuation_target_correction_token_ids_by_step"):
                 active_continuation_target_correction_token_ids_by_step = list(
                     e.get("active_continuation_target_correction_token_ids_by_step") or []
@@ -1951,6 +1995,21 @@ def aggregate_low_level_traces(
         row["active_continuation_target_correction_missing_count"] = active_continuation_target_correction_missing_count
         row["active_continuation_reject_recovery_missing_count"] = active_continuation_reject_recovery_missing_count
         row["active_continuation_target_correction_not_committed_count"] = active_continuation_target_correction_not_committed_count
+        row["active_continuation_zero_accept_correction_checked_count"] = active_continuation_zero_accept_correction_checked_count
+        row["active_continuation_zero_accept_correction_failure_count"] = active_continuation_zero_accept_correction_failure_count
+        row["active_continuation_zero_accept_correction_rows_count"] = active_continuation_zero_accept_correction_rows_count
+        if active_continuation_next_step_prefix_token_ids_by_step:
+            row["active_continuation_next_step_prefix_token_ids_by_step"] = active_continuation_next_step_prefix_token_ids_by_step
+        if active_continuation_next_step_prefix_len_by_step:
+            row["active_continuation_next_step_prefix_len_by_step"] = active_continuation_next_step_prefix_len_by_step
+        if active_continuation_next_step_contains_correction_by_step:
+            row["active_continuation_next_step_contains_correction_by_step"] = active_continuation_next_step_contains_correction_by_step
+        row["active_continuation_target_draft_prefix_divergence_count"] = active_continuation_target_draft_prefix_divergence_count
+        row["active_continuation_target_correction_not_in_next_prefix_count"] = active_continuation_target_correction_not_in_next_prefix_count
+        row["active_continuation_kv_state_mismatch_count"] = active_continuation_kv_state_mismatch_count
+        row["active_continuation_prefix_len_mismatch_count"] = active_continuation_prefix_len_mismatch_count
+        row["active_continuation_position_mismatch_count"] = active_continuation_position_mismatch_count
+        row["active_continuation_slot_mapping_mismatch_count"] = active_continuation_slot_mapping_mismatch_count
         if active_continuation_target_correction_token_ids_by_step:
             row["active_continuation_target_correction_token_ids_by_step"] = active_continuation_target_correction_token_ids_by_step
         if active_continuation_target_correction_available_by_step:

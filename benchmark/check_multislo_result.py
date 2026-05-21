@@ -277,6 +277,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_target_correction_missing_count = 0
     active_continuation_reject_recovery_missing_count = 0
     active_continuation_target_correction_not_committed_count = 0
+    active_continuation_zero_accept_correction_checked_count = 0
+    active_continuation_zero_accept_correction_failure_count = 0
+    active_continuation_zero_accept_correction_rows_count = 0
+    active_continuation_target_draft_prefix_divergence_count = 0
+    active_continuation_target_correction_not_in_next_prefix_count = 0
+    active_continuation_kv_state_mismatch_count = 0
+    active_continuation_prefix_len_mismatch_count = 0
+    active_continuation_position_mismatch_count = 0
+    active_continuation_slot_mapping_mismatch_count = 0
     active_continuation_target_correction_shadow_only_count = 0
     active_continuation_target_correction_wrong_sequence_count = 0
     active_continuation_target_correction_rolled_back_count = 0
@@ -693,6 +702,34 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_target_correction_not_committed_count += int(
             row.get("active_continuation_target_correction_not_committed_count") or 0
         )
+        active_continuation_zero_accept_correction_checked_count += int(
+            row.get("active_continuation_zero_accept_correction_checked_count") or 0
+        )
+        active_continuation_zero_accept_correction_failure_count += int(
+            row.get("active_continuation_zero_accept_correction_failure_count") or 0
+        )
+        active_continuation_zero_accept_correction_rows_count = max(
+            active_continuation_zero_accept_correction_rows_count,
+            int(row.get("active_continuation_zero_accept_correction_rows_count") or 0),
+        )
+        active_continuation_target_draft_prefix_divergence_count += int(
+            row.get("active_continuation_target_draft_prefix_divergence_count") or 0
+        )
+        active_continuation_target_correction_not_in_next_prefix_count += int(
+            row.get("active_continuation_target_correction_not_in_next_prefix_count") or 0
+        )
+        active_continuation_kv_state_mismatch_count += int(
+            row.get("active_continuation_kv_state_mismatch_count") or 0
+        )
+        active_continuation_prefix_len_mismatch_count += int(
+            row.get("active_continuation_prefix_len_mismatch_count") or 0
+        )
+        active_continuation_position_mismatch_count += int(
+            row.get("active_continuation_position_mismatch_count") or 0
+        )
+        active_continuation_slot_mapping_mismatch_count += int(
+            row.get("active_continuation_slot_mapping_mismatch_count") or 0
+        )
         active_continuation_target_correction_shadow_only_count += int(
             row.get("active_continuation_target_correction_shadow_only_count") or 0
         )
@@ -943,6 +980,26 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_reject_recovery_missing_count += 1
         if row.get("active_continuation_target_correction_not_committed"):
             active_continuation_target_correction_not_committed_count += 1
+        if row.get("active_continuation_zero_accept_correction_checked"):
+            active_continuation_zero_accept_correction_checked_count += 1
+        if row.get("active_continuation_zero_accept_correction_failure"):
+            active_continuation_zero_accept_correction_failure_count += 1
+        active_continuation_zero_accept_correction_rows_count = max(
+            active_continuation_zero_accept_correction_rows_count,
+            int(row.get("active_continuation_zero_accept_correction_rows_count") or 0),
+        )
+        if row.get("active_continuation_target_draft_prefix_divergence"):
+            active_continuation_target_draft_prefix_divergence_count += 1
+        if row.get("active_continuation_target_correction_not_in_next_prefix"):
+            active_continuation_target_correction_not_in_next_prefix_count += 1
+        if row.get("active_continuation_kv_state_mismatch"):
+            active_continuation_kv_state_mismatch_count += 1
+        if row.get("active_continuation_prefix_len_mismatch"):
+            active_continuation_prefix_len_mismatch_count += 1
+        if row.get("active_continuation_position_mismatch"):
+            active_continuation_position_mismatch_count += 1
+        if row.get("active_continuation_slot_mapping_mismatch"):
+            active_continuation_slot_mapping_mismatch_count += 1
         if row.get("active_continuation_target_correction_shadow_only"):
             active_continuation_target_correction_shadow_only_count += 1
         if row.get("active_continuation_target_correction_wrong_sequence"):
@@ -1194,6 +1251,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_target_correction_missing_count": active_continuation_target_correction_missing_count,
         "active_continuation_reject_recovery_missing_count": active_continuation_reject_recovery_missing_count,
         "active_continuation_target_correction_not_committed_count": active_continuation_target_correction_not_committed_count,
+        "active_continuation_zero_accept_correction_checked_count": active_continuation_zero_accept_correction_checked_count,
+        "active_continuation_zero_accept_correction_failure_count": active_continuation_zero_accept_correction_failure_count,
+        "active_continuation_zero_accept_correction_rows_count": active_continuation_zero_accept_correction_rows_count,
+        "active_continuation_target_draft_prefix_divergence_count": active_continuation_target_draft_prefix_divergence_count,
+        "active_continuation_target_correction_not_in_next_prefix_count": active_continuation_target_correction_not_in_next_prefix_count,
+        "active_continuation_kv_state_mismatch_count": active_continuation_kv_state_mismatch_count,
+        "active_continuation_prefix_len_mismatch_count": active_continuation_prefix_len_mismatch_count,
+        "active_continuation_position_mismatch_count": active_continuation_position_mismatch_count,
+        "active_continuation_slot_mapping_mismatch_count": active_continuation_slot_mapping_mismatch_count,
         "active_continuation_target_correction_shadow_only_count": active_continuation_target_correction_shadow_only_count,
         "active_continuation_target_correction_wrong_sequence_count": active_continuation_target_correction_wrong_sequence_count,
         "active_continuation_target_correction_rolled_back_count": active_continuation_target_correction_rolled_back_count,
@@ -1580,6 +1646,30 @@ def summarize(path: Path) -> int:
         "active continuation target correction not committed count: "
         f"{plan_summary['active_continuation_target_correction_not_committed_count']}"
     )
+    print(
+        "active continuation zero-accept correction checked count: "
+        f"{plan_summary['active_continuation_zero_accept_correction_checked_count']}"
+    )
+    print(
+        "active continuation zero-accept correction failure count: "
+        f"{plan_summary['active_continuation_zero_accept_correction_failure_count']}"
+    )
+    print(
+        "active continuation zero-accept correction rows count: "
+        f"{plan_summary['active_continuation_zero_accept_correction_rows_count']}"
+    )
+    print(
+        "active continuation target correction not in next prefix count: "
+        f"{plan_summary['active_continuation_target_correction_not_in_next_prefix_count']}"
+    )
+    print(
+        "active continuation target/draft prefix divergence count: "
+        f"{plan_summary['active_continuation_target_draft_prefix_divergence_count']}"
+    )
+    print(f"active continuation KV state mismatch count: {plan_summary['active_continuation_kv_state_mismatch_count']}")
+    print(f"active continuation prefix length mismatch count: {plan_summary['active_continuation_prefix_len_mismatch_count']}")
+    print(f"active continuation position mismatch count: {plan_summary['active_continuation_position_mismatch_count']}")
+    print(f"active continuation slot mapping mismatch count: {plan_summary['active_continuation_slot_mapping_mismatch_count']}")
     print(
         "active continuation target correction shadow-only count: "
         f"{plan_summary['active_continuation_target_correction_shadow_only_count']}"

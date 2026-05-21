@@ -76,6 +76,15 @@ V4W_ZERO_ACCEPT_CORRECTION_PRIORITY = (
     "active_request_continuation_target_correction_not_committed",
 )
 
+V4W_NEXT_STEP_PREFIX_PRIORITY = (
+    "active_request_continuation_target_correction_not_in_next_prefix",
+    "active_request_continuation_target_draft_prefix_divergence",
+    "active_request_continuation_kv_state_mismatch",
+    "active_request_continuation_prefix_len_mismatch",
+    "active_request_continuation_position_mismatch",
+    "active_request_continuation_slot_mapping_mismatch",
+)
+
 
 def _as_int_mapping(value: Any) -> dict[str, int]:
     return {str(key): int(inner or 0) for key, inner in dict(value or {}).items()}
@@ -87,6 +96,10 @@ def _as_bool_mapping(value: Any) -> dict[str, bool]:
 
 def _as_list_mapping(value: Any) -> dict[str, list[Any]]:
     return {str(key): list(inner or []) for key, inner in dict(value or {}).items()}
+
+
+def _as_dict_mapping(value: Any) -> dict[str, dict[str, Any]]:
+    return {str(key): dict(inner or {}) for key, inner in dict(value or {}).items()}
 
 
 def _group_v4w_rows_by_step(rows: list[JsonDict], value_key: str) -> list[JsonDict]:
@@ -253,6 +266,173 @@ def build_v4w_zero_accept_correction_diagnostics(progress_history: Iterable[Json
         ),
         "active_continuation_completion_token_export_missing": any(
             row.get("next_required_feature") == "active_request_continuation_completion_token_export_missing"
+            for row in rows
+        ),
+    }
+
+
+def _zero_accept_corrected_seq_ids(item: JsonDict) -> list[str]:
+    expected = _as_int_mapping(item.get("expected_len_by_seq"))
+    accepted = _as_int_mapping(item.get("accepted_len_by_seq"))
+    rejected = _as_int_mapping(item.get("rejected_len_by_seq"))
+    corrections = _as_list_mapping(item.get("target_correction_token_ids_by_seq"))
+    committed = _as_bool_mapping(item.get("target_correction_committed_by_seq"))
+    seq_ids = set(expected) | set(accepted) | set(rejected) | set(corrections)
+    corrected: list[str] = []
+    for seq_id in sorted(seq_ids, key=lambda value: int(value)):
+        expected_len = int(expected.get(seq_id, 0) or 0)
+        accepted_len = int(accepted.get(seq_id, 0) or 0)
+        rejected_len = int(rejected.get(seq_id, max(expected_len - accepted_len, 0)) or 0)
+        if (
+            expected_len > 0
+            and accepted_len == 0
+            and rejected_len > 0
+            and corrections.get(seq_id)
+            and bool(committed.get(seq_id, False))
+        ):
+            corrected.append(seq_id)
+    return corrected
+
+
+def build_v4w_next_step_prefix_diagnostics(progress_history: Iterable[JsonDict]) -> JsonDict:
+    """Check that committed correction tokens survive into the next step prefix."""
+
+    history = [dict(item) for item in progress_history]
+    rows: list[JsonDict] = []
+    priority_index = {
+        feature: index for index, feature in enumerate(V4W_NEXT_STEP_PREFIX_PRIORITY)
+    }
+    selected_feature: str | None = None
+    selected_error: str | None = None
+
+    for index, item in enumerate(history[:-1]):
+        next_item = history[index + 1]
+        corrections = _as_list_mapping(item.get("target_correction_token_ids_by_seq"))
+        current_tokens_by_seq = _as_dict_mapping(item.get("sequence_token_ids_before_after_by_seq"))
+        current_prefix_lens = _as_dict_mapping(item.get("prefix_len_before_after_by_seq"))
+        next_tokens_by_seq = _as_dict_mapping(next_item.get("sequence_token_ids_before_after_by_seq"))
+        next_prefix_lens = _as_dict_mapping(next_item.get("prefix_len_before_after_by_seq"))
+        next_draft_tokens_by_seq = _as_list_mapping(next_item.get("draft_side_sequence_token_ids_by_seq"))
+        next_kv_lens = _as_dict_mapping(next_item.get("kv_length_before_after_by_seq"))
+        next_positions = _as_list_mapping(next_item.get("position_ids_by_seq"))
+        next_slot_prefix_lens = _as_int_mapping(next_item.get("slot_mapping_prefix_len_by_seq"))
+        for seq_id in _zero_accept_corrected_seq_ids(item):
+            correction_tokens = [int(token) for token in corrections.get(seq_id, [])]
+            current_after_tokens = [
+                int(token) for token in list(current_tokens_by_seq.get(seq_id, {}).get("after") or [])
+            ]
+            next_before_tokens = [
+                int(token) for token in list(next_tokens_by_seq.get(seq_id, {}).get("before") or [])
+            ]
+            if not next_before_tokens:
+                next_before_tokens = [
+                    int(token) for token in list(next_item.get("sequence_token_ids_by_seq", {}).get(seq_id, []) or [])
+                ]
+            current_after_len = int(current_prefix_lens.get(seq_id, {}).get("after") or len(current_after_tokens))
+            next_before_len = int(next_prefix_lens.get(seq_id, {}).get("before") or len(next_before_tokens))
+            contains_correction = bool(
+                correction_tokens
+                and current_after_tokens
+                and len(next_before_tokens) >= len(current_after_tokens)
+                and next_before_tokens[: len(current_after_tokens)] == current_after_tokens
+                and next_before_tokens[:current_after_len][-len(correction_tokens):] == correction_tokens
+            )
+            draft_tokens = [int(token) for token in next_draft_tokens_by_seq.get(seq_id, [])]
+            draft_divergence = bool(
+                draft_tokens
+                and current_after_tokens
+                and (
+                    len(draft_tokens) < len(current_after_tokens)
+                    or draft_tokens[: len(current_after_tokens)] != current_after_tokens
+                )
+            )
+            kv_before = next_kv_lens.get(seq_id, {}).get("before")
+            kv_mismatch = bool(kv_before is not None and int(kv_before or 0) < current_after_len)
+            prefix_mismatch = bool(next_before_len < current_after_len or (next_before_tokens and next_before_len != len(next_before_tokens)))
+            positions = [int(value) for value in next_positions.get(seq_id, [])]
+            position_mismatch = bool(positions and min(positions) < current_after_len)
+            slot_prefix_len = next_slot_prefix_lens.get(seq_id)
+            slot_mismatch = bool(slot_prefix_len is not None and int(slot_prefix_len or 0) < current_after_len)
+            feature = None
+            reason = "next_prefix_aligned"
+            if not contains_correction:
+                feature = "active_request_continuation_target_correction_not_in_next_prefix"
+                reason = "target_correction_not_in_next_prefix"
+            elif draft_divergence:
+                feature = "active_request_continuation_target_draft_prefix_divergence"
+                reason = "target_draft_prefix_divergence"
+            elif kv_mismatch:
+                feature = "active_request_continuation_kv_state_mismatch"
+                reason = "kv_state_mismatch"
+            elif prefix_mismatch:
+                feature = "active_request_continuation_prefix_len_mismatch"
+                reason = "prefix_len_mismatch"
+            elif position_mismatch:
+                feature = "active_request_continuation_position_mismatch"
+                reason = "position_mismatch"
+            elif slot_mismatch:
+                feature = "active_request_continuation_slot_mapping_mismatch"
+                reason = "slot_mapping_mismatch"
+            row = {
+                "step_count": int(item.get("step_count") or 0),
+                "next_step_count": int(next_item.get("step_count") or 0),
+                "seq_id": int(seq_id),
+                "request_id": (item.get("request_ids_by_seq") or {}).get(seq_id),
+                "target_correction_token_ids": correction_tokens,
+                "current_step_sequence_token_ids_after": current_after_tokens,
+                "next_step_prefix_token_ids": next_before_tokens,
+                "next_step_prefix_len": next_before_len,
+                "next_step_contains_correction": contains_correction,
+                "target_draft_prefix_divergence": draft_divergence,
+                "kv_state_mismatch": kv_mismatch,
+                "prefix_len_mismatch": prefix_mismatch,
+                "position_mismatch": position_mismatch,
+                "slot_mapping_mismatch": slot_mismatch,
+                "final_diagnostic_reason": reason,
+                "next_required_feature": feature,
+            }
+            rows.append(row)
+            if feature is not None and (
+                selected_feature is None
+                or priority_index.get(feature, 999) < priority_index.get(selected_feature, 999)
+            ):
+                selected_feature = feature
+                selected_error = (
+                    f"zero-accept correction did not reach next-step prefix: {reason}; "
+                    f"seq_id={seq_id}, step_count={item.get('step_count')}"
+                )
+
+    return {
+        "next_step_prefix_rows": rows,
+        "next_step_prefix_checked": bool(rows),
+        "next_step_prefix_failure": selected_feature is not None,
+        "selected_next_required_feature": selected_feature,
+        "selected_error": selected_error,
+        "active_continuation_next_step_prefix_token_ids_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_token_ids"),
+        "active_continuation_next_step_prefix_len_by_step": _group_v4w_rows_by_step(rows, "next_step_prefix_len"),
+        "active_continuation_next_step_contains_correction_by_step": _group_v4w_rows_by_step(rows, "next_step_contains_correction"),
+        "active_continuation_target_correction_not_in_next_prefix": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_not_in_next_prefix"
+            for row in rows
+        ),
+        "active_continuation_target_draft_prefix_divergence": any(
+            row.get("next_required_feature") == "active_request_continuation_target_draft_prefix_divergence"
+            for row in rows
+        ),
+        "active_continuation_kv_state_mismatch": any(
+            row.get("next_required_feature") == "active_request_continuation_kv_state_mismatch"
+            for row in rows
+        ),
+        "active_continuation_prefix_len_mismatch": any(
+            row.get("next_required_feature") == "active_request_continuation_prefix_len_mismatch"
+            for row in rows
+        ),
+        "active_continuation_position_mismatch": any(
+            row.get("next_required_feature") == "active_request_continuation_position_mismatch"
+            for row in rows
+        ),
+        "active_continuation_slot_mapping_mismatch": any(
+            row.get("next_required_feature") == "active_request_continuation_slot_mapping_mismatch"
             for row in rows
         ),
     }
