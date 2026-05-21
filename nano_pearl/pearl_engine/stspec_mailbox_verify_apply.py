@@ -65,6 +65,199 @@ def reset_v4t_active_continuation_runner_state(runner: Any) -> None:
     runner.stspec_active_continuation_progress_by_step = []
 
 
+V4W_ZERO_ACCEPT_CORRECTION_PRIORITY = (
+    "active_request_continuation_target_correction_missing",
+    "active_request_continuation_reject_recovery_missing",
+    "active_request_continuation_target_correction_shadow_only",
+    "active_request_continuation_target_correction_wrong_sequence",
+    "active_request_continuation_target_correction_rolled_back",
+    "active_request_continuation_output_snapshot_mismatch",
+    "active_request_continuation_completion_token_export_missing",
+    "active_request_continuation_target_correction_not_committed",
+)
+
+
+def _as_int_mapping(value: Any) -> dict[str, int]:
+    return {str(key): int(inner or 0) for key, inner in dict(value or {}).items()}
+
+
+def _as_bool_mapping(value: Any) -> dict[str, bool]:
+    return {str(key): bool(inner) for key, inner in dict(value or {}).items()}
+
+
+def _as_list_mapping(value: Any) -> dict[str, list[Any]]:
+    return {str(key): list(inner or []) for key, inner in dict(value or {}).items()}
+
+
+def _group_v4w_rows_by_step(rows: list[JsonDict], value_key: str) -> list[JsonDict]:
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        step = int(row.get("step_count") or 0)
+        seq_id = str(row.get("seq_id"))
+        grouped.setdefault(step, {})[seq_id] = row.get(value_key)
+    return [
+        {"step_count": step, "values": grouped[step]}
+        for step in sorted(grouped)
+    ]
+
+
+def build_v4w_zero_accept_correction_diagnostics(progress_history: Iterable[JsonDict]) -> JsonDict:
+    """Prioritize zero-accept correction-token diagnostics over low acceptance.
+
+    V4W treats accepted_len=0 as a recoverable reject only when the target
+    correction token is generated, committed to the real Sequence, and visible
+    to the evaluator-facing completion export.  This helper is metadata-only so
+    CPU tests and checkers can exercise the same priority rules as the runner.
+    """
+
+    rows: list[JsonDict] = []
+    priority_index = {
+        feature: index for index, feature in enumerate(V4W_ZERO_ACCEPT_CORRECTION_PRIORITY)
+    }
+    selected_feature: str | None = None
+    selected_error: str | None = None
+
+    for item in progress_history:
+        step_count = int(item.get("step_count") or 0)
+        plan_id = item.get("plan_id")
+        request_ids = dict(item.get("request_ids_by_seq") or {})
+        expected = _as_int_mapping(item.get("expected_len_by_seq"))
+        accepted = _as_int_mapping(item.get("accepted_len_by_seq"))
+        rejected = _as_int_mapping(item.get("rejected_len_by_seq"))
+        rejected_tokens = _as_list_mapping(item.get("rejected_draft_token_ids_by_seq"))
+        correction_tokens = _as_list_mapping(item.get("target_correction_token_ids_by_seq"))
+        available = _as_bool_mapping(item.get("target_correction_available_by_seq"))
+        committed = _as_bool_mapping(item.get("target_correction_committed_by_seq"))
+        shadow_only = _as_bool_mapping(item.get("target_correction_shadow_only_by_seq"))
+        wrong_sequence = _as_bool_mapping(item.get("target_correction_wrong_sequence_by_seq"))
+        rolled_back = _as_bool_mapping(item.get("target_correction_rolled_back_by_seq"))
+        snapshot_mismatch = _as_bool_mapping(item.get("output_snapshot_mismatch_by_seq"))
+        export_missing = _as_bool_mapping(item.get("completion_token_export_missing_by_seq"))
+        output_delta = _as_int_mapping(item.get("target_correction_output_delta_by_seq"))
+        sequence_identity = dict(item.get("sequence_object_identity_by_seq") or {})
+        sequence_output_lens = dict(item.get("sequence_output_len_before_after_by_seq") or {})
+        completion_output_lens = dict(item.get("completion_token_len_before_after_by_seq") or {})
+        service_output_lens = dict(item.get("service_metadata_num_output_tokens_before_after_by_seq") or {})
+        commit_attempted = _as_bool_mapping(item.get("target_correction_commit_attempted_by_seq"))
+
+        seq_ids = set(expected) | set(accepted) | set(rejected) | set(correction_tokens)
+        for seq_id in sorted(seq_ids, key=lambda value: int(value)):
+            expected_len = int(expected.get(seq_id, 0) or 0)
+            accepted_len = int(accepted.get(seq_id, 0) or 0)
+            rejected_len = int(rejected.get(seq_id, max(expected_len - accepted_len, 0)) or 0)
+            if expected_len <= 0 or accepted_len != 0 or rejected_len <= 0:
+                continue
+            tokens = [int(token) for token in correction_tokens.get(seq_id, [])]
+            token_available = bool(available.get(seq_id, bool(tokens)))
+            token_committed = bool(committed.get(seq_id, False))
+            attempted = bool(commit_attempted.get(seq_id, token_available))
+            feature = None
+            reason = None
+            if not token_available:
+                feature = "active_request_continuation_target_correction_missing"
+                reason = "target_correction_missing"
+            elif bool(shadow_only.get(seq_id, False)):
+                feature = "active_request_continuation_target_correction_shadow_only"
+                reason = "target_correction_shadow_only"
+            elif bool(wrong_sequence.get(seq_id, False)):
+                feature = "active_request_continuation_target_correction_wrong_sequence"
+                reason = "target_correction_wrong_sequence"
+            elif bool(rolled_back.get(seq_id, False)):
+                feature = "active_request_continuation_target_correction_rolled_back"
+                reason = "target_correction_rolled_back"
+            elif bool(snapshot_mismatch.get(seq_id, False)):
+                feature = "active_request_continuation_output_snapshot_mismatch"
+                reason = "output_snapshot_mismatch"
+            elif bool(export_missing.get(seq_id, False)):
+                feature = "active_request_continuation_completion_token_export_missing"
+                reason = "completion_token_export_missing"
+            elif not token_committed:
+                feature = "active_request_continuation_target_correction_not_committed"
+                reason = "target_correction_not_committed"
+            else:
+                reason = "correction_committed"
+
+            row = {
+                "step_count": step_count,
+                "plan_id": plan_id,
+                "seq_id": int(seq_id),
+                "request_id": request_ids.get(seq_id),
+                "expected_len": expected_len,
+                "accepted_len": accepted_len,
+                "rejected_len": rejected_len,
+                "rejected_draft_token_ids": list(rejected_tokens.get(seq_id, [])),
+                "target_correction_available": token_available,
+                "target_correction_token_ids": tokens,
+                "target_correction_source": "commit_plan.target_correction_token_ids_by_seq" if token_available else "missing",
+                "target_correction_commit_attempted": attempted,
+                "target_correction_commit_success": token_committed,
+                "target_correction_output_delta": int(output_delta.get(seq_id, 0) or 0),
+                "sequence_object_identity": sequence_identity.get(seq_id),
+                "sequence_output_len_before_after": sequence_output_lens.get(seq_id),
+                "completion_token_len_before_after": completion_output_lens.get(seq_id),
+                "service_metadata_num_output_tokens_before_after": service_output_lens.get(seq_id),
+                "rollback_or_overwrite_detected": bool(rolled_back.get(seq_id, False)),
+                "final_diagnostic_reason": reason,
+                "next_required_feature": feature,
+            }
+            rows.append(row)
+            if feature is not None and (
+                selected_feature is None
+                or priority_index.get(feature, 999) < priority_index.get(selected_feature, 999)
+            ):
+                selected_feature = feature
+                selected_error = f"zero-accept correction diagnostic failed: {reason}; seq_id={seq_id}, step_count={step_count}"
+
+    return {
+        "zero_accept_correction_rows": rows,
+        "zero_accept_correction_checked": bool(rows),
+        "zero_accept_correction_failure": selected_feature is not None,
+        "selected_next_required_feature": selected_feature,
+        "selected_error": selected_error,
+        "active_continuation_correction_diagnostic_priority": list(V4W_ZERO_ACCEPT_CORRECTION_PRIORITY),
+        "active_continuation_zero_accept_correction_available_by_step": _group_v4w_rows_by_step(rows, "target_correction_available"),
+        "active_continuation_zero_accept_correction_token_ids_by_step": _group_v4w_rows_by_step(rows, "target_correction_token_ids"),
+        "active_continuation_zero_accept_correction_commit_attempted_by_step": _group_v4w_rows_by_step(rows, "target_correction_commit_attempted"),
+        "active_continuation_zero_accept_correction_commit_success_by_step": _group_v4w_rows_by_step(rows, "target_correction_commit_success"),
+        "active_continuation_zero_accept_correction_failure_reason_by_step": _group_v4w_rows_by_step(rows, "final_diagnostic_reason"),
+        "active_continuation_target_correction_missing": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_missing"
+            for row in rows
+        ),
+        "active_continuation_reject_recovery_missing": any(
+            row.get("next_required_feature") in {
+                "active_request_continuation_target_correction_missing",
+                "active_request_continuation_reject_recovery_missing",
+            }
+            for row in rows
+        ),
+        "active_continuation_target_correction_not_committed": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_not_committed"
+            for row in rows
+        ),
+        "active_continuation_target_correction_shadow_only": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_shadow_only"
+            for row in rows
+        ),
+        "active_continuation_target_correction_wrong_sequence": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_wrong_sequence"
+            for row in rows
+        ),
+        "active_continuation_target_correction_rolled_back": any(
+            row.get("next_required_feature") == "active_request_continuation_target_correction_rolled_back"
+            for row in rows
+        ),
+        "active_continuation_output_snapshot_mismatch": any(
+            row.get("next_required_feature") == "active_request_continuation_output_snapshot_mismatch"
+            for row in rows
+        ),
+        "active_continuation_completion_token_export_missing": any(
+            row.get("next_required_feature") == "active_request_continuation_completion_token_export_missing"
+            for row in rows
+        ),
+    }
+
+
 def _getattr_bool(obj: Any, name: str, default: bool = False) -> bool:
     return bool(getattr(obj, name, default))
 
@@ -1217,8 +1410,8 @@ def build_mailbox_verify_commit_plan(
                 raise MailboxVerifyApplyError(
                     f"target correction token unavailable for rejected mailbox span: "
                     f"seq_id={seq_id}, accepted_len={accepted_len}, target_len={len(target_tokens)}",
-                    next_required_feature="active_request_continuation_target_correction_not_committed",
-                    error_kind="active_request_continuation_target_correction_not_committed",
+                    next_required_feature="active_request_continuation_target_correction_missing",
+                    error_kind="active_request_continuation_target_correction_missing",
                 )
             correction_tokens = [int(target_tokens[accepted_len])]
         correction_tokens_by_seq[seq_id] = list(correction_tokens)

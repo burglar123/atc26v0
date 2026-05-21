@@ -348,6 +348,16 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_accepted_tokens_before_after_by_step",
         "active_continuation_zero_accept_step_count",
         "active_continuation_average_acceptance_rate",
+        "active_continuation_zero_accept_correction_available_by_step",
+        "active_continuation_zero_accept_correction_token_ids_by_step",
+        "active_continuation_zero_accept_correction_commit_attempted_by_step",
+        "active_continuation_zero_accept_correction_commit_success_by_step",
+        "active_continuation_zero_accept_correction_failure_reason_by_step",
+        "active_continuation_correction_diagnostic_priority",
+        "active_continuation_acceptance_too_low_after_correction_checked",
+        "active_continuation_target_correction_missing",
+        "active_continuation_reject_recovery_missing",
+        "active_continuation_target_correction_not_committed",
         "active_continuation_target_correction_available_by_step",
         "active_continuation_target_correction_committed_by_step",
         "active_continuation_target_correction_commit_seq_ids",
@@ -410,6 +420,10 @@ def test_limit_reached_is_reclassified_to_specific_progress_diagnostic():
     assert "active_request_continuation_completion_gate_mismatch" in source
     assert "active_request_continuation_output_not_committed" in source
     assert "active_request_continuation_acceptance_too_low" in source
+    assert "active_continuation_acceptance_too_low_after_correction_checked" in source
+    classify_source = source[source.index("def _classify_v4v_active_continuation_limit"):]
+    assert "build_v4w_zero_accept_correction_diagnostics(progress_history)" in classify_source
+    assert classify_source.index("build_v4w_zero_accept_correction_diagnostics(progress_history)") < classify_source.index("active_request_continuation_no_effective_token_progress")
     assert "active_request_continuation_partial_batch_starvation" in source
     assert "active_request_continuation_no_effective_token_progress" in source
     assert "mailbox_payload_after_active_continuation" in source
@@ -497,6 +511,79 @@ def test_zero_accept_reject_recovery_commits_target_correction_token():
     assert seqs[0].trace_stats["accepted_tokens"] == 0
 
 
+def _zero_accept_progress_item(**overrides):
+    item = {
+        "step_count": 1,
+        "plan_id": 8,
+        "request_ids_by_seq": {"1": "r1"},
+        "expected_len_by_seq": {"1": 1},
+        "accepted_len_by_seq": {"1": 0},
+        "rejected_len_by_seq": {"1": 1},
+        "rejected_draft_token_ids_by_seq": {"1": [111]},
+        "target_correction_token_ids_by_seq": {"1": [999]},
+        "target_correction_available_by_seq": {"1": True},
+        "target_correction_commit_attempted_by_seq": {"1": True},
+        "target_correction_committed_by_seq": {"1": True},
+        "target_correction_output_delta_by_seq": {"1": 1},
+        "sequence_object_identity_by_seq": {"1": 12345},
+        "sequence_output_len_before_after_by_seq": {"1": {"before": 0, "after": 1}},
+        "completion_token_len_before_after_by_seq": {"1": {"before": 0, "after": 1}},
+        "service_metadata_num_output_tokens_before_after_by_seq": {"1": {"before": 0, "after": 1}},
+    }
+    item.update(overrides)
+    return item
+
+
+def test_zero_accept_correction_missing_has_priority_over_acceptance_too_low():
+    diagnostic = apply_mod.build_v4w_zero_accept_correction_diagnostics([
+        _zero_accept_progress_item(
+            target_correction_token_ids_by_seq={"1": []},
+            target_correction_available_by_seq={"1": False},
+            target_correction_commit_attempted_by_seq={"1": False},
+            target_correction_committed_by_seq={"1": False},
+            target_correction_output_delta_by_seq={"1": 0},
+        )
+    ])
+    assert diagnostic["selected_next_required_feature"] == "active_request_continuation_target_correction_missing"
+    assert diagnostic["active_continuation_target_correction_missing"] is True
+    assert diagnostic["active_continuation_reject_recovery_missing"] is True
+
+
+def test_zero_accept_correction_available_but_not_committed_is_specific():
+    diagnostic = apply_mod.build_v4w_zero_accept_correction_diagnostics([
+        _zero_accept_progress_item(
+            target_correction_committed_by_seq={"1": False},
+            target_correction_output_delta_by_seq={"1": 0},
+        )
+    ])
+    assert diagnostic["selected_next_required_feature"] == "active_request_continuation_target_correction_not_committed"
+    assert diagnostic["active_continuation_target_correction_not_committed"] is True
+
+
+def test_zero_accept_correction_shadow_wrong_rollback_and_export_diagnostics():
+    cases = [
+        ("target_correction_shadow_only_by_seq", "active_request_continuation_target_correction_shadow_only"),
+        ("target_correction_wrong_sequence_by_seq", "active_request_continuation_target_correction_wrong_sequence"),
+        ("target_correction_rolled_back_by_seq", "active_request_continuation_target_correction_rolled_back"),
+        ("completion_token_export_missing_by_seq", "active_request_continuation_completion_token_export_missing"),
+    ]
+    for field, expected in cases:
+        diagnostic = apply_mod.build_v4w_zero_accept_correction_diagnostics([
+            _zero_accept_progress_item(**{field: {"1": True}, "target_correction_committed_by_seq": {"1": False}})
+        ])
+        assert diagnostic["selected_next_required_feature"] == expected
+
+
+def test_zero_accept_correction_committed_allows_acceptance_fallback():
+    diagnostic = apply_mod.build_v4w_zero_accept_correction_diagnostics([
+        _zero_accept_progress_item()
+    ])
+    assert diagnostic["zero_accept_correction_checked"] is True
+    assert diagnostic["zero_accept_correction_failure"] is False
+    assert diagnostic["selected_next_required_feature"] is None
+    assert diagnostic["active_continuation_zero_accept_correction_commit_success_by_step"][0]["values"] == {"1": True}
+
+
 def main() -> None:
     test_unfinished_requests_attempt_active_continuation()
     test_fake_runner_state_initializes_and_resets()
@@ -521,6 +608,10 @@ def main() -> None:
     test_max_steps_cli_config_is_not_hard_coded_in_runner()
     test_limit_reached_is_reclassified_to_specific_progress_diagnostic()
     test_zero_accept_reject_recovery_commits_target_correction_token()
+    test_zero_accept_correction_missing_has_priority_over_acceptance_too_low()
+    test_zero_accept_correction_available_but_not_committed_is_specific()
+    test_zero_accept_correction_shadow_wrong_rollback_and_export_diagnostics()
+    test_zero_accept_correction_committed_allows_acceptance_fallback()
 
 
 if __name__ == "__main__":

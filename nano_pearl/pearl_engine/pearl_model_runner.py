@@ -79,6 +79,7 @@ from nano_pearl.pearl_engine.stspec_pipeline import (
 from nano_pearl.pearl_engine.stspec_mailbox_verify_apply import (
     MailboxVerifyApplyError,
     build_v4t_active_continuation_metadata,
+    build_v4w_zero_accept_correction_diagnostics,
     build_v4s_result_finalization_metadata,
     build_mailbox_kv_commit_plan,
     build_mailbox_payload_consume_plan,
@@ -697,6 +698,16 @@ class ModelRunnerBase:
             "active_continuation_expected_len_by_step": [],
             "active_continuation_accepted_len_by_step": [],
             "active_continuation_rejected_len_by_step": [],
+            "active_continuation_zero_accept_correction_available_by_step": [],
+            "active_continuation_zero_accept_correction_token_ids_by_step": [],
+            "active_continuation_zero_accept_correction_commit_attempted_by_step": [],
+            "active_continuation_zero_accept_correction_commit_success_by_step": [],
+            "active_continuation_zero_accept_correction_failure_reason_by_step": [],
+            "active_continuation_correction_diagnostic_priority": [],
+            "active_continuation_acceptance_too_low_after_correction_checked": False,
+            "active_continuation_target_correction_missing": False,
+            "active_continuation_reject_recovery_missing": False,
+            "active_continuation_target_correction_not_committed": False,
             "active_continuation_target_correction_token_ids_by_step": [],
             "active_continuation_target_correction_available_by_step": [],
             "active_continuation_target_correction_committed_by_step": [],
@@ -1100,6 +1111,16 @@ class ModelRunnerBase:
             "active_continuation_expected_len_by_step",
             "active_continuation_accepted_len_by_step",
             "active_continuation_rejected_len_by_step",
+            "active_continuation_zero_accept_correction_available_by_step",
+            "active_continuation_zero_accept_correction_token_ids_by_step",
+            "active_continuation_zero_accept_correction_commit_attempted_by_step",
+            "active_continuation_zero_accept_correction_commit_success_by_step",
+            "active_continuation_zero_accept_correction_failure_reason_by_step",
+            "active_continuation_correction_diagnostic_priority",
+            "active_continuation_acceptance_too_low_after_correction_checked",
+            "active_continuation_target_correction_missing",
+            "active_continuation_reject_recovery_missing",
+            "active_continuation_target_correction_not_committed",
             "active_continuation_target_correction_token_ids_by_step",
             "active_continuation_target_correction_available_by_step",
             "active_continuation_target_correction_committed_by_step",
@@ -1773,10 +1794,17 @@ class ModelRunnerBase:
         target_correction_rolled_back_by_seq: dict[int, bool] = {}
         output_snapshot_mismatch_by_seq: dict[int, bool] = {}
         completion_token_export_missing_by_seq: dict[int, bool] = {}
+        target_correction_commit_attempted_by_seq: dict[int, bool] = {}
+        sequence_object_identity_by_seq: dict[int, int | None] = {}
+        completion_token_len_before_after_by_seq: dict[int, dict[str, int]] = {}
+        service_metadata_num_output_tokens_before_after_by_seq: dict[int, dict[str, int | None]] = {}
         for raw_seq_id, raw_tokens in target_correction_token_ids_by_seq.items():
             seq_id = int(raw_seq_id)
             correction_tokens = [int(token) for token in list(raw_tokens or [])]
             target_correction_available_by_seq[seq_id] = bool(correction_tokens)
+            target_correction_commit_attempted_by_seq[seq_id] = bool(
+                correction_tokens and getattr(commit_result, "sequence_state_commit_attempted", False)
+            )
             before_state = _state_for(sequence_state_before, seq_id)
             after_state = _state_for(sequence_state_after, seq_id)
             before_output_len = int(before_state.get("output_token_count") or 0)
@@ -1798,6 +1826,22 @@ class ModelRunnerBase:
                 int(token) for token in list(getattr(seq, "completion_token_ids", []) or [])
             ] if seq is not None else []
             current_output_len = int(getattr(seq, "num_completion_tokens", 0) or 0) if seq is not None else 0
+            sequence_object_identity_by_seq[seq_id] = id(seq) if seq is not None else None
+            completion_token_len_before_after_by_seq[seq_id] = {
+                "before": before_output_len,
+                "after": len(current_completion_tokens),
+            }
+            service_after = None
+            service_before = None
+            if seq is not None and hasattr(seq, "service_metadata"):
+                service_metadata = seq.service_metadata()
+                service_after = service_metadata.get("num_decode_output_tokens")
+                decode_ready_prefill = int(service_metadata.get("num_decode_ready_prefill_tokens") or 0)
+                service_before = max(before_output_len - decode_ready_prefill, 0)
+            service_metadata_num_output_tokens_before_after_by_seq[seq_id] = {
+                "before": service_before,
+                "after": service_after,
+            }
             commit_request_id = commit_request_ids_by_seq.get(seq_id)
             target_correction_commit_request_ids_by_seq[seq_id] = commit_request_id
             wrong_sequence = bool(
@@ -1869,6 +1913,9 @@ class ModelRunnerBase:
             "target_correction_committed_by_seq": {
                 str(key): value for key, value in target_correction_committed_by_seq.items()
             },
+            "target_correction_commit_attempted_by_seq": {
+                str(key): value for key, value in target_correction_commit_attempted_by_seq.items()
+            },
             "target_correction_commit_request_ids_by_seq": {
                 str(key): value for key, value in target_correction_commit_request_ids_by_seq.items()
             },
@@ -1895,6 +1942,15 @@ class ModelRunnerBase:
             },
             "prefix_len_before_after_by_seq": {
                 str(key): value for key, value in prefix_len_before_after_by_seq.items()
+            },
+            "sequence_object_identity_by_seq": {
+                str(key): value for key, value in sequence_object_identity_by_seq.items()
+            },
+            "completion_token_len_before_after_by_seq": {
+                str(key): value for key, value in completion_token_len_before_after_by_seq.items()
+            },
+            "service_metadata_num_output_tokens_before_after_by_seq": {
+                str(key): value for key, value in service_metadata_num_output_tokens_before_after_by_seq.items()
             },
             "rejected_draft_token_ids_by_seq": {
                 str(key): list(value or []) for key, value in rejected_token_ids_by_seq.items()
@@ -2128,6 +2184,34 @@ class ModelRunnerBase:
             {"step_count": item.get("step_count"), "values": dict(item.get("rejected_len_by_seq") or {})}
             for item in step_history
         ]
+        zero_accept_correction = build_v4w_zero_accept_correction_diagnostics(step_history)
+        trace_record["active_continuation_zero_accept_correction_available_by_step"] = list(
+            zero_accept_correction.get("active_continuation_zero_accept_correction_available_by_step") or []
+        )
+        trace_record["active_continuation_zero_accept_correction_token_ids_by_step"] = list(
+            zero_accept_correction.get("active_continuation_zero_accept_correction_token_ids_by_step") or []
+        )
+        trace_record["active_continuation_zero_accept_correction_commit_attempted_by_step"] = list(
+            zero_accept_correction.get("active_continuation_zero_accept_correction_commit_attempted_by_step") or []
+        )
+        trace_record["active_continuation_zero_accept_correction_commit_success_by_step"] = list(
+            zero_accept_correction.get("active_continuation_zero_accept_correction_commit_success_by_step") or []
+        )
+        trace_record["active_continuation_zero_accept_correction_failure_reason_by_step"] = list(
+            zero_accept_correction.get("active_continuation_zero_accept_correction_failure_reason_by_step") or []
+        )
+        trace_record["active_continuation_correction_diagnostic_priority"] = list(
+            zero_accept_correction.get("active_continuation_correction_diagnostic_priority") or []
+        )
+        trace_record["active_continuation_target_correction_missing"] = bool(
+            zero_accept_correction.get("active_continuation_target_correction_missing", False)
+        )
+        trace_record["active_continuation_reject_recovery_missing"] = bool(
+            zero_accept_correction.get("active_continuation_reject_recovery_missing", False)
+        )
+        trace_record["active_continuation_target_correction_not_committed"] = bool(
+            zero_accept_correction.get("active_continuation_target_correction_not_committed", False)
+        )
         trace_record["active_continuation_target_correction_token_ids_by_step"] = [
             {"step_count": item.get("step_count"), "values": dict(item.get("target_correction_token_ids_by_seq") or {})}
             for item in step_history
@@ -2278,6 +2362,27 @@ class ModelRunnerBase:
                 "active_request_continuation_output_not_committed",
                 "active continuation accepted tokens but Sequence output token count did not advance",
             )
+        zero_accept_correction = build_v4w_zero_accept_correction_diagnostics(progress_history)
+        trace_record["active_continuation_correction_diagnostic_priority"] = list(
+            zero_accept_correction.get("active_continuation_correction_diagnostic_priority") or []
+        )
+        for key in (
+            "active_continuation_target_correction_missing",
+            "active_continuation_reject_recovery_missing",
+            "active_continuation_target_correction_not_committed",
+            "active_continuation_target_correction_shadow_only",
+            "active_continuation_target_correction_wrong_sequence",
+            "active_continuation_target_correction_rolled_back",
+            "active_continuation_output_snapshot_mismatch",
+            "active_continuation_completion_token_export_missing",
+        ):
+            trace_record[key] = bool(trace_record.get(key, False) or zero_accept_correction.get(key, False))
+        if zero_accept_correction.get("zero_accept_correction_failure"):
+            next_feature = str(zero_accept_correction.get("selected_next_required_feature"))
+            return (
+                next_feature,
+                str(zero_accept_correction.get("selected_error") or "zero-accept correction diagnostic failed"),
+            )
         substantive_steps = [
             item
             for item in progress_history
@@ -2346,6 +2451,7 @@ class ModelRunnerBase:
                     "active_request_continuation_target_correction_not_committed",
                     "active continuation target correction token was available but did not advance Sequence output",
                 )
+            trace_record["active_continuation_acceptance_too_low_after_correction_checked"] = True
             return (
                 "active_request_continuation_acceptance_too_low",
                 (

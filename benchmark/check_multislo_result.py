@@ -273,6 +273,10 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_steps_insufficient_count = 0
     active_continuation_reject_recovery_attempt_count = 0
     active_continuation_reject_recovery_success_count = 0
+    active_continuation_acceptance_too_low_after_correction_checked_count = 0
+    active_continuation_target_correction_missing_count = 0
+    active_continuation_reject_recovery_missing_count = 0
+    active_continuation_target_correction_not_committed_count = 0
     active_continuation_target_correction_shadow_only_count = 0
     active_continuation_target_correction_wrong_sequence_count = 0
     active_continuation_target_correction_rolled_back_count = 0
@@ -677,6 +681,18 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_reject_recovery_success_count += int(
             row.get("active_continuation_reject_recovery_success_count") or 0
         )
+        active_continuation_acceptance_too_low_after_correction_checked_count += int(
+            row.get("active_continuation_acceptance_too_low_after_correction_checked_count") or 0
+        )
+        active_continuation_target_correction_missing_count += int(
+            row.get("active_continuation_target_correction_missing_count") or 0
+        )
+        active_continuation_reject_recovery_missing_count += int(
+            row.get("active_continuation_reject_recovery_missing_count") or 0
+        )
+        active_continuation_target_correction_not_committed_count += int(
+            row.get("active_continuation_target_correction_not_committed_count") or 0
+        )
         active_continuation_target_correction_shadow_only_count += int(
             row.get("active_continuation_target_correction_shadow_only_count") or 0
         )
@@ -919,6 +935,14 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_reject_recovery_attempt_count += 1
         if row.get("active_continuation_reject_recovery_success"):
             active_continuation_reject_recovery_success_count += 1
+        if row.get("active_continuation_acceptance_too_low_after_correction_checked"):
+            active_continuation_acceptance_too_low_after_correction_checked_count += 1
+        if row.get("active_continuation_target_correction_missing"):
+            active_continuation_target_correction_missing_count += 1
+        if row.get("active_continuation_reject_recovery_missing"):
+            active_continuation_reject_recovery_missing_count += 1
+        if row.get("active_continuation_target_correction_not_committed"):
+            active_continuation_target_correction_not_committed_count += 1
         if row.get("active_continuation_target_correction_shadow_only"):
             active_continuation_target_correction_shadow_only_count += 1
         if row.get("active_continuation_target_correction_wrong_sequence"):
@@ -1166,6 +1190,10 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_steps_insufficient_count": active_continuation_steps_insufficient_count,
         "active_continuation_reject_recovery_attempt_count": active_continuation_reject_recovery_attempt_count,
         "active_continuation_reject_recovery_success_count": active_continuation_reject_recovery_success_count,
+        "active_continuation_acceptance_too_low_after_correction_checked_count": active_continuation_acceptance_too_low_after_correction_checked_count,
+        "active_continuation_target_correction_missing_count": active_continuation_target_correction_missing_count,
+        "active_continuation_reject_recovery_missing_count": active_continuation_reject_recovery_missing_count,
+        "active_continuation_target_correction_not_committed_count": active_continuation_target_correction_not_committed_count,
         "active_continuation_target_correction_shadow_only_count": active_continuation_target_correction_shadow_only_count,
         "active_continuation_target_correction_wrong_sequence_count": active_continuation_target_correction_wrong_sequence_count,
         "active_continuation_target_correction_rolled_back_count": active_continuation_target_correction_rolled_back_count,
@@ -1536,6 +1564,22 @@ def summarize(path: Path) -> int:
     print(f"active continuation steps insufficient count: {plan_summary['active_continuation_steps_insufficient_count']}")
     print(f"active continuation reject recovery attempts: {plan_summary['active_continuation_reject_recovery_attempt_count']}")
     print(f"active continuation reject recovery successes: {plan_summary['active_continuation_reject_recovery_success_count']}")
+    print(
+        "active continuation acceptance-too-low after correction checked count: "
+        f"{plan_summary['active_continuation_acceptance_too_low_after_correction_checked_count']}"
+    )
+    print(
+        "active continuation target correction missing count: "
+        f"{plan_summary['active_continuation_target_correction_missing_count']}"
+    )
+    print(
+        "active continuation reject recovery missing count: "
+        f"{plan_summary['active_continuation_reject_recovery_missing_count']}"
+    )
+    print(
+        "active continuation target correction not committed count: "
+        f"{plan_summary['active_continuation_target_correction_not_committed_count']}"
+    )
     print(
         "active continuation target correction shadow-only count: "
         f"{plan_summary['active_continuation_target_correction_shadow_only_count']}"
