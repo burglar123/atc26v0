@@ -3387,6 +3387,66 @@ class ModelRunnerBase:
                     next_feature,
                     str(token_alignment.get("selected_error") or "V4Z token alignment diagnostic failed"),
                 )
+            # V4Z.1: cross-validate diagnostic data against real comparator
+            comparator_rows = list(trace_record.get(
+                "active_continuation_comparator_draft_token_ids_by_step"
+            ) or [])
+            trace_record["active_continuation_real_comparator_checked"] = bool(comparator_rows)
+            real_comparator_token_mismatch = False
+            real_comparator_offset_mismatch = False
+            token_diag_not_using_comparator = False
+            for c_row in comparator_rows:
+                seq_id = c_row.get("seq_id")
+                drafted = c_row.get("drafted", [])
+                target = c_row.get("target", [])
+                accepted_len = c_row.get("accepted_len", 0)
+                first_mismatch = c_row.get("first_mismatch_index")
+                if first_mismatch is not None and first_mismatch == 0 and accepted_len == 0:
+                    real_comparator_token_mismatch = True
+                if accepted_len == 0 and drafted and target and len(drafted) > 0 and len(target) > 0:
+                    if drafted[0] != target[0]:
+                        real_comparator_token_mismatch = True
+            # Cross-validate V4Z first_draft/first_target against comparator
+            v4z_first_draft = trace_record.get("active_continuation_first_draft_token_by_step") or []
+            v4z_first_target = trace_record.get("active_continuation_first_target_verify_token_by_step") or []
+            comp_first_draft = trace_record.get("active_continuation_comparator_first_draft_token_by_step") or []
+            for v4z_row in v4z_first_draft:
+                v4z_seq = v4z_row.get("seq_id")
+                v4z_draft = v4z_row.get("first_draft_token")
+                comp_match = next((r for r in comp_first_draft if r.get("seq_id") == v4z_seq), None)
+                if comp_match and v4z_draft != comp_match.get("first_draft"):
+                    token_diag_not_using_comparator = True
+                    break
+            trace_record["active_continuation_real_comparator_token_mismatch"] = real_comparator_token_mismatch
+            trace_record["active_continuation_real_comparator_offset_mismatch"] = real_comparator_offset_mismatch
+            trace_record["active_continuation_token_diagnostic_not_using_real_comparator"] = (
+                token_diag_not_using_comparator
+            )
+            trace_record["active_continuation_true_low_acceptance_after_real_comparator_checked"] = (
+                bool(comparator_rows)
+                and not real_comparator_token_mismatch
+                and not real_comparator_offset_mismatch
+                and not token_diag_not_using_comparator
+                and trace_record.get("active_continuation_acceptance_too_low_after_alignment_checked", False)
+            )
+            trace_record["active_continuation_acceptance_too_low_after_real_comparator_checked"] = (
+                trace_record["active_continuation_true_low_acceptance_after_real_comparator_checked"]
+            )
+            if token_diag_not_using_comparator:
+                return (
+                    "active_request_continuation_token_diagnostic_not_using_real_comparator",
+                    "V4Z token diagnostic data does not match real comparator data",
+                )
+            if real_comparator_token_mismatch:
+                return (
+                    "active_request_continuation_real_comparator_token_mismatch",
+                    "real comparator shows first draft token != first target token",
+                )
+            if real_comparator_offset_mismatch:
+                return (
+                    "active_request_continuation_real_comparator_offset_mismatch",
+                    "real comparator offset does not match expected variable_offsets span",
+                )
             return (
                 "active_request_continuation_acceptance_too_low",
                 (
@@ -3395,6 +3455,10 @@ class ModelRunnerBase:
                     "active_continuation_acceptance_too_low_after_correction_checked=True; "
                     "active_continuation_acceptance_too_low_after_alignment_checked=True; "
                     "active_continuation_acceptance_too_low_after_token_alignment_checked=True; "
+                    "active_continuation_acceptance_too_low_after_real_comparator_checked=True; "
+                    f"real_comparator_token_mismatch={real_comparator_token_mismatch}; "
+                    f"real_comparator_offset_mismatch={real_comparator_offset_mismatch}; "
+                    f"token_diag_not_using_comparator={token_diag_not_using_comparator}; "
                     f"zero_accept_correction_checked={bool(zero_accept_correction.get('zero_accept_correction_checked', False))}; "
                     f"zero_accept_correction_failure={bool(zero_accept_correction.get('zero_accept_correction_failure', False))}; "
                     f"zero_accept_correction_rows_count={len(zero_accept_correction.get('zero_accept_correction_rows') or [])}; "
@@ -3403,7 +3467,8 @@ class ModelRunnerBase:
                     f"alignment_checked={bool(alignment.get('alignment_checked', False))}; "
                     f"alignment_failure={bool(alignment.get('alignment_failure', False))}; "
                     f"token_alignment_checked={bool(token_alignment.get('token_alignment_checked', False))}; "
-                    f"token_alignment_failure={bool(token_alignment.get('token_alignment_failure', False))}"
+                    f"token_alignment_failure={bool(token_alignment.get('token_alignment_failure', False))}; "
+                    f"comparator_rows={len(comparator_rows)}"
                 ),
             )
         trace_record["active_continuation_progress_too_slow"] = True
@@ -4041,6 +4106,47 @@ class ModelRunnerBase:
             trace_record["mailbox_verify_total_accepted_tokens"] = int(verify_result.total_accepted_tokens)
             trace_record["mailbox_verify_total_rejected_tokens"] = int(verify_result.total_rejected_tokens)
             trace_record["mailbox_verify_invalidated_payload_count"] = len(verify_result.invalidated_mailbox_payload_ids)
+            # V4Z.1: capture real comparator trace
+            comparator_trace = dict(getattr(verify_result, "comparator_trace", {}) or {})
+            trace_record["active_continuation_comparator_draft_token_ids_by_step"] = [
+                {"seq_id": seq_id, "drafted": row.get("drafted_token_ids_compared", []),
+                 "target": row.get("target_token_ids_compared", []),
+                 "accepted_len": row.get("accepted_len"),
+                 "first_mismatch_index": row.get("first_mismatch_index")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_target_token_ids_by_step"] = [
+                {"seq_id": seq_id, "target_token_ids": row.get("target_token_ids_compared", [])}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_equal_flags_by_step"] = [
+                {"seq_id": seq_id, "per_position_equal": row.get("per_position_equal", [])}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_first_mismatch_index_by_step"] = [
+                {"seq_id": seq_id, "first_mismatch_index": row.get("first_mismatch_index")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_first_draft_token_by_step"] = [
+                {"seq_id": seq_id, "first_draft": row.get("first_draft_token_compared")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_first_target_token_by_step"] = [
+                {"seq_id": seq_id, "first_target": row.get("first_target_token_compared")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_comparator_start_offset_by_step"] = [
+                {"seq_id": seq_id, "start_offset": row.get("comparison_start_offset")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_accepted_len_reason_by_step"] = [
+                {"seq_id": seq_id, "accepted_len": row.get("accepted_len"),
+                 "expected_len": row.get("expected_len"),
+                 "first_draft": row.get("first_draft_token_compared"),
+                 "first_target": row.get("first_target_token_compared")}
+                for seq_id, row in comparator_trace.items()
+            ]
+            trace_record["active_continuation_real_comparator_checked"] = bool(comparator_trace)
             apply_plan = build_mailbox_verify_apply_plan(
                 verify_result,
                 exec_seqs,

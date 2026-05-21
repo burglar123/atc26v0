@@ -980,6 +980,8 @@ class MailboxVerifyResult:
     next_required_feature: str | None = None
     positions_by_seq: dict[int, list[int]] = field(default_factory=dict)
     kv_slot_ids_by_seq: dict[int, list[int]] = field(default_factory=dict)
+    # V4Z.1: per-position comparator trace
+    comparator_trace: dict[int, dict] = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         return _jsonable(asdict(self))
@@ -1364,6 +1366,7 @@ def build_mailbox_verify_result(
     rejected_positions: dict[int, list[int]] = {}
     invalidated_payload_ids: list[str] = []
     source_payload_ids = list(getattr(verification_input, "source_mailbox_payload_ids", []) or [])
+    comparator_trace: dict[int, dict] = {}
     for idx, seq_id in enumerate(seq_ids):
         offset = offsets[idx]
         length = lengths[idx]
@@ -1378,6 +1381,26 @@ def build_mailbox_verify_result(
         else:
             accepted_len = _accepted_prefix_length(drafted, target)
         accepted[seq_id] = accepted_len
+        # V4Z.1: per-position comparator trace
+        per_position_equal = [
+            int(d) == int(t) for d, t in zip(drafted, target)
+        ] if target_token_ids is not None else []
+        first_mismatch_idx = next(
+            (i for i, eq in enumerate(per_position_equal) if not eq), None
+        ) if per_position_equal else None
+        comparator_trace[int(seq_id)] = {
+            "accepted_len": accepted_len,
+            "expected_len": length,
+            "comparison_start_offset": offset,
+            "drafted_token_ids_compared": [int(t) for t in drafted],
+            "target_token_ids_compared": [int(t) for t in target],
+            "per_position_equal": per_position_equal,
+            "first_mismatch_index": first_mismatch_idx,
+            "first_draft_token_compared": int(drafted[0]) if drafted else None,
+            "first_target_token_compared": int(target[0]) if target else None,
+            "drafted_count": len(drafted),
+            "target_count": len(target),
+        }
         if accepted_len < length:
             rejected_seq_ids.append(seq_id)
             rejected_positions[seq_id] = list(range(accepted_len, length))
@@ -1409,6 +1432,7 @@ def build_mailbox_verify_result(
         next_required_feature="mailbox_verify_token_decision_backend" if metadata_only else None,
         positions_by_seq=positions_by_seq,
         kv_slot_ids_by_seq=kv_slot_ids_by_seq,
+        comparator_trace=comparator_trace,
     )
 
 
