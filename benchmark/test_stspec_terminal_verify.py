@@ -27,8 +27,14 @@ sys.modules[engine_pkg_name] = engine_pkg
 apply_mod = importlib.import_module("nano_pearl.pearl_engine.stspec_mailbox_verify_apply")
 
 
-def seq(seq_id: int, *, pre_verify: bool = False):
-    return SimpleNamespace(seq_id=seq_id, pre_verify=pre_verify)
+def seq(seq_id: int, *, pre_verify: bool = False, num_completion_tokens: int = 0, max_tokens: int | None = None):
+    return SimpleNamespace(
+        seq_id=seq_id,
+        pre_verify=pre_verify,
+        num_completion_tokens=num_completion_tokens,
+        max_tokens=max_tokens,
+        ignore_eos=False,
+    )
 
 
 def plan(accepted, targets):
@@ -100,6 +106,28 @@ def test_terminal_verify_tuple_json_serializable():
     json.dumps({"rows": rows, "metadata": metadata}, sort_keys=True, default=str)
 
 
+def test_terminal_verify_sets_finish_when_revise_reaches_max_tokens():
+    rows, metadata = apply_mod.build_terminal_verify_tuple_rows(
+        plan({1: 0}, {1: [901]}),
+        [seq(1, pre_verify=True, num_completion_tokens=31, max_tokens=32)],
+        gamma=4,
+    )
+    assert metadata["terminal_verify_tuple_success"] is True
+    assert rows == [[0], [4], [901], [1]]
+    assert metadata["terminal_verify_finish_by_seq"][1] is True
+
+
+def test_terminal_verify_sets_finish_when_eos_revise_token_emits():
+    rows, metadata = apply_mod.build_terminal_verify_tuple_rows(
+        plan({1: 0}, {1: [2]}),
+        [seq(1, pre_verify=True, num_completion_tokens=3, max_tokens=32)],
+        gamma=4,
+        eos_token_id=2,
+    )
+    assert metadata["terminal_verify_tuple_success"] is True
+    assert rows == [[0], [4], [2], [1]]
+
+
 def main() -> None:
     test_zero_accept_preverify_is_representable()
     test_partial_accept_decode_is_representable()
@@ -107,6 +135,8 @@ def main() -> None:
     test_mixed_accept_lengths_are_representable()
     test_missing_revise_token_gets_explicit_diagnostic()
     test_terminal_verify_tuple_json_serializable()
+    test_terminal_verify_sets_finish_when_revise_reaches_max_tokens()
+    test_terminal_verify_sets_finish_when_eos_revise_token_emits()
 
 
 if __name__ == "__main__":

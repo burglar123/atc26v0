@@ -330,8 +330,25 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_no_progress",
         "active_continuation_no_progress_reason",
         "active_continuation_progress_too_slow",
+        "active_request_continuation_no_effective_token_progress",
+        "active_request_continuation_acceptance_too_low",
+        "active_request_continuation_partial_batch_starvation",
+        "active_request_continuation_output_not_committed",
+        "active_request_continuation_completion_gate_mismatch",
+        "active_request_continuation_steps_insufficient",
+        "active_continuation_effective_token_progress_by_step",
+        "active_continuation_bookkeeping_progress_by_step",
+        "active_continuation_output_tokens_before_after_by_step",
+        "active_continuation_accepted_tokens_before_after_by_step",
+        "active_continuation_zero_accept_step_count",
+        "active_continuation_average_acceptance_rate",
+        "active_continuation_starving_seq_ids",
+        "active_continuation_last_advanced_step_by_seq",
+        "active_continuation_output_not_committed",
+        "active_continuation_completion_gate_mismatch",
+        "active_continuation_steps_insufficient",
+        "active_continuation_recommended_min_steps",
         "active_request_continuation_no_progress",
-        "active_request_continuation_progress_too_slow",
         "active_continuation_step_history",
         "active_continuation_home_batch_history",
         "active_continuation_total_output_token_delta",
@@ -371,7 +388,12 @@ def test_limit_reached_is_reclassified_to_specific_progress_diagnostic():
     assert limit_branch in source
     assert classifier in source
     assert source.index(limit_branch) < source.index(generic_raise)
-    assert "active_request_continuation_progress_too_slow" in source
+    assert "active_request_continuation_steps_insufficient" in source
+    assert "active_request_continuation_completion_gate_mismatch" in source
+    assert "active_request_continuation_output_not_committed" in source
+    assert "active_request_continuation_acceptance_too_low" in source
+    assert "active_request_continuation_partial_batch_starvation" in source
+    assert "active_request_continuation_no_effective_token_progress" in source
     assert "mailbox_payload_after_active_continuation" in source
 
 

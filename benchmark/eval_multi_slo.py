@@ -935,6 +935,14 @@ def aggregate_low_level_traces(
         active_continuation_no_progress_count = 0
         active_continuation_progress_too_slow_count = 0
         active_continuation_no_progress_reasons: List[str] = []
+        active_continuation_zero_accept_step_count = 0
+        active_continuation_average_acceptance_rate = 0.0
+        active_continuation_starving_seq_ids: List[Any] = []
+        active_continuation_last_advanced_step_by_seq: Dict[str, Any] = {}
+        active_continuation_output_not_committed_count = 0
+        active_continuation_completion_gate_mismatch_count = 0
+        active_continuation_steps_insufficient_count = 0
+        active_continuation_recommended_min_steps = None
         stspec_active_continuation_max_steps_values: List[int] = []
         stspec_active_continuation_max_steps_effective_values: List[int] = []
         stspec_active_continuation_max_steps_sources: List[str] = []
@@ -947,6 +955,13 @@ def aggregate_low_level_traces(
         active_continuation_home_batch_history: List[Any] = []
         active_continuation_step_history: List[Any] = []
         active_continuation_progress_by_step: List[Any] = []
+        active_continuation_effective_token_progress_by_step: List[Any] = []
+        active_continuation_bookkeeping_progress_by_step: List[Any] = []
+        active_continuation_output_tokens_before_after_by_step: List[Any] = []
+        active_continuation_accepted_tokens_before_after_by_step: List[Any] = []
+        active_continuation_expected_len_by_step: List[Any] = []
+        active_continuation_accepted_len_by_step: List[Any] = []
+        active_continuation_rejected_len_by_step: List[Any] = []
         active_continuation_total_output_token_delta = 0
         active_continuation_total_accepted_token_delta = 0
         active_continuation_completion_rechecked_count = 0
@@ -1311,6 +1326,30 @@ def aggregate_low_level_traces(
             if e.get("active_continuation_progress_too_slow"):
                 active_continuation_progress_too_slow_count += 1
             append_unique(active_continuation_no_progress_reasons, e.get("active_continuation_no_progress_reason"))
+            active_continuation_zero_accept_step_count = max(
+                active_continuation_zero_accept_step_count,
+                int(e.get("active_continuation_zero_accept_step_count") or 0),
+            )
+            active_continuation_average_acceptance_rate = max(
+                active_continuation_average_acceptance_rate,
+                float(e.get("active_continuation_average_acceptance_rate") or 0.0),
+            )
+            for value in e.get("active_continuation_starving_seq_ids") or []:
+                append_unique(active_continuation_starving_seq_ids, value)
+            last_advanced = e.get("active_continuation_last_advanced_step_by_seq")
+            if isinstance(last_advanced, dict):
+                active_continuation_last_advanced_step_by_seq.update({str(k): v for k, v in last_advanced.items()})
+            if e.get("active_continuation_output_not_committed"):
+                active_continuation_output_not_committed_count += 1
+            if e.get("active_continuation_completion_gate_mismatch"):
+                active_continuation_completion_gate_mismatch_count += 1
+            if e.get("active_continuation_steps_insufficient"):
+                active_continuation_steps_insufficient_count += 1
+            if e.get("active_continuation_recommended_min_steps") is not None:
+                active_continuation_recommended_min_steps = max(
+                    int(active_continuation_recommended_min_steps or 0),
+                    int(e.get("active_continuation_recommended_min_steps") or 0),
+                )
             if e.get("stspec_active_continuation_max_steps") is not None:
                 stspec_active_continuation_max_steps_values.append(int(e.get("stspec_active_continuation_max_steps") or 0))
             if e.get("stspec_active_continuation_max_steps_effective") is not None:
@@ -1338,6 +1377,28 @@ def aggregate_low_level_traces(
                 active_continuation_step_history = list(e.get("active_continuation_step_history") or [])
             if e.get("active_continuation_progress_by_step"):
                 active_continuation_progress_by_step = list(e.get("active_continuation_progress_by_step") or [])
+            if e.get("active_continuation_effective_token_progress_by_step"):
+                active_continuation_effective_token_progress_by_step = list(
+                    e.get("active_continuation_effective_token_progress_by_step") or []
+                )
+            if e.get("active_continuation_bookkeeping_progress_by_step"):
+                active_continuation_bookkeeping_progress_by_step = list(
+                    e.get("active_continuation_bookkeeping_progress_by_step") or []
+                )
+            if e.get("active_continuation_output_tokens_before_after_by_step"):
+                active_continuation_output_tokens_before_after_by_step = list(
+                    e.get("active_continuation_output_tokens_before_after_by_step") or []
+                )
+            if e.get("active_continuation_accepted_tokens_before_after_by_step"):
+                active_continuation_accepted_tokens_before_after_by_step = list(
+                    e.get("active_continuation_accepted_tokens_before_after_by_step") or []
+                )
+            if e.get("active_continuation_expected_len_by_step"):
+                active_continuation_expected_len_by_step = list(e.get("active_continuation_expected_len_by_step") or [])
+            if e.get("active_continuation_accepted_len_by_step"):
+                active_continuation_accepted_len_by_step = list(e.get("active_continuation_accepted_len_by_step") or [])
+            if e.get("active_continuation_rejected_len_by_step"):
+                active_continuation_rejected_len_by_step = list(e.get("active_continuation_rejected_len_by_step") or [])
             active_continuation_total_output_token_delta = max(
                 active_continuation_total_output_token_delta,
                 int(e.get("active_continuation_total_output_token_delta") or 0),
@@ -1699,6 +1760,17 @@ def aggregate_low_level_traces(
         row["active_continuation_progress_too_slow_count"] = active_continuation_progress_too_slow_count
         if active_continuation_no_progress_reasons:
             row["active_continuation_no_progress_reasons"] = active_continuation_no_progress_reasons
+        row["active_continuation_zero_accept_step_count"] = active_continuation_zero_accept_step_count
+        row["active_continuation_average_acceptance_rate"] = active_continuation_average_acceptance_rate
+        if active_continuation_starving_seq_ids:
+            row["active_continuation_starving_seq_ids"] = active_continuation_starving_seq_ids
+        if active_continuation_last_advanced_step_by_seq:
+            row["active_continuation_last_advanced_step_by_seq"] = active_continuation_last_advanced_step_by_seq
+        row["active_continuation_output_not_committed_count"] = active_continuation_output_not_committed_count
+        row["active_continuation_completion_gate_mismatch_count"] = active_continuation_completion_gate_mismatch_count
+        row["active_continuation_steps_insufficient_count"] = active_continuation_steps_insufficient_count
+        if active_continuation_recommended_min_steps is not None:
+            row["active_continuation_recommended_min_steps"] = active_continuation_recommended_min_steps
         if stspec_active_continuation_max_steps_values:
             row["stspec_active_continuation_max_steps"] = max(stspec_active_continuation_max_steps_values)
         if stspec_active_continuation_max_steps_effective_values:
@@ -1723,6 +1795,20 @@ def aggregate_low_level_traces(
             row["active_continuation_step_history"] = active_continuation_step_history
         if active_continuation_progress_by_step:
             row["active_continuation_progress_by_step"] = active_continuation_progress_by_step
+        if active_continuation_effective_token_progress_by_step:
+            row["active_continuation_effective_token_progress_by_step"] = active_continuation_effective_token_progress_by_step
+        if active_continuation_bookkeeping_progress_by_step:
+            row["active_continuation_bookkeeping_progress_by_step"] = active_continuation_bookkeeping_progress_by_step
+        if active_continuation_output_tokens_before_after_by_step:
+            row["active_continuation_output_tokens_before_after_by_step"] = active_continuation_output_tokens_before_after_by_step
+        if active_continuation_accepted_tokens_before_after_by_step:
+            row["active_continuation_accepted_tokens_before_after_by_step"] = active_continuation_accepted_tokens_before_after_by_step
+        if active_continuation_expected_len_by_step:
+            row["active_continuation_expected_len_by_step"] = active_continuation_expected_len_by_step
+        if active_continuation_accepted_len_by_step:
+            row["active_continuation_accepted_len_by_step"] = active_continuation_accepted_len_by_step
+        if active_continuation_rejected_len_by_step:
+            row["active_continuation_rejected_len_by_step"] = active_continuation_rejected_len_by_step
         row["active_continuation_total_output_token_delta"] = active_continuation_total_output_token_delta
         row["active_continuation_total_accepted_token_delta"] = active_continuation_total_accepted_token_delta
         row["active_continuation_completion_rechecked_count"] = active_continuation_completion_rechecked_count

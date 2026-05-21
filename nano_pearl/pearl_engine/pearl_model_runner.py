@@ -688,6 +688,21 @@ class ModelRunnerBase:
             "active_continuation_no_progress": False,
             "active_continuation_no_progress_reason": None,
             "active_continuation_progress_too_slow": False,
+            "active_continuation_effective_token_progress_by_step": [],
+            "active_continuation_bookkeeping_progress_by_step": [],
+            "active_continuation_output_tokens_before_after_by_step": [],
+            "active_continuation_accepted_tokens_before_after_by_step": [],
+            "active_continuation_expected_len_by_step": [],
+            "active_continuation_accepted_len_by_step": [],
+            "active_continuation_rejected_len_by_step": [],
+            "active_continuation_zero_accept_step_count": 0,
+            "active_continuation_average_acceptance_rate": 0.0,
+            "active_continuation_starving_seq_ids": [],
+            "active_continuation_last_advanced_step_by_seq": {},
+            "active_continuation_output_not_committed": False,
+            "active_continuation_completion_gate_mismatch": False,
+            "active_continuation_steps_insufficient": False,
+            "active_continuation_recommended_min_steps": None,
             "active_continuation_remaining_seq_ids": [],
             "active_continuation_remaining_output_tokens_by_seq": {},
             "active_continuation_pending_payload_ids": [],
@@ -1053,6 +1068,21 @@ class ModelRunnerBase:
             "active_continuation_no_progress",
             "active_continuation_no_progress_reason",
             "active_continuation_progress_too_slow",
+            "active_continuation_effective_token_progress_by_step",
+            "active_continuation_bookkeeping_progress_by_step",
+            "active_continuation_output_tokens_before_after_by_step",
+            "active_continuation_accepted_tokens_before_after_by_step",
+            "active_continuation_expected_len_by_step",
+            "active_continuation_accepted_len_by_step",
+            "active_continuation_rejected_len_by_step",
+            "active_continuation_zero_accept_step_count",
+            "active_continuation_average_acceptance_rate",
+            "active_continuation_starving_seq_ids",
+            "active_continuation_last_advanced_step_by_seq",
+            "active_continuation_output_not_committed",
+            "active_continuation_completion_gate_mismatch",
+            "active_continuation_steps_insufficient",
+            "active_continuation_recommended_min_steps",
             "active_continuation_remaining_seq_ids",
             "active_continuation_remaining_output_tokens_by_seq",
             "active_continuation_pending_payload_ids",
@@ -1449,7 +1479,12 @@ class ModelRunnerBase:
     def _build_v4s_terminal_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> list[list[int]]:
         if commit_result.plan is None:
             raise RuntimeError("V4S terminal verify requires a mailbox commit plan")
-        verify_rows, metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+        verify_rows, metadata = build_terminal_verify_tuple_rows(
+            commit_result.plan,
+            exec_seqs,
+            gamma=int(self.gamma),
+            eos_token_id=getattr(self.global_config, "eos", None),
+        )
         if not metadata.get("terminal_verify_tuple_success"):
             raise RuntimeError(str(metadata.get("terminal_verify_tuple_error")))
         verify_rows[3] = [1 for _ in exec_seqs]
@@ -1458,7 +1493,12 @@ class ModelRunnerBase:
     def _build_v4t_active_verify_rows(self, exec_seqs: list[Sequence], commit_result) -> tuple[list[list[int]], dict]:
         if commit_result.plan is None:
             raise RuntimeError("V4T active continuation requires a mailbox commit plan")
-        verify_rows, metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+        verify_rows, metadata = build_terminal_verify_tuple_rows(
+            commit_result.plan,
+            exec_seqs,
+            gamma=int(self.gamma),
+            eos_token_id=getattr(self.global_config, "eos", None),
+        )
         return verify_rows, metadata
 
     def _participate_v4s_terminal_verify_broadcast(
@@ -1567,7 +1607,12 @@ class ModelRunnerBase:
         try:
             if commit_result.plan is None:
                 raise RuntimeError("V4S terminal verify requires a mailbox commit plan")
-            verify_rows, tuple_metadata = build_terminal_verify_tuple_rows(commit_result.plan, exec_seqs, gamma=int(self.gamma))
+            verify_rows, tuple_metadata = build_terminal_verify_tuple_rows(
+                commit_result.plan,
+                exec_seqs,
+                gamma=int(self.gamma),
+                eos_token_id=getattr(self.global_config, "eos", None),
+            )
             trace_record.update(tuple_metadata)
             if not tuple_metadata.get("terminal_verify_tuple_success"):
                 raise RuntimeError(str(tuple_metadata.get("terminal_verify_tuple_error")))
@@ -1619,8 +1664,23 @@ class ModelRunnerBase:
         max_steps: int,
     ) -> dict:
         active_set = {int(seq_id) for seq_id in active_seq_ids}
+        request_ids_by_seq = {
+            int(seq.seq_id): getattr(seq, "request_id", None)
+            for seq in exec_seqs
+            if int(seq.seq_id) in active_set
+        }
         output_tokens_by_seq = {
             int(seq.seq_id): int(getattr(seq, "num_completion_tokens", 0) or 0)
+            for seq in exec_seqs
+            if int(seq.seq_id) in active_set
+        }
+        accepted_tokens_by_seq = {
+            int(seq.seq_id): int((getattr(seq, "trace_stats", {}) or {}).get("accepted_tokens") or 0)
+            for seq in exec_seqs
+            if int(seq.seq_id) in active_set
+        }
+        finished_by_seq = {
+            int(seq.seq_id): bool(getattr(seq, "is_finished", False))
             for seq in exec_seqs
             if int(seq.seq_id) in active_set
         }
@@ -1637,7 +1697,18 @@ class ModelRunnerBase:
         pending_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_pending_payload_ids_at_completion", []) or []]
         consumed_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_consumed_payload_ids", []) or []]
         invalidated_payload_ids = [str(payload_id) for payload_id in getattr(commit_result, "mailbox_payload_invalidated_payload_ids", []) or []]
-        accepted_lengths = dict(getattr(getattr(commit_result, "plan", None), "accepted_lengths_by_seq", {}) or {})
+        commit_plan = getattr(commit_result, "plan", None)
+        accepted_lengths = {int(key): int(value or 0) for key, value in dict(getattr(commit_plan, "accepted_lengths_by_seq", {}) or {}).items()}
+        rejected_token_ids_by_seq = dict(getattr(commit_plan, "rejected_token_ids_by_seq", {}) or {})
+        accepted_token_ids_by_seq = dict(getattr(commit_plan, "accepted_token_ids_by_seq", {}) or {})
+        rejected_lengths = {
+            int(key): len(value or [])
+            for key, value in rejected_token_ids_by_seq.items()
+        }
+        expected_lengths = {
+            int(seq_id): int(accepted_lengths.get(int(seq_id), 0)) + int(rejected_lengths.get(int(seq_id), 0))
+            for seq_id in set(accepted_lengths) | set(rejected_lengths)
+        }
         total_accepted = int(getattr(commit_result, "total_accepted_tokens", 0) or 0)
         if not total_accepted and accepted_lengths:
             total_accepted = sum(int(value or 0) for value in accepted_lengths.values())
@@ -1649,10 +1720,20 @@ class ModelRunnerBase:
             "target_home_batch_id": getattr(step_plan, "target_home_batch_id", None),
             "draft_home_batch_id": getattr(step_plan, "draft_home_batch_id", None),
             "remaining_seq_ids": sorted(active_set),
+            "request_ids_by_seq": {str(key): value for key, value in request_ids_by_seq.items()},
             "unfinished_seq_ids": list(getattr(commit_result, "unfinished_seq_ids_at_completion_check", []) or []),
             "scheduler_active_seq_ids": list(getattr(commit_result, "scheduler_active_seq_ids_at_completion", []) or []),
             "remaining_output_tokens_by_seq": {str(key): value for key, value in output_tokens_by_seq.items()},
+            "accepted_tokens_by_seq": {str(key): value for key, value in accepted_tokens_by_seq.items()},
             "remaining_tokens_to_max_by_seq": remaining_to_max_by_seq,
+            "finished_by_seq": {str(key): value for key, value in finished_by_seq.items()},
+            "max_tokens_by_seq": {str(key): value for key, value in max_tokens_by_seq.items()},
+            "expected_len_by_seq": {str(key): value for key, value in expected_lengths.items()},
+            "accepted_len_by_seq": {str(key): value for key, value in accepted_lengths.items()},
+            "rejected_len_by_seq": {str(key): value for key, value in rejected_lengths.items()},
+            "accepted_token_count_by_seq": {
+                str(key): len(value or []) for key, value in accepted_token_ids_by_seq.items()
+            },
             "pending_payload_ids": pending_payload_ids,
             "consumed_payload_ids": consumed_payload_ids,
             "invalidated_payload_ids": invalidated_payload_ids,
@@ -1669,6 +1750,8 @@ class ModelRunnerBase:
         pending_payload_delta = 0
         consumed_payload_delta = 0
         invalidated_payload_delta = 0
+        output_delta_by_seq: dict[str, int] = {}
+        accepted_delta_by_seq: dict[str, int] = {}
         if previous is None:
             progress_reasons.append("initial_active_continuation_snapshot")
         else:
@@ -1679,19 +1762,35 @@ class ModelRunnerBase:
             output_increased = False
             for seq_id, token_count in current_tokens.items():
                 token_delta = int(token_count or 0) - int(previous_tokens.get(seq_id, 0) or 0)
+                output_delta_by_seq[str(seq_id)] = int(token_delta)
                 output_token_delta += max(token_delta, 0)
                 if token_delta > 0:
                     output_increased = True
             if output_increased:
                 progress_reasons.append("output_token_increased")
-            accepted_token_delta = max(
-                int(snapshot.get("total_accepted_tokens") or 0)
-                - int(previous.get("total_accepted_tokens") or 0),
-                0,
-            )
+            current_accepted = snapshot.get("accepted_tokens_by_seq") or {}
+            previous_accepted = previous.get("accepted_tokens_by_seq") or {}
+            accepted_delta_by_seq = {
+                str(seq_id): int(value or 0) - int(previous_accepted.get(seq_id, 0) or 0)
+                for seq_id, value in current_accepted.items()
+            }
+            accepted_token_delta = sum(max(delta, 0) for delta in accepted_delta_by_seq.values())
+            if not accepted_token_delta:
+                accepted_token_delta = max(
+                    int(snapshot.get("total_accepted_tokens") or 0)
+                    - int(previous.get("total_accepted_tokens") or 0),
+                    0,
+                )
             if accepted_token_delta > 0:
                 progress_reasons.append("accepted_token_progress")
-            if set(snapshot.get("finished_seq_ids") or []) - set(previous.get("finished_seq_ids") or []):
+            current_finished = snapshot.get("finished_by_seq") or {}
+            previous_finished = previous.get("finished_by_seq") or {}
+            finished_transitions = [
+                str(seq_id)
+                for seq_id, finished in current_finished.items()
+                if bool(finished) and not bool(previous_finished.get(seq_id, False))
+            ]
+            if finished_transitions or set(snapshot.get("finished_seq_ids") or []) - set(previous.get("finished_seq_ids") or []):
                 progress_reasons.append("sequence_finished")
             if set(snapshot.get("consumed_payload_ids") or []) - set(previous.get("consumed_payload_ids") or []):
                 progress_reasons.append("payload_consumed")
@@ -1711,12 +1810,25 @@ class ModelRunnerBase:
         snapshot["made_progress"] = bool(progress_reasons)
         snapshot["output_token_delta"] = int(output_token_delta)
         snapshot["accepted_token_delta"] = int(accepted_token_delta)
+        snapshot["output_token_delta_by_seq"] = output_delta_by_seq if previous is not None else {}
+        snapshot["accepted_token_delta_by_seq"] = accepted_delta_by_seq if previous is not None else {}
         snapshot["pending_payload_delta"] = int(pending_payload_delta)
         snapshot["consumed_payload_delta"] = int(consumed_payload_delta)
         snapshot["invalidated_payload_delta"] = int(invalidated_payload_delta)
+        effective_reasons = [
+            reason
+            for reason in progress_reasons
+            if reason in {"output_token_increased", "accepted_token_progress", "sequence_finished", "unfinished_seq_count_decreased"}
+        ]
+        bookkeeping_reasons = [reason for reason in progress_reasons if reason not in set(effective_reasons)]
+        snapshot["effective_token_progress_reasons"] = effective_reasons
+        snapshot["bookkeeping_progress_reasons"] = bookkeeping_reasons
+        snapshot["made_effective_token_progress"] = bool(effective_reasons)
         if previous is not None:
             snapshot["before_output_tokens_by_seq"] = dict(previous.get("remaining_output_tokens_by_seq") or {})
             snapshot["after_output_tokens_by_seq"] = dict(snapshot.get("remaining_output_tokens_by_seq") or {})
+            snapshot["before_accepted_tokens_by_seq"] = dict(previous.get("accepted_tokens_by_seq") or {})
+            snapshot["after_accepted_tokens_by_seq"] = dict(snapshot.get("accepted_tokens_by_seq") or {})
             snapshot["before_pending_payload_ids"] = list(previous.get("pending_payload_ids") or [])
             snapshot["after_pending_payload_ids"] = list(snapshot.get("pending_payload_ids") or [])
             snapshot["before_consumed_payload_ids"] = list(previous.get("consumed_payload_ids") or [])
@@ -1725,6 +1837,8 @@ class ModelRunnerBase:
             snapshot["after_invalidated_payload_ids"] = list(snapshot.get("invalidated_payload_ids") or [])
             snapshot["before_finished_seq_ids"] = list(previous.get("finished_seq_ids") or [])
             snapshot["after_finished_seq_ids"] = list(snapshot.get("finished_seq_ids") or [])
+            snapshot["before_finished_by_seq"] = dict(previous.get("finished_by_seq") or {})
+            snapshot["after_finished_by_seq"] = dict(snapshot.get("finished_by_seq") or {})
         substantive_progress = [reason for reason in progress_reasons if reason != "plan_id_advanced"]
         no_progress = (
             previous is not None
@@ -1797,6 +1911,73 @@ class ModelRunnerBase:
             step_history.append(dict(snapshot))
         trace_record["active_continuation_step_history"] = step_history
         trace_record["active_continuation_progress_by_step"] = step_history
+        trace_record["active_continuation_effective_token_progress_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "plan_id": item.get("plan_id"),
+                "seq_ids": list(item.get("remaining_seq_ids") or []),
+                "reasons": list(item.get("effective_token_progress_reasons") or []),
+                "output_token_delta_by_seq": dict(item.get("output_token_delta_by_seq") or {}),
+                "accepted_token_delta_by_seq": dict(item.get("accepted_token_delta_by_seq") or {}),
+            }
+            for item in step_history
+        ]
+        trace_record["active_continuation_bookkeeping_progress_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "plan_id": item.get("plan_id"),
+                "reasons": list(item.get("bookkeeping_progress_reasons") or []),
+            }
+            for item in step_history
+        ]
+        trace_record["active_continuation_output_tokens_before_after_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "before": dict(item.get("before_output_tokens_by_seq") or {}),
+                "after": dict(item.get("after_output_tokens_by_seq") or item.get("remaining_output_tokens_by_seq") or {}),
+                "delta": dict(item.get("output_token_delta_by_seq") or {}),
+            }
+            for item in step_history
+        ]
+        trace_record["active_continuation_accepted_tokens_before_after_by_step"] = [
+            {
+                "step_count": item.get("step_count"),
+                "before": dict(item.get("before_accepted_tokens_by_seq") or {}),
+                "after": dict(item.get("after_accepted_tokens_by_seq") or item.get("accepted_tokens_by_seq") or {}),
+                "delta": dict(item.get("accepted_token_delta_by_seq") or {}),
+            }
+            for item in step_history
+        ]
+        trace_record["active_continuation_expected_len_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("expected_len_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_accepted_len_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("accepted_len_by_seq") or {})}
+            for item in step_history
+        ]
+        trace_record["active_continuation_rejected_len_by_step"] = [
+            {"step_count": item.get("step_count"), "values": dict(item.get("rejected_len_by_seq") or {})}
+            for item in step_history
+        ]
+        total_expected = sum(
+            sum(int(value or 0) for value in (item.get("expected_len_by_seq") or {}).values())
+            for item in step_history
+        )
+        total_accepted_len = sum(
+            sum(int(value or 0) for value in (item.get("accepted_len_by_seq") or {}).values())
+            for item in step_history
+        )
+        trace_record["active_continuation_zero_accept_step_count"] = sum(
+            1
+            for item in step_history
+            if (item.get("accepted_len_by_seq") or {}) and sum(int(value or 0) for value in (item.get("accepted_len_by_seq") or {}).values()) == 0
+        )
+        trace_record["active_continuation_average_acceptance_rate"] = (
+            float(total_accepted_len) / float(total_expected)
+            if total_expected > 0
+            else 0.0
+        )
         trace_record["active_continuation_total_output_token_delta"] = sum(
             int(item.get("output_token_delta") or 0) for item in step_history
         )
@@ -1821,6 +2002,18 @@ class ModelRunnerBase:
         if snapshot.get("pending_payload_ids"):
             return "mailbox_payload_after_active_continuation", "mailbox payloads remain pending after active continuation"
         progress_history = list(trace_record.get("active_continuation_progress_by_step") or [])
+        if self._v4v_completion_gate_mismatch(snapshot):
+            trace_record["active_continuation_completion_gate_mismatch"] = True
+            return (
+                "active_request_continuation_completion_gate_mismatch",
+                "active continuation reached completion criteria but completion gate still reports unfinished requests",
+            )
+        if self._v4v_output_not_committed(progress_history):
+            trace_record["active_continuation_output_not_committed"] = True
+            return (
+                "active_request_continuation_output_not_committed",
+                "active continuation accepted tokens but Sequence output token count did not advance",
+            )
         substantive_steps = [
             item
             for item in progress_history
@@ -1831,17 +2024,106 @@ class ModelRunnerBase:
         ]
         if not substantive_steps:
             return "active_request_continuation_no_progress", "active continuation reached max steps without observable progress"
+        effective_steps = [
+            item
+            for item in progress_history
+            if bool(item.get("made_effective_token_progress"))
+        ]
+        if not effective_steps:
+            return (
+                "active_request_continuation_no_effective_token_progress",
+                "active continuation only made bookkeeping progress without token-level request progress",
+            )
+        starving_seq_ids, last_advanced = self._v4v_starvation_snapshot(progress_history, snapshot, max_steps=max_steps)
+        trace_record["active_continuation_last_advanced_step_by_seq"] = last_advanced
+        if starving_seq_ids:
+            trace_record["active_continuation_starving_seq_ids"] = starving_seq_ids
+            return (
+                "active_request_continuation_partial_batch_starvation",
+                f"active continuation left seqs without token advancement: seq_ids={starving_seq_ids}",
+            )
+        average_acceptance = float(trace_record.get("active_continuation_average_acceptance_rate") or 0.0)
+        zero_accept_steps = int(trace_record.get("active_continuation_zero_accept_step_count") or 0)
+        if progress_history and (average_acceptance <= 0.05 or zero_accept_steps >= max(1, len(progress_history) // 2)):
+            return (
+                "active_request_continuation_acceptance_too_low",
+                (
+                    "active continuation token progress is dominated by rejected spans; "
+                    f"average_acceptance_rate={average_acceptance:.4f}, zero_accept_steps={zero_accept_steps}"
+                ),
+            )
         trace_record["active_continuation_progress_too_slow"] = True
         trace_record["active_continuation_remaining_tokens_to_max_by_seq"] = dict(
             snapshot.get("remaining_tokens_to_max_by_seq") or {}
         )
+        trace_record["active_continuation_steps_insufficient"] = True
+        remaining_tokens = [
+            int(value or 0)
+            for value in (snapshot.get("remaining_tokens_to_max_by_seq") or {}).values()
+        ]
+        token_delta = int(trace_record.get("active_continuation_total_output_token_delta") or 0)
+        observed_steps = max(1, len(progress_history))
+        tokens_per_step = max(float(token_delta) / float(observed_steps), 1.0)
+        trace_record["active_continuation_recommended_min_steps"] = int(max_steps + max(remaining_tokens or [0]) / tokens_per_step + 1)
         return (
-            "active_request_continuation_progress_too_slow",
+            "active_request_continuation_steps_insufficient",
             (
-                "active continuation made progress but did not finish within "
+                "active continuation made effective token progress but did not finish within "
                 f"{int(max_steps)} configured step(s)"
             ),
         )
+
+    def _v4v_completion_gate_mismatch(self, snapshot: dict) -> bool:
+        remaining = {str(seq_id) for seq_id in (snapshot.get("remaining_seq_ids") or [])}
+        if not remaining:
+            return False
+        finished = snapshot.get("finished_by_seq") or {}
+        output_tokens = snapshot.get("remaining_output_tokens_by_seq") or {}
+        max_tokens = snapshot.get("max_tokens_by_seq") or {}
+        for seq_id in remaining:
+            if bool(finished.get(seq_id, False)):
+                return True
+            max_value = int(max_tokens.get(seq_id, 0) or 0)
+            if max_value > 0 and int(output_tokens.get(seq_id, 0) or 0) >= max_value:
+                return True
+        return False
+
+    def _v4v_output_not_committed(self, progress_history: list[dict]) -> bool:
+        for item in progress_history:
+            accepted = item.get("accepted_len_by_seq") or {}
+            output_delta = item.get("output_token_delta_by_seq") or {}
+            if not output_delta:
+                continue
+            for seq_id, accepted_len in accepted.items():
+                if int(accepted_len or 0) > 0 and int(output_delta.get(str(seq_id), 0) or 0) <= 0:
+                    return True
+        return False
+
+    def _v4v_starvation_snapshot(self, progress_history: list[dict], snapshot: dict, *, max_steps: int) -> tuple[list[int], dict[str, int]]:
+        remaining = [str(seq_id) for seq_id in (snapshot.get("remaining_seq_ids") or [])]
+        last_advanced: dict[str, int] = {}
+        included: dict[str, list[int]] = {seq_id: [] for seq_id in remaining}
+        for item in progress_history:
+            step = int(item.get("step_count") or 0)
+            active = {str(seq_id) for seq_id in (item.get("remaining_seq_ids") or [])}
+            for seq_id in remaining:
+                if seq_id in active:
+                    included.setdefault(seq_id, []).append(step)
+            output_delta = item.get("output_token_delta_by_seq") or {}
+            accepted_delta = item.get("accepted_token_delta_by_seq") or {}
+            for seq_id in remaining:
+                if int(output_delta.get(seq_id, 0) or 0) > 0 or int(accepted_delta.get(seq_id, 0) or 0) > 0:
+                    last_advanced[seq_id] = step
+        latest_step = max([int(item.get("step_count") or 0) for item in progress_history] or [0])
+        starvation_window = max(4, int(max_steps) // 2)
+        starving: list[int] = []
+        for seq_id in remaining:
+            if not included.get(seq_id):
+                starving.append(int(seq_id))
+                continue
+            if latest_step - int(last_advanced.get(seq_id, 0) or 0) >= starvation_window:
+                starving.append(int(seq_id))
+        return sorted(set(starving)), last_advanced
 
     def _try_continue_v4t_active_requests(
         self,

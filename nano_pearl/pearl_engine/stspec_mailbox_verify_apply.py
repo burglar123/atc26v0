@@ -429,6 +429,7 @@ def build_terminal_verify_tuple_rows(
     seqs: Iterable[Any],
     *,
     gamma: int,
+    eos_token_id: int | list[int] | None = None,
 ) -> tuple[list[list[int]], JsonDict]:
     """Build PEARL verify rows for breadth-only terminal/continuation handoff.
 
@@ -444,6 +445,7 @@ def build_terminal_verify_tuple_rows(
     expected_lengths: dict[int, int] = {}
     accepted_lengths: dict[int, int] = {}
     rejected_lengths: dict[int, int] = {}
+    finish_by_seq: dict[int, bool] = {}
     acc: list[int] = []
     rollout: list[int] = []
     revise_token: list[int] = []
@@ -479,6 +481,8 @@ def build_terminal_verify_tuple_rows(
             acc.append(1)
             rollout.append(0)
             revise_token.append(-1)
+            receiver_output_delta = gamma
+            emitted_token_ids = list(getattr(commit_plan, "accepted_token_ids_by_seq", {}).get(seq_id, []) or target_by_seq.get(seq_id, []) or [])
         else:
             target_tokens = [int(token) for token in target_by_seq.get(seq_id, []) or []]
             if accepted_len >= len(target_tokens):
@@ -502,7 +506,22 @@ def build_terminal_verify_tuple_rows(
             acc.append(0)
             rollout.append(gamma if expected_len == 1 else rejected_len)
             revise_token.append(int(target_tokens[accepted_len]))
-        finish.append(0)
+            receiver_output_delta = 1 if bool(getattr(seq, "pre_verify", False)) else 0
+            emitted_token_ids = [int(target_tokens[accepted_len])]
+        current_output_tokens = int(getattr(seq, "num_completion_tokens", 0) or 0)
+        max_tokens = getattr(seq, "max_tokens", None)
+        max_tokens_reached = False
+        if max_tokens is not None:
+            try:
+                max_tokens_reached = current_output_tokens + int(receiver_output_delta) >= int(max_tokens)
+            except Exception:
+                max_tokens_reached = False
+        eos_reached = False
+        if eos_token_id is not None and not bool(getattr(seq, "ignore_eos", False)):
+            eos_reached = any(_is_eos_token(int(token), eos_token_id) for token in emitted_token_ids)
+        finish_flag = bool(max_tokens_reached or eos_reached)
+        finish_by_seq[seq_id] = finish_flag
+        finish.append(1 if finish_flag else 0)
     metadata = {
         "terminal_verify_tuple_attempted": True,
         "terminal_verify_tuple_success": True,
@@ -514,6 +533,7 @@ def build_terminal_verify_tuple_rows(
         "terminal_verify_expected_lengths_by_seq": expected_lengths,
         "terminal_verify_accepted_lengths_by_seq": accepted_lengths,
         "terminal_verify_rejected_lengths_by_seq": rejected_lengths,
+        "terminal_verify_finish_by_seq": finish_by_seq,
         "next_required_feature": None,
     }
     return [acc, rollout, revise_token, finish], metadata

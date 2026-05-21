@@ -268,6 +268,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_continuation_limit_reached_count = 0
     active_continuation_no_progress_count = 0
     active_continuation_progress_too_slow_count = 0
+    active_continuation_output_not_committed_count = 0
+    active_continuation_completion_gate_mismatch_count = 0
+    active_continuation_steps_insufficient_count = 0
     active_continuation_completion_rechecked_count = 0
     active_continuation_finalization_attempt_count = 0
     active_continuation_finalization_success_count = 0
@@ -652,6 +655,15 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         active_continuation_progress_too_slow_count += int(
             row.get("active_continuation_progress_too_slow_count") or 0
         )
+        active_continuation_output_not_committed_count += int(
+            row.get("active_continuation_output_not_committed_count") or 0
+        )
+        active_continuation_completion_gate_mismatch_count += int(
+            row.get("active_continuation_completion_gate_mismatch_count") or 0
+        )
+        active_continuation_steps_insufficient_count += int(
+            row.get("active_continuation_steps_insufficient_count") or 0
+        )
         active_continuation_completion_rechecked_count += int(
             row.get("active_continuation_completion_rechecked_count") or 0
         )
@@ -869,6 +881,12 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             active_continuation_no_progress_count += 1
         if row.get("active_continuation_progress_too_slow"):
             active_continuation_progress_too_slow_count += 1
+        if row.get("active_continuation_output_not_committed"):
+            active_continuation_output_not_committed_count += 1
+        if row.get("active_continuation_completion_gate_mismatch"):
+            active_continuation_completion_gate_mismatch_count += 1
+        if row.get("active_continuation_steps_insufficient"):
+            active_continuation_steps_insufficient_count += 1
         if row.get("active_continuation_completion_rechecked"):
             active_continuation_completion_rechecked_count += 1
         if row.get("active_continuation_finalization_attempted"):
@@ -1101,6 +1119,9 @@ def summarize_plan_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "active_continuation_limit_reached_count": active_continuation_limit_reached_count,
         "active_continuation_no_progress_count": active_continuation_no_progress_count,
         "active_continuation_progress_too_slow_count": active_continuation_progress_too_slow_count,
+        "active_continuation_output_not_committed_count": active_continuation_output_not_committed_count,
+        "active_continuation_completion_gate_mismatch_count": active_continuation_completion_gate_mismatch_count,
+        "active_continuation_steps_insufficient_count": active_continuation_steps_insufficient_count,
         "active_continuation_completion_rechecked_count": active_continuation_completion_rechecked_count,
         "active_continuation_finalization_attempt_count": active_continuation_finalization_attempt_count,
         "active_continuation_finalization_success_count": active_continuation_finalization_success_count,
@@ -1461,6 +1482,9 @@ def summarize(path: Path) -> int:
     print(f"active continuation limit reached count: {plan_summary['active_continuation_limit_reached_count']}")
     print(f"active continuation no progress count: {plan_summary['active_continuation_no_progress_count']}")
     print(f"active continuation progress too slow count: {plan_summary['active_continuation_progress_too_slow_count']}")
+    print(f"active continuation output not committed count: {plan_summary['active_continuation_output_not_committed_count']}")
+    print(f"active continuation completion gate mismatch count: {plan_summary['active_continuation_completion_gate_mismatch_count']}")
+    print(f"active continuation steps insufficient count: {plan_summary['active_continuation_steps_insufficient_count']}")
     print(f"active continuation completion rechecked count: {plan_summary['active_continuation_completion_rechecked_count']}")
     print(f"active continuation finalization attempts: {plan_summary['active_continuation_finalization_attempt_count']}")
     print(f"active continuation finalization successes: {plan_summary['active_continuation_finalization_success_count']}")
