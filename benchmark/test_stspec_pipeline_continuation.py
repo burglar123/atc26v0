@@ -804,7 +804,7 @@ def test_v4ad_uses_existing_verify_phase_not_new_broadcast():
     assert "draft_payload_base_version" in source
 
 
-def test_v4ae_stale_payload_discard_creates_redraft_required_without_verify_rows():
+def test_v4af_stale_payload_discard_sends_paired_verify_status():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -817,10 +817,34 @@ def test_v4ae_stale_payload_discard_creates_redraft_required_without_verify_rows
     assert '"active_continuation_redraft_reason"] = "stale_payload_after_correction"' in stale_source
     assert "_v4ae_create_redraft_required_entries(stale_payloads, trace_record)" in stale_source
     assert "_build_v4ae_stale_redraft_verify_rows" not in stale_source
-    assert "_participate_v4s_terminal_verify_broadcast" not in stale_source
+    assert "_build_v4af_stale_discard_status_rows(exec_seqs, stale_payloads, trace_record)" in stale_source
+    assert "_participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)" in stale_source
+    assert '"active_continuation_stale_discard_status_sent"] = True' in source
+    assert '"active_continuation_verify_collective_participated_after_stale_discard"] = True' in source
     assert '"active_request_continuation_draft_payload_discarded_due_to_stale_prefix"' not in stale_source
     assert '"active_request_continuation_redraft_required"' in stale_source
     assert "return True" in stale_source
+
+
+def test_v4af_draft_stale_status_invalidates_payload_without_zero_accept():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    verify_start = source.index("def verify(self, seqs: list[Sequence]", source.index("class DraftModelRunner"))
+    verify_end = source.index("class TargetModelRunner", verify_start)
+    verify_source = source[verify_start:verify_end]
+    assert "V4AF_STALE_DISCARD_VERIFY_STATUS" in verify_source
+    assert "has_stale_discard_status" in verify_source
+    assert 'trace_record["active_continuation_stale_discard_status_received"] = True' in verify_source
+    sentinel_start = verify_source.index("if int(acc[idx]) == V4AF_STALE_DISCARD_VERIFY_STATUS:")
+    sentinel_end = verify_source.index("was_pre_verify = target_seq.pre_verify", sentinel_start)
+    sentinel_source = verify_source[sentinel_start:sentinel_end]
+    assert "self.scheduler.rollback(target_seq, rollback_len)" in sentinel_source
+    assert "target_seq.append_token(token)" in sentinel_source
+    assert "accepted_lens[target_seq_id] = 0" in sentinel_source
+    assert "invalidated_lens[target_seq_id] = 0" in sentinel_source
+    assert "record_accepted" not in sentinel_source
+    assert "record_invalidated_predraft" not in sentinel_source
 
 
 def test_v4ae_redraft_metadata_uses_correction_token_and_specific_diagnostics():
@@ -944,7 +968,8 @@ def main() -> None:
     test_runner_has_guarded_v4x_pending_correction_propagation()
     test_v4ad_disables_unpaired_pre_draft_collective()
     test_v4ad_uses_existing_verify_phase_not_new_broadcast()
-    test_v4ae_stale_payload_discard_creates_redraft_required_without_verify_rows()
+    test_v4af_stale_payload_discard_sends_paired_verify_status()
+    test_v4af_draft_stale_status_invalidates_payload_without_zero_accept()
     test_v4ae_redraft_metadata_uses_correction_token_and_specific_diagnostics()
     test_v4ae_records_authoritative_correction_metadata_for_redraft()
     test_stale_payload_mark_removes_availability_and_allows_fresh_redraft()

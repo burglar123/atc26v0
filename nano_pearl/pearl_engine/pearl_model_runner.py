@@ -99,6 +99,9 @@ from transformers import AutoTokenizer
 from tqdm import trange
 
 
+V4AF_STALE_DISCARD_VERIFY_STATUS = -740301
+
+
 class ModelRunnerBase:
     """
     Different from ModelRunner in nano-vllm, 
@@ -1120,6 +1123,16 @@ class ModelRunnerBase:
             "active_continuation_draft_prefix_before_sync_by_step": {},
             "active_continuation_draft_prefix_after_sync_by_step": {},
             "active_continuation_draft_generation_allowed_after_sync": False,
+            # V4AF: stale-payload discard must stay paired with the verify phase.
+            "active_continuation_stale_discard_protocol_phase": None,
+            "active_continuation_stale_discard_peer_notified": False,
+            "active_continuation_verify_collective_participated_after_stale_discard": False,
+            "active_continuation_verify_collective_mismatch_after_stale_discard": False,
+            "active_continuation_stale_discard_status_sent": False,
+            "active_continuation_stale_discard_status_received": False,
+            "active_continuation_redraft_lifecycle_no_progress": False,
+            "active_continuation_redraft_lifecycle_step_count": 0,
+            "active_continuation_peer_expected_verify_collective": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1456,6 +1469,15 @@ class ModelRunnerBase:
             "active_continuation_draft_prefix_before_sync_by_step",
             "active_continuation_draft_prefix_after_sync_by_step",
             "active_continuation_draft_generation_allowed_after_sync",
+            "active_continuation_stale_discard_protocol_phase",
+            "active_continuation_stale_discard_peer_notified",
+            "active_continuation_verify_collective_participated_after_stale_discard",
+            "active_continuation_verify_collective_mismatch_after_stale_discard",
+            "active_continuation_stale_discard_status_sent",
+            "active_continuation_stale_discard_status_received",
+            "active_continuation_redraft_lifecycle_no_progress",
+            "active_continuation_redraft_lifecycle_step_count",
+            "active_continuation_peer_expected_verify_collective",
             "finalized_after_active_continuation",
             "second_step_rollback_attempted",
             "second_step_rollback_success",
@@ -2453,6 +2475,55 @@ class ModelRunnerBase:
             ):
                 trace_record["active_continuation_correction_metadata_cleared_before_redraft"] = True
         return created
+
+    def _build_v4af_stale_discard_status_rows(
+        self,
+        exec_seqs: list[Sequence],
+        stale_payloads: list[MailboxPayload],
+        trace_record: dict,
+    ) -> list[list[int]]:
+        stale_by_seq = {int(payload.seq_id): payload for payload in stale_payloads}
+        acc: list[int] = []
+        rollout: list[int] = []
+        revise_token: list[int] = []
+        finish: list[int] = []
+        missing_seq_ids: list[int] = []
+        for seq in exec_seqs:
+            seq_id = int(seq.seq_id)
+            payload = stale_by_seq.get(seq_id)
+            if payload is None:
+                acc.append(0)
+                rollout.append(0)
+                revise_token.append(-1)
+                finish.append(0)
+                continue
+            metadata, _sources = self._v4ae_lookup_correction_metadata(seq_id)
+            correction_tokens = [int(token) for token in list((metadata or {}).get("correction_token_ids") or [])]
+            if not correction_tokens:
+                missing_seq_ids.append(seq_id)
+                acc.append(0)
+                rollout.append(0)
+                revise_token.append(-1)
+                finish.append(0)
+                continue
+            acc.append(V4AF_STALE_DISCARD_VERIFY_STATUS)
+            rollout.append(int(self.gamma))
+            revise_token.append(int(correction_tokens[0]))
+            finish.append(0)
+        if missing_seq_ids:
+            trace_record["active_continuation_redraft_blocked_missing_correction_seq_ids"] = missing_seq_ids
+            trace_record["next_required_feature"] = "active_request_continuation_redraft_blocked_correction_not_applied"
+            raise RuntimeError(
+                "stale payload discard needs target correction token for paired draft status; "
+                f"missing_seq_ids={missing_seq_ids}; "
+                "next_required_feature=active_request_continuation_redraft_blocked_correction_not_applied"
+            )
+        trace_record["active_continuation_stale_discard_protocol_phase"] = "verify_res_status"
+        trace_record["active_continuation_stale_discard_peer_notified"] = True
+        trace_record["active_continuation_verify_collective_participated_after_stale_discard"] = True
+        trace_record["active_continuation_stale_discard_status_sent"] = True
+        trace_record["active_continuation_peer_expected_verify_collective"] = True
+        return [acc, rollout, revise_token, finish]
 
     def _v4ae_complete_verified_redraft_if_needed(self, trace_record: dict, commit_result) -> None:
         redraft_required = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
@@ -5333,6 +5404,8 @@ class ModelRunnerBase:
                     if locked_home_batch is not None:
                         self.scheduler.stspec_batch_lock_home_batch_id = locked_home_batch
                         self.scheduler.stspec_batch_lock_reason = "redraft_required"
+                verify_rows = self._build_v4af_stale_discard_status_rows(exec_seqs, stale_payloads, trace_record)
+                self._participate_v4s_terminal_verify_broadcast(exec_seqs, trace_record, verify_rows=verify_rows)
                 trace_record["active_continuation_fresh_redraft_missing"] = True
                 trace_record["next_required_feature"] = "active_request_continuation_redraft_required"
                 return True
@@ -6344,11 +6417,18 @@ class DraftModelRunner(ModelRunnerBase):
         revise_token = verify_flat[2]
         finish = verify_flat[3]
         verify_seq_ids = verify_flat[4] if len(verify_flat) > 4 else []
+        has_stale_discard_status = any(int(value) == V4AF_STALE_DISCARD_VERIFY_STATUS for value in acc)
+        if has_stale_discard_status and trace_record is not None:
+            trace_record["active_continuation_stale_discard_protocol_phase"] = "verify_res_status"
+            trace_record["active_continuation_stale_discard_status_received"] = True
+            trace_record["active_continuation_stale_discard_peer_notified"] = True
+            trace_record["active_continuation_verify_collective_participated_after_stale_discard"] = True
+            trace_record["active_continuation_peer_expected_verify_collective"] = True
         # V4AB: build seq_id-based lookup for correction routing
         seq_by_id = {int(s.seq_id): s for s in self.scheduler.running}
         for s in self.scheduler.finished:
             seq_by_id[int(s.seq_id)] = s
-        if self._pearl_protocol_enabled():
+        if self._pearl_protocol_enabled() and not has_stale_discard_status:
             verify_message = self._encode_verify_protocol_message(
                 seqs=seqs,
                 gamma=self.gamma,
@@ -6374,6 +6454,26 @@ class DraftModelRunner(ModelRunnerBase):
             target_seq_id = int(verify_seq_ids[idx])
             target_seq = seq_by_id.get(target_seq_id)
             if target_seq is None:
+                continue
+            if int(acc[idx]) == V4AF_STALE_DISCARD_VERIFY_STATUS:
+                rollback_len = int(rollout[idx]) if idx < len(rollout) and int(rollout[idx]) > 0 else int(self.gamma)
+                rollback_len = min(rollback_len, max(int(target_seq.num_completion_tokens), 0))
+                if rollback_len > 0:
+                    self.scheduler.rollback(target_seq, rollback_len)
+                token = int(revise_token[idx]) if idx < len(revise_token) else -1
+                if token >= 0 and (not target_seq.token_ids or int(target_seq.token_ids[-1]) != token):
+                    target_seq.append_token(token)
+                target_seq.pre_verify = True
+                accepted_lens[target_seq_id] = 0
+                invalidated_lens[target_seq_id] = 0
+                if trace_record is not None:
+                    seq_ids = list(trace_record.get("active_continuation_redraft_required_seq_ids") or [])
+                    if target_seq_id not in [int(seq_id) for seq_id in seq_ids]:
+                        seq_ids.append(target_seq_id)
+                    trace_record["active_continuation_redraft_required_seq_ids"] = seq_ids
+                    trace_record["active_continuation_stale_payload_discarded"] = True
+                    trace_record["active_continuation_fresh_redraft_missing"] = True
+                    trace_record["next_required_feature"] = "active_request_continuation_redraft_required"
                 continue
             was_pre_verify = target_seq.pre_verify
             accepted_len = 1 if was_pre_verify and acc[idx] else 0
