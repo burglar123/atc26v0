@@ -6141,8 +6141,38 @@ class ModelRunnerBase:
         start_time = time.time()
         if self.gamma == -1:
             self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+        # V4AE.3: bounded loop guard — fail-fast instead of silent hang
+        max_decode_steps = max(
+            int(getattr(self.global_config, "max_tokens", 32) or 32) * int(self.gamma or 4) * max(1, len(self.scheduler.running)) * 4,
+            256,
+        )
+        step_idx = 0
+        last_finished_count = len(self.scheduler.finished)
+        no_progress_count = 0
         while not self.scheduler.is_finished():
             self.pearl_step()
+            step_idx += 1
+            current_finished = len(self.scheduler.finished)
+            if current_finished > last_finished_count:
+                last_finished_count = current_finished
+                no_progress_count = 0
+            else:
+                no_progress_count += 1
+            if step_idx > max_decode_steps:
+                raise RuntimeError(
+                    f"V4AE.3 decode loop exceeded max steps ({max_decode_steps}); "
+                    f"rank={self.rank}, role={'draft' if self.is_draft else 'target'}, "
+                    f"finished={len(self.scheduler.finished)}/{len(self.scheduler.running) + len(self.scheduler.finished)}, "
+                    f"step={step_idx}, no_progress={no_progress_count}; "
+                    "next_required_feature=active_request_continuation_decode_loop_exceeded_max_steps"
+                )
+            if no_progress_count > max_decode_steps // 2:
+                raise RuntimeError(
+                    f"V4AE.3 decode loop no progress for {no_progress_count} steps; "
+                    f"rank={self.rank}, role={'draft' if self.is_draft else 'target'}, "
+                    f"finished={len(self.scheduler.finished)}/{len(self.scheduler.running) + len(self.scheduler.finished)}; "
+                    "next_required_feature=active_request_continuation_decode_loop_no_progress"
+                )
         torch.cuda.synchronize()
         end_time = time.time()
 
@@ -6578,6 +6608,14 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record)
             return
         if trace_record.get("target_verify_skipped_for_warmup"):
+            # V4AE.3: must still participate in verify broadcast to avoid
+            # deadlocking the draft rank that always enters Draft.verify().
+            num_to_be_verified_tokens = sum(1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma) for seq in exec_seqs)
+            num_next_round_input = int(self.gamma) * len(exec_seqs)
+            msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            verify_res = torch.zeros((5, len(exec_seqs)), dtype=torch.int64, device="cuda")
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             self._mark_trace_end(trace_record)
             return
         assert not is_prefill, "wrong match. current stage is prefill."
@@ -6609,6 +6647,12 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record)
             return
         if trace_record.get("target_verify_skipped_for_warmup"):
+            num_to_be_verified_tokens = sum(1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma) for seq in exec_seqs)
+            num_next_round_input = int(self.gamma) * len(exec_seqs)
+            msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            verify_res = torch.zeros((5, len(exec_seqs)), dtype=torch.int64, device="cuda")
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             self._mark_trace_end(trace_record)
             return
         assert not is_prefill, "wrong match. current stage is prefill."
