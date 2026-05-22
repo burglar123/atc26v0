@@ -1058,6 +1058,18 @@ class ModelRunnerBase:
             "active_continuation_fresh_redraft_missing": False,
             "active_continuation_batch_lock_released_before_fresh_redraft": False,
             "active_continuation_stale_payload_verified_after_discard": False,
+            "active_continuation_correction_token_by_seq": {},
+            "active_continuation_correction_source_by_seq": {},
+            "active_continuation_target_corrected_version_by_seq": {},
+            "active_continuation_correction_prefix_len_by_seq": {},
+            "active_continuation_redraft_metadata_created": False,
+            "active_continuation_redraft_metadata_seq_ids": [],
+            "active_continuation_redraft_metadata_token_ids": {},
+            "active_continuation_redraft_metadata_versions": {},
+            "active_continuation_redraft_blocked_missing_correction_seq_ids": [],
+            "active_continuation_redraft_blocked_sources_checked": [],
+            "active_continuation_correction_metadata_cleared_before_redraft": False,
+            "active_continuation_redraft_seq_not_scheduled": False,
             # V4AD: real pre-draft correction-sync barrier diagnostics
             "active_continuation_pre_draft_correction_sync_checked": False,
             "active_continuation_draft_forward_started_after_sync": False,
@@ -1381,6 +1393,18 @@ class ModelRunnerBase:
             "active_continuation_fresh_redraft_missing",
             "active_continuation_batch_lock_released_before_fresh_redraft",
             "active_continuation_stale_payload_verified_after_discard",
+            "active_continuation_correction_token_by_seq",
+            "active_continuation_correction_source_by_seq",
+            "active_continuation_target_corrected_version_by_seq",
+            "active_continuation_correction_prefix_len_by_seq",
+            "active_continuation_redraft_metadata_created",
+            "active_continuation_redraft_metadata_seq_ids",
+            "active_continuation_redraft_metadata_token_ids",
+            "active_continuation_redraft_metadata_versions",
+            "active_continuation_redraft_blocked_missing_correction_seq_ids",
+            "active_continuation_redraft_blocked_sources_checked",
+            "active_continuation_correction_metadata_cleared_before_redraft",
+            "active_continuation_redraft_seq_not_scheduled",
             "active_continuation_pre_draft_correction_sync_checked",
             "active_continuation_draft_forward_started_after_sync",
             "active_continuation_draft_forward_started_before_sync",
@@ -1815,9 +1839,47 @@ class ModelRunnerBase:
         self.stspec_active_continuation_pending_corrections = pending
         if recorded:
             last_versions = dict(getattr(self, "stspec_active_continuation_last_corrected_versions", {}) or {})
+            correction_metadata = dict(
+                getattr(self, "stspec_active_continuation_correction_metadata_by_seq", {}) or {}
+            )
             for key, value in recorded.items():
-                last_versions[int(key)] = int(value.get("prefix_len_after") or 0)
+                seq_id = int(key)
+                prefix_len_after = int(value.get("prefix_len_after") or 0)
+                last_versions[seq_id] = prefix_len_after
+                correction_metadata[seq_id] = {
+                    "seq_id": seq_id,
+                    "request_id": value.get("request_id"),
+                    "correction_token_ids": [int(token) for token in list(value.get("correction_token_ids") or [])],
+                    "target_corrected_version": prefix_len_after,
+                    "correction_prefix_len": prefix_len_after,
+                    "prefix_len_after": prefix_len_after,
+                    "sequence_token_ids_after": list(value.get("sequence_token_ids_after") or []),
+                    "source_plan_id": value.get("source_plan_id"),
+                    "home_batch_id": value.get("home_batch_id"),
+                    "correction_source": "commit_plan.target_correction_token_ids_by_seq",
+                }
             self.stspec_active_continuation_last_corrected_versions = last_versions
+            self.stspec_active_continuation_correction_metadata_by_seq = correction_metadata
+            trace_record["active_continuation_correction_token_by_seq"] = {
+                str(seq_id): list(info.get("correction_token_ids") or [])
+                for seq_id, info in correction_metadata.items()
+                if seq_id in {int(key) for key in recorded.keys()}
+            }
+            trace_record["active_continuation_correction_source_by_seq"] = {
+                str(seq_id): info.get("correction_source")
+                for seq_id, info in correction_metadata.items()
+                if seq_id in {int(key) for key in recorded.keys()}
+            }
+            trace_record["active_continuation_target_corrected_version_by_seq"] = {
+                str(seq_id): int(info.get("target_corrected_version") or 0)
+                for seq_id, info in correction_metadata.items()
+                if seq_id in {int(key) for key in recorded.keys()}
+            }
+            trace_record["active_continuation_correction_prefix_len_by_seq"] = {
+                str(seq_id): int(info.get("correction_prefix_len") or 0)
+                for seq_id, info in correction_metadata.items()
+                if seq_id in {int(key) for key in recorded.keys()}
+            }
         # V4X.3: acquire scheduler batch lock when pending corrections exist
         if pending:
             self.stspec_active_continuation_in_progress = True
@@ -2215,6 +2277,60 @@ class ModelRunnerBase:
                 stale.append(payload)
         return stale
 
+    def _v4ae_lookup_correction_metadata(self, seq_id: int) -> tuple[dict, list[str]]:
+        seq_id = int(seq_id)
+        sources_checked: list[str] = []
+
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        sources_checked.append("stspec_active_continuation_pending_corrections")
+        info = pending.get(seq_id) or pending.get(str(seq_id)) or {}
+        if info.get("correction_token_ids"):
+            metadata = dict(info)
+            metadata.setdefault("target_corrected_version", metadata.get("prefix_len_after"))
+            metadata.setdefault("correction_prefix_len", metadata.get("prefix_len_after"))
+            metadata.setdefault("correction_source", "pending_corrections")
+            return metadata, sources_checked
+
+        redraft = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        sources_checked.append("stspec_active_continuation_redraft_required_by_seq")
+        info = redraft.get(seq_id) or redraft.get(str(seq_id)) or {}
+        if info.get("correction_token_ids"):
+            metadata = dict(info)
+            metadata.setdefault("correction_source", "redraft_required_metadata")
+            return metadata, sources_checked
+
+        correction_metadata = dict(
+            getattr(self, "stspec_active_continuation_correction_metadata_by_seq", {}) or {}
+        )
+        sources_checked.append("stspec_active_continuation_correction_metadata_by_seq")
+        info = correction_metadata.get(seq_id) or correction_metadata.get(str(seq_id)) or {}
+        if info.get("correction_token_ids"):
+            metadata = dict(info)
+            metadata.setdefault("correction_source", "commit_plan.target_correction_token_ids_by_seq")
+            return metadata, sources_checked
+
+        sources_checked.append("stspec_active_continuation_progress_by_step")
+        for item in reversed(list(getattr(self, "stspec_active_continuation_progress_by_step", []) or [])):
+            corrections = dict(item.get("target_correction_token_ids_by_seq") or {})
+            tokens = corrections.get(str(seq_id)) or corrections.get(seq_id) or []
+            if not tokens:
+                continue
+            prefix_info = dict((item.get("prefix_len_before_after_by_seq") or {}).get(str(seq_id)) or {})
+            token_info = dict((item.get("sequence_token_ids_before_after_by_seq") or {}).get(str(seq_id)) or {})
+            prefix_len_after = int(prefix_info.get("after") or len(token_info.get("after") or []) or 0)
+            return {
+                "seq_id": seq_id,
+                "correction_token_ids": [int(token) for token in list(tokens or [])],
+                "target_corrected_version": prefix_len_after,
+                "correction_prefix_len": prefix_len_after,
+                "prefix_len_after": prefix_len_after,
+                "sequence_token_ids_after": list(token_info.get("after") or []),
+                "source_plan_id": item.get("plan_id"),
+                "correction_source": "progress_history.target_correction_token_ids_by_seq",
+            }, sources_checked
+
+        return {}, sources_checked
+
     def _build_v4ae_stale_redraft_verify_rows(
         self,
         exec_seqs: list[Sequence],
@@ -2224,37 +2340,97 @@ class ModelRunnerBase:
         stale_seq_ids = {int(payload.seq_id) for payload in stale_payloads}
         exec_seq_ids = {int(seq.seq_id) for seq in exec_seqs}
         if stale_seq_ids != exec_seq_ids:
-            trace_record["active_continuation_stale_payload_verified_after_discard"] = True
-            trace_record["next_required_feature"] = "active_request_continuation_stale_payload_verified_after_discard"
+            trace_record["active_continuation_redraft_seq_not_scheduled"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_redraft_seq_not_scheduled"
             raise RuntimeError(
-                "stale payload discard cannot safely mix stale and fresh target exec seqs; "
+                "stale payload discard cannot redraft because stale seqs are not exactly scheduled; "
                 f"stale_seq_ids={sorted(stale_seq_ids)}, exec_seq_ids={sorted(exec_seq_ids)}; "
-                "next_required_feature=active_request_continuation_stale_payload_verified_after_discard"
+                "next_required_feature=active_request_continuation_redraft_seq_not_scheduled"
             )
-        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        redraft_metadata = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
         acc: list[int] = []
         rollout: list[int] = []
         revise_token: list[int] = []
         finish: list[int] = []
         missing: list[int] = []
+        metadata_created: dict[int, dict] = {}
+        sources_checked_total: list[str] = []
         for seq in exec_seqs:
-            info = pending.get(int(seq.seq_id)) or pending.get(str(seq.seq_id)) or {}
+            info, sources_checked = self._v4ae_lookup_correction_metadata(int(seq.seq_id))
+            sources_checked_total.extend(sources_checked)
             tokens = [int(token) for token in list(info.get("correction_token_ids") or [])]
             if not tokens:
                 missing.append(int(seq.seq_id))
                 token = -1
             else:
                 token = int(tokens[0])
+                metadata = {
+                    "seq_id": int(seq.seq_id),
+                    "request_id": getattr(seq, "request_id", info.get("request_id")),
+                    "correction_token_ids": list(tokens),
+                    "target_corrected_version": int(
+                        info.get("target_corrected_version")
+                        or info.get("prefix_len_after")
+                        or info.get("correction_prefix_len")
+                        or 0
+                    ),
+                    "correction_prefix_len": int(
+                        info.get("correction_prefix_len")
+                        or info.get("prefix_len_after")
+                        or info.get("target_corrected_version")
+                        or 0
+                    ),
+                    "source_plan_id": info.get("source_plan_id"),
+                    "correction_source": info.get("correction_source") or "unknown_correction_metadata",
+                    "reason": "stale_payload_after_correction",
+                }
+                redraft_metadata[int(seq.seq_id)] = metadata
+                metadata_created[int(seq.seq_id)] = metadata
             acc.append(0)
             rollout.append(int(self.gamma))
             revise_token.append(token)
             finish.append(0)
+        if metadata_created:
+            self.stspec_active_continuation_redraft_required_by_seq = redraft_metadata
+            trace_record["active_continuation_redraft_metadata_created"] = True
+            trace_record["active_continuation_redraft_metadata_seq_ids"] = sorted(metadata_created)
+            trace_record["active_continuation_redraft_metadata_token_ids"] = {
+                str(seq_id): info.get("correction_token_ids", [])
+                for seq_id, info in metadata_created.items()
+            }
+            trace_record["active_continuation_redraft_metadata_versions"] = {
+                str(seq_id): info.get("target_corrected_version")
+                for seq_id, info in metadata_created.items()
+            }
+            trace_record["active_continuation_correction_token_by_seq"] = {
+                str(seq_id): info.get("correction_token_ids", [])
+                for seq_id, info in metadata_created.items()
+            }
+            trace_record["active_continuation_correction_source_by_seq"] = {
+                str(seq_id): info.get("correction_source")
+                for seq_id, info in metadata_created.items()
+            }
+            trace_record["active_continuation_target_corrected_version_by_seq"] = {
+                str(seq_id): info.get("target_corrected_version")
+                for seq_id, info in metadata_created.items()
+            }
+            trace_record["active_continuation_correction_prefix_len_by_seq"] = {
+                str(seq_id): info.get("correction_prefix_len")
+                for seq_id, info in metadata_created.items()
+            }
         if missing:
             trace_record["active_continuation_correction_sync_missing_before_draft_generation"] = True
+            trace_record["active_continuation_redraft_blocked_missing_correction_seq_ids"] = missing
+            trace_record["active_continuation_redraft_blocked_sources_checked"] = sorted(set(sources_checked_total))
+            if any(
+                int(seq_id) in getattr(self, "stspec_active_continuation_last_corrected_versions", {})
+                for seq_id in missing
+            ):
+                trace_record["active_continuation_correction_metadata_cleared_before_redraft"] = True
             trace_record["next_required_feature"] = "active_request_continuation_redraft_blocked_correction_not_applied"
             raise RuntimeError(
                 "stale payload discard needs target correction token for draft redraft; "
-                f"missing_seq_ids={missing}; "
+                f"missing_seq_ids={missing}; sources_checked={sorted(set(sources_checked_total))}; "
                 "next_required_feature=active_request_continuation_redraft_blocked_correction_not_applied"
             )
         return [acc, rollout, revise_token, finish]
