@@ -1040,6 +1040,24 @@ class ModelRunnerBase:
             "active_continuation_draft_payload_version_mismatch": False,
             "active_continuation_correction_sync_missing_before_draft_generation": False,
             "active_continuation_batch_lock_released_before_correction_sync": False,
+            "active_continuation_stale_payload_discarded": False,
+            "active_continuation_stale_payload_ids": [],
+            "active_continuation_stale_payload_seq_ids": [],
+            "active_continuation_stale_payload_base_versions": {},
+            "active_continuation_target_corrected_versions": {},
+            "active_continuation_stale_payload_discard_reason": None,
+            "active_continuation_stale_payload_consumed": False,
+            "active_continuation_stale_payload_invalidated": False,
+            "active_continuation_redraft_required_seq_ids": [],
+            "active_continuation_redraft_required_versions": {},
+            "active_continuation_redraft_reason": None,
+            "active_continuation_fresh_redraft_received": False,
+            "active_continuation_fresh_redraft_payload_ids": [],
+            "active_continuation_fresh_redraft_base_versions": {},
+            "active_continuation_fresh_redraft_still_stale": False,
+            "active_continuation_fresh_redraft_missing": False,
+            "active_continuation_batch_lock_released_before_fresh_redraft": False,
+            "active_continuation_stale_payload_verified_after_discard": False,
             # V4AD: real pre-draft correction-sync barrier diagnostics
             "active_continuation_pre_draft_correction_sync_checked": False,
             "active_continuation_draft_forward_started_after_sync": False,
@@ -1345,6 +1363,24 @@ class ModelRunnerBase:
             "active_continuation_draft_payload_version_mismatch",
             "active_continuation_correction_sync_missing_before_draft_generation",
             "active_continuation_batch_lock_released_before_correction_sync",
+            "active_continuation_stale_payload_discarded",
+            "active_continuation_stale_payload_ids",
+            "active_continuation_stale_payload_seq_ids",
+            "active_continuation_stale_payload_base_versions",
+            "active_continuation_target_corrected_versions",
+            "active_continuation_stale_payload_discard_reason",
+            "active_continuation_stale_payload_consumed",
+            "active_continuation_stale_payload_invalidated",
+            "active_continuation_redraft_required_seq_ids",
+            "active_continuation_redraft_required_versions",
+            "active_continuation_redraft_reason",
+            "active_continuation_fresh_redraft_received",
+            "active_continuation_fresh_redraft_payload_ids",
+            "active_continuation_fresh_redraft_base_versions",
+            "active_continuation_fresh_redraft_still_stale",
+            "active_continuation_fresh_redraft_missing",
+            "active_continuation_batch_lock_released_before_fresh_redraft",
+            "active_continuation_stale_payload_verified_after_discard",
             "active_continuation_pre_draft_correction_sync_checked",
             "active_continuation_draft_forward_started_after_sync",
             "active_continuation_draft_forward_started_before_sync",
@@ -2178,6 +2214,50 @@ class ModelRunnerBase:
             if corrected_version and base_version < corrected_version:
                 stale.append(payload)
         return stale
+
+    def _build_v4ae_stale_redraft_verify_rows(
+        self,
+        exec_seqs: list[Sequence],
+        stale_payloads: list[MailboxPayload],
+        trace_record: dict,
+    ) -> list[list[int]]:
+        stale_seq_ids = {int(payload.seq_id) for payload in stale_payloads}
+        exec_seq_ids = {int(seq.seq_id) for seq in exec_seqs}
+        if stale_seq_ids != exec_seq_ids:
+            trace_record["active_continuation_stale_payload_verified_after_discard"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_stale_payload_verified_after_discard"
+            raise RuntimeError(
+                "stale payload discard cannot safely mix stale and fresh target exec seqs; "
+                f"stale_seq_ids={sorted(stale_seq_ids)}, exec_seq_ids={sorted(exec_seq_ids)}; "
+                "next_required_feature=active_request_continuation_stale_payload_verified_after_discard"
+            )
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        acc: list[int] = []
+        rollout: list[int] = []
+        revise_token: list[int] = []
+        finish: list[int] = []
+        missing: list[int] = []
+        for seq in exec_seqs:
+            info = pending.get(int(seq.seq_id)) or pending.get(str(seq.seq_id)) or {}
+            tokens = [int(token) for token in list(info.get("correction_token_ids") or [])]
+            if not tokens:
+                missing.append(int(seq.seq_id))
+                token = -1
+            else:
+                token = int(tokens[0])
+            acc.append(0)
+            rollout.append(int(self.gamma))
+            revise_token.append(token)
+            finish.append(0)
+        if missing:
+            trace_record["active_continuation_correction_sync_missing_before_draft_generation"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_redraft_blocked_correction_not_applied"
+            raise RuntimeError(
+                "stale payload discard needs target correction token for draft redraft; "
+                f"missing_seq_ids={missing}; "
+                "next_required_feature=active_request_continuation_redraft_blocked_correction_not_applied"
+            )
+        return [acc, rollout, revise_token, finish]
 
     def _v4ad_pre_draft_sync_enabled(self) -> bool:
         return bool(
@@ -4986,6 +5066,19 @@ class ModelRunnerBase:
             stale_payloads = self._stale_draft_payloads_for_pending_corrections(result.payloads)
             if stale_payloads:
                 stale_ids = [payload.payload_id for payload in stale_payloads]
+                stale_seq_ids = [int(payload.seq_id) for payload in stale_payloads]
+                stale_base_versions = {
+                    str(payload.seq_id): int((payload.metadata or {}).get("draft_payload_base_version") or 0)
+                    for payload in stale_payloads
+                }
+                redraft_versions = {
+                    str(seq_id): int(
+                        (pending_corrections.get(seq_id) or pending_corrections.get(str(seq_id)) or {}).get("prefix_len_after")
+                        or last_corrected_versions.get(seq_id, 0)
+                        or 0
+                    )
+                    for seq_id in stale_seq_ids
+                }
                 self.stspec_mailbox.mark_payloads_stale(
                     stale_ids,
                     plan_id=step_plan.plan_id,
@@ -4993,10 +5086,18 @@ class ModelRunnerBase:
                 )
                 trace_record["active_continuation_stale_draft_payload_after_correction"] = True
                 trace_record["active_continuation_draft_payload_discarded_due_to_stale_prefix"] = True
-                trace_record["active_continuation_draft_payload_base_version"] = {
-                    str(payload.seq_id): (payload.metadata or {}).get("draft_payload_base_version")
-                    for payload in stale_payloads
-                }
+                trace_record["active_continuation_stale_payload_discarded"] = True
+                trace_record["active_continuation_stale_payload_ids"] = stale_ids
+                trace_record["active_continuation_stale_payload_seq_ids"] = stale_seq_ids
+                trace_record["active_continuation_stale_payload_base_versions"] = stale_base_versions
+                trace_record["active_continuation_target_corrected_versions"] = redraft_versions
+                trace_record["active_continuation_stale_payload_discard_reason"] = "stale_prefix_after_correction"
+                trace_record["active_continuation_stale_payload_consumed"] = False
+                trace_record["active_continuation_stale_payload_invalidated"] = True
+                trace_record["active_continuation_redraft_required_seq_ids"] = stale_seq_ids
+                trace_record["active_continuation_redraft_required_versions"] = redraft_versions
+                trace_record["active_continuation_redraft_reason"] = "stale_payload_after_correction"
+                trace_record["active_continuation_draft_payload_base_version"] = stale_base_versions
                 trace_record["active_continuation_draft_payload_base_prefix_len"] = {
                     str(payload.seq_id): (payload.metadata or {}).get("draft_payload_base_prefix_len")
                     for payload in stale_payloads
@@ -5005,12 +5106,11 @@ class ModelRunnerBase:
                     str(payload.seq_id): (payload.metadata or {}).get("draft_payload_base_last_token")
                     for payload in stale_payloads
                 }
-                trace_record["next_required_feature"] = "active_request_continuation_draft_payload_discarded_due_to_stale_prefix"
-                raise RuntimeError(
-                    "active continuation discarded stale draft payload after target correction; "
-                    f"stale_payload_ids={stale_ids}; "
-                    "next_required_feature=active_request_continuation_draft_payload_discarded_due_to_stale_prefix"
-                )
+                verify_rows = self._build_v4ae_stale_redraft_verify_rows(exec_seqs or [], stale_payloads, trace_record)
+                self._participate_v4s_terminal_verify_broadcast(exec_seqs or [], trace_record, verify_rows=verify_rows)
+                trace_record["active_continuation_fresh_redraft_missing"] = False
+                trace_record["next_required_feature"] = "active_request_continuation_handoff"
+                return True
             if payload_seq_ids != target_seq_ids or payload_home_batch_ids != {step_plan.target_home_batch_id}:
                 trace_record["illegal_legacy_fallback"] = True
                 message = (

@@ -391,6 +391,24 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_draft_payload_version_mismatch",
         "active_continuation_correction_sync_missing_before_draft_generation",
         "active_continuation_batch_lock_released_before_correction_sync",
+        "active_continuation_stale_payload_discarded",
+        "active_continuation_stale_payload_ids",
+        "active_continuation_stale_payload_seq_ids",
+        "active_continuation_stale_payload_base_versions",
+        "active_continuation_target_corrected_versions",
+        "active_continuation_stale_payload_discard_reason",
+        "active_continuation_stale_payload_consumed",
+        "active_continuation_stale_payload_invalidated",
+        "active_continuation_redraft_required_seq_ids",
+        "active_continuation_redraft_required_versions",
+        "active_continuation_redraft_reason",
+        "active_continuation_fresh_redraft_received",
+        "active_continuation_fresh_redraft_payload_ids",
+        "active_continuation_fresh_redraft_base_versions",
+        "active_continuation_fresh_redraft_still_stale",
+        "active_continuation_fresh_redraft_missing",
+        "active_continuation_batch_lock_released_before_fresh_redraft",
+        "active_continuation_stale_payload_verified_after_discard",
         "active_continuation_pre_draft_correction_sync_checked",
         "active_continuation_draft_forward_started_after_sync",
         "active_continuation_draft_forward_started_before_sync",
@@ -767,8 +785,56 @@ def test_v4ad_uses_existing_verify_phase_not_new_broadcast():
     assert "active_continuation_unpaired_collective_disabled" in barrier_source
     assert "active_continuation_correction_sync_piggybacked_on_verify_res" in source
     assert "active_request_continuation_stale_draft_payload_after_correction" in source
-    assert "active_request_continuation_draft_payload_discarded_due_to_stale_prefix" in source
+    assert "active_continuation_draft_payload_discarded_due_to_stale_prefix" in source
+    assert "active_request_continuation_handoff" in source
     assert "draft_payload_base_version" in source
+
+
+def test_v4ae_stale_payload_discard_hands_off_to_redraft_verify_res():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    stale_start = source.index("stale_payloads = self._stale_draft_payloads_for_pending_corrections")
+    stale_end = source.index("if payload_seq_ids != target_seq_ids", stale_start)
+    stale_source = source[stale_start:stale_end]
+    assert "self.stspec_mailbox.mark_payloads_stale" in stale_source
+    assert '"active_continuation_stale_payload_discarded"] = True' in stale_source
+    assert '"active_continuation_redraft_required_seq_ids"] = stale_seq_ids' in stale_source
+    assert '"active_continuation_redraft_reason"] = "stale_payload_after_correction"' in stale_source
+    assert "_build_v4ae_stale_redraft_verify_rows(exec_seqs or [], stale_payloads, trace_record)" in stale_source
+    assert "_participate_v4s_terminal_verify_broadcast(exec_seqs or [], trace_record, verify_rows=verify_rows)" in stale_source
+    assert '"active_request_continuation_draft_payload_discarded_due_to_stale_prefix"' not in stale_source
+    assert '"active_request_continuation_handoff"' in stale_source
+    assert "return True" in stale_source
+
+
+def test_v4ae_redraft_verify_rows_use_correction_token_and_specific_diagnostics():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    helper_start = source.index("def _build_v4ae_stale_redraft_verify_rows")
+    helper_end = source.index("def _v4ad_pre_draft_sync_enabled", helper_start)
+    helper_source = source[helper_start:helper_end]
+    assert "stale_seq_ids != exec_seq_ids" in helper_source
+    assert "active_request_continuation_stale_payload_verified_after_discard" in helper_source
+    assert "correction_token_ids" in helper_source
+    assert "revise_token.append(token)" in helper_source
+    assert "active_request_continuation_redraft_blocked_correction_not_applied" in helper_source
+    assert "return [acc, rollout, revise_token, finish]" in helper_source
+
+
+def test_stale_payload_mark_removes_availability_and_allows_fresh_redraft():
+    mailbox = mailbox_mod.STSpecPayloadMailbox()
+    stale = mailbox_payload(plan_id=1, seq_id=3, token_ids=[1753])
+    mailbox.put_payloads(0, [stale], plan_id=1, producer_role="draft")
+    mailbox.mark_payloads_stale([stale.payload_id], plan_id=2, reason="stale_prefix_after_correction")
+    assert mailbox.get_payloads(0, [3], plan_id=2, consumer_role="target").success is False
+    fresh = mailbox_payload(plan_id=2, seq_id=3, token_ids=[803])
+    mailbox.put_payloads(0, [fresh], plan_id=2, producer_role="draft")
+    result = mailbox.get_payloads(0, [3], plan_id=2, consumer_role="target")
+    assert result.success is True
+    assert result.payloads[0].payload_id == fresh.payload_id
+    assert result.payloads[0].draft_token_ids == [803]
 
 
 def main() -> None:
@@ -807,6 +873,9 @@ def main() -> None:
     test_runner_has_guarded_v4x_pending_correction_propagation()
     test_v4ad_disables_unpaired_pre_draft_collective()
     test_v4ad_uses_existing_verify_phase_not_new_broadcast()
+    test_v4ae_stale_payload_discard_hands_off_to_redraft_verify_res()
+    test_v4ae_redraft_verify_rows_use_correction_token_and_specific_diagnostics()
+    test_stale_payload_mark_removes_availability_and_allows_fresh_redraft()
 
 
 if __name__ == "__main__":
