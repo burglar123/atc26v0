@@ -403,9 +403,9 @@ class ModelRunnerBase:
         self.active_execution_mode = execution_mode
 
     def _schedule_with_plan(self, runner_role: str):
-        in_progress = bool(getattr(self, "stspec_active_continuation_in_progress", False))
-        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
-        skip_batch_flip = bool(in_progress and pending)
+        # V4AE.2: skip batch flip while any redraft lifecycle is active
+        lifecycle_active, _, _, _ = self._get_v4ae_active_correction_lifecycle()
+        skip_batch_flip = bool(lifecycle_active)
         return self.scheduler.schedule_with_plan(
             runner_role=runner_role,
             execution_mode=self.active_execution_mode,
@@ -1094,6 +1094,26 @@ class ModelRunnerBase:
             "active_continuation_draft_prefix_before_sync_by_step": {},
             "active_continuation_draft_prefix_after_sync_by_step": {},
             "active_continuation_draft_generation_allowed_after_sync": False,
+            # V4AE.2: redraft lifecycle / batch lock alignment
+            "active_continuation_redraft_lifecycle_active": False,
+            "active_continuation_redraft_lifecycle_reasons": [],
+            "active_continuation_redraft_lifecycle_seq_ids": [],
+            "active_continuation_redraft_required_states": {},
+            "active_continuation_redraft_required_state_by_seq": {},
+            "active_continuation_redraft_lifecycle_last_progress_step": 0,
+            "active_continuation_redraft_lifecycle_no_progress": False,
+            "active_continuation_pending_corrections_nonempty": False,
+            "active_continuation_last_corrected_versions_nonempty": False,
+            "active_continuation_batch_lock_home_batch_id": None,
+            "active_continuation_batch_lock_reason": None,
+            "active_continuation_batch_lock_missing_for_redraft_lifecycle": False,
+            "active_continuation_batch_lock_release_blocked_by_redraft": False,
+            "active_continuation_batch_lock_released_after_redraft": False,
+            "active_continuation_batch_lock_leak_after_redraft_completion": False,
+            "active_continuation_fresh_redraft_missing": False,
+            "active_continuation_fresh_redraft_still_stale": False,
+            "active_continuation_redraft_fresh_arrival_seq_ids": [],
+            "active_continuation_correction_metadata_nonempty": False,
         }
         if not self._is_stspec_real_probe_enabled(step_plan):
             self._strip_stspec_real_probe_only_trace_fields(record)
@@ -1405,6 +1425,21 @@ class ModelRunnerBase:
             "active_continuation_redraft_blocked_sources_checked",
             "active_continuation_correction_metadata_cleared_before_redraft",
             "active_continuation_redraft_seq_not_scheduled",
+            # V4AE.2
+            "active_continuation_redraft_lifecycle_active",
+            "active_continuation_redraft_lifecycle_reasons",
+            "active_continuation_redraft_lifecycle_seq_ids",
+            "active_continuation_redraft_required_state_by_seq",
+            "active_continuation_redraft_lifecycle_last_progress_step",
+            "active_continuation_redraft_lifecycle_no_progress",
+            "active_continuation_last_corrected_versions_nonempty",
+            "active_continuation_batch_lock_missing_for_redraft_lifecycle",
+            "active_continuation_batch_lock_release_blocked_by_redraft",
+            "active_continuation_batch_lock_released_after_redraft",
+            "active_continuation_batch_lock_leak_after_redraft_completion",
+            "active_continuation_fresh_redraft_missing",
+            "active_continuation_fresh_redraft_still_stale",
+            "active_continuation_redraft_fresh_arrival_seq_ids",
             "active_continuation_pre_draft_correction_sync_checked",
             "active_continuation_draft_forward_started_after_sync",
             "active_continuation_draft_forward_started_before_sync",
@@ -1860,6 +1895,28 @@ class ModelRunnerBase:
                 }
             self.stspec_active_continuation_last_corrected_versions = last_versions
             self.stspec_active_continuation_correction_metadata_by_seq = correction_metadata
+            # V4AE.2: create redraft lifecycle entries with explicit state
+            redraft_lifecycle = dict(
+                getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {}
+            )
+            step_now = int(getattr(self, "stspec_active_continuation_step_count", 0) or 0) + 1
+            for seq_id_str in recorded:
+                seq_id = int(seq_id_str)
+                existing = redraft_lifecycle.get(seq_id, {})
+                redraft_lifecycle[seq_id] = {
+                    "state": "created",
+                    "seq_id": seq_id,
+                    "correction_token_ids": recorded[seq_id_str].get("correction_token_ids", []),
+                    "target_corrected_version": int(recorded[seq_id_str].get("prefix_len_after") or 0),
+                    "corrected_prefix_len": int(recorded[seq_id_str].get("prefix_len_after") or 0),
+                    "stale_payload_ids": list(existing.get("stale_payload_ids") or []),
+                    "fresh_payload_ids": list(existing.get("fresh_payload_ids") or []),
+                    "home_batch_id": int(recorded[seq_id_str].get("home_batch_id") or -1),
+                    "step_created": int(existing.get("step_created") or step_now),
+                    "last_progress_step": int(step_now),
+                    "failure_reason": existing.get("failure_reason"),
+                }
+            self.stspec_active_continuation_redraft_required_by_seq = redraft_lifecycle
             trace_record["active_continuation_correction_token_by_seq"] = {
                 str(seq_id): list(info.get("correction_token_ids") or [])
                 for seq_id, info in correction_metadata.items()
@@ -1944,6 +2001,49 @@ class ModelRunnerBase:
                 info.get("home_batch_id") for info in recorded.values()
                 if info.get("home_batch_id") is not None
             })
+
+    def _get_v4ae_active_correction_lifecycle(self) -> tuple[bool, list[str], list[int], int | None]:
+        """Return (active, reasons, seq_ids, locked_home_batch_id) for batch lock.
+
+        Only unfinished redraft lifecycle states keep the lock active.
+        correction_metadata_by_seq and last_corrected_versions are metadata only
+        and do NOT independently trigger lock active.
+        """
+        ACTIVE_STATES = {
+            "created",
+            "waiting_for_stale_payload_reconciliation",
+            "waiting_for_fresh_payload",
+            "fresh_payload_received",
+            "pending_verify",
+        }
+        reasons: list[str] = []
+        seq_ids: set[int] = set()
+        locked_home_batch_id: int | None = None
+
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        if pending:
+            reasons.append("pending_corrections")
+            seq_ids.update(int(k) for k in pending.keys())
+
+        redraft = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        for seq_id, entry in redraft.items():
+            state = entry.get("state", "")
+            if state in ACTIVE_STATES:
+                reasons.append(f"redraft_required_{state}")
+                seq_ids.add(int(seq_id))
+                home_batch = entry.get("home_batch_id")
+                if home_batch is not None and locked_home_batch_id is None:
+                    locked_home_batch_id = int(home_batch)
+                elif home_batch is not None and int(home_batch) != locked_home_batch_id:
+                    reasons.append("redraft_home_batch_conflict")
+
+        active = bool(reasons)
+        if active and locked_home_batch_id is None:
+            lock = getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None)
+            if lock is not None:
+                locked_home_batch_id = int(lock)
+
+        return active, reasons, sorted(seq_ids), locked_home_batch_id
 
     def _propagate_v4x_pending_correction_prefix(
         self,
@@ -2122,16 +2222,34 @@ class ModelRunnerBase:
                     trace_record.get("next_required_feature")
                     or "active_request_continuation_batch_flip_with_pending_correction"
                 )
-        # V4X.3: release batch lock when all pending corrections consumed
+        # V4AE.2: release batch lock only when entire redraft lifecycle complete
         consumed = bool(pending_before_seq_ids and not pending_after_seq_ids)
         trace_record["active_continuation_pending_correction_consumed_by_step"] = consumed
-        if consumed and getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None:
+        lifecycle_active, lifecycle_reasons, lifecycle_seq_ids, _ = self._get_v4ae_active_correction_lifecycle()
+        trace_record["active_continuation_redraft_lifecycle_active"] = lifecycle_active
+        trace_record["active_continuation_redraft_lifecycle_reasons"] = lifecycle_reasons
+        trace_record["active_continuation_redraft_lifecycle_seq_ids"] = lifecycle_seq_ids
+        trace_record["active_continuation_pending_corrections_nonempty"] = bool(pending)
+        trace_record["active_continuation_redraft_required_nonempty"] = bool(
+            getattr(self, "stspec_active_continuation_redraft_required_by_seq", None)
+        )
+        redraft_states = {}
+        for sid, entry in (getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {}).items():
+            redraft_states[str(sid)] = entry.get("state", "unknown")
+        trace_record["active_continuation_redraft_required_states"] = redraft_states
+        if not lifecycle_active and getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None:
             trace_record["active_continuation_batch_lock_released_by_step"] = int(
                 getattr(self, "stspec_active_continuation_step_count", 0) or 0
             ) + 1
-            trace_record["active_continuation_batch_lock_release_reason"] = "pending_correction_consumed"
+            trace_record["active_continuation_batch_lock_release_reason"] = "correction_lifecycle_complete"
+            trace_record["active_continuation_batch_lock_released_after_redraft"] = True
             self.scheduler.stspec_batch_lock_home_batch_id = None
             self.scheduler.stspec_batch_lock_reason = None
+        elif lifecycle_active and not getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None):
+            trace_record["active_continuation_batch_lock_missing_for_redraft_lifecycle"] = True
+            trace_record["next_required_feature"] = "active_request_continuation_batch_lock_missing_for_redraft_lifecycle"
+        elif lifecycle_active:
+            trace_record["active_continuation_batch_lock_release_blocked_by_redraft"] = True
         trace_record["active_continuation_pending_correction_batch_lock_active"] = (
             getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None
         )
@@ -2383,6 +2501,15 @@ class ModelRunnerBase:
                     "source_plan_id": info.get("source_plan_id"),
                     "correction_source": info.get("correction_source") or "unknown_correction_metadata",
                     "reason": "stale_payload_after_correction",
+                    # V4AE.2: explicit redraft lifecycle state
+                    "state": "waiting_for_fresh_payload",
+                    "stale_payload_ids": [str(payload.payload_id) for payload in stale_payloads
+                                         if int(payload.seq_id) == int(seq.seq_id)],
+                    "fresh_payload_ids": [],
+                    "step_created": int((redraft_metadata.get(int(seq.seq_id)) or {}).get("step_created")
+                                        or getattr(self, "stspec_active_continuation_step_count", 0) or 0),
+                    "last_progress_step": int(getattr(self, "stspec_active_continuation_step_count", 0) or 0) + 1,
+                    "failure_reason": None,
                 }
                 redraft_metadata[int(seq.seq_id)] = metadata
                 metadata_created[int(seq.seq_id)] = metadata
@@ -4000,6 +4127,30 @@ class ModelRunnerBase:
                 "active_request_continuation_partial_batch_starvation",
                 f"active continuation left seqs without token advancement: seq_ids={starving_seq_ids}",
             )
+        # V4AE.2: redraft lifecycle no-progress guard
+        redraft_lifecycle = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        if redraft_lifecycle:
+            active_states = {seq_id: entry.get("state") for seq_id, entry in redraft_lifecycle.items()
+                           if entry.get("state") not in ("verified", "completed", "failed")}
+            if active_states:
+                no_progress_count = 0
+                for item in progress_history[-max(1, int(max_steps) // 4):]:
+                    prev_states = (item.get("redraft_required_states") or
+                                   item.get("active_continuation_redraft_required_states") or {})
+                    if prev_states == {str(k): v for k, v in active_states.items()}:
+                        no_progress_count += 1
+                if no_progress_count >= max(1, int(max_steps) // 2):
+                    trace_record["active_continuation_redraft_lifecycle_no_progress"] = True
+                    trace_record["active_continuation_redraft_required_state_by_seq"] = active_states
+                    trace_record["active_continuation_redraft_lifecycle_last_progress_step"] = max(
+                        int(entry.get("last_progress_step") or 0) for entry in redraft_lifecycle.values()
+                    )
+                    trace_record["next_required_feature"] = "active_request_continuation_redraft_lifecycle_no_progress"
+                    return (
+                        "active_request_continuation_redraft_lifecycle_no_progress",
+                        f"redraft lifecycle made no progress for {no_progress_count} steps; "
+                        f"active_states={active_states}",
+                    )
         average_acceptance = float(trace_record.get("active_continuation_average_acceptance_rate") or 0.0)
         zero_accept_steps = int(trace_record.get("active_continuation_zero_accept_step_count") or 0)
         if progress_history and (average_acceptance <= 0.05 or zero_accept_steps >= max(1, len(progress_history) // 2)):
@@ -5082,6 +5233,21 @@ class ModelRunnerBase:
                     f"next_required_feature={trace_record['next_required_feature']}"
                 )
             self._record_v4x_pending_corrections(commit_result, trace_record)
+            # V4AE.2: transition redraft lifecycle to verified for accepted seqs
+            accepted_lengths = dict(getattr(getattr(commit_result, "plan", None), "accepted_lengths_by_seq", {}) or {})
+            step_now = int(getattr(self, "stspec_active_continuation_step_count", 0) or 0) + 1
+            for seq_id, accepted_len in accepted_lengths.items():
+                if int(accepted_len or 0) <= 0:
+                    continue
+                redraft = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+                entry = redraft.get(int(seq_id))
+                if entry and entry.get("state") in (
+                    "created", "waiting_for_fresh_payload", "fresh_payload_received", "pending_verify",
+                ):
+                    entry["state"] = "verified"
+                    entry["last_progress_step"] = step_now
+                    redraft[int(seq_id)] = entry
+                    self.stspec_active_continuation_redraft_required_by_seq = redraft
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
                 reset_v4t_active_continuation_runner_state(self)
                 return True
@@ -5287,6 +5453,28 @@ class ModelRunnerBase:
                 trace_record["active_continuation_fresh_redraft_missing"] = False
                 trace_record["next_required_feature"] = "active_request_continuation_handoff"
                 return True
+            # V4AE.2: fresh redraft arrived — transition lifecycle state
+            redraft_lifecycle = dict(
+                getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {}
+            )
+            step_now = int(getattr(self, "stspec_active_continuation_step_count", 0) or 0) + 1
+            for payload in result.payloads:
+                seq_id = int(payload.seq_id)
+                entry = redraft_lifecycle.get(seq_id)
+                if entry and entry.get("state") in ("waiting_for_fresh_payload", "created"):
+                    base_version = int((payload.metadata or {}).get("draft_payload_base_version") or 0)
+                    target_version = int(entry.get("target_corrected_version") or 0)
+                    if base_version >= target_version:
+                        entry["state"] = "pending_verify"
+                        entry["fresh_payload_ids"] = list(entry.get("fresh_payload_ids") or []) + [str(payload.payload_id)]
+                        entry["last_progress_step"] = step_now
+                        redraft_lifecycle[seq_id] = entry
+                        trace_record.setdefault("active_continuation_redraft_fresh_arrival_seq_ids", []).append(seq_id)
+                    else:
+                        trace_record["active_continuation_fresh_redraft_still_stale"] = True
+                        trace_record["next_required_feature"] = "active_request_continuation_fresh_redraft_still_stale"
+            if redraft_lifecycle:
+                self.stspec_active_continuation_redraft_required_by_seq = redraft_lifecycle
             if payload_seq_ids != target_seq_ids or payload_home_batch_ids != {step_plan.target_home_batch_id}:
                 trace_record["illegal_legacy_fallback"] = True
                 message = (
