@@ -394,6 +394,24 @@ class ModelRunnerBase:
     def _runner_role(self):
         return "draft" if self.is_draft else "verify"
 
+    def _active_continuation_lock_state(self) -> dict:
+        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        redraft = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        correction_metadata = dict(getattr(self, "stspec_active_continuation_correction_metadata_by_seq", {}) or {})
+        active = bool(pending or redraft)
+        home_batch_ids = {
+            int(info.get("home_batch_id"))
+            for info in list(pending.values()) + list(redraft.values()) + list(correction_metadata.values())
+            if isinstance(info, dict) and info.get("home_batch_id") is not None
+        }
+        return {
+            "active": active,
+            "pending": pending,
+            "redraft": redraft,
+            "correction_metadata": correction_metadata,
+            "home_batch_ids": home_batch_ids,
+        }
+
     def _set_execution_mode(self, execution_mode: str):
         if execution_mode not in self.global_config.ALLOWED_EXECUTION_MODES:
             raise ValueError(
@@ -403,9 +421,15 @@ class ModelRunnerBase:
         self.active_execution_mode = execution_mode
 
     def _schedule_with_plan(self, runner_role: str):
-        in_progress = bool(getattr(self, "stspec_active_continuation_in_progress", False))
-        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
-        skip_batch_flip = bool(in_progress and pending)
+        lock_state = self._active_continuation_lock_state()
+        if (
+            lock_state["active"]
+            and getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is None
+            and lock_state["home_batch_ids"]
+        ):
+            self.scheduler.stspec_batch_lock_home_batch_id = sorted(lock_state["home_batch_ids"])[0]
+            self.scheduler.stspec_batch_lock_reason = "redraft_required" if lock_state["redraft"] else "pending_correction"
+        skip_batch_flip = bool(lock_state["active"])
         return self.scheduler.schedule_with_plan(
             runner_role=runner_role,
             execution_mode=self.active_execution_mode,
@@ -1056,6 +1080,8 @@ class ModelRunnerBase:
             "active_continuation_fresh_redraft_base_versions": {},
             "active_continuation_fresh_redraft_still_stale": False,
             "active_continuation_fresh_redraft_missing": False,
+            "active_continuation_fresh_redraft_verified": False,
+            "active_continuation_fresh_redraft_verified_seq_ids": [],
             "active_continuation_batch_lock_released_before_fresh_redraft": False,
             "active_continuation_stale_payload_verified_after_discard": False,
             "active_continuation_correction_token_by_seq": {},
@@ -1391,6 +1417,8 @@ class ModelRunnerBase:
             "active_continuation_fresh_redraft_base_versions",
             "active_continuation_fresh_redraft_still_stale",
             "active_continuation_fresh_redraft_missing",
+            "active_continuation_fresh_redraft_verified",
+            "active_continuation_fresh_redraft_verified_seq_ids",
             "active_continuation_batch_lock_released_before_fresh_redraft",
             "active_continuation_stale_payload_verified_after_discard",
             "active_continuation_correction_token_by_seq",
@@ -1953,7 +1981,9 @@ class ModelRunnerBase:
     ) -> None:
         if not self._v4s_real_probe_finalization_mode(step_plan):
             return
-        pending = dict(getattr(self, "stspec_active_continuation_pending_corrections", {}) or {})
+        lock_state = self._active_continuation_lock_state()
+        pending = dict(lock_state.get("pending") or {})
+        redraft_required = dict(lock_state.get("redraft") or {})
         if not pending:
             return
         trace_record["active_continuation_target_correction_sync_attempted"] = True
@@ -2116,22 +2146,36 @@ class ModelRunnerBase:
                 info.get("home_batch_id") for info in pending.values()
                 if info.get("home_batch_id") is not None
             }
-            if current_target_batch is not None and current_target_batch not in pending_home_batches:
+            redraft_home_batches = {
+                info.get("home_batch_id") for info in redraft_required.values()
+                if isinstance(info, dict) and info.get("home_batch_id") is not None
+            }
+            locked_home_batches = pending_home_batches | redraft_home_batches
+            if current_target_batch is not None and current_target_batch not in locked_home_batches:
                 trace_record["active_continuation_batch_flip_with_pending_correction"] = True
                 trace_record["next_required_feature"] = (
                     trace_record.get("next_required_feature")
                     or "active_request_continuation_batch_flip_with_pending_correction"
                 )
         # V4X.3: release batch lock when all pending corrections consumed
+        redraft_after = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
         consumed = bool(pending_before_seq_ids and not pending_after_seq_ids)
         trace_record["active_continuation_pending_correction_consumed_by_step"] = consumed
-        if consumed and getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None:
+        if (
+            consumed
+            and not redraft_after
+            and getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None
+        ):
             trace_record["active_continuation_batch_lock_released_by_step"] = int(
                 getattr(self, "stspec_active_continuation_step_count", 0) or 0
             ) + 1
             trace_record["active_continuation_batch_lock_release_reason"] = "pending_correction_consumed"
             self.scheduler.stspec_batch_lock_home_batch_id = None
             self.scheduler.stspec_batch_lock_reason = None
+        elif consumed and redraft_after:
+            self.scheduler.stspec_batch_lock_reason = "redraft_required"
+            trace_record["active_continuation_batch_lock_release_deferred_reason"] = "redraft_required"
+            trace_record["active_continuation_redraft_required_seq_ids"] = sorted(int(seq_id) for seq_id in redraft_after.keys())
         trace_record["active_continuation_pending_correction_batch_lock_active"] = (
             getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None
         )
@@ -2331,95 +2375,76 @@ class ModelRunnerBase:
 
         return {}, sources_checked
 
-    def _build_v4ae_stale_redraft_verify_rows(
+    def _v4ae_create_redraft_required_entries(
         self,
-        exec_seqs: list[Sequence],
         stale_payloads: list[MailboxPayload],
         trace_record: dict,
-    ) -> list[list[int]]:
-        stale_seq_ids = {int(payload.seq_id) for payload in stale_payloads}
-        exec_seq_ids = {int(seq.seq_id) for seq in exec_seqs}
-        if stale_seq_ids != exec_seq_ids:
-            trace_record["active_continuation_redraft_seq_not_scheduled"] = True
-            trace_record["next_required_feature"] = "active_request_continuation_redraft_seq_not_scheduled"
-            raise RuntimeError(
-                "stale payload discard cannot redraft because stale seqs are not exactly scheduled; "
-                f"stale_seq_ids={sorted(stale_seq_ids)}, exec_seq_ids={sorted(exec_seq_ids)}; "
-                "next_required_feature=active_request_continuation_redraft_seq_not_scheduled"
-            )
-        redraft_metadata = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
-        acc: list[int] = []
-        rollout: list[int] = []
-        revise_token: list[int] = []
-        finish: list[int] = []
+    ) -> dict[int, dict]:
+        redraft_required = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        created: dict[int, dict] = {}
         missing: list[int] = []
-        metadata_created: dict[int, dict] = {}
         sources_checked_total: list[str] = []
-        for seq in exec_seqs:
-            info, sources_checked = self._v4ae_lookup_correction_metadata(int(seq.seq_id))
+        for payload in stale_payloads:
+            seq_id = int(payload.seq_id)
+            info, sources_checked = self._v4ae_lookup_correction_metadata(seq_id)
             sources_checked_total.extend(sources_checked)
             tokens = [int(token) for token in list(info.get("correction_token_ids") or [])]
             if not tokens:
-                missing.append(int(seq.seq_id))
-                token = -1
-            else:
-                token = int(tokens[0])
-                metadata = {
-                    "seq_id": int(seq.seq_id),
-                    "request_id": getattr(seq, "request_id", info.get("request_id")),
-                    "correction_token_ids": list(tokens),
-                    "target_corrected_version": int(
-                        info.get("target_corrected_version")
-                        or info.get("prefix_len_after")
-                        or info.get("correction_prefix_len")
-                        or 0
-                    ),
-                    "correction_prefix_len": int(
-                        info.get("correction_prefix_len")
-                        or info.get("prefix_len_after")
-                        or info.get("target_corrected_version")
-                        or 0
-                    ),
-                    "source_plan_id": info.get("source_plan_id"),
-                    "correction_source": info.get("correction_source") or "unknown_correction_metadata",
-                    "reason": "stale_payload_after_correction",
-                }
-                redraft_metadata[int(seq.seq_id)] = metadata
-                metadata_created[int(seq.seq_id)] = metadata
-            acc.append(0)
-            rollout.append(int(self.gamma))
-            revise_token.append(token)
-            finish.append(0)
-        if metadata_created:
-            self.stspec_active_continuation_redraft_required_by_seq = redraft_metadata
+                missing.append(seq_id)
+                continue
+            entry = {
+                "seq_id": seq_id,
+                "request_id": info.get("request_id") or payload.request_id,
+                "correction_token_ids": tokens,
+                "target_corrected_version": int(
+                    info.get("target_corrected_version")
+                    or info.get("prefix_len_after")
+                    or info.get("correction_prefix_len")
+                    or 0
+                ),
+                "correction_prefix_len": int(
+                    info.get("correction_prefix_len")
+                    or info.get("prefix_len_after")
+                    or info.get("target_corrected_version")
+                    or 0
+                ),
+                "source_plan_id": info.get("source_plan_id"),
+                "home_batch_id": payload.home_batch_id,
+                "stale_payload_id": payload.payload_id,
+                "correction_source": info.get("correction_source") or "unknown_correction_metadata",
+                "reason": "stale_payload_after_correction",
+            }
+            redraft_required[seq_id] = entry
+            created[seq_id] = entry
+        self.stspec_active_continuation_redraft_required_by_seq = redraft_required
+        if created:
             trace_record["active_continuation_redraft_metadata_created"] = True
-            trace_record["active_continuation_redraft_metadata_seq_ids"] = sorted(metadata_created)
+            trace_record["active_continuation_redraft_metadata_seq_ids"] = sorted(created)
             trace_record["active_continuation_redraft_metadata_token_ids"] = {
                 str(seq_id): info.get("correction_token_ids", [])
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
             trace_record["active_continuation_redraft_metadata_versions"] = {
                 str(seq_id): info.get("target_corrected_version")
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
             trace_record["active_continuation_correction_token_by_seq"] = {
                 str(seq_id): info.get("correction_token_ids", [])
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
             trace_record["active_continuation_correction_source_by_seq"] = {
                 str(seq_id): info.get("correction_source")
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
             trace_record["active_continuation_target_corrected_version_by_seq"] = {
                 str(seq_id): info.get("target_corrected_version")
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
             trace_record["active_continuation_correction_prefix_len_by_seq"] = {
                 str(seq_id): info.get("correction_prefix_len")
-                for seq_id, info in metadata_created.items()
+                for seq_id, info in created.items()
             }
         if missing:
-            trace_record["active_continuation_correction_sync_missing_before_draft_generation"] = True
             trace_record["active_continuation_redraft_blocked_missing_correction_seq_ids"] = missing
             trace_record["active_continuation_redraft_blocked_sources_checked"] = sorted(set(sources_checked_total))
             if any(
@@ -2427,13 +2452,28 @@ class ModelRunnerBase:
                 for seq_id in missing
             ):
                 trace_record["active_continuation_correction_metadata_cleared_before_redraft"] = True
-            trace_record["next_required_feature"] = "active_request_continuation_redraft_blocked_correction_not_applied"
-            raise RuntimeError(
-                "stale payload discard needs target correction token for draft redraft; "
-                f"missing_seq_ids={missing}; sources_checked={sorted(set(sources_checked_total))}; "
-                "next_required_feature=active_request_continuation_redraft_blocked_correction_not_applied"
-            )
-        return [acc, rollout, revise_token, finish]
+        return created
+
+    def _v4ae_complete_verified_redraft_if_needed(self, trace_record: dict, commit_result) -> None:
+        redraft_required = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+        if not redraft_required or not trace_record.get("active_continuation_fresh_redraft_received"):
+            return
+        plan = getattr(commit_result, "plan", None)
+        verified_seq_ids = {int(seq_id) for seq_id in list(getattr(plan, "seq_ids", []) or [])}
+        completed = sorted(int(seq_id) for seq_id in redraft_required if int(seq_id) in verified_seq_ids)
+        if not completed:
+            return
+        for seq_id in completed:
+            redraft_required.pop(seq_id, None)
+            redraft_required.pop(str(seq_id), None)
+        self.stspec_active_continuation_redraft_required_by_seq = redraft_required
+        trace_record["active_continuation_fresh_redraft_verified"] = True
+        trace_record["active_continuation_fresh_redraft_verified_seq_ids"] = completed
+        if not redraft_required and not getattr(self, "stspec_active_continuation_pending_corrections", {}):
+            if getattr(self.scheduler, "stspec_batch_lock_home_batch_id", None) is not None:
+                trace_record["active_continuation_batch_lock_release_reason"] = "fresh_redraft_verified"
+            self.scheduler.stspec_batch_lock_home_batch_id = None
+            self.scheduler.stspec_batch_lock_reason = None
 
     def _v4ad_pre_draft_sync_enabled(self) -> bool:
         return bool(
@@ -5082,6 +5122,7 @@ class ModelRunnerBase:
                     f"next_required_feature={trace_record['next_required_feature']}"
                 )
             self._record_v4x_pending_corrections(commit_result, trace_record)
+            self._v4ae_complete_verified_redraft_if_needed(trace_record, commit_result)
             if self._try_finalize_v4s_result(exec_seqs, step_plan, trace_record, commit_result, output):
                 reset_v4t_active_continuation_runner_state(self)
                 return True
@@ -5282,11 +5323,47 @@ class ModelRunnerBase:
                     str(payload.seq_id): (payload.metadata or {}).get("draft_payload_base_last_token")
                     for payload in stale_payloads
                 }
-                verify_rows = self._build_v4ae_stale_redraft_verify_rows(exec_seqs or [], stale_payloads, trace_record)
-                self._participate_v4s_terminal_verify_broadcast(exec_seqs or [], trace_record, verify_rows=verify_rows)
-                trace_record["active_continuation_fresh_redraft_missing"] = False
-                trace_record["next_required_feature"] = "active_request_continuation_handoff"
+                redraft_entries = self._v4ae_create_redraft_required_entries(stale_payloads, trace_record)
+                if redraft_entries:
+                    locked_home_batch = next(iter({
+                        int(info.get("home_batch_id"))
+                        for info in redraft_entries.values()
+                        if info.get("home_batch_id") is not None
+                    }), None)
+                    if locked_home_batch is not None:
+                        self.scheduler.stspec_batch_lock_home_batch_id = locked_home_batch
+                        self.scheduler.stspec_batch_lock_reason = "redraft_required"
+                trace_record["active_continuation_fresh_redraft_missing"] = True
+                trace_record["next_required_feature"] = "active_request_continuation_redraft_required"
                 return True
+            redraft_required = dict(getattr(self, "stspec_active_continuation_redraft_required_by_seq", {}) or {})
+            fresh_redraft_payloads = []
+            if redraft_required:
+                for payload in result.payloads:
+                    info = redraft_required.get(int(payload.seq_id)) or redraft_required.get(str(payload.seq_id)) or {}
+                    if not info:
+                        continue
+                    base_version = int((payload.metadata or {}).get("draft_payload_base_version") or 0)
+                    corrected_version = int(info.get("target_corrected_version") or info.get("correction_prefix_len") or 0)
+                    if corrected_version and base_version >= corrected_version:
+                        fresh_redraft_payloads.append(payload)
+                    elif corrected_version:
+                        trace_record["active_continuation_fresh_redraft_still_stale"] = True
+                        trace_record["next_required_feature"] = "active_request_continuation_fresh_redraft_still_stale"
+                        raise RuntimeError(
+                            "active continuation fresh redraft payload is still stale; "
+                            f"seq_id={payload.seq_id}, base_version={base_version}, corrected_version={corrected_version}; "
+                            "next_required_feature=active_request_continuation_fresh_redraft_still_stale"
+                        )
+            if fresh_redraft_payloads:
+                trace_record["active_continuation_fresh_redraft_received"] = True
+                trace_record["active_continuation_fresh_redraft_payload_ids"] = [
+                    payload.payload_id for payload in fresh_redraft_payloads
+                ]
+                trace_record["active_continuation_fresh_redraft_base_versions"] = {
+                    str(payload.seq_id): int((payload.metadata or {}).get("draft_payload_base_version") or 0)
+                    for payload in fresh_redraft_payloads
+                }
             if payload_seq_ids != target_seq_ids or payload_home_batch_ids != {step_plan.target_home_batch_id}:
                 trace_record["illegal_legacy_fallback"] = True
                 message = (

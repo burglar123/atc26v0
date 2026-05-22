@@ -407,6 +407,8 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_fresh_redraft_base_versions",
         "active_continuation_fresh_redraft_still_stale",
         "active_continuation_fresh_redraft_missing",
+        "active_continuation_fresh_redraft_verified",
+        "active_continuation_fresh_redraft_verified_seq_ids",
         "active_continuation_batch_lock_released_before_fresh_redraft",
         "active_continuation_stale_payload_verified_after_discard",
         "active_continuation_correction_token_by_seq",
@@ -798,11 +800,11 @@ def test_v4ad_uses_existing_verify_phase_not_new_broadcast():
     assert "active_continuation_correction_sync_piggybacked_on_verify_res" in source
     assert "active_request_continuation_stale_draft_payload_after_correction" in source
     assert "active_continuation_draft_payload_discarded_due_to_stale_prefix" in source
-    assert "active_request_continuation_handoff" in source
+    assert "active_request_continuation_redraft_required" in source
     assert "draft_payload_base_version" in source
 
 
-def test_v4ae_stale_payload_discard_hands_off_to_redraft_verify_res():
+def test_v4ae_stale_payload_discard_creates_redraft_required_without_verify_rows():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -813,33 +815,31 @@ def test_v4ae_stale_payload_discard_hands_off_to_redraft_verify_res():
     assert '"active_continuation_stale_payload_discarded"] = True' in stale_source
     assert '"active_continuation_redraft_required_seq_ids"] = stale_seq_ids' in stale_source
     assert '"active_continuation_redraft_reason"] = "stale_payload_after_correction"' in stale_source
-    assert "_build_v4ae_stale_redraft_verify_rows(exec_seqs or [], stale_payloads, trace_record)" in stale_source
-    assert "_participate_v4s_terminal_verify_broadcast(exec_seqs or [], trace_record, verify_rows=verify_rows)" in stale_source
+    assert "_v4ae_create_redraft_required_entries(stale_payloads, trace_record)" in stale_source
+    assert "_build_v4ae_stale_redraft_verify_rows" not in stale_source
+    assert "_participate_v4s_terminal_verify_broadcast" not in stale_source
     assert '"active_request_continuation_draft_payload_discarded_due_to_stale_prefix"' not in stale_source
-    assert '"active_request_continuation_handoff"' in stale_source
+    assert '"active_request_continuation_redraft_required"' in stale_source
     assert "return True" in stale_source
 
 
-def test_v4ae_redraft_verify_rows_use_correction_token_and_specific_diagnostics():
+def test_v4ae_redraft_metadata_uses_correction_token_and_specific_diagnostics():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
-    helper_start = source.index("def _build_v4ae_stale_redraft_verify_rows")
-    helper_end = source.index("def _v4ad_pre_draft_sync_enabled", helper_start)
-    helper_source = source[helper_start:helper_end]
     lookup_start = source.index("def _v4ae_lookup_correction_metadata")
-    lookup_end = source.index("def _build_v4ae_stale_redraft_verify_rows", lookup_start)
+    lookup_end = source.index("def _v4ae_create_redraft_required_entries", lookup_start)
     lookup_source = source[lookup_start:lookup_end]
-    assert "stale_seq_ids != exec_seq_ids" in helper_source
-    assert "active_request_continuation_redraft_seq_not_scheduled" in helper_source
-    assert "correction_token_ids" in helper_source
-    assert "revise_token.append(token)" in helper_source
-    assert "_v4ae_lookup_correction_metadata" in helper_source
+    helper_start = source.index("def _v4ae_create_redraft_required_entries")
+    helper_end = source.index("def _v4ae_complete_verified_redraft_if_needed", helper_start)
+    helper_source = source[helper_start:helper_end]
     assert "stspec_active_continuation_correction_metadata_by_seq" in lookup_source
     assert "stspec_active_continuation_progress_by_step" in lookup_source
+    assert "_v4ae_lookup_correction_metadata" in helper_source
+    assert "correction_token_ids" in helper_source
     assert "active_continuation_redraft_metadata_created" in helper_source
-    assert "active_request_continuation_redraft_blocked_correction_not_applied" in helper_source
-    assert "return [acc, rollout, revise_token, finish]" in helper_source
+    assert "active_continuation_redraft_blocked_missing_correction_seq_ids" in helper_source
+    assert "active_continuation_redraft_blocked_sources_checked" in helper_source
 
 
 def test_v4ae_records_authoritative_correction_metadata_for_redraft():
@@ -874,17 +874,38 @@ def test_stale_payload_mark_removes_availability_and_allows_fresh_redraft():
     assert result.payloads[0].draft_token_ids == [803]
 
 
-def test_v4ae_redraft_helper_reports_sources_when_metadata_missing():
+def test_v4ae_redraft_metadata_reports_sources_when_metadata_missing():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
-    helper_start = source.index("def _build_v4ae_stale_redraft_verify_rows")
-    helper_end = source.index("def _v4ad_pre_draft_sync_enabled", helper_start)
+    helper_start = source.index("def _v4ae_create_redraft_required_entries")
+    helper_end = source.index("def _v4ae_complete_verified_redraft_if_needed", helper_start)
     helper_source = source[helper_start:helper_end]
     assert "active_continuation_redraft_blocked_missing_correction_seq_ids" in helper_source
     assert "active_continuation_redraft_blocked_sources_checked" in helper_source
     assert "active_continuation_correction_metadata_cleared_before_redraft" in helper_source
-    assert "sources_checked=" in helper_source
+
+
+def test_v4ae_batch_lock_uses_redraft_required_state_until_fresh_verify():
+    runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
+    with open(runner_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    schedule_start = source.index("def _schedule_with_plan")
+    schedule_end = source.index("def _trace_schedule", schedule_start)
+    schedule_source = source[schedule_start:schedule_end]
+    assert "_active_continuation_lock_state" in schedule_source
+    assert "stspec_active_continuation_redraft_required_by_seq" in source
+    assert 'self.scheduler.stspec_batch_lock_reason = "redraft_required"' in schedule_source
+    propagate_start = source.index("def _propagate_v4x_pending_correction_prefix")
+    propagate_end = source.index("def _sync_v4aa_pending_corrections_before_draft", propagate_start)
+    propagate_source = source[propagate_start:propagate_end]
+    assert "redraft_after" in propagate_source
+    assert "active_continuation_batch_lock_release_deferred_reason" in propagate_source
+    complete_start = source.index("def _v4ae_complete_verified_redraft_if_needed")
+    complete_end = source.index("def _v4ad_pre_draft_sync_enabled", complete_start)
+    complete_source = source[complete_start:complete_end]
+    assert "active_continuation_fresh_redraft_verified" in complete_source
+    assert "fresh_redraft_verified" in complete_source
 
 
 def main() -> None:
@@ -923,11 +944,12 @@ def main() -> None:
     test_runner_has_guarded_v4x_pending_correction_propagation()
     test_v4ad_disables_unpaired_pre_draft_collective()
     test_v4ad_uses_existing_verify_phase_not_new_broadcast()
-    test_v4ae_stale_payload_discard_hands_off_to_redraft_verify_res()
-    test_v4ae_redraft_verify_rows_use_correction_token_and_specific_diagnostics()
+    test_v4ae_stale_payload_discard_creates_redraft_required_without_verify_rows()
+    test_v4ae_redraft_metadata_uses_correction_token_and_specific_diagnostics()
     test_v4ae_records_authoritative_correction_metadata_for_redraft()
     test_stale_payload_mark_removes_availability_and_allows_fresh_redraft()
-    test_v4ae_redraft_helper_reports_sources_when_metadata_missing()
+    test_v4ae_redraft_metadata_reports_sources_when_metadata_missing()
+    test_v4ae_batch_lock_uses_redraft_required_state_until_fresh_verify()
 
 
 if __name__ == "__main__":
