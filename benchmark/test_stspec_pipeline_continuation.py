@@ -379,6 +379,18 @@ def test_active_continuation_trace_has_v4v_progress_fields():
         "active_continuation_target_correction_sync_attempted",
         "active_continuation_target_correction_sync_success",
         "active_continuation_target_correction_double_append",
+        "active_continuation_correction_sync_phase",
+        "active_continuation_correction_sync_piggybacked_on_verify_res",
+        "active_continuation_unpaired_collective_disabled",
+        "active_continuation_draft_payload_base_prefix_len",
+        "active_continuation_draft_payload_base_version",
+        "active_continuation_target_corrected_version",
+        "active_continuation_draft_payload_base_last_token",
+        "active_continuation_stale_draft_payload_after_correction",
+        "active_continuation_draft_payload_discarded_due_to_stale_prefix",
+        "active_continuation_draft_payload_version_mismatch",
+        "active_continuation_correction_sync_missing_before_draft_generation",
+        "active_continuation_batch_lock_released_before_correction_sync",
         "active_continuation_pre_draft_correction_sync_checked",
         "active_continuation_draft_forward_started_after_sync",
         "active_continuation_draft_forward_started_before_sync",
@@ -725,7 +737,7 @@ def test_runner_has_guarded_v4x_pending_correction_propagation():
     assert "active_request_continuation_target_correction_double_append" in source
 
 
-def test_v4ad_pre_draft_correction_sync_barrier_precedes_draft_forward():
+def test_v4ad_disables_unpaired_pre_draft_collective():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -733,27 +745,30 @@ def test_v4ad_pre_draft_correction_sync_barrier_precedes_draft_forward():
     draft_pearl = source.index("def pearl_step(self):", draft_start)
     draft_verify = source.index("def serialized_pearl_step", draft_pearl)
     draft_pearl_source = source[draft_pearl:draft_verify]
-    barrier = "self._v4ad_pre_draft_correction_sync_barrier()"
-    prepare_decode = "input_ids, positions = self.prepare_pearl_decode(exec_seqs)"
-    run_model = "logits = self.run_model(input_ids, positions, is_prefill)"
-    assert barrier in draft_pearl_source
-    assert draft_pearl_source.index(barrier) < draft_pearl_source.index(prepare_decode)
-    assert draft_pearl_source.index(barrier) < draft_pearl_source.index(run_model)
-    assert "self._sync_v4aa_pending_corrections_before_draft()" not in draft_pearl_source
+    target_start = source.index("class TargetModelRunner")
+    target_pearl = source.index("def pearl_step(self):", target_start)
+    target_serialized = source.index("def serialized_pearl_step", target_pearl)
+    target_pearl_source = source[target_pearl:target_serialized]
+    assert "self._v4ad_pre_draft_correction_sync_barrier()" not in draft_pearl_source
+    assert "self._v4ad_pre_draft_correction_sync_barrier()" not in target_pearl_source
+    assert "self._sync_v4aa_pending_corrections_before_draft()" in draft_pearl_source
+    assert "active_continuation_unpaired_collective_disabled" in draft_pearl_source
     assert "active_continuation_draft_forward_started_after_sync" in draft_pearl_source
     assert "active_continuation_draft_forward_started_before_sync" in draft_pearl_source
 
 
-def test_v4ad_uses_verify_group_broadcast_and_draft_ack():
+def test_v4ad_uses_existing_verify_phase_not_new_broadcast():
     runner_path = os.path.join(REPO_ROOT, "nano_pearl", "pearl_engine", "pearl_model_runner.py")
     with open(runner_path, "r", encoding="utf-8") as f:
         source = f.read()
     sync_source = source[source.index("def _v4ad_pre_draft_correction_sync_barrier"):]
-    assert "dist.broadcast(message, src=self.global_config.target_config.master_rank, group=self.verify_group)" in sync_source
-    assert "dist.broadcast(ack, src=self.global_config.draft_config.master_rank, group=self.verify_group)" in sync_source
-    assert "active_request_continuation_draft_sync_seq_not_found" in sync_source
-    assert "active_request_continuation_draft_correction_apply_failed" in sync_source
-    assert "self.stspec_active_continuation_pending_corrections = {}" in sync_source
+    barrier_source = sync_source[: sync_source.index("def _attach_v4ad_pre_draft_sync_trace")]
+    assert "dist.broadcast(" not in barrier_source
+    assert "active_continuation_unpaired_collective_disabled" in barrier_source
+    assert "active_continuation_correction_sync_piggybacked_on_verify_res" in source
+    assert "active_request_continuation_stale_draft_payload_after_correction" in source
+    assert "active_request_continuation_draft_payload_discarded_due_to_stale_prefix" in source
+    assert "draft_payload_base_version" in source
 
 
 def main() -> None:
@@ -790,8 +805,8 @@ def main() -> None:
     test_prefix_and_kv_mismatch_are_specific()
     test_next_prefix_aligned_allows_acceptance_fallback()
     test_runner_has_guarded_v4x_pending_correction_propagation()
-    test_v4ad_pre_draft_correction_sync_barrier_precedes_draft_forward()
-    test_v4ad_uses_verify_group_broadcast_and_draft_ack()
+    test_v4ad_disables_unpaired_pre_draft_collective()
+    test_v4ad_uses_existing_verify_phase_not_new_broadcast()
 
 
 if __name__ == "__main__":
