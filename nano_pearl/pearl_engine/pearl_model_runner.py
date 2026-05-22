@@ -6401,7 +6401,17 @@ class DraftModelRunner(ModelRunnerBase):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
 
-        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
+        # V4AE.4: during warmup-draft-only, draft must also skip verify() to
+        # avoid deadlocking on verify_group broadcast that target will skip.
+        if (step_plan is not None
+                and step_plan.stspec_pipeline_phase == STSpecPipelinePhase.WARMUP_DRAFT_ONLY.value
+                and self._mailbox_allow_warmup_miss()):
+            if trace_record is not None:
+                trace_record["draft_verify_skipped_for_warmup_draft_only"] = True
+            accepted_lens = {}
+            invalidated_lens = {}
+        else:
+            accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -6438,7 +6448,15 @@ class DraftModelRunner(ModelRunnerBase):
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
-        accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
+        if (step_plan is not None
+                and step_plan.stspec_pipeline_phase == STSpecPipelinePhase.WARMUP_DRAFT_ONLY.value
+                and self._mailbox_allow_warmup_miss()):
+            if trace_record is not None:
+                trace_record["draft_verify_skipped_for_warmup_draft_only"] = True
+            accepted_lens = {}
+            invalidated_lens = {}
+        else:
+            accepted_lens, invalidated_lens = self.verify(exec_seqs, trace_record=trace_record, step_plan=step_plan)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -6608,14 +6626,6 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record)
             return
         if trace_record.get("target_verify_skipped_for_warmup"):
-            # V4AE.3: must still participate in verify broadcast to avoid
-            # deadlocking the draft rank that always enters Draft.verify().
-            num_to_be_verified_tokens = sum(1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma) for seq in exec_seqs)
-            num_next_round_input = int(self.gamma) * len(exec_seqs)
-            msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
-            dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
-            verify_res = torch.zeros((5, len(exec_seqs)), dtype=torch.int64, device="cuda")
-            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             self._mark_trace_end(trace_record)
             return
         assert not is_prefill, "wrong match. current stage is prefill."
@@ -6647,12 +6657,6 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record)
             return
         if trace_record.get("target_verify_skipped_for_warmup"):
-            num_to_be_verified_tokens = sum(1 if bool(getattr(seq, "pre_verify", False)) else int(self.gamma) for seq in exec_seqs)
-            num_next_round_input = int(self.gamma) * len(exec_seqs)
-            msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
-            dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
-            verify_res = torch.zeros((5, len(exec_seqs)), dtype=torch.int64, device="cuda")
-            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             self._mark_trace_end(trace_record)
             return
         assert not is_prefill, "wrong match. current stage is prefill."
