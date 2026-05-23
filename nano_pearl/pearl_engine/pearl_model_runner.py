@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from nano_pearl.models import model_dict
 from nano_pearl.utils.loader import load_model
 from nano_pearl.pearl_config import TPParams
-from nano_pearl.layers.sampler import Sampler, norm_logits
+from nano_pearl.layers.sampler import Sampler, norm_logits, SamplingParams
 from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
