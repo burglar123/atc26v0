@@ -488,6 +488,12 @@ class ModelRunnerBase:
     def _profile_defaults(self, seqs: list[Sequence], step_plan: StepPlan) -> dict:
         target_home_size = len(step_plan.target_home_set)
         draft_home_size = len(step_plan.draft_home_set)
+        active_seq_count = int(step_plan.active_seq_count) if step_plan.active_seq_count else len(seqs)
+        active_batch_count = int(step_plan.active_batch_count) if step_plan.active_batch_count else (1 if seqs else 0)
+        target_fraction_of_active = target_home_size / max(1, active_seq_count)
+        draft_fraction_of_active = draft_home_size / max(1, active_seq_count)
+        split_imbalance = abs(target_home_size - draft_home_size) / max(1, target_home_size + draft_home_size)
+        target_to_draft_size_ratio = target_home_size / max(1, draft_home_size)
         return {
             "step_start_ts": None,
             "step_end_ts": None,
@@ -511,6 +517,12 @@ class ModelRunnerBase:
             "running_queue_size": len(self.scheduler.running),
             "target_batch_size": target_home_size,
             "draft_batch_size": draft_home_size,
+            "active_seq_count": active_seq_count,
+            "active_batch_count": active_batch_count,
+            "target_fraction_of_active": target_fraction_of_active,
+            "draft_fraction_of_active": draft_fraction_of_active,
+            "split_imbalance": split_imbalance,
+            "target_to_draft_size_ratio": target_to_draft_size_ratio,
         }
 
     def _finalize_record_profile(self, record: dict):
@@ -624,6 +636,22 @@ class ModelRunnerBase:
         plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
         plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
         plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
+        if plan.plan_phase == "fallback":
+            plan.fallback_buffer_hit_count = plan.proposal_buffer_hit_count
+            plan.fallback_buffer_miss_count = plan.proposal_buffer_miss_count
+            if plan.proposal_buffer_miss_count and plan.fallback_reason == "single_active_batch_with_buffered_proposals":
+                plan.fallback_reason = "missing_target_proposals"
+            if plan.fallback_reason is None:
+                if not plan.target_home_set and plan.draft_home_set:
+                    plan.fallback_reason = "empty_target_batch"
+                elif plan.target_home_set and not plan.draft_home_set:
+                    plan.fallback_reason = "empty_draft_batch"
+                elif not plan.target_home_set and not plan.draft_home_set:
+                    plan.fallback_reason = "no_active_batch"
+                else:
+                    plan.fallback_reason = "unknown_fallback_condition"
+            if plan.dual_batch_state is not None:
+                plan.dual_batch_state.fallback_reason = plan.fallback_reason
         return plan
 
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:

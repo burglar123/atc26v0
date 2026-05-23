@@ -45,6 +45,23 @@ class StepPlan:
     steady_step: bool = False
     priming_step: bool = False
 
+    fallback_has_target_batch: bool = False
+    fallback_has_draft_batch: bool = False
+    fallback_active_batch_count: int = 0
+    fallback_active_seq_count: int = 0
+    fallback_pending_proposal_count: int = 0
+    fallback_target_seq_count: int = 0
+    fallback_draft_seq_count: int = 0
+    fallback_buffer_hit_count: int = 0
+    fallback_buffer_miss_count: int = 0
+
+    active_seq_count: int = 0
+    active_batch_count: int = 0
+    target_fraction_of_active: float = 0.0
+    draft_fraction_of_active: float = 0.0
+    split_imbalance: float = 0.0
+    target_to_draft_size_ratio: float = 0.0
+
     proposal_buffer_size_before: Optional[int] = None
     proposal_buffer_size_after: Optional[int] = None
     proposal_buffer_requested_seq_ids: List[int] = field(default_factory=list)
@@ -142,6 +159,21 @@ class StepPlan:
             "fallback_reason": self.fallback_reason,
             "steady_step": bool(self.steady_step),
             "priming_step": bool(self.priming_step),
+            "fallback_has_target_batch": bool(self.fallback_has_target_batch),
+            "fallback_has_draft_batch": bool(self.fallback_has_draft_batch),
+            "fallback_active_batch_count": int(self.fallback_active_batch_count),
+            "fallback_active_seq_count": int(self.fallback_active_seq_count),
+            "fallback_pending_proposal_count": int(self.fallback_pending_proposal_count),
+            "fallback_target_seq_count": int(self.fallback_target_seq_count),
+            "fallback_draft_seq_count": int(self.fallback_draft_seq_count),
+            "fallback_buffer_hit_count": int(self.fallback_buffer_hit_count),
+            "fallback_buffer_miss_count": int(self.fallback_buffer_miss_count),
+            "active_seq_count": int(self.active_seq_count),
+            "active_batch_count": int(self.active_batch_count),
+            "target_fraction_of_active": float(self.target_fraction_of_active),
+            "draft_fraction_of_active": float(self.draft_fraction_of_active),
+            "split_imbalance": float(self.split_imbalance),
+            "target_to_draft_size_ratio": float(self.target_to_draft_size_ratio),
             "proposal_buffer_size_before": self.proposal_buffer_size_before,
             "proposal_buffer_size_after": self.proposal_buffer_size_after,
             "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],

@@ -186,6 +186,8 @@ class DualBatchManager:
         draft_batch_id: Optional[int] = None
         phase = "fallback"
         fallback_reason: Optional[str] = None
+        active_batch_count = len(active)
+        active_seq_count = sum(len(self.batches[batch_id].seq_ids) for batch_id in active)
 
         if len(active) == 2:
             active_pending = [batch_id for batch_id in pending_batch_ids if batch_id in active]
@@ -207,6 +209,12 @@ class DualBatchManager:
                 draft_batch_id = only_batch_id
                 fallback_reason = "single_active_batch_without_buffered_proposals"
             phase = "fallback"
+        elif len(active) == 0:
+            phase = "fallback"
+            fallback_reason = "no_active_batch"
+        else:
+            phase = "fallback"
+            fallback_reason = "unknown_fallback_condition"
 
         target_home_set = self.batch_seq_ids(target_batch_id)
         draft_home_set = self.batch_seq_ids(draft_batch_id)
@@ -215,6 +223,22 @@ class DualBatchManager:
             seq_id: RequestBudget(normal_gamma=self.gamma, eager_gamma=0)
             for seq_id in involved_seq_ids
         }
+        target_home_size = len(target_home_set)
+        draft_home_size = len(draft_home_set)
+        active_denominator = max(1, active_seq_count)
+        split_denominator = max(1, target_home_size + draft_home_size)
+        target_fraction_of_active = target_home_size / active_denominator
+        draft_fraction_of_active = draft_home_size / active_denominator
+        split_imbalance = abs(target_home_size - draft_home_size) / split_denominator
+        target_to_draft_size_ratio = target_home_size / max(1, draft_home_size)
+
+        if phase == "fallback" and fallback_reason is None:
+            if target_batch_id is None and draft_batch_id is not None:
+                fallback_reason = "empty_target_batch"
+            elif draft_batch_id is None and target_batch_id is not None:
+                fallback_reason = "empty_draft_batch"
+            else:
+                fallback_reason = "unknown_fallback_condition"
 
         plan = StepPlan(
             plan_id=plan_id,
@@ -240,6 +264,19 @@ class DualBatchManager:
             fallback_reason=fallback_reason,
             steady_step=phase == "steady",
             priming_step=phase == "priming",
+            fallback_has_target_batch=phase == "fallback" and target_batch_id is not None,
+            fallback_has_draft_batch=phase == "fallback" and draft_batch_id is not None,
+            fallback_active_batch_count=active_batch_count if phase == "fallback" else 0,
+            fallback_active_seq_count=active_seq_count if phase == "fallback" else 0,
+            fallback_pending_proposal_count=len(pending_proposal_seq_ids) if phase == "fallback" else 0,
+            fallback_target_seq_count=target_home_size if phase == "fallback" else 0,
+            fallback_draft_seq_count=draft_home_size if phase == "fallback" else 0,
+            active_seq_count=active_seq_count,
+            active_batch_count=active_batch_count,
+            target_fraction_of_active=target_fraction_of_active,
+            draft_fraction_of_active=draft_fraction_of_active,
+            split_imbalance=split_imbalance,
+            target_to_draft_size_ratio=target_to_draft_size_ratio,
         )
         plan_state = DualBatchPlanState(
             target_batch_id=target_batch_id,
