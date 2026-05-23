@@ -20,6 +20,7 @@ from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -111,6 +112,7 @@ class ModelRunnerBase:
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
+        self._trace_plan_id = 0
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         self.cached_kv_store = {}
@@ -447,10 +449,31 @@ class ModelRunnerBase:
             )
         self.active_execution_mode = execution_mode
 
+    def _build_trace_step_plan(self, seq_ids: list[int], iteration_id: int, batch_id: str, runner_role: str, is_prefill: bool) -> StepPlan:
+        self._trace_plan_id += 1
+        budgets = {seq_id: RequestBudget(normal_gamma=self.gamma, eager_gamma=0) for seq_id in seq_ids}
+        is_draft_role = "draft" in runner_role
+        return StepPlan(
+            plan_id=self._trace_plan_id,
+            iteration_id=iteration_id,
+            execution_mode=self.active_execution_mode,
+            target_home_set=[] if is_draft_role else list(seq_ids),
+            target_eager_set=[],
+            draft_home_set=list(seq_ids) if is_draft_role else [],
+            draft_eager_set=[],
+            budgets=budgets,
+            target_batch_id=None if is_draft_role else batch_id,
+            draft_batch_id=batch_id if is_draft_role else None,
+            decode_ready_mode=self.active_decode_ready_mode,
+            is_prefill=is_prefill,
+        )
+
     def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
+        seq_ids = [seq.seq_id for seq in seqs]
+        step_plan = self._build_trace_step_plan(seq_ids, iteration_id, batch_id, runner_role, is_prefill)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
         record = {
             "execution_mode": self.active_execution_mode,
@@ -458,7 +481,7 @@ class ModelRunnerBase:
             "iteration_id": iteration_id,
             "batch_id": batch_id,
             "runner_role": runner_role,
-            "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "scheduled_seq_ids": seq_ids,
             "request_ids": [seq.request_id for seq in seqs],
             "num_seqs_in_batch": len(seqs),
             "is_prefill": is_prefill,
@@ -476,6 +499,7 @@ class ModelRunnerBase:
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
         }
+        record.update(step_plan.to_trace_dict())
         self.trace_records.append(record)
         return record
 
