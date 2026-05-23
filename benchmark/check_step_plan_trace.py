@@ -36,6 +36,9 @@ def main():
     with_plan_id = sum(1 for r in records if "plan_id" in r)
     with_draft_home = sum(1 for r in records if "draft_home_set" in r)
     with_target_home = sum(1 for r in records if "target_home_set" in r)
+    with_resolved_seq_ids = sum(1 for r in records if "resolved_seq_ids" in r)
+    resolved_matches = sum(1 for r in records if r.get("resolved_seq_ids") == r.get("scheduled_seq_ids"))
+    eager_empty = sum(1 for r in records if not r.get("draft_eager_set") and not r.get("target_eager_set"))
 
     print(f"trace_records={len(records)}")
     print(f"execution_modes={execution_modes}")
@@ -43,6 +46,9 @@ def main():
     print(f"records_with_plan_id={with_plan_id}")
     print(f"records_with_draft_home_set={with_draft_home}")
     print(f"records_with_target_home_set={with_target_home}")
+    print(f"records_with_resolved_seq_ids={with_resolved_seq_ids}")
+    print(f"records_with_resolved_eq_scheduled={resolved_matches}")
+    print(f"records_with_empty_eager_sets={eager_empty}")
 
     errors = []
     for idx, r in enumerate(records):
@@ -57,6 +63,11 @@ def main():
             errors.append(f"record[{idx}] has non-empty draft_eager_set in Phase 1A")
         if r.get("target_eager_set"):
             errors.append(f"record[{idx}] has non-empty target_eager_set in Phase 1A")
+        budgets = r.get("budgets", {})
+        if isinstance(budgets, dict):
+            for seq_id, budget in budgets.items():
+                if int(budget.get("eager_gamma", 0)) != 0:
+                    errors.append(f"record[{idx}] budget[{seq_id}] eager_gamma must be 0 in Phase 1B")
 
         if "draft" in role:
             if r.get("target_home_set"):
@@ -73,6 +84,7 @@ def main():
             "plan_id": r.get("plan_id"),
             "batch_id": r.get("batch_id"),
             "scheduled_seq_ids": r.get("scheduled_seq_ids"),
+            "resolved_seq_ids": r.get("resolved_seq_ids"),
             "draft_home_set": r.get("draft_home_set"),
             "target_home_set": r.get("target_home_set"),
             "draft_eager_set": r.get("draft_eager_set"),

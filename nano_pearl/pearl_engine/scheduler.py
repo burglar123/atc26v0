@@ -77,6 +77,15 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+
+    def find_by_seq_ids(self, seq_ids: list[int]) -> list[Sequence]:
+        seq_id_to_seq = {}
+        for seq in list(self.running) + list(self.waiting) + list(self.pending_cached) + list(self.finished):
+            seq_id_to_seq[seq.seq_id] = seq
+        missing = [seq_id for seq_id in seq_ids if seq_id not in seq_id_to_seq]
+        assert not missing, f"Scheduler.find_by_seq_ids missing seq_ids={missing}"
+        return [seq_id_to_seq[seq_id] for seq_id in seq_ids]
+
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)

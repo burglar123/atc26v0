@@ -33,6 +33,27 @@ class StepPlan:
     decode_ready_mode: bool = False
     is_prefill: bool = False
 
+    def all_seq_ids(self) -> List[int]:
+        return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
+
+    def role_seq_ids(self, runner_role: str) -> List[int]:
+        if "draft" in runner_role:
+            return list(self.draft_home_set) + list(self.draft_eager_set)
+        return list(self.target_home_set) + list(self.target_eager_set)
+
+    def is_eager_empty(self) -> bool:
+        return not self.target_eager_set and not self.draft_eager_set
+
+    def validate_phase1b(self, gamma: int, runner_role: str):
+        assert self.is_eager_empty(), f"Phase 1B requires empty eager sets, got target_eager_set={self.target_eager_set}, draft_eager_set={self.draft_eager_set}"
+        if "draft" in runner_role:
+            assert not self.target_home_set, f"Draft role cannot own target_home_set: {self.target_home_set}"
+        else:
+            assert not self.draft_home_set, f"Verify/target role cannot own draft_home_set: {self.draft_home_set}"
+        for seq_id, budget in self.budgets.items():
+            assert int(budget.eager_gamma) == 0, f"Phase 1B eager_gamma must be 0 for seq_id={seq_id}, got {budget.eager_gamma}"
+            assert int(budget.normal_gamma) == int(gamma), f"Phase 1B normal_gamma mismatch for seq_id={seq_id}: expected {gamma}, got {budget.normal_gamma}"
+
     def to_trace_dict(self) -> dict:
         return {
             "plan_id": int(self.plan_id),
