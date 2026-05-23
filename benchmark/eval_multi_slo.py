@@ -1369,6 +1369,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cached-admission",
+        action="store_true",
+        help=(
+            "Reserved for in-memory cached-admission decode-ready evaluation. "
+            "Current implementation still uses existing decode-ready flow."
+        ),
+    )
+    parser.add_argument("--cache-build-batch-size", type=int, default=None)
+    parser.add_argument("--max-active-cached-seqs", type=int, default=None)
+    parser.add_argument(
         "--eval-batch-size",
         type=int,
         default=None,

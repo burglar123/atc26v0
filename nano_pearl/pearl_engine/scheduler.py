@@ -37,6 +37,7 @@ class Scheduler:
         self.waiting.append(seq)
 
     def add_cached(self, seq: Sequence):
+        seq.status = SequenceStatus.PENDING_CACHED
         self.pending_cached.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:

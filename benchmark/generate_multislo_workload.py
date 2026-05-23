@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Synthetic deterministic workload generator used by unit tests.
+
+NOTE:
+- This file is intentionally lightweight and synthetic.
+- Do NOT use it to replace benchmark/gen_multi_slo_workload.py in real
+  experiments; the production benchmark pipeline should continue to use
+  benchmark/gen_multi_slo_workload.py and existing workload JSONL inputs.
+"""
 from __future__ import annotations
 import argparse, json, random, math
 from typing import List
