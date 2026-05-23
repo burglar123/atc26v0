@@ -1347,6 +1347,7 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "arrival_ts": row.get("arrival_ts"),
         "admit_ts": row.get("admit_ts"),
         "decode_ready_ts": row.get("decode_ready_ts"),
+        "num_decode_ready_prefill_tokens": row.get("num_decode_ready_prefill_tokens"),
         "first_token_ts": row.get("first_token_ts"),
         "num_output_tokens": row.get("num_output_tokens"),
         "num_decode_output_tokens": row.get("num_decode_output_tokens"),
