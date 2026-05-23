@@ -8,9 +8,19 @@ def load_trace(path: Path):
     data = json.loads(path.read_text())
     if isinstance(data, list):
         return data
-    if isinstance(data, dict) and isinstance(data.get("trace_records"), list):
-        return data["trace_records"]
-    raise ValueError("Unsupported engine trace JSON format")
+    if isinstance(data, dict):
+        for key in ("traces", "records", "trace_records"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        if "requests" in data:
+            raise ValueError(
+                "No trace records found in engine trace JSON: found 'requests' but none of "
+                "'traces', 'records', or 'trace_records'."
+            )
+    raise ValueError(
+        "Unsupported engine trace JSON format. Expected one of: raw list, or dict with "
+        "'traces', 'records', or 'trace_records'."
+    )
 
 
 def main():
