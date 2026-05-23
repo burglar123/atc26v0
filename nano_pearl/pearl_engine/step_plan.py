@@ -109,6 +109,16 @@ class StepPlan:
     expected_normal_receive_seq_ids: List[int] = field(default_factory=list)
     received_normal_seq_ids: List[int] = field(default_factory=list)
     received_eager_seq_ids: List[int] = field(default_factory=list)
+    send_expected_normal_seq_ids: List[int] = field(default_factory=list)
+    send_actual_normal_seq_ids: List[int] = field(default_factory=list)
+    send_expected_eager_seq_ids: List[int] = field(default_factory=list)
+    send_actual_eager_seq_ids: List[int] = field(default_factory=list)
+    send_combined_payload_kind: Optional[str] = None
+    send_combined_payload_plan_id: Optional[int] = None
+    send_combined_payload_step_id: Optional[int] = None
+    eager_draft_skipped_reason: Optional[str] = None
+    eager_draft_failed_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_empty_reason: Optional[str] = None
     proposal_message_kind: Optional[str] = None
     proposal_message_plan_id: Optional[int] = None
     proposal_message_step_id: Optional[int] = None
@@ -373,6 +383,26 @@ class StepPlan:
             "received_eager_seq_ids": [
                 int(seq_id) for seq_id in self.received_eager_seq_ids
             ],
+            "send_expected_normal_seq_ids": [
+                int(seq_id) for seq_id in self.send_expected_normal_seq_ids
+            ],
+            "send_actual_normal_seq_ids": [
+                int(seq_id) for seq_id in self.send_actual_normal_seq_ids
+            ],
+            "send_expected_eager_seq_ids": [
+                int(seq_id) for seq_id in self.send_expected_eager_seq_ids
+            ],
+            "send_actual_eager_seq_ids": [
+                int(seq_id) for seq_id in self.send_actual_eager_seq_ids
+            ],
+            "send_combined_payload_kind": self.send_combined_payload_kind,
+            "send_combined_payload_plan_id": self.send_combined_payload_plan_id,
+            "send_combined_payload_step_id": self.send_combined_payload_step_id,
+            "eager_draft_skipped_reason": self.eager_draft_skipped_reason,
+            "eager_draft_failed_seq_ids": [
+                int(seq_id) for seq_id in self.eager_draft_failed_seq_ids
+            ],
+            "eager_draft_empty_reason": self.eager_draft_empty_reason,
             "proposal_message_kind": self.proposal_message_kind,
             "proposal_message_plan_id": self.proposal_message_plan_id,
             "proposal_message_step_id": self.proposal_message_step_id,

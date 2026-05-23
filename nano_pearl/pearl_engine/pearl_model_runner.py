@@ -125,7 +125,6 @@ class ModelRunnerBase:
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
-        self._normal_refresh_needed_seq_ids: set[int] = set()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -633,7 +632,6 @@ class ModelRunnerBase:
         )
         plan.target_eager_set = list(target_eager_set)
         plan.draft_home_set = [seq_id for seq_id in plan.draft_home_set if seq_id not in set(target_eager_set)]
-        self._normal_refresh_needed_seq_ids.update(int(seq_id) for seq_id in target_eager_set)
         target_home_size = len(plan.target_home_set)
         draft_home_size = len(plan.draft_home_set)
         plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
@@ -655,8 +653,7 @@ class ModelRunnerBase:
             return
 
         inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
-        refresh_due = sorted(set(plan.target_home_set) & self._normal_refresh_needed_seq_ids)
-        missing = sorted(set(inspect["miss_seq_ids"]) | set(inspect["invalid_seq_ids"]) | set(refresh_due))
+        missing = sorted(set(inspect["miss_seq_ids"]) | set(inspect["invalid_seq_ids"]))
         plan.missing_normal_proposal_seq_ids = list(missing)
         if not missing:
             plan.proposal_buffer_requested_seq_ids = inspect["requested_seq_ids"]
@@ -686,7 +683,6 @@ class ModelRunnerBase:
         dropped_refresh = self.dual_proposal_buffer.discard(missing)
         plan.proposal_buffer_dropped_seq_ids = sorted(set(plan.proposal_buffer_dropped_seq_ids) | set(dropped_refresh))
         plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
-        self._normal_refresh_needed_seq_ids.difference_update(missing)
         plan.fallback_has_target_batch = False
         plan.fallback_has_draft_batch = bool(missing)
         plan.fallback_active_batch_count = int(plan.active_batch_count)
@@ -1188,7 +1184,35 @@ class ModelRunnerBase:
         normal_proposals: list[BufferedProposal],
         eager_proposals: list[EagerBufferedProposal],
         plan: StepPlan,
+        expected_normal_seq_ids: list[int],
+        expected_eager_seq_ids: list[int],
     ) -> None:
+        actual_normal_seq_ids = [int(proposal.seq_id) for proposal in normal_proposals]
+        actual_eager_seq_ids = [int(proposal.seq_id) for proposal in eager_proposals]
+        plan.send_expected_normal_seq_ids = list(expected_normal_seq_ids)
+        plan.send_actual_normal_seq_ids = list(actual_normal_seq_ids)
+        plan.send_expected_eager_seq_ids = list(expected_eager_seq_ids)
+        plan.send_actual_eager_seq_ids = list(actual_eager_seq_ids)
+        plan.send_combined_payload_kind = "combined"
+        plan.send_combined_payload_plan_id = int(plan.plan_id)
+        plan.send_combined_payload_step_id = None if plan.step_id is None else int(plan.step_id)
+        if expected_eager_seq_ids and not actual_eager_seq_ids:
+            plan.eager_draft_empty_reason = "draft_eager_set_nonempty_but_no_eager_proposals"
+        assert actual_normal_seq_ids == list(expected_normal_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"send normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, actual={actual_normal_seq_ids}, "
+            f"actual_eager_seq_ids={actual_eager_seq_ids}",
+        )
+        assert actual_eager_seq_ids == list(expected_eager_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"send eager proposal seq_id mismatch: expected={expected_eager_seq_ids}, actual={actual_eager_seq_ids}, "
+            f"actual_normal_seq_ids={actual_normal_seq_ids}",
+        )
+        if expected_eager_seq_ids and not actual_eager_seq_ids:
+            assert False, self._proposal_assertion_message(
+                plan,
+                f"eager draft produced no proposals for expected_eager_seq_ids={expected_eager_seq_ids}",
+            )
         if self.tp_params.local_rank != 0:
             return
         normal_payload = self._combined_normal_payload(normal_proposals)
@@ -1367,6 +1391,18 @@ class ModelRunnerBase:
         trace_record["proposal_message_step_id"] = plan.proposal_message_step_id
         trace_record["normal_proposal_buffer_keys_after_receive"] = self.dual_proposal_buffer.pending_seq_ids()
         trace_record["eager_buffer_keys_after_receive"] = self.eager_proposal_buffer.keys()
+
+    def _apply_combined_send_trace_fields(self, trace_record: dict, plan: StepPlan) -> None:
+        trace_record["send_expected_normal_seq_ids"] = list(plan.send_expected_normal_seq_ids)
+        trace_record["send_actual_normal_seq_ids"] = list(plan.send_actual_normal_seq_ids)
+        trace_record["send_expected_eager_seq_ids"] = list(plan.send_expected_eager_seq_ids)
+        trace_record["send_actual_eager_seq_ids"] = list(plan.send_actual_eager_seq_ids)
+        trace_record["send_combined_payload_kind"] = plan.send_combined_payload_kind
+        trace_record["send_combined_payload_plan_id"] = plan.send_combined_payload_plan_id
+        trace_record["send_combined_payload_step_id"] = plan.send_combined_payload_step_id
+        trace_record["eager_draft_skipped_reason"] = plan.eager_draft_skipped_reason
+        trace_record["eager_draft_failed_seq_ids"] = list(plan.eager_draft_failed_seq_ids)
+        trace_record["eager_draft_empty_reason"] = plan.eager_draft_empty_reason
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
@@ -1745,7 +1781,6 @@ class ModelRunnerBase:
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
         self.eager_proposal_buffer.clear()
-        self._normal_refresh_needed_seq_ids.clear()
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -2303,17 +2338,31 @@ class DraftModelRunner(ModelRunnerBase):
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
         draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
 
-        proposals = []
+        expected_normal_seq_ids = list(plan.normal_proposal_refresh_seq_ids or plan.draft_home_set)
+        expected_eager_seq_ids = list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
+        normal_seq_ids = [int(seq.seq_id) for seq in draft_seqs]
+        eager_seq_ids = [int(seq.seq_id) for seq in draft_eager_seqs]
+        assert normal_seq_ids == expected_normal_seq_ids, self._proposal_assertion_message(
+            plan,
+            f"draft normal seq_id mismatch before send packaging: expected={expected_normal_seq_ids}, actual={normal_seq_ids}",
+        )
+        assert eager_seq_ids == expected_eager_seq_ids, self._proposal_assertion_message(
+            plan,
+            f"draft eager seq_id mismatch before send packaging: expected={expected_eager_seq_ids}, actual={eager_seq_ids}",
+        )
+
+        normal_proposals = []
         draft_records = []
         if draft_seqs:
-            proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
+            normal_proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             if plan.plan_phase in {"priming", "steady"}:
-                self.dual_proposal_buffer.store(proposals)
+                self.dual_proposal_buffer.store(normal_proposals)
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
 
         eager_proposals = []
+        eager_trace_record = None
         if draft_eager_seqs and self.global_config.enable_eager_execution:
             eager_proposals, eager_trace_record = self._draft_eager_proposals(draft_eager_seqs, plan)
             self.eager_proposal_buffer.store(eager_proposals)
@@ -2321,9 +2370,22 @@ class DraftModelRunner(ModelRunnerBase):
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
                 eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
                 self._finalize_record_profile(eager_trace_record)
+        elif plan.draft_eager_set and not self.global_config.enable_eager_execution:
+            plan.eager_draft_skipped_reason = "eager_execution_disabled"
+            plan.eager_draft_failed_seq_ids = list(plan.draft_eager_set)
 
-        if draft_seqs or draft_eager_seqs:
-            self._send_combined_dual_proposals(proposals, eager_proposals, plan)
+        if draft_seqs or expected_eager_seq_ids:
+            self._send_combined_dual_proposals(
+                normal_proposals,
+                eager_proposals,
+                plan,
+                expected_normal_seq_ids,
+                expected_eager_seq_ids,
+            )
+            for trace_record in draft_records:
+                self._apply_combined_send_trace_fields(trace_record, plan)
+            if eager_trace_record is not None:
+                self._apply_combined_send_trace_fields(eager_trace_record, plan)
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
