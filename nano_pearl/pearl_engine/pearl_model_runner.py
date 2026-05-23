@@ -114,6 +114,8 @@ class ModelRunnerBase:
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         self.cached_kv_store = {}
+        self.cached_admission_log_interval = 32
+        self.last_result_used_file_fallback = False
         if not self.global_config.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_dtype(self.default_dtype)
@@ -519,6 +521,7 @@ class ModelRunnerBase:
         n = len(data)
         shm_capacity = self.shm.size
         total_output_tokens = sum(len(tokens) for _, tokens, _ in output) if output else 0
+        self.last_result_used_file_fallback = False
         if self.tp_params.local_rank == 0:
             logger.info(
                 f"[Rank {self.rank}: {self.group_name}] result payload bytes={n}, shm bytes={shm_capacity}, "
@@ -543,6 +546,7 @@ class ModelRunnerBase:
             logger.warning(
                 f"[Rank {self.rank}: {self.group_name}] payload exceeds shm; using file fallback: {path}",
             )
+        self.last_result_used_file_fallback = True
         self.shm.buf[0:4] = ctrl_n.to_bytes(4, "little")
         self.shm.buf[4:ctrl_n+4] = ctrl
 
@@ -719,10 +723,15 @@ class ModelRunnerBase:
         base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
         serving_start_ts = start_time
         materialized_count = 0
+        min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
+        last_logged_materialized_bucket = -1
+        last_logged_pending_bucket = -1
+        last_logged_running = -1
         while pending or self.scheduler.running:
             now = time.time()
             free_blocks_before = len(self.scheduler.block_manager.free_block_ids)
             gpu_free_before, gpu_total = torch.cuda.mem_get_info()
+            guard_triggered = False
             while pending and (serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)) <= now and len(self.scheduler.running) < max_active_cached_seqs:
                 seq = pending.pop(0)
                 cached = self.cached_kv_store.get(seq.request_id)
@@ -731,6 +740,7 @@ class ModelRunnerBase:
                 need_blocks = int(cached["num_blocks"])
                 if len(self.scheduler.block_manager.free_block_ids) < need_blocks:
                     pending.insert(0, seq)
+                    guard_triggered = True
                     break
                 gpu_free_now, _ = torch.cuda.mem_get_info()
                 if gpu_free_now < 256 * 1024 * 1024:
@@ -739,18 +749,33 @@ class ModelRunnerBase:
                         logger.warning(
                             f"[Rank {self.rank}: {self.group_name}] low GPU free mem={gpu_free_now} bytes; defer admission."
                         )
+                    guard_triggered = True
                     break
                 self.materialize_cached_request(seq.request_id, now)
                 materialized_count += 1
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
-            if self.tp_params.local_rank == 0:
+            min_free_blocks = min(min_free_blocks, free_blocks_after)
+            running_count = len(self.scheduler.running)
+            pending_count = len(pending)
+            mat_bucket = materialized_count // self.cached_admission_log_interval
+            pending_bucket = pending_count // self.cached_admission_log_interval
+            should_log = (
+                guard_triggered
+                or mat_bucket != last_logged_materialized_bucket
+                or pending_bucket != last_logged_pending_bucket
+                or running_count != last_logged_running
+            )
+            if self.tp_params.local_rank == 0 and should_log:
                 logger.info(
                     f"[Rank {self.rank}: {self.group_name}] cached loop: max_active={max_active_cached_seqs}, "
-                    f"running={len(self.scheduler.running)}, materialized={materialized_count}, pending={len(pending)}, "
+                    f"running={running_count}, materialized={materialized_count}, pending={pending_count}, "
                     f"free_blocks_before={free_blocks_before}, free_blocks_after={free_blocks_after}, "
                     f"gpu_free_before={gpu_free_before}, gpu_total={gpu_total}",
                     color="yellow",
                 )
+            last_logged_materialized_bucket = mat_bucket
+            last_logged_pending_bucket = pending_bucket
+            last_logged_running = running_count
             if self.scheduler.running:
                 if self.gamma == -1:
                     self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
@@ -764,7 +789,9 @@ class ModelRunnerBase:
         end_time = time.time()
         if self.tp_params.local_rank == 0:
             logger.info(
-                f"[Rank {self.rank}: {self.group_name}] cached materialized requests={materialized_count}",
+                f"[Rank {self.rank}: {self.group_name}] cached final summary: "
+                f"materialized={materialized_count}, finished={len(seqs)}, elapsed_s={end_time - start_time:.4f}, "
+                f"min_free_blocks={min_free_blocks}, file_fallback_used={self.last_result_used_file_fallback}",
                 color="green",
             )
         seqs = self.scheduler.finished
