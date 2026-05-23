@@ -20,6 +20,7 @@ from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -111,6 +112,7 @@ class ModelRunnerBase:
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
+        self._trace_plan_id = 0
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         self.cached_kv_store = {}
@@ -447,10 +449,44 @@ class ModelRunnerBase:
             )
         self.active_execution_mode = execution_mode
 
+    def _build_step_plan_from_scheduled_batch(self, seqs: list[Sequence], is_prefill: bool, runner_role: str, batch_id: str, iteration_id: int) -> StepPlan:
+        seq_ids = [seq.seq_id for seq in seqs]
+        budgets = {seq_id: RequestBudget(normal_gamma=self.gamma, eager_gamma=0) for seq_id in seq_ids}
+        is_draft_role = "draft" in runner_role
+        plan = StepPlan(
+            plan_id=self._trace_plan_id,
+            iteration_id=iteration_id,
+            execution_mode=self.active_execution_mode,
+            target_home_set=[] if is_draft_role else list(seq_ids),
+            target_eager_set=[],
+            draft_home_set=list(seq_ids) if is_draft_role else [],
+            draft_eager_set=[],
+            budgets=budgets,
+            target_batch_id=None if is_draft_role else batch_id,
+            draft_batch_id=batch_id if is_draft_role else None,
+            decode_ready_mode=self.active_decode_ready_mode,
+            is_prefill=is_prefill,
+        )
+        plan.validate_phase1b(self.gamma, runner_role)
+        return plan
+
+    def _resolve_plan_seqs(self, plan: StepPlan, runner_role: str) -> list[Sequence]:
+        plan.validate_phase1b(self.gamma, runner_role)
+        seq_ids = plan.role_seq_ids(runner_role)
+        resolved = self.scheduler.find_by_seq_ids(seq_ids)
+        resolved_ids = [seq.seq_id for seq in resolved]
+        assert resolved_ids == seq_ids, (
+            f"Resolved seq_id mismatch for runner_role={runner_role}: expected={seq_ids}, resolved={resolved_ids}"
+        )
+        return resolved
+
     def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
+        self._trace_plan_id += 1
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
+        seq_ids = [seq.seq_id for seq in seqs]
+        step_plan = self._build_step_plan_from_scheduled_batch(seqs, is_prefill, runner_role, batch_id, iteration_id)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
         record = {
             "execution_mode": self.active_execution_mode,
@@ -458,7 +494,7 @@ class ModelRunnerBase:
             "iteration_id": iteration_id,
             "batch_id": batch_id,
             "runner_role": runner_role,
-            "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "scheduled_seq_ids": seq_ids,
             "request_ids": [seq.request_id for seq in seqs],
             "num_seqs_in_batch": len(seqs),
             "is_prefill": is_prefill,
@@ -476,8 +512,9 @@ class ModelRunnerBase:
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
         }
+        record.update(step_plan.to_trace_dict())
         self.trace_records.append(record)
-        return record
+        return record, step_plan
 
     def _mark_trace_start(self, record: dict):
         if self.tp_params.local_rank != 0:
@@ -562,7 +599,9 @@ class ModelRunnerBase:
 
     def prefill(self):
         seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, f"{self._runner_role()}_prefill")
+        trace_record, step_plan = self._trace_schedule(seqs, is_prefill, f"{self._runner_role()}_prefill")
+        seqs = self._resolve_plan_seqs(step_plan, f"{self._runner_role()}_prefill")
+        trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         assert is_prefill, "wrong match. current stage is decode."
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
@@ -582,7 +621,9 @@ class ModelRunnerBase:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, self._runner_role())
+        trace_record, step_plan = self._trace_schedule(seqs, is_prefill, self._runner_role())
+        seqs = self._resolve_plan_seqs(step_plan, self._runner_role())
+        trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
@@ -1021,7 +1062,9 @@ class DraftModelRunner(ModelRunnerBase):
         trace_record = None
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "draft")
+            trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "draft")
+            seqs = self._resolve_plan_seqs(step_plan, "draft")
+            trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(seqs)
             torch.cuda.synchronize()
@@ -1055,7 +1098,9 @@ class DraftModelRunner(ModelRunnerBase):
         trace_record = None
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
-            trace_record = self._trace_schedule(seqs, is_prefill, "serialized_draft")
+            trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "serialized_draft")
+            seqs = self._resolve_plan_seqs(step_plan, "serialized_draft")
+            trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(seqs)
             torch.cuda.synchronize()
@@ -1172,7 +1217,9 @@ class TargetModelRunner(ModelRunnerBase):
 
     def pearl_step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "verify")
+        trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "verify")
+        seqs = self._resolve_plan_seqs(step_plan, "verify")
+        trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
@@ -1195,7 +1242,9 @@ class TargetModelRunner(ModelRunnerBase):
         # Do not move this below target compute, or draft/verify will overlap.
         dist.barrier()
         seqs, is_prefill = self.scheduler.schedule()
-        trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")
+        trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "serialized_verify")
+        seqs = self._resolve_plan_seqs(step_plan, "serialized_verify")
+        trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
