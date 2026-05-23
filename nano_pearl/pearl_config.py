@@ -85,12 +85,23 @@ class PEARLConfig:
     enforce_eager: bool = False
     gamma: int = -1
     execution_mode: str = "parallel_pearl"
+    enable_eager_trace: bool = False
+    max_eager_requests_per_step: int = 0
+    max_eager_tokens_per_step: int = 0
+    max_eager_tokens_per_request: int = 0
+    eager_policy: str = "none"
+    eager_accept_threshold: float = 0.0
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
             raise ValueError(
                 f"Invalid execution_mode={self.execution_mode!r}. "
                 f"Expected one of {sorted(self.ALLOWED_EXECUTION_MODES)}."
+            )
+        if self.eager_policy not in {"none", "tight_only", "urgency"}:
+            raise ValueError(
+                f"Invalid eager_policy={self.eager_policy!r}. "
+                "Expected one of ['none', 'tight_only', 'urgency']."
             )
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
@@ -109,6 +120,12 @@ class PEARLConfig:
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
+        logger.info(f"Enable_Eager_Trace={self.enable_eager_trace}")
+        logger.info(f"Eager_Policy={self.eager_policy}")
+        logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
+        logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")
+        logger.info(f"Max_Eager_Tokens_Per_Request={self.max_eager_tokens_per_request}")
+        logger.info(f"Eager_Accept_Threshold={self.eager_accept_threshold}")
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len

@@ -567,6 +567,86 @@ class ModelRunnerBase:
     def _proposal_verify_token_count(self, seqs: list[Sequence]) -> int:
         return sum(1 if seq.pre_verify else self.gamma for seq in seqs)
 
+    def _has_pending_eager_state(self, seq: Sequence) -> bool:
+        return bool(
+            getattr(seq, "pending_eager_state", False)
+            or getattr(seq, "pending_eager_proposal", False)
+            or getattr(seq, "eager_pending", False)
+        )
+
+    def _eager_candidate_score(self, seq: Sequence, now: float) -> tuple[float, str]:
+        policy = self.global_config.eager_policy
+        if policy == "tight_only":
+            if getattr(seq, "slo_class", None) == "tight":
+                return 1.0, "tight_only:slo_class=tight"
+            return 0.0, "tight_only:not_tight"
+        if policy == "urgency":
+            slo_tpot_ms = getattr(seq, "slo_tpot_ms", None)
+            decode_start_ts = getattr(seq, "decode_start_ts", None)
+            if slo_tpot_ms is None or float(slo_tpot_ms) <= 0.0 or decode_start_ts is None:
+                return 0.0, "urgency:missing_metadata"
+            expected_elapsed_ms = seq.num_completion_tokens * float(slo_tpot_ms)
+            actual_elapsed_ms = max(0.0, (now - float(decode_start_ts)) * 1000)
+            debt_ms = actual_elapsed_ms - expected_elapsed_ms
+            return max(0.0, debt_ms), f"urgency:debt_ms={max(0.0, debt_ms):.3f}"
+        return 0.0, "policy_none"
+
+    def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
+        plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace)
+        plan.eager_policy = self.global_config.eager_policy
+        plan.max_eager_requests_per_step = max(0, int(self.global_config.max_eager_requests_per_step))
+        plan.max_eager_tokens_per_step = max(0, int(self.global_config.max_eager_tokens_per_step))
+        plan.max_eager_tokens_per_request = max(0, int(self.global_config.max_eager_tokens_per_request))
+
+        if (
+            not plan.eager_trace_enabled
+            or plan.eager_policy == "none"
+            or plan.plan_phase != "steady"
+        ):
+            return
+
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        now = time.time()
+        scored = []
+        threshold = float(self.global_config.eager_accept_threshold)
+        for seq in self.scheduler.find_by_seq_ids(plan.target_home_set):
+            if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
+                continue
+            score, reason = self._eager_candidate_score(seq, now)
+            if score <= 0.0 or score <= threshold:
+                continue
+            seq_id = int(seq.seq_id)
+            plan.eager_candidate_seq_ids.append(seq_id)
+            plan.eager_score_by_seq_id[seq_id] = float(score)
+            plan.eager_selection_reason_by_seq_id[seq_id] = reason
+            plan.eager_slo_class_by_seq_id[seq_id] = str(getattr(seq, "slo_class", None))
+            scored.append((float(score), seq_id))
+
+        if (
+            plan.max_eager_requests_per_step <= 0
+            or plan.max_eager_tokens_per_step <= 0
+            or plan.max_eager_tokens_per_request <= 0
+        ):
+            return
+
+        remaining_tokens = plan.max_eager_tokens_per_step
+        for _, seq_id in sorted(scored, key=lambda item: (-item[0], item[1])):
+            if len(plan.eager_selected_seq_ids) >= plan.max_eager_requests_per_step:
+                break
+            if remaining_tokens <= 0:
+                break
+            budget = min(plan.max_eager_tokens_per_request, remaining_tokens)
+            if budget <= 0:
+                break
+            plan.eager_selected_seq_ids.append(seq_id)
+            plan.eager_budget_by_seq_id[seq_id] = int(budget)
+            plan.eager_total_budget += int(budget)
+            plan.budgets.setdefault(seq_id, RequestBudget(normal_gamma=self.gamma, eager_gamma=0))
+            plan.budgets[seq_id].eager_gamma = int(budget)
+            remaining_tokens -= int(budget)
+
+        plan.draft_eager_set = list(plan.eager_selected_seq_ids)
+
     def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
         self._trace_plan_id += 1
@@ -652,6 +732,8 @@ class ModelRunnerBase:
                     plan.fallback_reason = "unknown_fallback_condition"
             if plan.dual_batch_state is not None:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
+        self._annotate_eager_trace_plan(plan)
+        plan.validate_phase1c()
         return plan
 
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:

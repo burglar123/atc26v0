@@ -39,12 +39,14 @@ def check_budget_gamma(record: dict[str, Any]) -> list[str]:
     if not isinstance(budgets, dict):
         return errors
     normal_gamma = record.get("normal_gamma")
+    selected = {int(seq_id) for seq_id in record.get("eager_selected_seq_ids") or []}
+    eager_trace_enabled = bool(record.get("eager_trace_enabled"))
     seen_normal = set()
     for seq_id, budget in budgets.items():
         if not isinstance(budget, dict):
             continue
         eager_gamma = int(budget.get("eager_gamma", 0) or 0)
-        if eager_gamma != 0:
+        if eager_gamma != 0 and (not eager_trace_enabled or int(seq_id) not in selected):
             errors.append(f"budget[{seq_id}] eager_gamma must be 0, got {eager_gamma}")
         if budget.get("normal_gamma") is not None:
             budget_gamma = int(budget.get("normal_gamma"))

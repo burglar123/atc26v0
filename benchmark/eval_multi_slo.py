@@ -132,6 +132,12 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "target_tensor_parallel_size": args.target_tp,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "execution_mode": args.execution_mode,
+        "enable_eager_trace": bool(args.enable_eager_trace),
+        "max_eager_requests_per_step": int(args.max_eager_requests_per_step),
+        "max_eager_tokens_per_step": int(args.max_eager_tokens_per_step),
+        "max_eager_tokens_per_request": int(args.max_eager_tokens_per_request),
+        "eager_policy": args.eager_policy,
+        "eager_accept_threshold": float(args.eager_accept_threshold),
     }
 
     # Try new named-path style with gamma.
@@ -147,6 +153,12 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
 
     # Older PEARLConfig variants may not expose execution_mode yet.
     common_kwargs.pop("execution_mode", None)
+    common_kwargs.pop("enable_eager_trace", None)
+    common_kwargs.pop("max_eager_requests_per_step", None)
+    common_kwargs.pop("max_eager_tokens_per_step", None)
+    common_kwargs.pop("max_eager_tokens_per_request", None)
+    common_kwargs.pop("eager_policy", None)
+    common_kwargs.pop("eager_accept_threshold", None)
 
     try:
         return PEARLConfig(
@@ -1410,6 +1422,23 @@ def main() -> None:
             "decode_ready_generate(...). Reported TPOT is decode-stage TPOT."
         ),
     )
+    parser.add_argument(
+        "--enable-eager-trace",
+        action="store_true",
+        help=(
+            "Enable Phase 1G-lite trace-only eager candidate selection for "
+            "dual_batch_pearl. This does not execute eager drafting or verification."
+        ),
+    )
+    parser.add_argument("--max-eager-requests-per-step", type=int, default=0)
+    parser.add_argument("--max-eager-tokens-per-step", type=int, default=0)
+    parser.add_argument("--max-eager-tokens-per-request", type=int, default=0)
+    parser.add_argument(
+        "--eager-policy",
+        choices=["none", "tight_only", "urgency"],
+        default="none",
+    )
+    parser.add_argument("--eager-accept-threshold", type=float, default=0.0)
     parser.add_argument(
         "--cached-admission",
         action="store_true",

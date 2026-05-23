@@ -157,6 +157,17 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
     invalidated_predraft_tokens = isum([r.get("invalidated_predraft_tokens") for r in verify_token_records if is_verify_stage(r)])
     dropped_tokens = len(dropped_seq_ids) * int(first_present(records, "normal_gamma", 0) or 0)
     wasted_draft_tokens = invalidated_predraft_tokens + dropped_tokens
+    eager_candidate_seq_ids = set()
+    eager_selected_seq_ids = set()
+    eager_slo_class_by_seq_id = {}
+    for record in records:
+        eager_candidate_seq_ids.update(int(x) for x in record.get("eager_candidate_seq_ids") or [])
+        eager_selected_seq_ids.update(int(x) for x in record.get("eager_selected_seq_ids") or [])
+        eager_slo_class_by_seq_id.update(record.get("eager_slo_class_by_seq_id") or {})
+    eager_selected_slo_classes = [
+        str(eager_slo_class_by_seq_id.get(str(seq_id), eager_slo_class_by_seq_id.get(seq_id, "unknown")))
+        for seq_id in sorted(eager_selected_seq_ids)
+    ]
 
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
@@ -188,6 +199,11 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "draft_fraction_of_active": draft_fraction_of_active,
         "split_imbalance": split_imbalance,
         "target_to_draft_size_ratio": target_to_draft_size_ratio,
+        "eager_trace_enabled": any(bool(r.get("eager_trace_enabled")) for r in records),
+        "eager_candidate_count": len(eager_candidate_seq_ids),
+        "eager_selected_count": len(eager_selected_seq_ids),
+        "eager_total_budget": max([int(r.get("eager_total_budget") or 0) for r in records], default=0),
+        "eager_selected_slo_classes": eager_selected_slo_classes,
     }
 
 
@@ -227,6 +243,12 @@ def summarize(path: Path) -> dict[str, Any]:
     draft_fractions = [p["draft_fraction_of_active"] for p in step_profiles if p["active_seq_count"]]
     split_imbalances = [p["split_imbalance"] for p in step_profiles]
     target_to_draft_ratios = [p["target_to_draft_size_ratio"] for p in step_profiles]
+    eager_selected_by_slo_class = Counter()
+    eager_selected_by_plan_phase = Counter()
+    for profile in step_profiles:
+        eager_selected_by_slo_class.update(profile["eager_selected_slo_classes"])
+        if profile["eager_selected_count"]:
+            eager_selected_by_plan_phase[profile["phase"]] += profile["eager_selected_count"]
 
     return {
         "path": str(path),
@@ -258,6 +280,11 @@ def summarize(path: Path) -> dict[str, Any]:
         "mean_draft_fraction_of_active": mean_or_zero(draft_fractions),
         "mean_split_imbalance": mean_or_zero(split_imbalances),
         "mean_target_to_draft_size_ratio": mean_or_zero(target_to_draft_ratios),
+        "avg_eager_candidates_per_step": mean_or_zero([p["eager_candidate_count"] for p in step_profiles]),
+        "avg_eager_selected_per_step": mean_or_zero([p["eager_selected_count"] for p in step_profiles]),
+        "total_eager_budget": sum(p["eager_total_budget"] for p in step_profiles),
+        "eager_selected_by_slo_class": dict(eager_selected_by_slo_class),
+        "eager_selected_by_plan_phase": dict(eager_selected_by_plan_phase),
         "steps": step_profiles,
     }
 
@@ -417,6 +444,11 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
         print(f"  fallback_reason_time_pct={fallback_reasons['time_pct']}")
         print(f"  fallback_reason_mean_target_size={fallback_reasons['mean_target_size']}")
         print(f"  fallback_reason_mean_draft_size={fallback_reasons['mean_draft_size']}")
+        print(f"  avg_eager_candidates_per_step={row['avg_eager_candidates_per_step']:.3f}")
+        print(f"  avg_eager_selected_per_step={row['avg_eager_selected_per_step']:.3f}")
+        print(f"  total_eager_budget={row['total_eager_budget']}")
+        print(f"  eager_selected_by_slo_class={row['eager_selected_by_slo_class']}")
+        print(f"  eager_selected_by_plan_phase={row['eager_selected_by_plan_phase']}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

@@ -59,6 +59,10 @@ def main():
         1 for r in dual_records
         if r.get("target_eager_set") or r.get("draft_eager_set")
     )
+    unexpected_non_empty_eager = sum(
+        1 for r in dual_records
+        if r.get("target_eager_set") or (r.get("draft_eager_set") and not r.get("eager_trace_enabled"))
+    )
     missing_plan_id = sum(1 for r in dual_records if "plan_id" not in r)
     resolved_mismatch = sum(
         1 for r in dual_records
@@ -73,6 +77,7 @@ def main():
     print(f"steady_records_with_same_batch_id={steady_same_batch}")
     print(f"steady_records_with_intersecting_home_sets={steady_intersections}")
     print(f"records_with_non_empty_eager_sets={non_empty_eager}")
+    print(f"records_with_unexpected_non_empty_eager_sets={unexpected_non_empty_eager}")
     print(f"records_missing_plan_id={missing_plan_id}")
     print(f"records_with_resolved_seq_ids_mismatch={resolved_mismatch}")
 
@@ -107,7 +112,7 @@ def main():
             errors.append(f"dual_record[{idx}] invalid plan_phase={phase!r}")
         if record.get("target_eager_set"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
-        if record.get("draft_eager_set"):
+        if record.get("draft_eager_set") and not record.get("eager_trace_enabled"):
             errors.append(f"dual_record[{idx}] has non-empty draft_eager_set")
         if record.get("eager_gamma", 0) != 0:
             errors.append(f"dual_record[{idx}] eager_gamma must be 0")

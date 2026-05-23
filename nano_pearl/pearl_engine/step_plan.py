@@ -62,6 +62,23 @@ class StepPlan:
     split_imbalance: float = 0.0
     target_to_draft_size_ratio: float = 0.0
 
+    eager_trace_enabled: bool = False
+    eager_policy: str = "none"
+    eager_candidate_seq_ids: List[int] = field(default_factory=list)
+    eager_selected_seq_ids: List[int] = field(default_factory=list)
+    eager_score_by_seq_id: Dict[int, float] = field(default_factory=dict)
+    eager_budget_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_total_budget: int = 0
+    eager_selection_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    eager_slo_class_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    max_eager_requests_per_step: int = 0
+    max_eager_tokens_per_step: int = 0
+    max_eager_tokens_per_request: int = 0
+    eager_tokens_generated: int = 0
+    eager_tokens_verified: int = 0
+    eager_tokens_promoted: int = 0
+    eager_tokens_discarded: int = 0
+
     proposal_buffer_size_before: Optional[int] = None
     proposal_buffer_size_after: Optional[int] = None
     proposal_buffer_requested_seq_ids: List[int] = field(default_factory=list)
@@ -105,10 +122,13 @@ class StepPlan:
         assert self.plan_phase in {"priming", "steady", "fallback"}, (
             f"Invalid Phase 1C plan_phase={self.plan_phase!r}"
         )
-        assert self.is_eager_empty(), (
-            f"Phase 1C keeps eager sets empty, got target_eager_set={self.target_eager_set}, "
-            f"draft_eager_set={self.draft_eager_set}"
+        assert not self.target_eager_set, (
+            f"Phase 1C/1G-lite keeps target_eager_set empty, got target_eager_set={self.target_eager_set}"
         )
+        if self.draft_eager_set:
+            assert self.eager_trace_enabled, (
+                f"draft_eager_set may be non-empty only in trace-only eager mode, got {self.draft_eager_set}"
+            )
         if self.plan_phase == "steady":
             assert self.target_batch_id != self.draft_batch_id, (
                 f"Steady dual-batch plan must use different batches, got target_batch_id={self.target_batch_id}, "
@@ -119,9 +139,11 @@ class StepPlan:
                 f"draft_home_set={self.draft_home_set}"
             )
         for seq_id, budget in self.budgets.items():
-            assert int(budget.eager_gamma) == 0, (
-                f"Phase 1C eager_gamma must be 0 for seq_id={seq_id}, got {budget.eager_gamma}"
-            )
+            if int(budget.eager_gamma) != 0:
+                assert self.eager_trace_enabled and int(seq_id) in set(self.eager_selected_seq_ids), (
+                    f"Non-zero eager_gamma is trace-only and must belong to selected eager seqs, "
+                    f"seq_id={seq_id}, eager_gamma={budget.eager_gamma}"
+                )
             if self.normal_gamma is not None:
                 assert int(budget.normal_gamma) == int(self.normal_gamma), (
                     f"Phase 1C normal_gamma mismatch for seq_id={seq_id}: "
@@ -174,6 +196,34 @@ class StepPlan:
             "draft_fraction_of_active": float(self.draft_fraction_of_active),
             "split_imbalance": float(self.split_imbalance),
             "target_to_draft_size_ratio": float(self.target_to_draft_size_ratio),
+            "eager_trace_enabled": bool(self.eager_trace_enabled),
+            "eager_policy": self.eager_policy,
+            "eager_candidate_seq_ids": [int(seq_id) for seq_id in self.eager_candidate_seq_ids],
+            "eager_selected_seq_ids": [int(seq_id) for seq_id in self.eager_selected_seq_ids],
+            "eager_score_by_seq_id": {
+                str(seq_id): float(score)
+                for seq_id, score in self.eager_score_by_seq_id.items()
+            },
+            "eager_budget_by_seq_id": {
+                str(seq_id): int(budget)
+                for seq_id, budget in self.eager_budget_by_seq_id.items()
+            },
+            "eager_total_budget": int(self.eager_total_budget),
+            "eager_selection_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.eager_selection_reason_by_seq_id.items()
+            },
+            "eager_slo_class_by_seq_id": {
+                str(seq_id): str(slo_class)
+                for seq_id, slo_class in self.eager_slo_class_by_seq_id.items()
+            },
+            "max_eager_requests_per_step": int(self.max_eager_requests_per_step),
+            "max_eager_tokens_per_step": int(self.max_eager_tokens_per_step),
+            "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
+            "eager_tokens_generated": int(self.eager_tokens_generated),
+            "eager_tokens_verified": int(self.eager_tokens_verified),
+            "eager_tokens_promoted": int(self.eager_tokens_promoted),
+            "eager_tokens_discarded": int(self.eager_tokens_discarded),
             "proposal_buffer_size_before": self.proposal_buffer_size_before,
             "proposal_buffer_size_after": self.proposal_buffer_size_after,
             "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],
