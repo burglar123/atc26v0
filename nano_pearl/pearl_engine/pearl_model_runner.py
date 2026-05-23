@@ -648,6 +648,67 @@ class ModelRunnerBase:
             plan.budgets[seq_id].eager_gamma = int(proposal.eager_len)
         plan.eager_ready_seq_ids = self.eager_proposal_buffer.ready_seq_ids()
 
+    def _handle_missing_normal_proposals_after_eager(self, plan: StepPlan) -> None:
+        if not self.global_config.enable_eager_execution or plan.plan_phase != "steady":
+            return
+
+        inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        missing = sorted(set(inspect["miss_seq_ids"]) | set(inspect["invalid_seq_ids"]))
+        plan.missing_normal_proposal_seq_ids = list(missing)
+        if not missing:
+            plan.proposal_buffer_requested_seq_ids = inspect["requested_seq_ids"]
+            plan.proposal_buffer_hit_seq_ids = inspect["hit_seq_ids"]
+            plan.proposal_buffer_miss_seq_ids = inspect["miss_seq_ids"]
+            plan.proposal_buffer_invalid_seq_ids = inspect["invalid_seq_ids"]
+            plan.proposal_buffer_hit_count = len(plan.proposal_buffer_hit_seq_ids)
+            plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
+            plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
+            return
+
+        # Phase 1H-lite keeps normal and eager buffers separate. If a ready
+        # eager sidecar caused a seq to skip normal drafting in the previous
+        # round, refresh its normal proposal explicitly instead of verifying a
+        # partially populated target batch.
+        plan.plan_phase = "fallback"
+        plan.steady_step = False
+        plan.priming_step = False
+        plan.fallback_reason = "missing_normal_proposal_after_eager"
+        plan.target_batch_id = None
+        plan.target_home_set = []
+        plan.target_eager_set = []
+        plan.draft_batch_id = plan.home_batch_ids.get(missing[0]) if missing else None
+        plan.draft_home_set = list(missing)
+        plan.draft_eager_set = []
+        plan.normal_proposal_refresh_seq_ids = list(missing)
+        plan.fallback_has_target_batch = False
+        plan.fallback_has_draft_batch = bool(missing)
+        plan.fallback_active_batch_count = int(plan.active_batch_count)
+        plan.fallback_active_seq_count = int(plan.active_seq_count)
+        plan.fallback_pending_proposal_count = self.dual_proposal_buffer.size()
+        plan.fallback_target_seq_count = 0
+        plan.fallback_draft_seq_count = len(missing)
+        plan.fallback_buffer_hit_count = len(inspect["hit_seq_ids"])
+        plan.fallback_buffer_miss_count = len(missing)
+        for seq_id in list(plan.budgets):
+            plan.budgets[seq_id].eager_gamma = 0
+        for seq_id in missing:
+            plan.budgets.setdefault(seq_id, RequestBudget(normal_gamma=self.gamma, eager_gamma=0))
+        target_home_size = len(plan.target_home_set)
+        draft_home_size = len(plan.draft_home_set)
+        plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
+        plan.draft_fraction_of_active = draft_home_size / max(1, int(plan.active_seq_count))
+        plan.split_imbalance = abs(target_home_size - draft_home_size) / max(1, target_home_size + draft_home_size)
+        plan.target_to_draft_size_ratio = target_home_size / max(1, draft_home_size)
+
+        refreshed_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        plan.proposal_buffer_requested_seq_ids = refreshed_inspect["requested_seq_ids"]
+        plan.proposal_buffer_hit_seq_ids = refreshed_inspect["hit_seq_ids"]
+        plan.proposal_buffer_miss_seq_ids = refreshed_inspect["miss_seq_ids"]
+        plan.proposal_buffer_invalid_seq_ids = refreshed_inspect["invalid_seq_ids"]
+        plan.proposal_buffer_hit_count = len(plan.proposal_buffer_hit_seq_ids)
+        plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
+        plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
+
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
         plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
         plan.eager_policy = self.global_config.eager_policy
@@ -767,6 +828,7 @@ class ModelRunnerBase:
         buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
+        plan.proposal_buffer_keys_before_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
         plan.proposal_buffer_requested_seq_ids = buffer_inspect["requested_seq_ids"]
         plan.proposal_buffer_hit_seq_ids = buffer_inspect["hit_seq_ids"]
         plan.proposal_buffer_miss_seq_ids = buffer_inspect["miss_seq_ids"]
@@ -797,6 +859,8 @@ class ModelRunnerBase:
             if plan.dual_batch_state is not None:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
         self._annotate_eager_execution_plan(plan)
+        plan.proposal_buffer_keys_after_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
+        self._handle_missing_normal_proposals_after_eager(plan)
         self._annotate_eager_trace_plan(plan)
         if self.global_config.enable_eager_execution:
             plan.validate_phase1h_eager_execution()
@@ -2028,6 +2092,7 @@ class DraftModelRunner(ModelRunnerBase):
             self.eager_proposal_buffer.store(eager_proposals)
             if eager_trace_record is not None:
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+                eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
                 self._finalize_record_profile(eager_trace_record)
             self._send_eager_proposals(eager_proposals, plan)
 

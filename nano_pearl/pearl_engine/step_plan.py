@@ -101,6 +101,11 @@ class StepPlan:
 
     proposal_buffer_size_before: Optional[int] = None
     proposal_buffer_size_after: Optional[int] = None
+    proposal_buffer_keys_before_eager_selection: List[int] = field(default_factory=list)
+    proposal_buffer_keys_after_eager_selection: List[int] = field(default_factory=list)
+    proposal_buffer_keys_after_eager_draft: List[int] = field(default_factory=list)
+    missing_normal_proposal_seq_ids: List[int] = field(default_factory=list)
+    normal_proposal_refresh_seq_ids: List[int] = field(default_factory=list)
     proposal_buffer_requested_seq_ids: List[int] = field(default_factory=list)
     proposal_buffer_hit_seq_ids: List[int] = field(default_factory=list)
     proposal_buffer_miss_seq_ids: List[int] = field(default_factory=list)
@@ -336,6 +341,21 @@ class StepPlan:
             "eager_verify_time_ms": float(self.eager_verify_time_ms),
             "proposal_buffer_size_before": self.proposal_buffer_size_before,
             "proposal_buffer_size_after": self.proposal_buffer_size_after,
+            "proposal_buffer_keys_before_eager_selection": [
+                int(seq_id) for seq_id in self.proposal_buffer_keys_before_eager_selection
+            ],
+            "proposal_buffer_keys_after_eager_selection": [
+                int(seq_id) for seq_id in self.proposal_buffer_keys_after_eager_selection
+            ],
+            "proposal_buffer_keys_after_eager_draft": [
+                int(seq_id) for seq_id in self.proposal_buffer_keys_after_eager_draft
+            ],
+            "missing_normal_proposal_seq_ids": [
+                int(seq_id) for seq_id in self.missing_normal_proposal_seq_ids
+            ],
+            "normal_proposal_refresh_seq_ids": [
+                int(seq_id) for seq_id in self.normal_proposal_refresh_seq_ids
+            ],
             "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],
             "proposal_buffer_hit_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_hit_seq_ids],
             "proposal_buffer_miss_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_miss_seq_ids],
