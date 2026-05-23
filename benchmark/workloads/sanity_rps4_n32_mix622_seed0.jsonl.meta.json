@@ -1,0 +1,31 @@
+{
+  "rps": 4.0,
+  "duration_sec": 120.0,
+  "num_requests": 32,
+  "mix": {
+    "coding": 0.6,
+    "chat": 0.2,
+    "summarization": 0.2
+  },
+  "seed": 0,
+  "baseline_tpot_ms": 26.3,
+  "slo_scale": 1.2,
+  "tight_slo_tpot_ms": 31.56,
+  "normal_slo_tpot_ms": 50.0,
+  "loose_slo_tpot_ms": 150.0,
+  "max_tokens": 64,
+  "tight_gamma": 4,
+  "normal_gamma": 4,
+  "loose_gamma": 4,
+  "category_counts": {
+    "coding": 16,
+    "chat": 8,
+    "summarization": 8
+  },
+  "slo_class_counts": {
+    "tight": 16,
+    "normal": 8,
+    "loose": 8
+  },
+  "workload_path": "benchmark/workloads/sanity_rps4_n32_mix622_seed0.jsonl"
+}
