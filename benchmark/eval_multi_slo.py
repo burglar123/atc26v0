@@ -1284,6 +1284,7 @@ def run_eval_chunk(
                     per_request_gamma=int(req.get("per_request_gamma", 0)),
                 )
             )
+            setattr(seqs[-1], "arrival_offset_sec", float(req.get("arrival_offset_sec", 0.0) or 0.0))
         engine.cached_build_from_sequences(seqs, args.cache_build_batch_size)
         for seq in sorted(seqs, key=lambda s: s.arrival_ts):
             engine.add_cached_sequence(seq)
@@ -1409,8 +1410,8 @@ def main() -> None:
         "--cached-admission",
         action="store_true",
         help=(
-            "Reserved for in-memory cached-admission decode-ready evaluation. "
-            "Current implementation still uses existing decode-ready flow."
+            "Enable in-memory cached-admission decode-ready evaluation: "
+            "offline cache-build + online-style decode-only admission loop."
         ),
     )
     parser.add_argument("--cache-build-batch-size", type=int, default=None)
