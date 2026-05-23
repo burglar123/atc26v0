@@ -787,6 +787,7 @@ class ModelRunnerBase:
                 time.sleep(min(max(next_arrival - now, 0.0), 0.01))
         torch.cuda.synchronize()
         end_time = time.time()
+        seqs = self.scheduler.finished
         if self.tp_params.local_rank == 0:
             logger.info(
                 f"[Rank {self.rank}: {self.group_name}] cached final summary: "
@@ -794,7 +795,6 @@ class ModelRunnerBase:
                 f"min_free_blocks={min_free_blocks}, file_fallback_used={self.last_result_used_file_fallback}",
                 color="green",
             )
-        seqs = self.scheduler.finished
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)
 
