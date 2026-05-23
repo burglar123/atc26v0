@@ -1,0 +1,31 @@
+{
+  "rps": 12.0,
+  "duration_sec": 120.0,
+  "num_requests": 1418,
+  "mix": {
+    "coding": 0.6,
+    "chat": 0.2,
+    "summarization": 0.2
+  },
+  "seed": 2,
+  "baseline_tpot_ms": 26.3,
+  "slo_scale": 1.2,
+  "tight_slo_tpot_ms": 31.56,
+  "normal_slo_tpot_ms": 50.0,
+  "loose_slo_tpot_ms": 150.0,
+  "max_tokens": 256,
+  "tight_gamma": 4,
+  "normal_gamma": 4,
+  "loose_gamma": 4,
+  "category_counts": {
+    "coding": 876,
+    "summarization": 271,
+    "chat": 271
+  },
+  "slo_class_counts": {
+    "tight": 876,
+    "loose": 271,
+    "normal": 271
+  },
+  "workload_path": "benchmark/workloads/load_rps12_dur120_mix622_seed2.jsonl"
+}
