@@ -2,6 +2,7 @@ import pickle
 import torch
 import time
 import random
+from collections import deque
 from abc import abstractmethod
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -110,6 +111,7 @@ class ModelRunnerBase:
         self.trace_records = []
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
+        self.cached_kv_store = {}
         if not self.global_config.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_dtype(self.default_dtype)
@@ -306,6 +308,47 @@ class ModelRunnerBase:
     def add_request(self, seq: Sequence):
         self.scheduler.add(seq)
         dist.barrier()
+
+    def add_cached_request(self, seq: Sequence):
+        self.scheduler.add_cached(seq)
+        dist.barrier()
+
+    def cache_build_prepare(self, seqs: list[Sequence], cache_build_batch_size: int):
+        self.cached_kv_store = {}
+        for i in range(0, len(seqs), cache_build_batch_size):
+            chunk = seqs[i:i+cache_build_batch_size]
+            for seq in chunk:
+                self.scheduler.add(seq)
+            dist.barrier()
+            self.prepare_decode_ready()
+            if self.tp_params.local_rank == 0:
+                for seq in list(self.scheduler.running):
+                    block_ids = list(seq.block_table)
+                    kv_cpu = self.kv_cache[:, :, block_ids].detach().cpu().clone()
+                    self.cached_kv_store[seq.request_id] = {
+                        "seq": pickle.dumps(seq),
+                        "kv_cpu": kv_cpu,
+                        "num_blocks": len(block_ids),
+                    }
+            dist.barrier()
+            self.clear_requests()
+        dist.barrier()
+
+    def materialize_cached_request(self, request_id: str, admit_ts: float):
+        cached = self.cached_kv_store[request_id]
+        seq: Sequence = pickle.loads(cached["seq"])
+        seq.status = SequenceStatus.RUNNING
+        seq.admit_ts = admit_ts
+        seq.mark_decode_ready(admit_ts)
+        seq.mark_decode_started(admit_ts)
+        seq.block_table = []
+        seq.num_cached_tokens = 0
+        self.scheduler.block_manager.allocate(seq)
+        new_block_ids = list(seq.block_table)
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        kv_cpu = cached["kv_cpu"].to(self.kv_cache.device)
+        self.kv_cache[:, :, new_block_ids] = kv_cpu
+        self.scheduler.running.append(seq)
 
     def _runner_role(self):
         return "draft" if self.is_draft else "verify"
@@ -559,6 +602,33 @@ class ModelRunnerBase:
         torch.cuda.synchronize()
         end_time = time.time()
 
+        seqs = self.scheduler.finished
+        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+        self._finish_decode_ready_generation(output, end_time - start_time)
+
+    def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
+        self._set_execution_mode("parallel_pearl")
+        self.active_decode_ready_mode = True
+        if max_active_cached_seqs <= 0:
+            max_active_cached_seqs = self.scheduler.max_num_seqs
+        pending = sorted(list(self.scheduler.pending_cached), key=lambda s: s.arrival_ts)
+        self.scheduler.pending_cached = deque()
+        dist.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        while pending or self.scheduler.running:
+            now = time.time()
+            while pending and pending[0].arrival_ts <= now and len(self.scheduler.running) < max_active_cached_seqs:
+                seq = pending.pop(0)
+                self.materialize_cached_request(seq.request_id, now)
+            if self.scheduler.running:
+                if self.gamma == -1:
+                    self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+                self.pearl_step()
+            elif pending:
+                time.sleep(min(max(pending[0].arrival_ts - now, 0.0), 0.01))
+        torch.cuda.synchronize()
+        end_time = time.time()
         seqs = self.scheduler.finished
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)

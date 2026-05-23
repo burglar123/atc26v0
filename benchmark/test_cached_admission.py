@@ -26,6 +26,34 @@ def _load_sequence_symbols():
 
 Sequence, SamplingParams = _load_sequence_symbols()
 
+def _load_scheduler_symbols():
+    sch_path = ROOT / "nano_pearl/pearl_engine/scheduler.py"
+    src = sch_path.read_text(encoding="utf-8")
+    src = src.replace("from nano_pearl.pearl_config import PEARLConfig", "")
+    src = src.replace("from nano_pearl.pearl_engine.sequence import Sequence, SequenceStatus", "")
+    src = src.replace("from nano_pearl.pearl_engine.block_manager import BlockManager", "")
+    src = src.replace("from nano_pearl.pearl_engine.pearl_model_runner import logger", "")
+    module = types.ModuleType("sched_test_module")
+    ns = module.__dict__
+    exec(
+        "SequenceStatus = type('SequenceStatus', (), {'WAITING': type('S',(),{'name':'WAITING'})(), 'PENDING_CACHED': type('S',(),{'name':'PENDING_CACHED'})(), 'RUNNING': type('S',(),{'name':'RUNNING'})(), 'FINISHED': type('S',(),{'name':'FINISHED'})()})\n"
+        "class _L:\n  def warning(self,*a,**k):\n   pass\n"
+        "logger=_L()\n"
+        "class BlockManager:\n"
+        "  def __init__(self,*a,**k):\n   self.blocks=[]; self.hash_to_block_id={}\n"
+        "  def can_allocate(self,*a,**k): return True\n"
+        "  def allocate(self,*a,**k): pass\n"
+        "  def can_append(self,*a,**k): return True\n"
+        "  def may_append(self,*a,**k): pass\n"
+        "  def deallocate(self,*a,**k): pass\n"
+        "  def rollback(self,*a,**k): pass\n"
+        + src,
+        ns,
+    )
+    return ns["Scheduler"]
+
+Scheduler = _load_scheduler_symbols()
+
 def test_workload_generator_determinism(tmp_path):
     out1 = tmp_path / 'a.jsonl'
     out2 = tmp_path / 'b.jsonl'
@@ -51,3 +79,22 @@ def test_sequence_admit_ts_pickle_roundtrip():
     seq.admit_ts = 1234.567
     cloned = pickle.loads(pickle.dumps(seq))
     assert cloned.admit_ts == seq.admit_ts
+
+
+def test_add_cached_sets_pending_cached_status():
+    cfg = type("Cfg", (), {"max_num_seqs": 4, "max_num_batched_tokens": 256, "eos": 0, "num_kvcache_blocks": 8, "kvcache_block_size": 256})()
+    scheduler = Scheduler(cfg)
+    seq = Sequence([1, 2], SamplingParams())
+    scheduler.add_cached(seq)
+    assert seq.status.name == "PENDING_CACHED"
+
+
+def test_pending_cached_queue_is_distinct_from_waiting():
+    cfg = type("Cfg", (), {"max_num_seqs": 4, "max_num_batched_tokens": 256, "eos": 0, "num_kvcache_blocks": 8, "kvcache_block_size": 256})()
+    scheduler = Scheduler(cfg)
+    a = Sequence([1], SamplingParams())
+    b = Sequence([2], SamplingParams())
+    scheduler.add(a)
+    scheduler.add_cached(b)
+    assert len(scheduler.waiting) == 1
+    assert len(scheduler.pending_cached) == 1
