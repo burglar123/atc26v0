@@ -51,16 +51,19 @@ class Controller:
         n = int.from_bytes(shm.buf[0:4], "little")
         data = shm.buf[4:n+4]
         payload = pickle.loads(data)
-        if len(payload) == 2:
-            output, elapsed_time = payload
-            return output, elapsed_time, [], []
-        output, elapsed_time, traces, service_metadata = payload
-        return output, elapsed_time, traces, service_metadata
-    
-    def read_payload(self, shm: SharedMemory):
-        n = int.from_bytes(shm.buf[0:4], "little")
-        data = shm.buf[4:n+4]
-        payload = pickle.loads(data)
+        if (
+            isinstance(payload, list)
+            and len(payload) == 2
+            and payload[0] == "__PAYLOAD_FILE__"
+            and isinstance(payload[1], str)
+        ):
+            path = payload[1]
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
         if len(payload) == 2:
             output, elapsed_time = payload
             return output, elapsed_time, [], []

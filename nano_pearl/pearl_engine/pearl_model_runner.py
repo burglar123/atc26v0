@@ -2,6 +2,8 @@ import pickle
 import torch
 import time
 import random
+import tempfile
+import os
 from collections import deque
 from abc import abstractmethod
 import torch.distributed as dist
@@ -515,8 +517,34 @@ class ModelRunnerBase:
     def _write_generation_result(self, output, elapsed_time):
         data = pickle.dumps([output, elapsed_time, self.trace_records, self._service_metadata()])
         n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        shm_capacity = self.shm.size
+        total_output_tokens = sum(len(tokens) for _, tokens, _ in output) if output else 0
+        if self.tp_params.local_rank == 0:
+            logger.info(
+                f"[Rank {self.rank}: {self.group_name}] result payload bytes={n}, shm bytes={shm_capacity}, "
+                f"num_output_reqs={len(output)}, total_output_tokens={total_output_tokens}",
+                color="yellow",
+            )
+        if n + 4 <= shm_capacity:
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+            return
+        fd, path = tempfile.mkstemp(prefix=f"pearl_result_{self.group_name}_{self.rank}_", suffix=".pkl")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(data)
+        ctrl = pickle.dumps(["__PAYLOAD_FILE__", path])
+        ctrl_n = len(ctrl)
+        if ctrl_n + 4 > shm_capacity:
+            raise RuntimeError(
+                f"Control payload does not fit shared memory: ctrl={ctrl_n}, shm={shm_capacity}"
+            )
+        if self.tp_params.local_rank == 0:
+            logger.warning(
+                f"[Rank {self.rank}: {self.group_name}] payload exceeds shm; using file fallback: {path}",
+            )
+        self.shm.buf[0:4] = ctrl_n.to_bytes(4, "little")
+        self.shm.buf[4:ctrl_n+4] = ctrl
 
     def prefill(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -693,10 +721,36 @@ class ModelRunnerBase:
         materialized_count = 0
         while pending or self.scheduler.running:
             now = time.time()
+            free_blocks_before = len(self.scheduler.block_manager.free_block_ids)
+            gpu_free_before, gpu_total = torch.cuda.mem_get_info()
             while pending and (serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)) <= now and len(self.scheduler.running) < max_active_cached_seqs:
                 seq = pending.pop(0)
+                cached = self.cached_kv_store.get(seq.request_id)
+                if cached is None:
+                    raise RuntimeError(f"Missing cached entry for request_id={seq.request_id}")
+                need_blocks = int(cached["num_blocks"])
+                if len(self.scheduler.block_manager.free_block_ids) < need_blocks:
+                    pending.insert(0, seq)
+                    break
+                gpu_free_now, _ = torch.cuda.mem_get_info()
+                if gpu_free_now < 256 * 1024 * 1024:
+                    pending.insert(0, seq)
+                    if self.tp_params.local_rank == 0:
+                        logger.warning(
+                            f"[Rank {self.rank}: {self.group_name}] low GPU free mem={gpu_free_now} bytes; defer admission."
+                        )
+                    break
                 self.materialize_cached_request(seq.request_id, now)
                 materialized_count += 1
+            free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
+            if self.tp_params.local_rank == 0:
+                logger.info(
+                    f"[Rank {self.rank}: {self.group_name}] cached loop: max_active={max_active_cached_seqs}, "
+                    f"running={len(self.scheduler.running)}, materialized={materialized_count}, pending={len(pending)}, "
+                    f"free_blocks_before={free_blocks_before}, free_blocks_after={free_blocks_after}, "
+                    f"gpu_free_before={gpu_free_before}, gpu_total={gpu_total}",
+                    color="yellow",
+                )
             if self.scheduler.running:
                 if self.gamma == -1:
                     self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]

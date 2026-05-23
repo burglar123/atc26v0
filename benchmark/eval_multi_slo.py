@@ -1345,6 +1345,7 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "decode_ready_mode": row.get("decode_ready_mode", decode_ready),
         "arrival_offset_sec": row.get("arrival_offset_sec"),
         "arrival_ts": row.get("arrival_ts"),
+        "admit_ts": row.get("admit_ts"),
         "decode_ready_ts": row.get("decode_ready_ts"),
         "first_token_ts": row.get("first_token_ts"),
         "num_output_tokens": row.get("num_output_tokens"),
