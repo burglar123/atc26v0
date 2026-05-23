@@ -344,6 +344,35 @@ class PEARLEngine:
 
         return output_text, num_tokens, num_acc_tokens, time
 
+    def cached_build_from_sequences(self, seqs: list[Sequence], cache_build_batch_size: int):
+        self.controller.write_draft_shm("cache_build_prepare", seqs, cache_build_batch_size)
+        self.controller.write_target_shm("cache_build_prepare", seqs, cache_build_batch_size)
+        self.control_event.wait()
+        self.control_event.clear()
+
+    def add_cached_sequence(self, seq: Sequence):
+        self.controller.write_draft_shm("add_cached_request", seq)
+        self.controller.write_target_shm("add_cached_request", seq)
+        self.control_event.wait()
+        self.control_event.clear()
+
+    def cached_decode_ready_generate(self, max_active_cached_seqs: int):
+        self.controller.write_draft_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
+        self.controller.write_target_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
+        self.control_event.wait()
+        self.control_event.clear()
+        output, time, target_traces, target_request_metadata = self.controller.read_output()
+        try:
+            self.last_traces, self.last_request_metadata = self.controller.read_all_traces()
+        except Exception:
+            self.last_traces = target_traces
+            self.last_request_metadata = target_request_metadata
+        output = sorted(output, key=lambda x: x[0])
+        seq_id, token_ids, num_acc_tokens = zip(*output)
+        output_text = [self.tokenizer.decode(token_ids, skip_special_tokens=False) for token_ids in token_ids]
+        num_tokens = [len(t) for t in token_ids]
+        return output_text, num_tokens, num_acc_tokens, time
+
     def get_traces(self):
         return {
             "traces": self.last_traces,

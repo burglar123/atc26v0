@@ -47,6 +47,7 @@ try:
     from nano_pearl import SamplingParams  # type: ignore  # noqa: E402
 except Exception:
     from nano_pearl.layers.sampler import SamplingParams  # type: ignore  # noqa: E402
+from nano_pearl.pearl_engine.sequence import Sequence  # noqa: E402
 
 
 def load_workload(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1256,14 +1257,51 @@ def run_eval_chunk(
     args: argparse.Namespace,
 ) -> Tuple[List[str], List[int], Any, float, List[Dict[str, Any]]]:
     print(f"[INFO] Adding {len(chunk)} request(s) to engine...")
-    add_workload_chunk(engine, chunk, args)
+    if args.cached_admission:
+        if not args.decode_ready:
+            raise ValueError("--cached-admission requires --decode-ready")
+        if args.cache_build_batch_size is None or args.cache_build_batch_size <= 0:
+            raise ValueError("--cache-build-batch-size must be positive with --cached-admission")
+        seqs = []
+        for req in chunk:
+            sp = make_sampling_params(req, args)
+            prompt = get_request_prompt(req)
+            if isinstance(prompt, str):
+                prompt = engine.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompt = engine.tokenizer.encode(prompt)
+            seqs.append(
+                Sequence(
+                    prompt,
+                    sp,
+                    request_id=req["request_id"],
+                    arrival_ts=float(req["arrival_ts"]),
+                    slo_tpot_ms=float(req["slo_tpot_ms"]),
+                    slo_class=req["slo_class"],
+                    per_request_gamma=int(req.get("per_request_gamma", 0)),
+                )
+            )
+            setattr(seqs[-1], "arrival_offset_sec", float(req.get("arrival_offset_sec", 0.0) or 0.0))
+        engine.cached_build_from_sequences(seqs, args.cache_build_batch_size)
+        for seq in sorted(seqs, key=lambda s: s.arrival_ts):
+            engine.add_cached_sequence(seq)
+    else:
+        add_workload_chunk(engine, chunk, args)
 
     run_start_ts = time.time()
-    output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
-        engine=engine,
-        execution_mode=args.execution_mode,
-        decode_ready=args.decode_ready,
-    )
+    if args.cached_admission:
+        output_text, num_tokens, num_acc_tokens, elapsed_time = engine.cached_decode_ready_generate(
+            args.max_active_cached_seqs or 0
+        )
+    else:
+        output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
+            engine=engine,
+            execution_mode=args.execution_mode,
+            decode_ready=args.decode_ready,
+        )
     run_end_ts = time.time()
     print(f"[OK] Chunk generation finished. engine_elapsed_s={elapsed_time:.6f}")
 
@@ -1368,6 +1406,16 @@ def main() -> None:
             "decode_ready_generate(...). Reported TPOT is decode-stage TPOT."
         ),
     )
+    parser.add_argument(
+        "--cached-admission",
+        action="store_true",
+        help=(
+            "Enable in-memory cached-admission decode-ready evaluation: "
+            "offline cache-build + online-style decode-only admission loop."
+        ),
+    )
+    parser.add_argument("--cache-build-batch-size", type=int, default=None)
+    parser.add_argument("--max-active-cached-seqs", type=int, default=None)
     parser.add_argument(
         "--eval-batch-size",
         type=int,
