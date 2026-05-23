@@ -20,6 +20,7 @@ class Scheduler:
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
+        self.pending_cached: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.finished: list[Sequence] = []
         self.iteration_id = 0
@@ -30,10 +31,13 @@ class Scheduler:
         return iteration_id, f"{runner_role}-{iteration_id}"
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return not self.waiting and not self.pending_cached and not self.running
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    def add_cached(self, seq: Sequence):
+        self.pending_cached.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill
@@ -92,6 +96,9 @@ class Scheduler:
     def clear(self):
         while self.waiting:
             seq = self.waiting.pop()
+            self.block_manager.deallocate(seq)
+        while self.pending_cached:
+            seq = self.pending_cached.pop()
             self.block_manager.deallocate(seq)
         while self.running:
             seq = self.running.pop()
