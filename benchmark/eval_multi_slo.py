@@ -1497,6 +1497,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.cached_admission and args.execution_mode != "parallel_pearl":
+        raise ValueError(
+            "--cached-admission currently supports only --execution-mode parallel_pearl"
+        )
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)
     workload_meta = load_workload_meta(args.workload_in)

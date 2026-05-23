@@ -30,6 +30,7 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.request_id = self.seq_id if request_id is None else request_id
         self.arrival_ts = time.time() if arrival_ts is None else arrival_ts
+        self.arrival_offset_sec = None
         self.first_token_ts = None
         self.admit_ts = None
         self.finish_ts = None
@@ -164,6 +165,7 @@ class Sequence:
             "seq_id": self.seq_id,
             "request_id": self.request_id,
             "arrival_ts": self.arrival_ts,
+            "arrival_offset_sec": self.arrival_offset_sec,
             "first_token_ts": self.first_token_ts,
             "finish_ts": self.finish_ts,
             "admit_ts": self.admit_ts,
@@ -184,6 +186,7 @@ class Sequence:
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
                 self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+                self.arrival_offset_sec,
                 self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
                 self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
                 self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats,
@@ -193,6 +196,7 @@ class Sequence:
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
          self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
          self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+         self.arrival_offset_sec,
          self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
          self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
          self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = state[:-1]

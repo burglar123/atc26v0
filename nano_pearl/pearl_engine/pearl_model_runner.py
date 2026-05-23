@@ -329,7 +329,7 @@ class ModelRunnerBase:
             "temperature": float(seq.temperature),
             "ignore_eos": bool(seq.ignore_eos),
             "arrival_ts": float(seq.arrival_ts),
-            "arrival_offset_sec": arrival_offset_sec,
+            "arrival_offset_sec": arrival_offset_sec if arrival_offset_sec is not None else getattr(seq, "arrival_offset_sec", None),
             "slo_tpot_ms": seq.slo_tpot_ms,
             "slo_class": seq.slo_class,
             "per_request_gamma": seq.per_request_gamma,
@@ -375,19 +375,25 @@ class ModelRunnerBase:
 
     def cache_build_prepare(self, seqs: list[Sequence], cache_build_batch_size: int):
         self.cached_kv_store = {}
+        total_cached_kv_cpu_bytes = 0
+        num_blocks_list = []
         for i in range(0, len(seqs), cache_build_batch_size):
             chunk = seqs[i:i+cache_build_batch_size]
             for seq in chunk:
                 self.scheduler.add(seq)
             dist.barrier()
+            # TODO: refactor to a narrower cache_build_prefill_chunk() helper to
+            # avoid coupling cache build to broader decode-ready helper side effects.
             self.prepare_decode_ready()
             for seq in list(self.scheduler.running):
                 block_ids = list(seq.block_table)
                 kv_cpu = self.kv_cache[:, :, block_ids].detach().cpu().clone()
+                total_cached_kv_cpu_bytes += kv_cpu.element_size() * kv_cpu.nelement()
+                num_blocks_list.append(len(block_ids))
                 self.cached_kv_store[seq.request_id] = {
                     "snapshot": self._build_cached_seq_snapshot(
                         seq,
-                        arrival_offset_sec=max(float(seq.arrival_ts - min(s.arrival_ts for s in seqs)), 0.0),
+                        arrival_offset_sec=getattr(seq, "arrival_offset_sec", None),
                     ),
                     "kv_cpu": kv_cpu,
                     "num_blocks": len(block_ids),
@@ -399,8 +405,11 @@ class ModelRunnerBase:
         dist.all_gather_object(gathered, key_set, group=self.group)
         assert all(g == key_set for g in gathered), "cached_kv_store key-set mismatch across TP ranks"
         if self.tp_params.local_rank == 0:
+            avg_blocks = (sum(num_blocks_list) / len(num_blocks_list)) if num_blocks_list else 0.0
+            max_blocks = max(num_blocks_list) if num_blocks_list else 0
             logger.info(
-                f"[Rank {self.rank}: {self.group_name}] cache_build_prepare stored {len(key_set)} requests",
+                f"[Rank {self.rank}: {self.group_name}] cache_build_prepare stored {len(key_set)} requests, "
+                f"cached_kv_cpu_bytes={total_cached_kv_cpu_bytes}, avg_blocks={avg_blocks:.2f}, max_blocks={max_blocks}",
                 color="green",
             )
         dist.barrier()

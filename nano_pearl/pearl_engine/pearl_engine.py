@@ -373,7 +373,11 @@ class PEARLEngine:
         output = sorted(output, key=lambda x: x[0])
         seq_id, token_ids, num_acc_tokens = zip(*output)
         output_text = [self.tokenizer.decode(token_ids, skip_special_tokens=False) for token_ids in token_ids]
-        num_tokens = [len(t) for t in token_ids]
+        prefill_tokens = {
+            req["seq_id"]: req.get("num_decode_ready_prefill_tokens", 0)
+            for req in self.last_request_metadata
+        }
+        num_tokens = [max(len(t) - prefill_tokens.get(seq, 0), 0) for seq, t in zip(seq_id, token_ids)]
         return output_text, num_tokens, num_acc_tokens, time
 
     def get_traces(self):
