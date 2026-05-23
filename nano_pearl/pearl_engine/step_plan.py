@@ -106,6 +106,14 @@ class StepPlan:
     proposal_buffer_keys_after_eager_draft: List[int] = field(default_factory=list)
     missing_normal_proposal_seq_ids: List[int] = field(default_factory=list)
     normal_proposal_refresh_seq_ids: List[int] = field(default_factory=list)
+    expected_normal_receive_seq_ids: List[int] = field(default_factory=list)
+    received_normal_seq_ids: List[int] = field(default_factory=list)
+    received_eager_seq_ids: List[int] = field(default_factory=list)
+    proposal_message_kind: Optional[str] = None
+    proposal_message_plan_id: Optional[int] = None
+    proposal_message_step_id: Optional[int] = None
+    normal_proposal_buffer_keys_after_receive: List[int] = field(default_factory=list)
+    eager_buffer_keys_after_receive: List[int] = field(default_factory=list)
     proposal_buffer_requested_seq_ids: List[int] = field(default_factory=list)
     proposal_buffer_hit_seq_ids: List[int] = field(default_factory=list)
     proposal_buffer_miss_seq_ids: List[int] = field(default_factory=list)
@@ -355,6 +363,24 @@ class StepPlan:
             ],
             "normal_proposal_refresh_seq_ids": [
                 int(seq_id) for seq_id in self.normal_proposal_refresh_seq_ids
+            ],
+            "expected_normal_receive_seq_ids": [
+                int(seq_id) for seq_id in self.expected_normal_receive_seq_ids
+            ],
+            "received_normal_seq_ids": [
+                int(seq_id) for seq_id in self.received_normal_seq_ids
+            ],
+            "received_eager_seq_ids": [
+                int(seq_id) for seq_id in self.received_eager_seq_ids
+            ],
+            "proposal_message_kind": self.proposal_message_kind,
+            "proposal_message_plan_id": self.proposal_message_plan_id,
+            "proposal_message_step_id": self.proposal_message_step_id,
+            "normal_proposal_buffer_keys_after_receive": [
+                int(seq_id) for seq_id in self.normal_proposal_buffer_keys_after_receive
+            ],
+            "eager_buffer_keys_after_receive": [
+                int(seq_id) for seq_id in self.eager_buffer_keys_after_receive
             ],
             "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],
             "proposal_buffer_hit_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_hit_seq_ids],

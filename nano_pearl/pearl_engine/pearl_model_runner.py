@@ -125,6 +125,7 @@ class ModelRunnerBase:
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
+        self._normal_refresh_needed_seq_ids: set[int] = set()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -632,6 +633,7 @@ class ModelRunnerBase:
         )
         plan.target_eager_set = list(target_eager_set)
         plan.draft_home_set = [seq_id for seq_id in plan.draft_home_set if seq_id not in set(target_eager_set)]
+        self._normal_refresh_needed_seq_ids.update(int(seq_id) for seq_id in target_eager_set)
         target_home_size = len(plan.target_home_set)
         draft_home_size = len(plan.draft_home_set)
         plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
@@ -653,7 +655,8 @@ class ModelRunnerBase:
             return
 
         inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
-        missing = sorted(set(inspect["miss_seq_ids"]) | set(inspect["invalid_seq_ids"]))
+        refresh_due = sorted(set(plan.target_home_set) & self._normal_refresh_needed_seq_ids)
+        missing = sorted(set(inspect["miss_seq_ids"]) | set(inspect["invalid_seq_ids"]) | set(refresh_due))
         plan.missing_normal_proposal_seq_ids = list(missing)
         if not missing:
             plan.proposal_buffer_requested_seq_ids = inspect["requested_seq_ids"]
@@ -680,6 +683,10 @@ class ModelRunnerBase:
         plan.draft_home_set = list(missing)
         plan.draft_eager_set = []
         plan.normal_proposal_refresh_seq_ids = list(missing)
+        dropped_refresh = self.dual_proposal_buffer.discard(missing)
+        plan.proposal_buffer_dropped_seq_ids = sorted(set(plan.proposal_buffer_dropped_seq_ids) | set(dropped_refresh))
+        plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
+        self._normal_refresh_needed_seq_ids.difference_update(missing)
         plan.fallback_has_target_batch = False
         plan.fallback_has_draft_batch = bool(missing)
         plan.fallback_active_batch_count = int(plan.active_batch_count)
@@ -1141,6 +1148,226 @@ class ModelRunnerBase:
         )
         return proposals
 
+    def _combined_normal_payload(self, proposals: list[BufferedProposal]) -> list[int]:
+        header = []
+        tokens = []
+        for proposal in proposals:
+            header.extend(
+                [
+                    int(proposal.seq_id),
+                    int(proposal.home_batch_id),
+                    int(proposal.pre_verify),
+                    int(len(proposal.to_be_verified_token_ids)),
+                    int(proposal.proposal_len),
+                ]
+            )
+            tokens.extend(int(token) for token in proposal.to_be_verified_token_ids)
+            tokens.extend(int(token) for token in proposal.proposal_token_ids)
+        return header + tokens
+
+    def _combined_eager_payload(self, proposals: list[EagerBufferedProposal]) -> list[int]:
+        header = []
+        tokens = []
+        for proposal in proposals:
+            header.extend(
+                [
+                    int(proposal.seq_id),
+                    int(proposal.home_batch_id),
+                    int(proposal.eager_len),
+                    int(proposal.eager_base_len),
+                    int(proposal.source_plan_id),
+                    int(proposal.source_step_id),
+                    int(proposal.source_home_batch_id),
+                ]
+            )
+            tokens.extend(int(token) for token in proposal.eager_token_ids)
+        return header + tokens
+
+    def _send_combined_dual_proposals(
+        self,
+        normal_proposals: list[BufferedProposal],
+        eager_proposals: list[EagerBufferedProposal],
+        plan: StepPlan,
+    ) -> None:
+        if self.tp_params.local_rank != 0:
+            return
+        normal_payload = self._combined_normal_payload(normal_proposals)
+        eager_payload = self._combined_eager_payload(eager_proposals)
+        payload = normal_payload + eager_payload
+        meta = torch.tensor(
+            [
+                1,  # proposal_message_kind="combined"
+                len(payload),
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                -1 if plan.draft_batch_id is None else int(plan.draft_batch_id),
+                len(normal_proposals),
+                len(normal_payload),
+                len(eager_proposals),
+                len(eager_payload),
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        payload_tensor = torch.tensor(payload, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        if int(meta[1].item()) > 0:
+            dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _parse_combined_normal_payload(
+        self,
+        payload: list[int],
+        n: int,
+        proposal_plan_id: int,
+        expected_seq_ids: list[int],
+    ) -> list[BufferedProposal]:
+        header_len = n * 5
+        headers = payload[:header_len]
+        token_data = payload[header_len:]
+        proposals = []
+        token_offset = 0
+        seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
+        for idx in range(n):
+            base = idx * 5
+            seq_id, home_batch_id, pre_verify, to_verify_len, proposal_len = headers[base:base + 5]
+            to_verify = [int(x) for x in token_data[token_offset:token_offset + to_verify_len]]
+            token_offset += to_verify_len
+            proposal_tokens = [int(x) for x in token_data[token_offset:token_offset + proposal_len]]
+            token_offset += proposal_len
+            seq = seq_lookup.get(seq_id)
+            proposals.append(
+                BufferedProposal(
+                    seq_id=int(seq_id),
+                    request_id=seq.request_id if seq is not None else int(seq_id),
+                    home_batch_id=int(home_batch_id),
+                    proposal_token_ids=proposal_tokens,
+                    to_be_verified_token_ids=to_verify,
+                    proposal_len=int(proposal_len),
+                    pre_verify=bool(pre_verify),
+                    plan_id=int(proposal_plan_id),
+                    valid=True,
+                )
+            )
+        return proposals
+
+    def _parse_combined_eager_payload(
+        self,
+        payload: list[int],
+        n: int,
+        expected_seq_ids: list[int],
+        plan: StepPlan,
+    ) -> list[EagerBufferedProposal]:
+        header_len = n * 7
+        headers = payload[:header_len]
+        token_data = payload[header_len:]
+        proposals = []
+        token_offset = 0
+        seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
+        for idx in range(n):
+            base = idx * 7
+            seq_id, home_batch_id, eager_len, eager_base_len, source_plan_id, source_step_id, source_home_batch_id = headers[base:base + 7]
+            eager_token_ids = [int(x) for x in token_data[token_offset:token_offset + eager_len]]
+            token_offset += eager_len
+            seq = seq_lookup.get(seq_id)
+            proposals.append(
+                EagerBufferedProposal(
+                    seq_id=int(seq_id),
+                    request_id=seq.request_id if seq is not None else int(seq_id),
+                    home_batch_id=int(home_batch_id),
+                    eager_token_ids=eager_token_ids,
+                    eager_len=int(eager_len),
+                    eager_base_len=int(eager_base_len),
+                    source_plan_id=int(source_plan_id),
+                    source_step_id=int(source_step_id),
+                    source_home_batch_id=int(source_home_batch_id),
+                    verify_with_batch_id=None if plan.draft_batch_id is None else int(plan.draft_batch_id),
+                    score=float(plan.eager_score_by_seq_id.get(int(seq_id), 0.0)),
+                    policy=plan.eager_policy,
+                    valid=True,
+                    ready=False,
+                )
+            )
+        return proposals
+
+    def _receive_combined_dual_proposals(
+        self,
+        expected_normal_seq_ids: list[int],
+        expected_eager_seq_ids: list[int],
+        plan: StepPlan,
+    ) -> tuple[list[BufferedProposal], list[EagerBufferedProposal]]:
+        meta = torch.zeros(10, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        (
+            proposal_kind,
+            payload_len,
+            gamma,
+            proposal_plan_id,
+            proposal_step_id,
+            batch_id,
+            normal_n,
+            normal_payload_len,
+            eager_n,
+            eager_payload_len,
+        ) = [int(x) for x in meta.tolist()]
+        assert proposal_kind == 1, self._proposal_assertion_message(
+            plan,
+            f"proposal message kind mismatch: expected combined=1, got {proposal_kind}",
+        )
+        assert gamma == int(self.gamma), self._proposal_assertion_message(
+            plan,
+            f"combined proposal gamma mismatch: expected={self.gamma}, got={gamma}",
+        )
+        payload_tensor = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+        if payload_len > 0:
+            dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        payload = payload_tensor.tolist()
+        normal_payload = payload[:normal_payload_len]
+        eager_payload = payload[normal_payload_len:normal_payload_len + eager_payload_len]
+        normal_proposals = self._parse_combined_normal_payload(
+            normal_payload,
+            normal_n,
+            proposal_plan_id,
+            expected_normal_seq_ids,
+        )
+        eager_proposals = self._parse_combined_eager_payload(
+            eager_payload,
+            eager_n,
+            expected_eager_seq_ids,
+            plan,
+        )
+        received_normal_seq_ids = [proposal.seq_id for proposal in normal_proposals]
+        received_eager_seq_ids = [proposal.seq_id for proposal in eager_proposals]
+        plan.expected_normal_receive_seq_ids = list(expected_normal_seq_ids)
+        plan.received_normal_seq_ids = list(received_normal_seq_ids)
+        plan.received_eager_seq_ids = list(received_eager_seq_ids)
+        plan.proposal_message_kind = "combined"
+        plan.proposal_message_plan_id = int(proposal_plan_id)
+        plan.proposal_message_step_id = int(proposal_step_id)
+        assert received_normal_seq_ids == list(expected_normal_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, received={received_normal_seq_ids}, "
+            f"received_eager_seq_ids={received_eager_seq_ids}, batch_id={batch_id}, "
+            f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
+        )
+        assert received_eager_seq_ids == list(expected_eager_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"eager proposal seq_id mismatch: expected={expected_eager_seq_ids}, received={received_eager_seq_ids}, "
+            f"received_normal_seq_ids={received_normal_seq_ids}, batch_id={batch_id}, "
+            f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
+        )
+        return normal_proposals, eager_proposals
+
+    def _apply_combined_proposal_trace_fields(self, trace_record: dict, plan: StepPlan) -> None:
+        trace_record["expected_normal_receive_seq_ids"] = list(plan.expected_normal_receive_seq_ids)
+        trace_record["received_normal_seq_ids"] = list(plan.received_normal_seq_ids)
+        trace_record["received_eager_seq_ids"] = list(plan.received_eager_seq_ids)
+        trace_record["proposal_message_kind"] = plan.proposal_message_kind
+        trace_record["proposal_message_plan_id"] = plan.proposal_message_plan_id
+        trace_record["proposal_message_step_id"] = plan.proposal_message_step_id
+        trace_record["normal_proposal_buffer_keys_after_receive"] = self.dual_proposal_buffer.pending_seq_ids()
+        trace_record["eager_buffer_keys_after_receive"] = self.eager_proposal_buffer.keys()
+
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
         seq_ids = [seq.seq_id for seq in seqs]
@@ -1518,6 +1745,7 @@ class ModelRunnerBase:
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
         self.eager_proposal_buffer.clear()
+        self._normal_refresh_needed_seq_ids.clear()
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -2084,7 +2312,6 @@ class DraftModelRunner(ModelRunnerBase):
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
-            self._send_dual_proposals(proposals, plan)
 
         eager_proposals = []
         if draft_eager_seqs and self.global_config.enable_eager_execution:
@@ -2094,7 +2321,9 @@ class DraftModelRunner(ModelRunnerBase):
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
                 eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
                 self._finalize_record_profile(eager_trace_record)
-            self._send_eager_proposals(eager_proposals, plan)
+
+        if draft_seqs or draft_eager_seqs:
+            self._send_combined_dual_proposals(proposals, eager_proposals, plan)
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
@@ -2398,20 +2627,28 @@ class TargetModelRunner(ModelRunnerBase):
             logits = self.run_model(input_ids, positions, False)
 
         received_proposals = []
-        if draft_seq_ids:
-            received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
+        received_eager_proposals = []
+        expected_eager_seq_ids = list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
+        if draft_seq_ids or expected_eager_seq_ids:
+            received_proposals, received_eager_proposals = self._receive_combined_dual_proposals(
+                draft_seq_ids,
+                expected_eager_seq_ids,
+                plan,
+            )
             if fallback_same_batch:
                 target_proposals = received_proposals
                 if trace_record is not None:
                     trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
                     trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             else:
-                self.dual_proposal_buffer.store(received_proposals)
-
-        received_eager_proposals = []
-        if plan.draft_eager_set and self.global_config.enable_eager_execution:
-            received_eager_proposals = self._receive_eager_proposals(plan.draft_eager_set, plan)
-            self.eager_proposal_buffer.store(received_eager_proposals)
+                if received_proposals:
+                    self.dual_proposal_buffer.store(received_proposals)
+            if received_eager_proposals:
+                self.eager_proposal_buffer.store(received_eager_proposals)
+            plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
+            plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
+            if trace_record is not None:
+                self._apply_combined_proposal_trace_fields(trace_record, plan)
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
@@ -2437,9 +2674,10 @@ class TargetModelRunner(ModelRunnerBase):
             )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
-        elif received_proposals:
+        elif received_proposals or received_eager_proposals:
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            self._apply_combined_proposal_trace_fields(priming_record, plan)
             self._finalize_record_profile(priming_record)
 
         if target_eager_seqs:
