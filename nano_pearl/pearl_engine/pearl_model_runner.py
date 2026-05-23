@@ -21,6 +21,7 @@ from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
+from nano_pearl.pearl_engine.dual_batch import BufferedProposal, DualBatchManager, ProposalBuffer
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -115,6 +116,8 @@ class ModelRunnerBase:
         self._trace_plan_id = 0
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
+        self.dual_batch_manager = DualBatchManager(self.gamma)
+        self.dual_proposal_buffer = ProposalBuffer()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -335,6 +338,7 @@ class ModelRunnerBase:
             "slo_tpot_ms": seq.slo_tpot_ms,
             "slo_class": seq.slo_class,
             "per_request_gamma": seq.per_request_gamma,
+            "home_batch_id": seq.home_batch_id,
             "num_decode_ready_prefill_tokens": int(seq.num_decode_ready_prefill_tokens),
             "decode_ready_mode": bool(seq.decode_ready_mode),
             "trace_stats": seq.trace_stats,
@@ -361,6 +365,7 @@ class ModelRunnerBase:
         seq.pre_verify = bool(snapshot["pre_verify"])
         seq.decode_ready_mode = bool(snapshot.get("decode_ready_mode", False))
         seq.num_decode_ready_prefill_tokens = int(snapshot.get("num_decode_ready_prefill_tokens", 0))
+        seq.home_batch_id = snapshot.get("home_batch_id")
         seq.trace_stats = snapshot.get("trace_stats", seq.trace_stats)
         seq.arrival_offset_sec = snapshot.get("arrival_offset_sec")
         return seq
@@ -515,6 +520,243 @@ class ModelRunnerBase:
         record.update(step_plan.to_trace_dict())
         self.trace_records.append(record)
         return record, step_plan
+
+    def _prepare_dual_batch_state(self):
+        self.dual_batch_manager.gamma = int(self.gamma)
+        self.dual_batch_manager.update_running(self.scheduler.running)
+        active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
+        self.dual_proposal_buffer.discard_inactive(active_seq_ids)
+
+    def _build_dual_batch_step_plan(self) -> StepPlan:
+        self._prepare_dual_batch_state()
+        iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
+        self._trace_plan_id += 1
+        plan_id = self._trace_plan_id
+        return self.dual_batch_manager.build_step_plan(
+            plan_id=plan_id,
+            iteration_id=iteration_id,
+            execution_mode=self.active_execution_mode,
+            decode_ready_mode=self.active_decode_ready_mode,
+            pending_proposal_seq_ids=self.dual_proposal_buffer.pending_seq_ids(),
+            pending_batch_ids=self.dual_proposal_buffer.pending_batch_ids(),
+        )
+
+    def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:
+        if not seq_ids:
+            return []
+        seqs = self.scheduler.find_by_seq_ids(seq_ids)
+        resolved_ids = [seq.seq_id for seq in seqs]
+        assert resolved_ids == list(seq_ids), (
+            f"Dual-batch resolved seq_id mismatch for {label}: plan_id={plan.plan_id}, "
+            f"target_home_set={plan.target_home_set}, draft_home_set={plan.draft_home_set}, "
+            f"expected={seq_ids}, resolved={resolved_ids}"
+        )
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        for seq in seqs:
+            assert seq.seq_id in running_seq_ids, (
+                f"Dual-batch attempted to schedule inactive seq_id={seq.seq_id}: "
+                f"plan_id={plan.plan_id}, label={label}, status={seq.status}"
+            )
+        return seqs
+
+    def _allocate_decode_slots_for_dual(self, seqs: list[Sequence], plan: StepPlan, label: str):
+        for seq in seqs:
+            if not self.scheduler.block_manager.can_append(seq):
+                raise RuntimeError(
+                    f"Dual-batch cannot append KV slot for seq_id={seq.seq_id}: "
+                    f"plan_id={plan.plan_id}, label={label}, free_blocks="
+                    f"{len(self.scheduler.block_manager.free_block_ids)}"
+                )
+            self.scheduler.block_manager.may_append(seq)
+
+    def _trace_dual_batch_schedule(self, seqs: list[Sequence], plan: StepPlan, runner_role: str):
+        batch_id = f"{runner_role}-{plan.iteration_id}"
+        for seq in seqs:
+            seq.mark_scheduled(plan.iteration_id, batch_id, False, runner_role)
+        seq_ids = [seq.seq_id for seq in seqs]
+        per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
+        record = {
+            "execution_mode": self.active_execution_mode,
+            "decode_ready_mode": self.active_decode_ready_mode,
+            "iteration_id": plan.iteration_id,
+            "batch_id": batch_id,
+            "runner_role": runner_role,
+            "scheduled_seq_ids": seq_ids,
+            "resolved_seq_ids": list(seq_ids),
+            "request_ids": [seq.request_id for seq in seqs],
+            "num_seqs_in_batch": len(seqs),
+            "is_prefill": False,
+            "draft_start_ts": None,
+            "draft_end_ts": None,
+            "verify_start_ts": None,
+            "verify_end_ts": None,
+            "total_iteration_start_ts": None,
+            "total_iteration_end_ts": None,
+            "draft_time_ms": 0.0,
+            "verify_time_ms": 0.0,
+            "total_iteration_time_ms": 0.0,
+            "per_seq_accepted_len": dict(per_seq_zeros),
+            "accepted_tokens_per_seq": dict(per_seq_zeros),
+            "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
+            "total_accepted_tokens": 0,
+        }
+        record.update(plan.to_trace_dict())
+        self.trace_records.append(record)
+        return record
+
+    def _proposal_assertion_message(self, plan: StepPlan, detail: str) -> str:
+        return (
+            f"{detail}: plan_id={plan.plan_id}, target_home_set={plan.target_home_set}, "
+            f"draft_home_set={plan.draft_home_set}, buffered_proposal_seq_ids="
+            f"{self.dual_proposal_buffer.pending_seq_ids()}"
+        )
+
+    def _build_buffered_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
+        proposals = []
+        for seq in seqs:
+            proposal_tokens = list(seq.token_ids[-self.gamma:])
+            if seq.pre_verify:
+                to_be_verified = [int(seq.token_ids[-self.gamma])]
+            else:
+                to_be_verified = [int(x) for x in seq.token_ids[-2 * self.gamma + 1:-self.gamma + 1]]
+            assert len(proposal_tokens) == self.gamma, self._proposal_assertion_message(
+                plan,
+                f"proposal length mismatch for seq_id={seq.seq_id}",
+            )
+            expected_verify_len = 1 if seq.pre_verify else self.gamma
+            assert len(to_be_verified) == expected_verify_len, self._proposal_assertion_message(
+                plan,
+                f"to_be_verified length mismatch for seq_id={seq.seq_id}",
+            )
+            proposals.append(
+                BufferedProposal(
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    home_batch_id=int(seq.home_batch_id),
+                    proposal_token_ids=[int(x) for x in proposal_tokens],
+                    to_be_verified_token_ids=to_be_verified,
+                    proposal_len=int(self.gamma),
+                    pre_verify=bool(seq.pre_verify),
+                    plan_id=int(plan.plan_id),
+                    valid=True,
+                )
+            )
+        return proposals
+
+    def _serialize_proposals(self, proposals: list[BufferedProposal], plan: StepPlan) -> tuple[torch.Tensor, torch.Tensor]:
+        header = []
+        tokens = []
+        for proposal in proposals:
+            header.extend(
+                [
+                    int(proposal.seq_id),
+                    int(proposal.home_batch_id),
+                    int(proposal.pre_verify),
+                    int(len(proposal.to_be_verified_token_ids)),
+                    int(proposal.proposal_len),
+                ]
+            )
+            tokens.extend(int(token) for token in proposal.to_be_verified_token_ids)
+            tokens.extend(int(token) for token in proposal.proposal_token_ids)
+        payload = header + tokens
+        meta = torch.tensor(
+            [
+                len(proposals),
+                len(payload),
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.draft_batch_id is None else int(plan.draft_batch_id),
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        payload_tensor = torch.tensor(payload, dtype=torch.int64, device="cuda")
+        return meta, payload_tensor
+
+    def _send_dual_proposals(self, proposals: list[BufferedProposal], plan: StepPlan):
+        if self.tp_params.local_rank != 0:
+            return
+        meta, payload = self._serialize_proposals(proposals, plan)
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        if int(meta[1].item()) > 0:
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _receive_dual_proposals(self, expected_seq_ids: list[int], plan: StepPlan) -> list[BufferedProposal]:
+        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        n, payload_len, gamma, proposal_plan_id, batch_id = [int(x) for x in meta.tolist()]
+        assert gamma == int(self.gamma), self._proposal_assertion_message(
+            plan,
+            f"proposal gamma mismatch: expected={self.gamma}, got={gamma}",
+        )
+        payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+        if payload_len > 0:
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        data = payload.tolist()
+        header_len = n * 5
+        headers = data[:header_len]
+        token_data = data[header_len:]
+        proposals = []
+        token_offset = 0
+        seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
+        for idx in range(n):
+            base = idx * 5
+            seq_id, home_batch_id, pre_verify, to_verify_len, proposal_len = headers[base:base + 5]
+            to_verify = [int(x) for x in token_data[token_offset:token_offset + to_verify_len]]
+            token_offset += to_verify_len
+            proposal_tokens = [int(x) for x in token_data[token_offset:token_offset + proposal_len]]
+            token_offset += proposal_len
+            seq = seq_lookup.get(seq_id)
+            proposals.append(
+                BufferedProposal(
+                    seq_id=int(seq_id),
+                    request_id=seq.request_id if seq is not None else int(seq_id),
+                    home_batch_id=int(home_batch_id),
+                    proposal_token_ids=proposal_tokens,
+                    to_be_verified_token_ids=to_verify,
+                    proposal_len=int(proposal_len),
+                    pre_verify=bool(pre_verify),
+                    plan_id=int(proposal_plan_id),
+                    valid=True,
+                )
+            )
+        received_seq_ids = [proposal.seq_id for proposal in proposals]
+        assert received_seq_ids == list(expected_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, batch_id={batch_id}",
+        )
+        return proposals
+
+    def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
+        proposal_seq_ids = [proposal.seq_id for proposal in proposals]
+        seq_ids = [seq.seq_id for seq in seqs]
+        assert proposal_seq_ids == seq_ids, self._proposal_assertion_message(
+            plan,
+            f"target proposal seq_id mismatch: expected={seq_ids}, got={proposal_seq_ids}",
+        )
+        for proposal, seq in zip(proposals, seqs):
+            assert proposal.valid, self._proposal_assertion_message(
+                plan,
+                f"target proposal invalid for seq_id={seq.seq_id}",
+            )
+            assert seq.seq_id in {running_seq.seq_id for running_seq in self.scheduler.running}, self._proposal_assertion_message(
+                plan,
+                f"target proposal used for inactive seq_id={seq.seq_id}",
+            )
+            assert bool(proposal.pre_verify) == bool(seq.pre_verify), self._proposal_assertion_message(
+                plan,
+                f"proposal pre_verify mismatch for seq_id={seq.seq_id}: "
+                f"proposal={proposal.pre_verify}, seq={seq.pre_verify}",
+            )
+            assert int(proposal.home_batch_id) == int(seq.home_batch_id), self._proposal_assertion_message(
+                plan,
+                f"proposal home_batch_id mismatch for seq_id={seq.seq_id}: "
+                f"proposal={proposal.home_batch_id}, seq={seq.home_batch_id}",
+            )
+            assert int(proposal.proposal_len) == int(self.gamma), self._proposal_assertion_message(
+                plan,
+                f"proposal_len mismatch for seq_id={seq.seq_id}: proposal={proposal.proposal_len}, gamma={self.gamma}",
+            )
 
     def _mark_trace_start(self, record: dict):
         if self.tp_params.local_rank != 0:
@@ -703,6 +945,8 @@ class ModelRunnerBase:
         self.scheduler.clear()
         self.trace_records.clear()
         self.active_decode_ready_mode = False
+        self.dual_batch_manager.reset()
+        self.dual_proposal_buffer.clear()
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -761,7 +1005,29 @@ class ModelRunnerBase:
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)
 
+    def decode_ready_dual_batch_pearl_generate(self):
+        """Decode-only Phase 1C dual-batch PEARL after prepare_decode_ready()."""
+        self._set_execution_mode("dual_batch_pearl")
+        self.active_decode_ready_mode = True
+        dist.barrier()
+        self._mark_decode_started()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        if self.gamma == -1:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+        self.dual_batch_manager.gamma = int(self.gamma)
+        while not self.scheduler.is_finished():
+            self.dual_batch_pearl_step()
+        torch.cuda.synchronize()
+        end_time = time.time()
+
+        seqs = self.scheduler.finished
+        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+        self._finish_decode_ready_generation(output, end_time - start_time)
+
     def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
+        if self.active_execution_mode == "dual_batch_pearl" or self.global_config.execution_mode == "dual_batch_pearl":
+            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
         self._set_execution_mode("parallel_pearl")
         self.active_decode_ready_mode = True
         if max_active_cached_seqs <= 0:
@@ -935,6 +1201,30 @@ class ModelRunnerBase:
             
         self.clear_requests()
 
+    def dual_batch_pearl_generate(self):
+        self._set_execution_mode("dual_batch_pearl")
+        dist.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        self.prefill()
+
+        if self.gamma == -1:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+        self.dual_batch_manager.gamma = int(self.gamma)
+
+        while not self.scheduler.is_finished():
+            self.dual_batch_pearl_step()
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+        seqs = self.scheduler.finished
+        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+
+        if self.tp_params.local_rank == 0:
+            self._write_generation_result(output, end_time - start_time)
+
+        self.clear_requests()
+
     def pearl_bench_generate(self, num_pearl_steps: int = 100):
         """Benchmark the real-world throughput of the PEARL algorithm.
 
@@ -1050,6 +1340,10 @@ class ModelRunnerBase:
     def serialized_pearl_step(self):
         pass
 
+    @abstractmethod
+    def dual_batch_pearl_step(self):
+        pass
+
 
 class DraftModelRunner(ModelRunnerBase):
     def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
@@ -1057,6 +1351,91 @@ class DraftModelRunner(ModelRunnerBase):
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         return super().prepare_decode(seqs)
+
+    def _draft_dual_batch_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
+        for _ in range(self.gamma):
+            self._allocate_decode_slots_for_dual(seqs, plan, "dual_draft")
+            trace_record = self._trace_dual_batch_schedule(seqs, plan, "dual_draft")
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, False)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            torch.cuda.synchronize()
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+            self._mark_trace_end(trace_record)
+        return self._build_buffered_proposals(seqs, plan)
+
+    def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        return verify_res
+
+    def _apply_verify_result(self, seqs: list[Sequence], verify_res: torch.Tensor):
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        accepted_lens = {}
+        invalidated_lens = {}
+        for idx, seq in enumerate(seqs):
+            was_pre_verify = seq.pre_verify
+            accepted_len = 1 if was_pre_verify and acc[idx] else 0
+            if not was_pre_verify:
+                accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
+            invalidated_len = 0 if acc[idx] else rollout[idx]
+            accepted_lens[seq.seq_id] = accepted_len
+            invalidated_lens[seq.seq_id] = invalidated_len
+            seq.record_accepted(accepted_len)
+            seq.record_invalidated_predraft(invalidated_len)
+
+            if finish[idx]:
+                seq.mark_finished()
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+
+            if seq.pre_verify:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, self.gamma)
+                    seq.append_token(revise_token[idx])
+            else:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, self.gamma)
+                    if rollout[idx] > 1:
+                        self.scheduler.rollback(seq, rollout[idx] - 1)
+                    seq.append_token(revise_token[idx])
+        return accepted_lens, invalidated_lens
+
+    def dual_batch_pearl_step(self):
+        plan = self._build_dual_batch_step_plan()
+        target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
+        draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
+
+        proposals = []
+        if draft_seqs:
+            proposals = self._draft_dual_batch_proposals(draft_seqs, plan)
+            if plan.plan_phase in {"priming", "steady"}:
+                self.dual_proposal_buffer.store(proposals)
+            self._send_dual_proposals(proposals, plan)
+
+        if target_seqs:
+            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            verify_res = self._receive_verify_result(target_seqs)
+            accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+            self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+            torch.cuda.synchronize()
+            self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
     
     def pearl_step(self):
         trace_record = None
@@ -1136,49 +1515,8 @@ class DraftModelRunner(ModelRunnerBase):
                 next_round_input.extend(seq.token_ids[-self.gamma:])
             msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
-        
-        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
-        
-        # post-process the seqs according to the verify_res.
-        acc, rollout, revise_token, finish = verify_res.tolist()
-        accepted_lens = {}
-        invalidated_lens = {}
-        for idx, seq in enumerate(seqs):
-            was_pre_verify = seq.pre_verify
-            accepted_len = 1 if was_pre_verify and acc[idx] else 0
-            if not was_pre_verify:
-                accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
-            invalidated_len = 0 if acc[idx] else rollout[idx]
-            accepted_lens[seq.seq_id] = accepted_len
-            invalidated_lens[seq.seq_id] = invalidated_len
-            seq.record_accepted(accepted_len)
-            seq.record_invalidated_predraft(invalidated_len)
-
-            if finish[idx]:
-                seq.mark_finished()
-                self.scheduler.block_manager.deallocate(seq)
-                self.scheduler.running.remove(seq)
-                self.scheduler.finished.append(seq)
-                continue
-            
-            if seq.pre_verify:
-                if acc[idx]:
-                    seq.pre_verify = False
-                else:
-                    seq.pre_verify = True
-                    self.scheduler.rollback(seq, self.gamma)
-                    seq.append_token(revise_token[idx])
-            else:
-                if acc[idx]:
-                    seq.pre_verify = False
-                else:
-                    seq.pre_verify = True
-                    self.scheduler.rollback(seq, self.gamma)
-                    if rollout[idx] > 1:
-                        self.scheduler.rollback(seq, rollout[idx] - 1)
-                    seq.append_token(revise_token[idx])
-        return accepted_lens, invalidated_lens
+        verify_res = self._receive_verify_result(seqs)
+        return self._apply_verify_result(seqs, verify_res)
 
 
 class TargetModelRunner(ModelRunnerBase):
@@ -1230,6 +1568,54 @@ class TargetModelRunner(ModelRunnerBase):
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
+    def dual_batch_pearl_step(self):
+        plan = self._build_dual_batch_step_plan()
+        target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")
+        draft_seq_ids = list(plan.draft_home_set)
+        target_seq_ids = [seq.seq_id for seq in target_seqs]
+        fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"
+
+        target_proposals = []
+        if target_seqs and not fallback_same_batch:
+            assert self.dual_proposal_buffer.has_all(target_seq_ids), self._proposal_assertion_message(
+                plan,
+                f"missing buffered proposals for target seq_ids={target_seq_ids}",
+            )
+            target_proposals = self.dual_proposal_buffer.get_many(target_seq_ids)
+
+        trace_record = None
+        logits = None
+        temperatures = None
+        if target_seqs:
+            self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")
+            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "dual_verify")
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode(target_seqs)
+            temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, False)
+
+        received_proposals = []
+        if draft_seq_ids:
+            received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
+            if fallback_same_batch:
+                target_proposals = received_proposals
+            else:
+                self.dual_proposal_buffer.store(received_proposals)
+
+        if target_seqs:
+            self._validate_proposals_for_target(target_proposals, target_seqs, plan)
+            self.dual_proposal_buffer.discard(target_seq_ids)
+            accepted_lens, invalidated_lens = self.verify_from_proposals(
+                logits,
+                target_seqs,
+                temperatures,
+                target_proposals,
+                plan,
+            )
+            torch.cuda.synchronize()
+            self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.
 
@@ -1263,6 +1649,28 @@ class TargetModelRunner(ModelRunnerBase):
         num_next_round_input = self.gamma * len(seqs)
         msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        return self._verify_from_message(logits, seqs, temperatures, msg, num_to_be_verified_tokens)
+
+    def verify_from_proposals(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor,
+        proposals: list[BufferedProposal],
+        plan: StepPlan,
+    ):
+        self._validate_proposals_for_target(proposals, seqs, plan)
+        to_be_verified_tokens = []
+        next_round_input = []
+        for proposal in proposals:
+            to_be_verified_tokens.extend(proposal.to_be_verified_token_ids)
+            next_round_input.extend(proposal.proposal_token_ids)
+        msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
+        return self._verify_from_message(logits, seqs, temperatures, msg, len(to_be_verified_tokens))
+
+    @torch.inference_mode()
+    def _verify_from_message(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, msg: torch.Tensor, num_to_be_verified_tokens: int):
+        """Refer to the verification logic in the draft model verification function."""
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
         

@@ -69,7 +69,7 @@ class BaseConfig:
 
 @dataclass
 class PEARLConfig:
-    ALLOWED_EXECUTION_MODES: ClassVar[set[str]] = {"ar", "serialized_pearl", "parallel_pearl"}
+    ALLOWED_EXECUTION_MODES: ClassVar[set[str]] = {"ar", "serialized_pearl", "parallel_pearl", "dual_batch_pearl"}
     draft_model_path: str
     target_model_path: str
     draft_tensor_parallel_size: int = 2

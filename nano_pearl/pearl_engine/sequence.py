@@ -41,6 +41,7 @@ class Sequence:
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
+        self.home_batch_id = None
         self.trace_stats = {
             "scheduled_iterations": [],
             "accepted_tokens": 0,
@@ -179,6 +180,7 @@ class Sequence:
             "slo_tpot_ms": self.slo_tpot_ms,
             "slo_class": self.slo_class,
             "per_request_gamma": self.per_request_gamma,
+            "home_batch_id": self.home_batch_id,
             "trace_stats": self.trace_stats,
         }
 
@@ -189,17 +191,28 @@ class Sequence:
                 self.arrival_offset_sec,
                 self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
                 self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
-                self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats,
+                self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-         self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
-         self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
-         self.arrival_offset_sec,
-         self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
-         self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
-         self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = state[:-1]
+        fields = state[:-1]
+        if len(fields) == 25:
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.arrival_offset_sec,
+             self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = fields
+            self.home_batch_id = None
+        else:
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.arrival_offset_sec,
+             self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats) = fields
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

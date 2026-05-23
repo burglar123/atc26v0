@@ -1200,6 +1200,8 @@ def run_generation(
     print(f"[INFO] Starting generation: execution_mode={execution_mode}")
     if execution_mode == "parallel_pearl":
         return engine.generate()
+    if execution_mode == "dual_batch_pearl":
+        return engine.dual_batch_pearl_generate()
     if execution_mode == "serialized_pearl":
         print(
             "[INFO] Running serialized_pearl approximation baseline; this is not "
@@ -1391,11 +1393,11 @@ def main() -> None:
     parser.add_argument("--gamma", type=int, default=4)
     parser.add_argument(
         "--execution-mode",
-        choices=["ar", "serialized_pearl", "parallel_pearl"],
+        choices=["ar", "serialized_pearl", "parallel_pearl", "dual_batch_pearl"],
         default="parallel_pearl",
         help=(
-            "Unified execution mode: ar, serialized_pearl approximation, or "
-            "current parallel_pearl (default: parallel_pearl)."
+            "Unified execution mode: ar, serialized_pearl approximation, "
+            "parallel_pearl, or Phase 1C dual_batch_pearl (default: parallel_pearl)."
         ),
     )
     parser.add_argument(
@@ -1500,7 +1502,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.cached_admission and args.execution_mode != "parallel_pearl":
         raise ValueError(
-            "--cached-admission currently supports only --execution-mode parallel_pearl"
+            "cached-admission is not yet supported for dual_batch_pearl"
+            if args.execution_mode == "dual_batch_pearl"
+            else "--cached-admission currently supports only --execution-mode parallel_pearl"
         )
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)

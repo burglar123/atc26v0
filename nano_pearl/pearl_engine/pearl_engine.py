@@ -189,6 +189,8 @@ class PEARLEngine:
         self.control_event.clear()
     
     def generate(self):
+        if self.config.execution_mode == "dual_batch_pearl":
+            return self.dual_batch_pearl_generate()
         self.controller.write_draft_shm("pearl_generate")
         self.controller.write_target_shm("pearl_generate")
         self.control_event.wait()
@@ -205,6 +207,26 @@ class PEARLEngine:
         output_text = [self.tokenizer.decode(token_ids, skip_special_tokens=False) for token_ids in token_ids]
         num_tokens = [len(t) for t in token_ids]
         
+        return output_text, num_tokens, num_acc_tokens, time
+
+    def dual_batch_pearl_generate(self):
+        """Run the Phase 1C dual-batch PEARL backbone."""
+        self.controller.write_draft_shm("dual_batch_pearl_generate")
+        self.controller.write_target_shm("dual_batch_pearl_generate")
+        self.control_event.wait()
+        self.control_event.clear()
+
+        output, time, target_traces, target_request_metadata = self.controller.read_output()
+        try:
+            self.last_traces, self.last_request_metadata = self.controller.read_all_traces()
+        except Exception:
+            self.last_traces = target_traces
+            self.last_request_metadata = target_request_metadata
+        output = sorted(output, key=lambda x: x[0])
+        seq_id, token_ids, num_acc_tokens = zip(*output)
+        output_text = [self.tokenizer.decode(token_ids, skip_special_tokens=False) for token_ids in token_ids]
+        num_tokens = [len(t) for t in token_ids]
+
         return output_text, num_tokens, num_acc_tokens, time
 
     def serialized_pearl_generate(self):
@@ -319,6 +341,7 @@ class PEARLEngine:
         method_name = {
             "ar": "decode_ready_parallel_generate",
             "parallel_pearl": "decode_ready_pearl_generate",
+            "dual_batch_pearl": "decode_ready_dual_batch_pearl_generate",
             "serialized_pearl": "decode_ready_serialized_pearl_generate",
         }[execution_mode]
         self.controller.write_draft_shm(method_name)
@@ -360,6 +383,8 @@ class PEARLEngine:
         self.control_event.clear()
 
     def cached_decode_ready_generate(self, max_active_cached_seqs: int):
+        if self.config.execution_mode == "dual_batch_pearl":
+            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
         self.controller.write_draft_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
         self.controller.write_target_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
         self.control_event.wait()

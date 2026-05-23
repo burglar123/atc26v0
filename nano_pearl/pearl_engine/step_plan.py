@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -27,11 +27,20 @@ class StepPlan:
 
     budgets: Dict[int, RequestBudget] = field(default_factory=dict)
 
-    target_batch_id: Optional[str] = None
-    draft_batch_id: Optional[str] = None
+    target_batch_id: Optional[str | int] = None
+    draft_batch_id: Optional[str | int] = None
 
     decode_ready_mode: bool = False
     is_prefill: bool = False
+    plan_phase: Optional[str] = None
+    dual_batch_enabled: bool = False
+    home_batch_ids: Dict[int, int] = field(default_factory=dict)
+    pending_proposal_seq_ids: List[int] = field(default_factory=list)
+    buffered_proposal_seq_ids: List[int] = field(default_factory=list)
+    normal_gamma: Optional[int] = None
+    eager_gamma: int = 0
+    step_id: Optional[int] = None
+    dual_batch_state: Optional[Any] = None
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -54,6 +63,37 @@ class StepPlan:
             assert int(budget.eager_gamma) == 0, f"Phase 1B eager_gamma must be 0 for seq_id={seq_id}, got {budget.eager_gamma}"
             assert int(budget.normal_gamma) == int(gamma), f"Phase 1B normal_gamma mismatch for seq_id={seq_id}: expected {gamma}, got {budget.normal_gamma}"
 
+    def validate_phase1c(self):
+        assert self.execution_mode == "dual_batch_pearl", (
+            f"Phase 1C StepPlan requires execution_mode='dual_batch_pearl', got {self.execution_mode!r}"
+        )
+        assert self.dual_batch_enabled, "Phase 1C StepPlan must set dual_batch_enabled=True"
+        assert self.plan_phase in {"priming", "steady", "fallback"}, (
+            f"Invalid Phase 1C plan_phase={self.plan_phase!r}"
+        )
+        assert self.is_eager_empty(), (
+            f"Phase 1C keeps eager sets empty, got target_eager_set={self.target_eager_set}, "
+            f"draft_eager_set={self.draft_eager_set}"
+        )
+        if self.plan_phase == "steady":
+            assert self.target_batch_id != self.draft_batch_id, (
+                f"Steady dual-batch plan must use different batches, got target_batch_id={self.target_batch_id}, "
+                f"draft_batch_id={self.draft_batch_id}"
+            )
+            assert set(self.target_home_set).isdisjoint(self.draft_home_set), (
+                f"Steady dual-batch home sets must be disjoint, got target_home_set={self.target_home_set}, "
+                f"draft_home_set={self.draft_home_set}"
+            )
+        for seq_id, budget in self.budgets.items():
+            assert int(budget.eager_gamma) == 0, (
+                f"Phase 1C eager_gamma must be 0 for seq_id={seq_id}, got {budget.eager_gamma}"
+            )
+            if self.normal_gamma is not None:
+                assert int(budget.normal_gamma) == int(self.normal_gamma), (
+                    f"Phase 1C normal_gamma mismatch for seq_id={seq_id}: "
+                    f"expected {self.normal_gamma}, got {budget.normal_gamma}"
+                )
+
     def to_trace_dict(self) -> dict:
         return {
             "plan_id": int(self.plan_id),
@@ -71,4 +111,15 @@ class StepPlan:
             "draft_batch_id": self.draft_batch_id,
             "decode_ready_mode": bool(self.decode_ready_mode),
             "is_prefill": bool(self.is_prefill),
+            "plan_phase": self.plan_phase,
+            "dual_batch_enabled": bool(self.dual_batch_enabled),
+            "home_batch_ids": {
+                str(seq_id): int(batch_id)
+                for seq_id, batch_id in self.home_batch_ids.items()
+            },
+            "pending_proposal_seq_ids": [int(seq_id) for seq_id in self.pending_proposal_seq_ids],
+            "buffered_proposal_seq_ids": [int(seq_id) for seq_id in self.buffered_proposal_seq_ids],
+            "normal_gamma": None if self.normal_gamma is None else int(self.normal_gamma),
+            "eager_gamma": int(self.eager_gamma),
+            "step_id": None if self.step_id is None else int(self.step_id),
         }
