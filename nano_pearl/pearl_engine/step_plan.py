@@ -63,6 +63,8 @@ class StepPlan:
     target_to_draft_size_ratio: float = 0.0
 
     eager_trace_enabled: bool = False
+    enable_eager_execution: bool = False
+    eager_execution_enabled: bool = False
     eager_policy: str = "none"
     eager_candidate_seq_ids: List[int] = field(default_factory=list)
     eager_selected_seq_ids: List[int] = field(default_factory=list)
@@ -76,8 +78,26 @@ class StepPlan:
     max_eager_tokens_per_request: int = 0
     eager_tokens_generated: int = 0
     eager_tokens_verified: int = 0
+    eager_tokens_accepted: int = 0
+    eager_tokens_rejected: int = 0
+    eager_tokens_invalidated: int = 0
     eager_tokens_promoted: int = 0
     eager_tokens_discarded: int = 0
+    eager_waste_rate: Optional[float] = None
+    eager_buffer_size_before: int = 0
+    eager_buffer_size_after: int = 0
+    eager_ready_seq_ids: List[int] = field(default_factory=list)
+    eager_promoted_seq_ids: List[int] = field(default_factory=list)
+    eager_discarded_seq_ids: List[int] = field(default_factory=list)
+    eager_verified_seq_ids: List[int] = field(default_factory=list)
+    eager_accepted_seq_ids: List[int] = field(default_factory=list)
+    eager_rejected_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_start_ts: Optional[float] = None
+    eager_draft_end_ts: Optional[float] = None
+    eager_draft_time_ms: float = 0.0
+    eager_verify_start_ts: Optional[float] = None
+    eager_verify_end_ts: Optional[float] = None
+    eager_verify_time_ms: float = 0.0
 
     proposal_buffer_size_before: Optional[int] = None
     proposal_buffer_size_after: Optional[int] = None
@@ -126,8 +146,20 @@ class StepPlan:
             f"Phase 1C/1G-lite keeps target_eager_set empty, got target_eager_set={self.target_eager_set}"
         )
         if self.draft_eager_set:
-            assert self.eager_trace_enabled, (
+            assert self.eager_trace_enabled or self.eager_execution_enabled, (
                 f"draft_eager_set may be non-empty only in trace-only eager mode, got {self.draft_eager_set}"
+            )
+        if self.target_eager_set:
+            assert self.eager_execution_enabled, (
+                f"target_eager_set may be non-empty only when eager execution is enabled, got {self.target_eager_set}"
+            )
+            assert set(self.target_eager_set).isdisjoint(self.target_home_set), (
+                f"target_eager_set must be disjoint from target_home_set, got target_eager_set={self.target_eager_set}, "
+                f"target_home_set={self.target_home_set}"
+            )
+            assert set(self.target_eager_set).isdisjoint(self.draft_home_set), (
+                f"target_eager_set must be disjoint from draft_home_set, got target_eager_set={self.target_eager_set}, "
+                f"draft_home_set={self.draft_home_set}"
             )
         if self.plan_phase == "steady":
             assert self.target_batch_id != self.draft_batch_id, (
@@ -140,7 +172,10 @@ class StepPlan:
             )
         for seq_id, budget in self.budgets.items():
             if int(budget.eager_gamma) != 0:
-                assert self.eager_trace_enabled and int(seq_id) in set(self.eager_selected_seq_ids), (
+                assert (
+                    (self.eager_trace_enabled and int(seq_id) in set(self.eager_selected_seq_ids))
+                    or (self.eager_execution_enabled and int(seq_id) in set(self.target_eager_set))
+                ), (
                     f"Non-zero eager_gamma is trace-only and must belong to selected eager seqs, "
                     f"seq_id={seq_id}, eager_gamma={budget.eager_gamma}"
                 )
@@ -197,6 +232,8 @@ class StepPlan:
             "split_imbalance": float(self.split_imbalance),
             "target_to_draft_size_ratio": float(self.target_to_draft_size_ratio),
             "eager_trace_enabled": bool(self.eager_trace_enabled),
+            "enable_eager_execution": bool(self.enable_eager_execution),
+            "eager_execution_enabled": bool(self.eager_execution_enabled),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": [int(seq_id) for seq_id in self.eager_candidate_seq_ids],
             "eager_selected_seq_ids": [int(seq_id) for seq_id in self.eager_selected_seq_ids],
@@ -222,8 +259,26 @@ class StepPlan:
             "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
             "eager_tokens_generated": int(self.eager_tokens_generated),
             "eager_tokens_verified": int(self.eager_tokens_verified),
+            "eager_tokens_accepted": int(self.eager_tokens_accepted),
+            "eager_tokens_rejected": int(self.eager_tokens_rejected),
+            "eager_tokens_invalidated": int(self.eager_tokens_invalidated),
             "eager_tokens_promoted": int(self.eager_tokens_promoted),
             "eager_tokens_discarded": int(self.eager_tokens_discarded),
+            "eager_waste_rate": self.eager_waste_rate,
+            "eager_buffer_size_before": int(self.eager_buffer_size_before),
+            "eager_buffer_size_after": int(self.eager_buffer_size_after),
+            "eager_ready_seq_ids": [int(seq_id) for seq_id in self.eager_ready_seq_ids],
+            "eager_promoted_seq_ids": [int(seq_id) for seq_id in self.eager_promoted_seq_ids],
+            "eager_discarded_seq_ids": [int(seq_id) for seq_id in self.eager_discarded_seq_ids],
+            "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
+            "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],
+            "eager_rejected_seq_ids": [int(seq_id) for seq_id in self.eager_rejected_seq_ids],
+            "eager_draft_start_ts": self.eager_draft_start_ts,
+            "eager_draft_end_ts": self.eager_draft_end_ts,
+            "eager_draft_time_ms": float(self.eager_draft_time_ms),
+            "eager_verify_start_ts": self.eager_verify_start_ts,
+            "eager_verify_end_ts": self.eager_verify_end_ts,
+            "eager_verify_time_ms": float(self.eager_verify_time_ms),
             "proposal_buffer_size_before": self.proposal_buffer_size_before,
             "proposal_buffer_size_after": self.proposal_buffer_size_after,
             "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],

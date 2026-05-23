@@ -91,8 +91,11 @@ class PEARLConfig:
     max_eager_tokens_per_request: int = 0
     eager_policy: str = "none"
     eager_accept_threshold: float = 0.0
+    enable_eager_execution: bool = False
 
     def __post_init__(self):
+        if self.enable_eager_execution:
+            self.enable_eager_trace = True
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
             raise ValueError(
                 f"Invalid execution_mode={self.execution_mode!r}. "
@@ -103,6 +106,17 @@ class PEARLConfig:
                 f"Invalid eager_policy={self.eager_policy!r}. "
                 "Expected one of ['none', 'tight_only', 'urgency']."
             )
+        if self.enable_eager_execution:
+            if self.execution_mode != "dual_batch_pearl":
+                raise ValueError("--enable-eager-execution requires --execution-mode dual_batch_pearl")
+            if self.eager_policy == "none":
+                raise ValueError("--enable-eager-execution requires --eager-policy tight_only or urgency")
+            if int(self.max_eager_requests_per_step) <= 0:
+                raise ValueError("--enable-eager-execution requires --max-eager-requests-per-step > 0")
+            if int(self.max_eager_tokens_per_step) <= 0:
+                raise ValueError("--enable-eager-execution requires --max-eager-tokens-per-step > 0")
+            if int(self.max_eager_tokens_per_request) <= 0:
+                raise ValueError("--enable-eager-execution requires --max-eager-tokens-per-request > 0")
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))
@@ -121,6 +135,7 @@ class PEARLConfig:
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
         logger.info(f"Enable_Eager_Trace={self.enable_eager_trace}")
+        logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")

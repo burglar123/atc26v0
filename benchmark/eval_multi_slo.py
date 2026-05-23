@@ -138,6 +138,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_eager_tokens_per_request": int(args.max_eager_tokens_per_request),
         "eager_policy": args.eager_policy,
         "eager_accept_threshold": float(args.eager_accept_threshold),
+        "enable_eager_execution": bool(args.enable_eager_execution),
     }
 
     # Try new named-path style with gamma.
@@ -159,6 +160,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
     common_kwargs.pop("max_eager_tokens_per_request", None)
     common_kwargs.pop("eager_policy", None)
     common_kwargs.pop("eager_accept_threshold", None)
+    common_kwargs.pop("enable_eager_execution", None)
 
     try:
         return PEARLConfig(
@@ -1439,6 +1441,14 @@ def main() -> None:
         default="none",
     )
     parser.add_argument("--eager-accept-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--enable-eager-execution",
+        action="store_true",
+        help=(
+            "Enable Phase 1H-lite minimal eager sidecar execution for "
+            "dual_batch_pearl. Implies --enable-eager-trace."
+        ),
+    )
     parser.add_argument(
         "--cached-admission",
         action="store_true",

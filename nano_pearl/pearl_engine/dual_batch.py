@@ -33,6 +33,25 @@ class BufferedProposal:
     valid: bool = True
 
 
+@dataclass
+class EagerBufferedProposal:
+    seq_id: int
+    request_id: str | int
+    home_batch_id: int
+    eager_token_ids: list[int]
+    eager_len: int
+    eager_base_len: int
+    source_plan_id: int
+    source_step_id: int
+    source_home_batch_id: int
+    verify_with_batch_id: Optional[int] = None
+    score: float = 0.0
+    policy: str = "none"
+    valid: bool = True
+    ready: bool = False
+    consumed: bool = False
+
+
 class ProposalBuffer:
     """Small seq-id keyed proposal buffer for delayed dual-batch verification."""
 
@@ -108,6 +127,82 @@ class ProposalBuffer:
 
     def pending_batch_ids(self) -> list[int]:
         return sorted({proposal.home_batch_id for proposal in self._proposals.values() if proposal.valid})
+
+
+class EagerProposalBuffer:
+    """Seq-id keyed sidecar proposal buffer kept separate from normal proposals."""
+
+    def __init__(self):
+        self._proposals: Dict[int, EagerBufferedProposal] = {}
+
+    def clear(self) -> None:
+        self._proposals.clear()
+
+    def size(self) -> int:
+        return len(self._proposals)
+
+    def keys(self) -> list[int]:
+        return sorted(self._proposals)
+
+    def store(self, proposals: Iterable[EagerBufferedProposal]) -> None:
+        for proposal in proposals:
+            if proposal.valid:
+                self._proposals[int(proposal.seq_id)] = proposal
+
+    def get(self, seq_id: int) -> Optional[EagerBufferedProposal]:
+        proposal = self._proposals.get(int(seq_id))
+        if proposal is not None and proposal.valid and not proposal.consumed:
+            return proposal
+        return None
+
+    def get_many(self, seq_ids: Iterable[int], ready_only: bool = False) -> list[EagerBufferedProposal]:
+        proposals = []
+        for seq_id in seq_ids:
+            proposal = self.get(int(seq_id))
+            if proposal is None:
+                continue
+            if ready_only and not proposal.ready:
+                continue
+            proposals.append(proposal)
+        return proposals
+
+    def mark_ready(self, seq_id: int) -> bool:
+        proposal = self.get(int(seq_id))
+        if proposal is None:
+            return False
+        proposal.ready = True
+        return True
+
+    def discard(self, seq_ids: Iterable[int]) -> list[int]:
+        dropped = []
+        for seq_id in seq_ids:
+            seq_id = int(seq_id)
+            if self._proposals.pop(seq_id, None) is not None:
+                dropped.append(seq_id)
+        return dropped
+
+    def consume(self, seq_ids: Iterable[int]) -> list[EagerBufferedProposal]:
+        proposals = self.get_many(seq_ids, ready_only=True)
+        for proposal in proposals:
+            proposal.consumed = True
+        self.discard([proposal.seq_id for proposal in proposals])
+        return proposals
+
+    def discard_inactive(self, active_seq_ids: Iterable[int]) -> list[int]:
+        active = {int(seq_id) for seq_id in active_seq_ids}
+        dropped = []
+        for seq_id in list(self._proposals):
+            if seq_id not in active:
+                self._proposals.pop(seq_id, None)
+                dropped.append(seq_id)
+        return dropped
+
+    def ready_seq_ids(self) -> list[int]:
+        return sorted(
+            seq_id
+            for seq_id, proposal in self._proposals.items()
+            if proposal.valid and proposal.ready and not proposal.consumed
+        )
 
 
 class DualBatchManager:

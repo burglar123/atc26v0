@@ -21,7 +21,13 @@ from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
-from nano_pearl.pearl_engine.dual_batch import BufferedProposal, DualBatchManager, ProposalBuffer
+from nano_pearl.pearl_engine.dual_batch import (
+    BufferedProposal,
+    DualBatchManager,
+    EagerBufferedProposal,
+    EagerProposalBuffer,
+    ProposalBuffer,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -118,6 +124,7 @@ class ModelRunnerBase:
         self.active_decode_ready_mode = False
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
+        self.eager_proposal_buffer = EagerProposalBuffer()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -452,6 +459,8 @@ class ModelRunnerBase:
                 f"Invalid execution_mode={execution_mode!r}. "
                 f"Expected one of {sorted(self.global_config.ALLOWED_EXECUTION_MODES)}."
             )
+        if self.global_config.enable_eager_execution and execution_mode != "dual_batch_pearl":
+            raise ValueError("enable_eager_execution is only supported with execution_mode='dual_batch_pearl'")
         self.active_execution_mode = execution_mode
 
     def _build_step_plan_from_scheduled_batch(self, seqs: list[Sequence], is_prefill: bool, runner_role: str, batch_id: str, iteration_id: int) -> StepPlan:
@@ -563,6 +572,12 @@ class ModelRunnerBase:
         verified = int(record.get("proposal_tokens_verified") or 0)
         record["draft_waste_rate"] = wasted_tokens / max(1, generated) if generated else None
         record["acceptance_rate"] = accepted_tokens / max(1, verified) if verified else None
+        eager_generated = int(record.get("eager_tokens_generated") or 0)
+        eager_discarded = int(record.get("eager_tokens_discarded") or 0)
+        eager_rejected = int(record.get("eager_tokens_rejected") or 0)
+        eager_invalidated = int(record.get("eager_tokens_invalidated") or 0)
+        eager_wasted = eager_discarded + eager_rejected + eager_invalidated
+        record["eager_waste_rate"] = eager_wasted / max(1, eager_generated) if eager_generated else None
 
     def _proposal_verify_token_count(self, seqs: list[Sequence]) -> int:
         return sum(1 if seq.pre_verify else self.gamma for seq in seqs)
@@ -591,8 +606,50 @@ class ModelRunnerBase:
             return max(0.0, debt_ms), f"urgency:debt_ms={max(0.0, debt_ms):.3f}"
         return 0.0, "policy_none"
 
+    def _annotate_eager_execution_plan(self, plan: StepPlan) -> None:
+        plan.enable_eager_execution = bool(self.global_config.enable_eager_execution)
+        plan.eager_execution_enabled = bool(self.global_config.enable_eager_execution)
+        if not plan.eager_execution_enabled:
+            return
+
+        assert self.active_execution_mode == "dual_batch_pearl", self._proposal_assertion_message(
+            plan,
+            "eager execution is only supported for dual_batch_pearl",
+        )
+        if plan.plan_phase != "steady":
+            return
+
+        ready = set(self.eager_proposal_buffer.ready_seq_ids())
+        target_eager_set = [seq_id for seq_id in plan.draft_home_set if seq_id in ready]
+        if not target_eager_set:
+            return
+
+        target_home = set(plan.target_home_set)
+        overlap_home = sorted(target_home & set(target_eager_set))
+        assert not overlap_home, self._proposal_assertion_message(
+            plan,
+            f"target_eager_set overlaps target_home_set: {overlap_home}",
+        )
+        plan.target_eager_set = list(target_eager_set)
+        plan.draft_home_set = [seq_id for seq_id in plan.draft_home_set if seq_id not in set(target_eager_set)]
+        target_home_size = len(plan.target_home_set)
+        draft_home_size = len(plan.draft_home_set)
+        plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
+        plan.draft_fraction_of_active = draft_home_size / max(1, int(plan.active_seq_count))
+        plan.split_imbalance = abs(target_home_size - draft_home_size) / max(1, target_home_size + draft_home_size)
+        plan.target_to_draft_size_ratio = target_home_size / max(1, draft_home_size)
+        for seq_id in target_eager_set:
+            proposal = self.eager_proposal_buffer.get(seq_id)
+            assert proposal is not None and proposal.ready, self._proposal_assertion_message(
+                plan,
+                f"missing ready eager proposal for seq_id={seq_id}",
+            )
+            plan.budgets.setdefault(seq_id, RequestBudget(normal_gamma=self.gamma, eager_gamma=0))
+            plan.budgets[seq_id].eager_gamma = int(proposal.eager_len)
+        plan.eager_ready_seq_ids = self.eager_proposal_buffer.ready_seq_ids()
+
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
-        plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace)
+        plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
         plan.eager_policy = self.global_config.eager_policy
         plan.max_eager_requests_per_step = max(0, int(self.global_config.max_eager_requests_per_step))
         plan.max_eager_tokens_per_step = max(0, int(self.global_config.max_eager_tokens_per_step))
@@ -688,11 +745,14 @@ class ModelRunnerBase:
         self.dual_batch_manager.gamma = int(self.gamma)
         self.dual_batch_manager.update_running(self.scheduler.running)
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
-        return self.dual_proposal_buffer.discard_inactive(active_seq_ids)
+        dropped_normal = self.dual_proposal_buffer.discard_inactive(active_seq_ids)
+        dropped_eager = self.eager_proposal_buffer.discard_inactive(active_seq_ids)
+        return dropped_normal, dropped_eager
 
     def _build_dual_batch_step_plan(self) -> StepPlan:
         proposal_buffer_size_before = self.dual_proposal_buffer.size()
-        dropped_seq_ids = self._prepare_dual_batch_state()
+        eager_buffer_size_before = self.eager_proposal_buffer.size()
+        dropped_seq_ids, dropped_eager_seq_ids = self._prepare_dual_batch_state()
         iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
@@ -716,6 +776,10 @@ class ModelRunnerBase:
         plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
         plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
         plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
+        plan.eager_buffer_size_before = int(eager_buffer_size_before)
+        plan.eager_buffer_size_after = self.eager_proposal_buffer.size()
+        plan.eager_ready_seq_ids = self.eager_proposal_buffer.ready_seq_ids()
+        plan.eager_discarded_seq_ids = [int(seq_id) for seq_id in dropped_eager_seq_ids]
         if plan.plan_phase == "fallback":
             plan.fallback_buffer_hit_count = plan.proposal_buffer_hit_count
             plan.fallback_buffer_miss_count = plan.proposal_buffer_miss_count
@@ -732,6 +796,7 @@ class ModelRunnerBase:
                     plan.fallback_reason = "unknown_fallback_condition"
             if plan.dual_batch_state is not None:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
+        self._annotate_eager_execution_plan(plan)
         self._annotate_eager_trace_plan(plan)
         plan.validate_phase1c()
         return plan
@@ -803,8 +868,9 @@ class ModelRunnerBase:
     def _proposal_assertion_message(self, plan: StepPlan, detail: str) -> str:
         return (
             f"{detail}: plan_id={plan.plan_id}, target_home_set={plan.target_home_set}, "
-            f"draft_home_set={plan.draft_home_set}, buffered_proposal_seq_ids="
-            f"{self.dual_proposal_buffer.pending_seq_ids()}"
+            f"draft_home_set={plan.draft_home_set}, target_eager_set={plan.target_eager_set}, "
+            f"draft_eager_set={plan.draft_eager_set}, buffered_proposal_seq_ids="
+            f"{self.dual_proposal_buffer.pending_seq_ids()}, eager_buffer_keys={self.eager_proposal_buffer.keys()}"
         )
 
     def _build_buffered_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
@@ -923,6 +989,91 @@ class ModelRunnerBase:
         )
         return proposals
 
+    def _serialize_eager_proposals(self, proposals: list[EagerBufferedProposal], plan: StepPlan) -> tuple[torch.Tensor, torch.Tensor]:
+        header = []
+        tokens = []
+        for proposal in proposals:
+            header.extend(
+                [
+                    int(proposal.seq_id),
+                    int(proposal.home_batch_id),
+                    int(proposal.eager_len),
+                    int(proposal.eager_base_len),
+                    int(proposal.source_plan_id),
+                    int(proposal.source_step_id),
+                    int(proposal.source_home_batch_id),
+                ]
+            )
+            tokens.extend(int(token) for token in proposal.eager_token_ids)
+        payload = header + tokens
+        meta = torch.tensor(
+            [
+                len(proposals),
+                len(payload),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                -1 if plan.target_batch_id is None else int(plan.target_batch_id),
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        payload_tensor = torch.tensor(payload, dtype=torch.int64, device="cuda")
+        return meta, payload_tensor
+
+    def _send_eager_proposals(self, proposals: list[EagerBufferedProposal], plan: StepPlan):
+        if self.tp_params.local_rank != 0:
+            return
+        meta, payload = self._serialize_eager_proposals(proposals, plan)
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        if int(meta[1].item()) > 0:
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _receive_eager_proposals(self, expected_seq_ids: list[int], plan: StepPlan) -> list[EagerBufferedProposal]:
+        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        n, payload_len, proposal_plan_id, proposal_step_id, batch_id = [int(x) for x in meta.tolist()]
+        payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+        if payload_len > 0:
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        data = payload.tolist()
+        header_len = n * 7
+        headers = data[:header_len]
+        token_data = data[header_len:]
+        proposals = []
+        token_offset = 0
+        seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
+        for idx in range(n):
+            base = idx * 7
+            seq_id, home_batch_id, eager_len, eager_base_len, source_plan_id, source_step_id, source_home_batch_id = headers[base:base + 7]
+            eager_token_ids = [int(x) for x in token_data[token_offset:token_offset + eager_len]]
+            token_offset += eager_len
+            seq = seq_lookup.get(seq_id)
+            proposals.append(
+                EagerBufferedProposal(
+                    seq_id=int(seq_id),
+                    request_id=seq.request_id if seq is not None else int(seq_id),
+                    home_batch_id=int(home_batch_id),
+                    eager_token_ids=eager_token_ids,
+                    eager_len=int(eager_len),
+                    eager_base_len=int(eager_base_len),
+                    source_plan_id=int(source_plan_id),
+                    source_step_id=int(source_step_id),
+                    source_home_batch_id=int(source_home_batch_id),
+                    verify_with_batch_id=None if batch_id < 0 else int(batch_id),
+                    score=float(plan.eager_score_by_seq_id.get(int(seq_id), 0.0)),
+                    policy=plan.eager_policy,
+                    valid=True,
+                    ready=False,
+                )
+            )
+        received_seq_ids = [proposal.seq_id for proposal in proposals]
+        assert received_seq_ids == list(expected_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"eager proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, "
+            f"source_plan_id={proposal_plan_id}, source_step_id={proposal_step_id}",
+        )
+        return proposals
+
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
         seq_ids = [seq.seq_id for seq in seqs]
@@ -953,6 +1104,156 @@ class ModelRunnerBase:
                 plan,
                 f"proposal_len mismatch for seq_id={seq.seq_id}: proposal={proposal.proposal_len}, gamma={self.gamma}",
             )
+
+    def _validate_eager_proposals(self, proposals: list[EagerBufferedProposal], seqs: list[Sequence], plan: StepPlan):
+        proposal_seq_ids = [proposal.seq_id for proposal in proposals]
+        seq_ids = [seq.seq_id for seq in seqs]
+        assert proposal_seq_ids == seq_ids, self._proposal_assertion_message(
+            plan,
+            f"eager proposal seq_id mismatch: expected={seq_ids}, got={proposal_seq_ids}",
+        )
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        for proposal, seq in zip(proposals, seqs):
+            assert proposal.valid and proposal.ready and not proposal.consumed, self._proposal_assertion_message(
+                plan,
+                f"eager proposal is not ready/valid for seq_id={seq.seq_id}",
+            )
+            assert seq.seq_id in running_seq_ids, self._proposal_assertion_message(
+                plan,
+                f"eager proposal used for inactive seq_id={seq.seq_id}",
+            )
+            assert int(proposal.eager_base_len) == int(len(seq)), self._proposal_assertion_message(
+                plan,
+                f"eager proposal base length mismatch for seq_id={seq.seq_id}: "
+                f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}",
+            )
+            assert int(proposal.eager_len) == len(proposal.eager_token_ids), self._proposal_assertion_message(
+                plan,
+                f"eager proposal length mismatch for seq_id={seq.seq_id}",
+            )
+            assert int(proposal.eager_len) <= int(self.gamma), self._proposal_assertion_message(
+                plan,
+                f"Phase 1H-lite eager_len must be <= gamma for seq_id={seq.seq_id}: "
+                f"eager_len={proposal.eager_len}, gamma={self.gamma}",
+            )
+
+    def _promote_or_discard_eager_after_normal(
+        self,
+        plan: StepPlan,
+        accepted_lens: dict[int, int],
+        invalidated_lens: dict[int, int],
+        trace_record: dict | None,
+        count_tokens: bool,
+    ) -> None:
+        if not self.global_config.enable_eager_execution or not plan.draft_eager_set:
+            return
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        promoted_seq_ids = []
+        discarded_seq_ids = []
+        promoted_tokens = 0
+        discarded_tokens = 0
+        for seq_id in plan.draft_eager_set:
+            proposal = self.eager_proposal_buffer.get(seq_id)
+            assert proposal is not None, self._proposal_assertion_message(
+                plan,
+                f"missing eager proposal for selected seq_id={seq_id}",
+            )
+            full_accept = (
+                int(seq_id) in running_seq_ids
+                and int(invalidated_lens.get(seq_id, 0)) == 0
+                and int(accepted_lens.get(seq_id, 0)) > 0
+            )
+            if full_accept:
+                self.eager_proposal_buffer.mark_ready(seq_id)
+                promoted_seq_ids.append(int(seq_id))
+                promoted_tokens += int(proposal.eager_len)
+            else:
+                self.eager_proposal_buffer.discard([seq_id])
+                discarded_seq_ids.append(int(seq_id))
+                discarded_tokens += int(proposal.eager_len)
+
+        if trace_record is not None:
+            trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+            trace_record["eager_promoted_seq_ids"] = promoted_seq_ids
+            trace_record["eager_discarded_seq_ids"] = discarded_seq_ids
+            if count_tokens:
+                trace_record["eager_tokens_promoted"] = promoted_tokens
+                trace_record["eager_tokens_discarded"] = discarded_tokens
+            self._finalize_record_profile(trace_record)
+
+    def _receive_eager_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
+        verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
+        if seqs:
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        return verify_res
+
+    def _apply_eager_verify_result(
+        self,
+        seqs: list[Sequence],
+        proposals: list[EagerBufferedProposal],
+        verify_res: torch.Tensor,
+        plan: StepPlan,
+        trace_record: dict | None,
+        count_tokens: bool,
+    ) -> None:
+        if not seqs:
+            return
+        self._validate_eager_proposals(proposals, seqs, plan)
+        seq_ids, accepted, eager_lens, accepted_lens, rejected_lens, finish = verify_res.tolist()
+        verified_seq_ids = []
+        accepted_seq_ids = []
+        rejected_seq_ids = []
+        verified_tokens = 0
+        accepted_tokens = 0
+        rejected_tokens = 0
+        invalidated_tokens = 0
+        for idx, (seq, proposal) in enumerate(zip(seqs, proposals)):
+            assert int(seq_ids[idx]) == int(seq.seq_id), self._proposal_assertion_message(
+                plan,
+                f"eager verify result seq_id mismatch for seq_id={seq.seq_id}, got={seq_ids[idx]}",
+            )
+            assert int(eager_lens[idx]) == int(proposal.eager_len), self._proposal_assertion_message(
+                plan,
+                f"eager verify result length mismatch for seq_id={seq.seq_id}",
+            )
+            verified_seq_ids.append(int(seq.seq_id))
+            verified_tokens += int(proposal.eager_len)
+            if int(accepted[idx]):
+                assert int(proposal.eager_base_len) == int(len(seq)), self._proposal_assertion_message(
+                    plan,
+                    f"eager apply base length mismatch for seq_id={seq.seq_id}: "
+                    f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}",
+                )
+                for token_id in proposal.eager_token_ids:
+                    seq.append_token(int(token_id))
+                seq.cur_acc_tokens += int(proposal.eager_len)
+                seq.record_accepted(int(accepted_lens[idx]))
+                accepted_seq_ids.append(int(seq.seq_id))
+                accepted_tokens += int(accepted_lens[idx])
+                if int(finish[idx]):
+                    seq.mark_finished()
+                    seq.num_acc_tokens.append(seq.cur_acc_tokens)
+                    if seq in self.scheduler.running:
+                        self.scheduler.block_manager.deallocate(seq)
+                        self.scheduler.running.remove(seq)
+                        self.scheduler.finished.append(seq)
+            else:
+                seq.record_invalidated_predraft(int(rejected_lens[idx]))
+                rejected_seq_ids.append(int(seq.seq_id))
+                rejected_tokens += int(rejected_lens[idx])
+                invalidated_tokens += int(rejected_lens[idx])
+        self.eager_proposal_buffer.discard([seq.seq_id for seq in seqs])
+        if trace_record is not None:
+            trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+            trace_record["eager_verified_seq_ids"] = verified_seq_ids
+            trace_record["eager_accepted_seq_ids"] = accepted_seq_ids
+            trace_record["eager_rejected_seq_ids"] = rejected_seq_ids
+            if count_tokens:
+                trace_record["eager_tokens_verified"] = verified_tokens
+                trace_record["eager_tokens_accepted"] = accepted_tokens
+                trace_record["eager_tokens_rejected"] = rejected_tokens
+                trace_record["eager_tokens_invalidated"] = invalidated_tokens
+            self._finalize_record_profile(trace_record)
 
     def _mark_trace_start(self, record: dict):
         if self.tp_params.local_rank != 0:
@@ -1149,6 +1450,7 @@ class ModelRunnerBase:
         self.active_decode_ready_mode = False
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
+        self.eager_proposal_buffer.clear()
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -1578,6 +1880,82 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
         return proposals, draft_records
 
+    def _draft_eager_proposals(self, seqs: list[Sequence], plan: StepPlan) -> tuple[list[EagerBufferedProposal], dict | None]:
+        if not self.global_config.enable_eager_execution or not seqs:
+            return [], None
+
+        trace_record = self._trace_dual_batch_schedule(seqs, plan, "dual_eager_draft")
+        budgets = {seq.seq_id: int(plan.eager_budget_by_seq_id.get(seq.seq_id, 0)) for seq in seqs}
+        base_lens = {seq.seq_id: len(seq) for seq in seqs}
+        generated: dict[int, list[int]] = {seq.seq_id: [] for seq in seqs}
+
+        torch.cuda.synchronize()
+        self._mark_trace_start(trace_record)
+        trace_record["eager_draft_start_ts"] = trace_record.get("draft_start_ts")
+        max_budget = max(budgets.values(), default=0)
+        for token_idx in range(max_budget):
+            active = [seq for seq in seqs if token_idx < budgets[seq.seq_id]]
+            if not active:
+                continue
+            self._allocate_decode_slots_for_dual(active, plan, "dual_eager_draft")
+            input_ids, positions = self.prepare_pearl_decode(active)
+            logits = self.run_model(input_ids, positions, False)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(active), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            for seq, token_id in zip(active, token_ids):
+                token_id = int(token_id)
+                seq.append_token(token_id)
+                generated[seq.seq_id].append(token_id)
+
+        proposals = []
+        for seq in seqs:
+            eager_token_ids = generated[seq.seq_id]
+            eager_len = len(eager_token_ids)
+            assert eager_len == budgets[seq.seq_id], self._proposal_assertion_message(
+                plan,
+                f"eager generated length mismatch for seq_id={seq.seq_id}: generated={eager_len}, budget={budgets[seq.seq_id]}",
+            )
+            proposals.append(
+                EagerBufferedProposal(
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    home_batch_id=int(seq.home_batch_id),
+                    eager_token_ids=eager_token_ids,
+                    eager_len=int(eager_len),
+                    eager_base_len=int(base_lens[seq.seq_id]),
+                    source_plan_id=int(plan.plan_id),
+                    source_step_id=-1 if plan.step_id is None else int(plan.step_id),
+                    source_home_batch_id=-1 if plan.target_batch_id is None else int(plan.target_batch_id),
+                    verify_with_batch_id=None if plan.draft_batch_id is None else int(plan.draft_batch_id),
+                    score=float(plan.eager_score_by_seq_id.get(seq.seq_id, 0.0)),
+                    policy=plan.eager_policy,
+                    valid=True,
+                    ready=False,
+                )
+            )
+
+        for seq in seqs:
+            if generated[seq.seq_id]:
+                self.scheduler.rollback(seq, len(generated[seq.seq_id]))
+            assert len(seq) == base_lens[seq.seq_id], self._proposal_assertion_message(
+                plan,
+                f"eager draft rollback failed for seq_id={seq.seq_id}: expected_len={base_lens[seq.seq_id]}, got={len(seq)}",
+            )
+
+        torch.cuda.synchronize()
+        self._mark_trace_end(trace_record)
+        trace_record["eager_draft_end_ts"] = trace_record.get("draft_end_ts")
+        if trace_record["eager_draft_start_ts"] is not None and trace_record["eager_draft_end_ts"] is not None:
+            trace_record["eager_draft_time_ms"] = (
+                trace_record["eager_draft_end_ts"] - trace_record["eager_draft_start_ts"]
+            ) * 1000
+        trace_record["eager_tokens_generated"] = sum(len(tokens) for tokens in generated.values())
+        trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+        self._finalize_record_profile(trace_record)
+        return proposals, trace_record
+
     def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
@@ -1626,7 +2004,9 @@ class DraftModelRunner(ModelRunnerBase):
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
+        target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "draft_apply_eager_verify")
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
+        draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
 
         proposals = []
         draft_records = []
@@ -1638,6 +2018,15 @@ class DraftModelRunner(ModelRunnerBase):
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
+
+        eager_proposals = []
+        if draft_eager_seqs and self.global_config.enable_eager_execution:
+            eager_proposals, eager_trace_record = self._draft_eager_proposals(draft_eager_seqs, plan)
+            self.eager_proposal_buffer.store(eager_proposals)
+            if eager_trace_record is not None:
+                eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+                self._finalize_record_profile(eager_trace_record)
+            self._send_eager_proposals(eager_proposals, plan)
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
@@ -1651,8 +2040,28 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            self._promote_or_discard_eager_after_normal(
+                plan,
+                accepted_lens,
+                invalidated_lens,
+                trace_record,
+                count_tokens=False,
+            )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+        if target_eager_seqs:
+            trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
+            eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
+            eager_ready = self.eager_proposal_buffer.get_many([seq.seq_id for seq in target_eager_seqs], ready_only=True)
+            self._apply_eager_verify_result(
+                target_eager_seqs,
+                eager_ready,
+                eager_verify_res,
+                plan,
+                trace_record,
+                count_tokens=False,
+            )
     
     def pearl_step(self):
         trace_record = None
@@ -1791,11 +2200,110 @@ class TargetModelRunner(ModelRunnerBase):
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
+    def _build_eager_verify_result(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor,
+        proposals: list[EagerBufferedProposal],
+        plan: StepPlan,
+    ) -> torch.Tensor:
+        verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
+        if self.tp_params.local_rank == 0:
+            row_indices = []
+            token_ids = []
+            for idx, (seq, proposal) in enumerate(zip(seqs, proposals)):
+                assert not seq.pre_verify, self._proposal_assertion_message(
+                    plan,
+                    f"Phase 1H-lite eager verify requires post-normal-accept state for seq_id={seq.seq_id}",
+                )
+                row_indices.extend(range(idx * self.gamma, idx * self.gamma + int(proposal.eager_len)))
+                token_ids.extend(int(token_id) for token_id in proposal.eager_token_ids)
+            if token_ids:
+                row_tensor = torch.tensor(row_indices, dtype=torch.long, device="cuda")
+                token_tensor = torch.tensor(token_ids, dtype=torch.long, device="cuda")
+                selected_logits = logits.index_select(0, row_tensor)
+                selected_temperatures = temperatures.index_select(0, row_tensor)
+                target_logits = norm_logits(selected_logits, selected_temperatures)
+                target_prob = target_logits.gather(dim=1, index=token_tensor.unsqueeze(1)).squeeze(1)
+                judge = (torch.rand(len(token_ids), device="cuda") <= target_prob).tolist()
+            else:
+                judge = []
+
+            offset = 0
+            rows = []
+            for seq, proposal in zip(seqs, proposals):
+                eager_len = int(proposal.eager_len)
+                accepted = bool(judge[offset:offset + eager_len]) and all(judge[offset:offset + eager_len])
+                finish = False
+                if accepted:
+                    finish = any(
+                        (not seq.ignore_eos and is_eos(token_id, self.scheduler.eos))
+                        for token_id in proposal.eager_token_ids
+                    ) or seq.num_completion_tokens + eager_len >= seq.max_tokens
+                rows.append(
+                    [
+                        int(seq.seq_id),
+                        int(accepted),
+                        eager_len,
+                        eager_len if accepted else 0,
+                        0 if accepted else eager_len,
+                        int(finish),
+                    ]
+                )
+                offset += eager_len
+            if rows:
+                verify_res = torch.tensor(rows, dtype=torch.int64, device="cuda").T.contiguous()
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        return verify_res
+
+    def _run_eager_verify_sidecar(
+        self,
+        seqs: list[Sequence],
+        proposals: list[EagerBufferedProposal],
+        plan: StepPlan,
+    ) -> None:
+        if not seqs:
+            return
+        self._validate_eager_proposals(proposals, seqs, plan)
+        self._allocate_decode_slots_for_dual(seqs, plan, "dual_eager_verify")
+        trace_record = self._trace_dual_batch_schedule(seqs, plan, "dual_eager_verify")
+        trace_record["eager_buffer_size_before"] = self.eager_proposal_buffer.size()
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+        torch.cuda.synchronize()
+        self._mark_trace_start(trace_record)
+        trace_record["eager_verify_start_ts"] = trace_record.get("verify_start_ts")
+        logits = self.run_model(input_ids, positions, False)
+        verify_res = self._build_eager_verify_result(logits, seqs, temperatures, proposals, plan)
+        self._apply_eager_verify_result(
+            seqs,
+            proposals,
+            verify_res,
+            plan,
+            trace_record,
+            count_tokens=True,
+        )
+        torch.cuda.synchronize()
+        self._mark_trace_end(trace_record)
+        trace_record["eager_verify_end_ts"] = trace_record.get("verify_end_ts")
+        if trace_record["eager_verify_start_ts"] is not None and trace_record["eager_verify_end_ts"] is not None:
+            trace_record["eager_verify_time_ms"] = (
+                trace_record["eager_verify_end_ts"] - trace_record["eager_verify_start_ts"]
+            ) * 1000
+        self._finalize_record_profile(trace_record)
+
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")
+        target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "dual_eager_verify")
         draft_seq_ids = list(plan.draft_home_set)
         target_seq_ids = [seq.seq_id for seq in target_seqs]
+        target_eager_seq_ids = [seq.seq_id for seq in target_eager_seqs]
+        assert set(target_eager_seq_ids).isdisjoint(draft_seq_ids), self._proposal_assertion_message(
+            plan,
+            f"target_eager_set overlaps draft_home_set: {target_eager_seq_ids}",
+        )
         fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"
 
         target_proposals = []
@@ -1805,6 +2313,7 @@ class TargetModelRunner(ModelRunnerBase):
                 f"missing buffered proposals for target seq_ids={target_seq_ids}",
             )
             target_proposals = self.dual_proposal_buffer.get_many(target_seq_ids)
+        eager_proposals = self.eager_proposal_buffer.get_many(target_eager_seq_ids, ready_only=True)
 
         trace_record = None
         logits = None
@@ -1831,6 +2340,11 @@ class TargetModelRunner(ModelRunnerBase):
             else:
                 self.dual_proposal_buffer.store(received_proposals)
 
+        received_eager_proposals = []
+        if plan.draft_eager_set and self.global_config.enable_eager_execution:
+            received_eager_proposals = self._receive_eager_proposals(plan.draft_eager_set, plan)
+            self.eager_proposal_buffer.store(received_eager_proposals)
+
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
             consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
@@ -1846,12 +2360,22 @@ class TargetModelRunner(ModelRunnerBase):
                 target_proposals,
                 plan,
             )
+            self._promote_or_discard_eager_after_normal(
+                plan,
+                accepted_lens,
+                invalidated_lens,
+                trace_record,
+                count_tokens=True,
+            )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
         elif received_proposals:
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             self._finalize_record_profile(priming_record)
+
+        if target_eager_seqs:
+            self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.

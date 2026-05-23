@@ -98,9 +98,9 @@ def main() -> int:
         errors.append("no dual_batch_pearl records with dual_batch_enabled=True")
 
     for idx, record in enumerate(dual_records):
-        if record.get("target_eager_set"):
+        if record.get("target_eager_set") and not record.get("eager_execution_enabled"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
-        if record.get("draft_eager_set"):
+        if record.get("draft_eager_set") and not (record.get("eager_trace_enabled") or record.get("eager_execution_enabled")):
             errors.append(f"dual_record[{idx}] has non-empty draft_eager_set")
         for field in ("active_seq_count", "target_fraction_of_active", "split_imbalance"):
             if field not in record or record.get(field) is None:

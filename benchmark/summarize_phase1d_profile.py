@@ -168,6 +168,13 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         str(eager_slo_class_by_seq_id.get(str(seq_id), eager_slo_class_by_seq_id.get(seq_id, "unknown")))
         for seq_id in sorted(eager_selected_seq_ids)
     ]
+    eager_tokens_generated = isum([r.get("eager_tokens_generated") for r in records])
+    eager_tokens_promoted = isum([r.get("eager_tokens_promoted") for r in records])
+    eager_tokens_discarded = isum([r.get("eager_tokens_discarded") for r in records])
+    eager_tokens_verified = isum([r.get("eager_tokens_verified") for r in records])
+    eager_tokens_accepted = isum([r.get("eager_tokens_accepted") for r in records])
+    eager_tokens_rejected = isum([r.get("eager_tokens_rejected") for r in records])
+    records_with_target_eager_set = 1 if any(r.get("target_eager_set") for r in records) else 0
 
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
@@ -204,6 +211,13 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "eager_selected_count": len(eager_selected_seq_ids),
         "eager_total_budget": max([int(r.get("eager_total_budget") or 0) for r in records], default=0),
         "eager_selected_slo_classes": eager_selected_slo_classes,
+        "eager_tokens_generated": eager_tokens_generated,
+        "eager_tokens_promoted": eager_tokens_promoted,
+        "eager_tokens_discarded": eager_tokens_discarded,
+        "eager_tokens_verified": eager_tokens_verified,
+        "eager_tokens_accepted": eager_tokens_accepted,
+        "eager_tokens_rejected": eager_tokens_rejected,
+        "records_with_target_eager_set": records_with_target_eager_set,
     }
 
 
@@ -249,6 +263,13 @@ def summarize(path: Path) -> dict[str, Any]:
         eager_selected_by_slo_class.update(profile["eager_selected_slo_classes"])
         if profile["eager_selected_count"]:
             eager_selected_by_plan_phase[profile["phase"]] += profile["eager_selected_count"]
+    total_eager_generated = sum(p["eager_tokens_generated"] for p in step_profiles)
+    total_eager_promoted = sum(p["eager_tokens_promoted"] for p in step_profiles)
+    total_eager_discarded = sum(p["eager_tokens_discarded"] for p in step_profiles)
+    total_eager_verified = sum(p["eager_tokens_verified"] for p in step_profiles)
+    total_eager_accepted = sum(p["eager_tokens_accepted"] for p in step_profiles)
+    total_eager_rejected = sum(p["eager_tokens_rejected"] for p in step_profiles)
+    records_with_target_eager_set = sum(p["records_with_target_eager_set"] for p in step_profiles)
 
     return {
         "path": str(path),
@@ -285,6 +306,17 @@ def summarize(path: Path) -> dict[str, Any]:
         "total_eager_budget": sum(p["eager_total_budget"] for p in step_profiles),
         "eager_selected_by_slo_class": dict(eager_selected_by_slo_class),
         "eager_selected_by_plan_phase": dict(eager_selected_by_plan_phase),
+        "total_eager_tokens_generated": total_eager_generated,
+        "total_eager_tokens_promoted": total_eager_promoted,
+        "total_eager_tokens_discarded": total_eager_discarded,
+        "total_eager_tokens_verified": total_eager_verified,
+        "total_eager_tokens_accepted": total_eager_accepted,
+        "total_eager_tokens_rejected": total_eager_rejected,
+        "eager_promotion_rate": total_eager_promoted / max(1, total_eager_generated),
+        "eager_verification_acceptance_rate": total_eager_accepted / max(1, total_eager_verified),
+        "eager_waste_rate": (total_eager_discarded + total_eager_rejected) / max(1, total_eager_generated),
+        "records_with_target_eager_set": records_with_target_eager_set,
+        "eager_benefit_proxy": total_eager_verified / max(1, proposal_tokens_verified + total_eager_verified),
         "steps": step_profiles,
     }
 
@@ -449,6 +481,16 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
         print(f"  total_eager_budget={row['total_eager_budget']}")
         print(f"  eager_selected_by_slo_class={row['eager_selected_by_slo_class']}")
         print(f"  eager_selected_by_plan_phase={row['eager_selected_by_plan_phase']}")
+        print(f"  total_eager_tokens_generated={row['total_eager_tokens_generated']}")
+        print(f"  total_eager_tokens_promoted={row['total_eager_tokens_promoted']}")
+        print(f"  total_eager_tokens_discarded={row['total_eager_tokens_discarded']}")
+        print(f"  total_eager_tokens_verified={row['total_eager_tokens_verified']}")
+        print(f"  total_eager_tokens_accepted={row['total_eager_tokens_accepted']}")
+        print(f"  eager_promotion_rate={row['eager_promotion_rate']:.3f}")
+        print(f"  eager_verification_acceptance_rate={row['eager_verification_acceptance_rate']:.3f}")
+        print(f"  eager_waste_rate={row['eager_waste_rate']:.3f}")
+        print(f"  records_with_target_eager_set={row['records_with_target_eager_set']}")
+        print(f"  eager_benefit_proxy={row['eager_benefit_proxy']:.3f}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

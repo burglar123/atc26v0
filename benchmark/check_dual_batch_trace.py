@@ -61,7 +61,10 @@ def main():
     )
     unexpected_non_empty_eager = sum(
         1 for r in dual_records
-        if r.get("target_eager_set") or (r.get("draft_eager_set") and not r.get("eager_trace_enabled"))
+        if (
+            (r.get("target_eager_set") and not r.get("eager_execution_enabled"))
+            or (r.get("draft_eager_set") and not (r.get("eager_trace_enabled") or r.get("eager_execution_enabled")))
+        )
     )
     missing_plan_id = sum(1 for r in dual_records if "plan_id" not in r)
     resolved_mismatch = sum(
@@ -110,9 +113,9 @@ def main():
         phase = record.get("plan_phase")
         if phase not in {"priming", "steady", "fallback"}:
             errors.append(f"dual_record[{idx}] invalid plan_phase={phase!r}")
-        if record.get("target_eager_set"):
+        if record.get("target_eager_set") and not record.get("eager_execution_enabled"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
-        if record.get("draft_eager_set") and not record.get("eager_trace_enabled"):
+        if record.get("draft_eager_set") and not (record.get("eager_trace_enabled") or record.get("eager_execution_enabled")):
             errors.append(f"dual_record[{idx}] has non-empty draft_eager_set")
         if record.get("eager_gamma", 0) != 0:
             errors.append(f"dual_record[{idx}] eager_gamma must be 0")
