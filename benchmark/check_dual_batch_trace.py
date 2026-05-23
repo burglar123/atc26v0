@@ -115,6 +115,14 @@ def main():
             errors.append(f"dual_record[{idx}] invalid plan_phase={phase!r}")
         if record.get("target_eager_set") and not record.get("eager_execution_enabled"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
+        if record.get("target_eager_set") and record.get("eager_execution_enabled"):
+            target_eager = as_set(record.get("target_eager_set"))
+            if phase != "steady":
+                errors.append(f"dual_record[{idx}] has target_eager_set outside steady phase")
+            if target_eager & as_set(record.get("target_home_set")):
+                errors.append(f"dual_record[{idx}] target_eager_set overlaps target_home_set")
+            if target_eager & as_set(record.get("draft_home_set")):
+                errors.append(f"dual_record[{idx}] target_eager_set overlaps draft_home_set")
         if record.get("draft_eager_set") and not (record.get("eager_trace_enabled") or record.get("eager_execution_enabled")):
             errors.append(f"dual_record[{idx}] has non-empty draft_eager_set")
         if record.get("eager_gamma", 0) != 0:

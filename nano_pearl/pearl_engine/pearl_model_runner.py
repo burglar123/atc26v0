@@ -798,7 +798,10 @@ class ModelRunnerBase:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
         self._annotate_eager_execution_plan(plan)
         self._annotate_eager_trace_plan(plan)
-        plan.validate_phase1c()
+        if self.global_config.enable_eager_execution:
+            plan.validate_phase1h_eager_execution()
+        else:
+            plan.validate_phase1c()
         return plan
 
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:

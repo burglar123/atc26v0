@@ -185,6 +185,61 @@ class StepPlan:
                     f"expected {self.normal_gamma}, got {budget.normal_gamma}"
                 )
 
+    def validate_phase1h_eager_execution(self):
+        assert self.execution_mode == "dual_batch_pearl", (
+            f"Phase 1H eager execution requires execution_mode='dual_batch_pearl', got {self.execution_mode!r}"
+        )
+        assert self.dual_batch_enabled, "Phase 1H eager execution requires dual_batch_enabled=True"
+        assert self.plan_phase in {"priming", "steady", "fallback"}, (
+            f"Invalid Phase 1H plan_phase={self.plan_phase!r}"
+        )
+        assert self.enable_eager_execution and self.eager_execution_enabled, (
+            "Phase 1H eager execution validator requires eager execution to be enabled"
+        )
+        if self.target_eager_set:
+            assert self.plan_phase == "steady", (
+                f"target_eager_set is allowed only in steady eager execution steps, "
+                f"got plan_phase={self.plan_phase!r}, target_eager_set={self.target_eager_set}"
+            )
+        assert not (self.plan_phase == "priming" and self.target_eager_set), (
+            f"Priming steps cannot have target_eager_set, got {self.target_eager_set}"
+        )
+        if self.draft_eager_set:
+            assert self.eager_trace_enabled or self.eager_execution_enabled, (
+                f"draft_eager_set may be non-empty only when eager trace or eager execution is enabled, "
+                f"got {self.draft_eager_set}"
+            )
+        assert set(self.target_eager_set).isdisjoint(self.target_home_set), (
+            f"target_eager_set must be disjoint from target_home_set, got target_eager_set={self.target_eager_set}, "
+            f"target_home_set={self.target_home_set}"
+        )
+        assert set(self.target_eager_set).isdisjoint(self.draft_home_set), (
+            f"target_eager_set must be disjoint from draft_home_set, got target_eager_set={self.target_eager_set}, "
+            f"draft_home_set={self.draft_home_set}"
+        )
+        if self.plan_phase == "steady":
+            assert self.target_batch_id != self.draft_batch_id, (
+                f"Steady dual-batch plan must use different batches, got target_batch_id={self.target_batch_id}, "
+                f"draft_batch_id={self.draft_batch_id}"
+            )
+            assert set(self.target_home_set).isdisjoint(self.draft_home_set), (
+                f"Steady dual-batch home sets must be disjoint, got target_home_set={self.target_home_set}, "
+                f"draft_home_set={self.draft_home_set}"
+            )
+        allowed_eager_budget_seq_ids = set(self.eager_selected_seq_ids) | set(self.draft_eager_set) | set(self.target_eager_set)
+        for seq_id, budget in self.budgets.items():
+            if int(budget.eager_gamma) != 0:
+                assert int(seq_id) in allowed_eager_budget_seq_ids, (
+                    f"Non-zero eager_gamma must belong to selected or eager seqs, "
+                    f"seq_id={seq_id}, eager_gamma={budget.eager_gamma}, "
+                    f"allowed={sorted(allowed_eager_budget_seq_ids)}"
+                )
+            if self.normal_gamma is not None:
+                assert int(budget.normal_gamma) == int(self.normal_gamma), (
+                    f"Phase 1H normal_gamma mismatch for seq_id={seq_id}: "
+                    f"expected {self.normal_gamma}, got {budget.normal_gamma}"
+                )
+
     def to_trace_dict(self) -> dict:
         return {
             "plan_id": int(self.plan_id),
