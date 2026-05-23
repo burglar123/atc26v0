@@ -360,6 +360,7 @@ class ModelRunnerBase:
         seq.decode_ready_mode = bool(snapshot.get("decode_ready_mode", False))
         seq.num_decode_ready_prefill_tokens = int(snapshot.get("num_decode_ready_prefill_tokens", 0))
         seq.trace_stats = snapshot.get("trace_stats", seq.trace_stats)
+        seq.arrival_offset_sec = snapshot.get("arrival_offset_sec")
         return seq
 
     def _allocate_cached_blocks(self, seq: Sequence, num_blocks: int) -> list[int]:
@@ -729,43 +730,67 @@ class ModelRunnerBase:
         dist.barrier()
         torch.cuda.synchronize()
         start_time = time.time()
+        serving_start_tensor = torch.tensor(
+            [start_time if self.rank == 0 else 0.0],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        dist.broadcast(serving_start_tensor, src=0)
+        serving_start_ts = float(serving_start_tensor.item())
         base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
-        serving_start_ts = start_time
         materialized_count = 0
         min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
         last_logged_materialized_bucket = -1
         last_logged_pending_bucket = -1
         last_logged_running = -1
         while pending or self.scheduler.running:
-            now = time.time()
+            now_tensor = torch.tensor(
+                [time.time() if self.rank == 0 else 0.0],
+                dtype=torch.float64,
+                device="cuda",
+            )
+            dist.broadcast(now_tensor, src=0)
+            now = float(now_tensor.item())
             free_blocks_before = len(self.scheduler.block_manager.free_block_ids)
             gpu_free_before, gpu_total = torch.cuda.mem_get_info()
             guard_triggered = False
-            while pending and (serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)) <= now and len(self.scheduler.running) < max_active_cached_seqs:
+            eligible = 0
+            while eligible < len(pending):
+                seq = pending[eligible]
+                seq_arrival = serving_start_ts + (float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset)
+                if seq_arrival <= now:
+                    eligible += 1
+                else:
+                    break
+            local_active_capacity = max(max_active_cached_seqs - len(self.scheduler.running), 0)
+            if eligible > 0 and local_active_capacity > 0:
+                first_need_blocks = int(self.cached_kv_store[pending[0].request_id]["num_blocks"])
+                local_block_capacity = len(self.scheduler.block_manager.free_block_ids) // max(first_need_blocks, 1)
+            else:
+                local_block_capacity = 0
+            gpu_free_now, _ = torch.cuda.mem_get_info()
+            local_mem_capacity = local_active_capacity if gpu_free_now >= 256 * 1024 * 1024 else 0
+            local_k = min(eligible, local_active_capacity, local_block_capacity, local_mem_capacity)
+            k_tensor = torch.tensor([local_k], dtype=torch.int64, device="cuda")
+            dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN)
+            global_k = int(k_tensor.item())
+            if global_k == 0 and eligible > 0 and local_active_capacity > 0:
+                guard_triggered = True
+            for _ in range(global_k):
                 seq = pending.pop(0)
-                cached = self.cached_kv_store.get(seq.request_id)
-                if cached is None:
-                    raise RuntimeError(f"Missing cached entry for request_id={seq.request_id}")
-                need_blocks = int(cached["num_blocks"])
-                if len(self.scheduler.block_manager.free_block_ids) < need_blocks:
-                    pending.insert(0, seq)
-                    guard_triggered = True
-                    break
-                gpu_free_now, _ = torch.cuda.mem_get_info()
-                if gpu_free_now < 256 * 1024 * 1024:
-                    pending.insert(0, seq)
-                    if self.tp_params.local_rank == 0:
-                        logger.warning(
-                            f"[Rank {self.rank}: {self.group_name}] low GPU free mem={gpu_free_now} bytes; defer admission."
-                        )
-                    guard_triggered = True
-                    break
                 self.materialize_cached_request(seq.request_id, now)
                 materialized_count += 1
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
             min_free_blocks = min(min_free_blocks, free_blocks_after)
             running_count = len(self.scheduler.running)
             pending_count = len(pending)
+            sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
+            gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, sync_vec)
+            assert all(torch.equal(g, gathered[0]) for g in gathered), (
+                "cached admission divergence across ranks: "
+                + ", ".join(str(g.tolist()) for g in gathered)
+            )
             mat_bucket = materialized_count // self.cached_admission_log_interval
             pending_bucket = pending_count // self.cached_admission_log_interval
             should_log = (
