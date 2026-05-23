@@ -485,6 +485,76 @@ class ModelRunnerBase:
         )
         return resolved
 
+    def _profile_defaults(self, seqs: list[Sequence], step_plan: StepPlan) -> dict:
+        target_home_size = len(step_plan.target_home_set)
+        draft_home_size = len(step_plan.draft_home_set)
+        return {
+            "step_start_ts": None,
+            "step_end_ts": None,
+            "step_time_ms": 0.0,
+            "overlap_time_ms": 0.0,
+            "overlap_ratio": None,
+            "exposed_draft_time_ms": None,
+            "exposed_verify_time_ms": None,
+            "pipeline_bubble_ms": None,
+            "draft_tokens_generated": 0,
+            "proposal_tokens_available": 0,
+            "proposal_tokens_verified": 0,
+            "accepted_tokens": 0,
+            "invalidated_predraft_tokens": 0,
+            "wasted_draft_tokens": 0,
+            "draft_waste_rate": None,
+            "acceptance_rate": None,
+            "target_home_size": target_home_size,
+            "draft_home_size": draft_home_size,
+            "active_batch_size": len(seqs),
+            "running_queue_size": len(self.scheduler.running),
+            "target_batch_size": target_home_size,
+            "draft_batch_size": draft_home_size,
+        }
+
+    def _finalize_record_profile(self, record: dict):
+        draft_start = record.get("draft_start_ts")
+        draft_end = record.get("draft_end_ts")
+        verify_start = record.get("verify_start_ts")
+        verify_end = record.get("verify_end_ts")
+        draft_time_ms = float(record.get("draft_time_ms") or 0.0)
+        verify_time_ms = float(record.get("verify_time_ms") or 0.0)
+        step_start = record.get("step_start_ts")
+        step_end = record.get("step_end_ts")
+        if step_start is not None and step_end is not None:
+            record["step_time_ms"] = max(0.0, (step_end - step_start) * 1000)
+
+        overlap_time_ms = 0.0
+        if draft_start is not None and draft_end is not None and verify_start is not None and verify_end is not None:
+            overlap_s = max(0.0, min(draft_end, verify_end) - max(draft_start, verify_start))
+            overlap_time_ms = overlap_s * 1000
+        record["overlap_time_ms"] = overlap_time_ms
+
+        min_stage_ms = min(draft_time_ms, verify_time_ms)
+        record["overlap_ratio"] = None if min_stage_ms <= 0 else overlap_time_ms / max(1e-9, min_stage_ms)
+        record["exposed_draft_time_ms"] = max(0.0, draft_time_ms - overlap_time_ms)
+        record["exposed_verify_time_ms"] = max(0.0, verify_time_ms - overlap_time_ms)
+        # Phase 1D uses the inclusion-exclusion bubble:
+        # wall step time minus union(draft interval, verify interval).
+        record["pipeline_bubble_ms"] = max(
+            0.0,
+            float(record.get("step_time_ms") or 0.0) - draft_time_ms - verify_time_ms + overlap_time_ms,
+        )
+
+        accepted_tokens = int(record.get("accepted_tokens") or 0)
+        invalidated_tokens = int(record.get("invalidated_predraft_tokens") or 0)
+        dropped_tokens = int(record.get("proposal_buffer_dropped_count") or 0) * max(int(self.gamma), 0)
+        wasted_tokens = invalidated_tokens + dropped_tokens
+        record["wasted_draft_tokens"] = wasted_tokens
+        generated = int(record.get("draft_tokens_generated") or 0)
+        verified = int(record.get("proposal_tokens_verified") or 0)
+        record["draft_waste_rate"] = wasted_tokens / max(1, generated) if generated else None
+        record["acceptance_rate"] = accepted_tokens / max(1, verified) if verified else None
+
+    def _proposal_verify_token_count(self, seqs: list[Sequence]) -> int:
+        return sum(1 if seq.pre_verify else self.gamma for seq in seqs)
+
     def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
         self._trace_plan_id += 1
@@ -518,6 +588,7 @@ class ModelRunnerBase:
             "total_accepted_tokens": 0,
         }
         record.update(step_plan.to_trace_dict())
+        record.update(self._profile_defaults(seqs, step_plan))
         self.trace_records.append(record)
         return record, step_plan
 
@@ -525,14 +596,15 @@ class ModelRunnerBase:
         self.dual_batch_manager.gamma = int(self.gamma)
         self.dual_batch_manager.update_running(self.scheduler.running)
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
-        self.dual_proposal_buffer.discard_inactive(active_seq_ids)
+        return self.dual_proposal_buffer.discard_inactive(active_seq_ids)
 
     def _build_dual_batch_step_plan(self) -> StepPlan:
-        self._prepare_dual_batch_state()
+        proposal_buffer_size_before = self.dual_proposal_buffer.size()
+        dropped_seq_ids = self._prepare_dual_batch_state()
         iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
-        return self.dual_batch_manager.build_step_plan(
+        plan = self.dual_batch_manager.build_step_plan(
             plan_id=plan_id,
             iteration_id=iteration_id,
             execution_mode=self.active_execution_mode,
@@ -540,6 +612,19 @@ class ModelRunnerBase:
             pending_proposal_seq_ids=self.dual_proposal_buffer.pending_seq_ids(),
             pending_batch_ids=self.dual_proposal_buffer.pending_batch_ids(),
         )
+        buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
+        plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
+        plan.proposal_buffer_requested_seq_ids = buffer_inspect["requested_seq_ids"]
+        plan.proposal_buffer_hit_seq_ids = buffer_inspect["hit_seq_ids"]
+        plan.proposal_buffer_miss_seq_ids = buffer_inspect["miss_seq_ids"]
+        plan.proposal_buffer_invalid_seq_ids = buffer_inspect["invalid_seq_ids"]
+        plan.proposal_buffer_dropped_seq_ids = [int(seq_id) for seq_id in dropped_seq_ids]
+        plan.proposal_buffer_hit_count = len(plan.proposal_buffer_hit_seq_ids)
+        plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
+        plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
+        plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
+        return plan
 
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:
         if not seq_ids:
@@ -601,6 +686,7 @@ class ModelRunnerBase:
             "total_accepted_tokens": 0,
         }
         record.update(plan.to_trace_dict())
+        record.update(self._profile_defaults(seqs, plan))
         self.trace_records.append(record)
         return record
 
@@ -764,6 +850,8 @@ class ModelRunnerBase:
         now = time.time()
         key = "draft_start_ts" if self.is_draft else "verify_start_ts"
         record[key] = now
+        if record.get("step_start_ts") is None:
+            record["step_start_ts"] = now
         if record["total_iteration_start_ts"] is None:
             record["total_iteration_start_ts"] = now
 
@@ -773,15 +861,18 @@ class ModelRunnerBase:
             record["per_seq_accepted_len"].update(accepted_lens)
             record["accepted_tokens_per_seq"].update(accepted_lens)
             record["total_accepted_tokens"] = sum(record["accepted_tokens_per_seq"].values())
+            record["accepted_tokens"] = record["total_accepted_tokens"]
         if invalidated_lens:
             invalidated_lens = {seq_id: int(invalidated_len) for seq_id, invalidated_len in invalidated_lens.items()}
             record["per_seq_invalidated_predraft_len"].update(invalidated_lens)
+            record["invalidated_predraft_tokens"] = sum(record["per_seq_invalidated_predraft_len"].values())
 
     def _mark_trace_end(self, record: dict, accepted_lens: dict[int, int] | None = None, invalidated_lens: dict[int, int] | None = None):
         if self.tp_params.local_rank == 0:
             now = time.time()
             key = "draft_end_ts" if self.is_draft else "verify_end_ts"
             record[key] = now
+            record["step_end_ts"] = now
             record["total_iteration_end_ts"] = now
             if record["draft_start_ts"] is not None and record["draft_end_ts"] is not None:
                 record["draft_time_ms"] = (record["draft_end_ts"] - record["draft_start_ts"]) * 1000
@@ -790,6 +881,7 @@ class ModelRunnerBase:
             if record["total_iteration_start_ts"] is not None:
                 record["total_iteration_time_ms"] = (now - record["total_iteration_start_ts"]) * 1000
         self._update_trace_token_stats(record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+        self._finalize_record_profile(record)
 
     def _service_metadata(self):
         seqs = list(self.scheduler.waiting) + list(self.scheduler.running) + list(self.scheduler.finished)
@@ -1352,10 +1444,13 @@ class DraftModelRunner(ModelRunnerBase):
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         return super().prepare_decode(seqs)
 
-    def _draft_dual_batch_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
+    def _draft_dual_batch_proposals(self, seqs: list[Sequence], plan: StepPlan) -> tuple[list[BufferedProposal], list[dict]]:
+        draft_records = []
         for _ in range(self.gamma):
             self._allocate_decode_slots_for_dual(seqs, plan, "dual_draft")
             trace_record = self._trace_dual_batch_schedule(seqs, plan, "dual_draft")
+            draft_records.append(trace_record)
+            trace_record["draft_tokens_generated"] = len(seqs)
             input_ids, positions = self.prepare_pearl_decode(seqs)
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
@@ -1368,7 +1463,10 @@ class DraftModelRunner(ModelRunnerBase):
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
-        return self._build_buffered_proposals(seqs, plan)
+        proposals = self._build_buffered_proposals(seqs, plan)
+        for trace_record in draft_records:
+            trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+        return proposals, draft_records
 
     def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
@@ -1421,19 +1519,28 @@ class DraftModelRunner(ModelRunnerBase):
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
 
         proposals = []
+        draft_records = []
         if draft_seqs:
-            proposals = self._draft_dual_batch_proposals(draft_seqs, plan)
+            proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             if plan.plan_phase in {"priming", "steady"}:
                 self.dual_proposal_buffer.store(proposals)
+            for trace_record in draft_records:
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+            trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
+            trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             verify_res = self._receive_verify_result(target_seqs)
             accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
-            self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+            consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+            trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+            trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+            trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
     
@@ -1444,6 +1551,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "draft")
             seqs = self._resolve_plan_seqs(step_plan, "draft")
             trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
+            trace_record["draft_tokens_generated"] = len(seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(seqs)
             torch.cuda.synchronize()
@@ -1465,6 +1573,7 @@ class DraftModelRunner(ModelRunnerBase):
         accepted_lens, invalidated_lens = self.verify(seqs)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            self._finalize_record_profile(trace_record)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL draft phase.
@@ -1480,6 +1589,7 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record, step_plan = self._trace_schedule(seqs, is_prefill, "serialized_draft")
             seqs = self._resolve_plan_seqs(step_plan, "serialized_draft")
             trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
+            trace_record["draft_tokens_generated"] = len(seqs)
             assert not is_prefill, "wrong match. current stage is prefill."
             input_ids, positions = self.prepare_pearl_decode(seqs)
             torch.cuda.synchronize()
@@ -1501,6 +1611,7 @@ class DraftModelRunner(ModelRunnerBase):
         accepted_lens, invalidated_lens = self.verify(seqs)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            self._finalize_record_profile(trace_record)
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -1559,6 +1670,8 @@ class TargetModelRunner(ModelRunnerBase):
         seqs = self._resolve_plan_seqs(step_plan, "verify")
         trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         assert not is_prefill, "wrong match. current stage is prefill."
+        trace_record["proposal_tokens_available"] = self._proposal_verify_token_count(seqs)
+        trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
@@ -1589,6 +1702,8 @@ class TargetModelRunner(ModelRunnerBase):
         if target_seqs:
             self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "dual_verify")
+            trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
+            trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             input_ids, positions, temp_seqs = self.prepare_pearl_decode(target_seqs)
             temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
             torch.cuda.synchronize()
@@ -1600,12 +1715,20 @@ class TargetModelRunner(ModelRunnerBase):
             received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
             if fallback_same_batch:
                 target_proposals = received_proposals
+                if trace_record is not None:
+                    trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
+                    trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             else:
                 self.dual_proposal_buffer.store(received_proposals)
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
-            self.dual_proposal_buffer.discard(target_seq_ids)
+            consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
+            if fallback_same_batch:
+                consumed_seq_ids = [proposal.seq_id for proposal in target_proposals]
+            trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+            trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+            trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             accepted_lens, invalidated_lens = self.verify_from_proposals(
                 logits,
                 target_seqs,
@@ -1615,6 +1738,10 @@ class TargetModelRunner(ModelRunnerBase):
             )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+        elif received_proposals:
+            priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
+            priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            self._finalize_record_profile(priming_record)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.
@@ -1632,6 +1759,8 @@ class TargetModelRunner(ModelRunnerBase):
         seqs = self._resolve_plan_seqs(step_plan, "serialized_verify")
         trace_record["resolved_seq_ids"] = [seq.seq_id for seq in seqs]
         assert not is_prefill, "wrong match. current stage is prefill."
+        trace_record["proposal_tokens_available"] = self._proposal_verify_token_count(seqs)
+        trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()

@@ -17,6 +17,7 @@ class DualBatchPlanState:
     draft_batch_id: Optional[int]
     step_id: int
     phase: str
+    fallback_reason: Optional[str] = None
 
 
 @dataclass
@@ -41,20 +42,30 @@ class ProposalBuffer:
     def clear(self) -> None:
         self._proposals.clear()
 
+    def size(self) -> int:
+        return len(self._proposals)
+
     def store(self, proposals: Iterable[BufferedProposal]) -> None:
         for proposal in proposals:
             if proposal.valid:
                 self._proposals[int(proposal.seq_id)] = proposal
 
-    def discard(self, seq_ids: Iterable[int]) -> None:
+    def discard(self, seq_ids: Iterable[int]) -> list[int]:
+        dropped = []
         for seq_id in seq_ids:
-            self._proposals.pop(int(seq_id), None)
+            seq_id = int(seq_id)
+            if self._proposals.pop(seq_id, None) is not None:
+                dropped.append(seq_id)
+        return dropped
 
-    def discard_inactive(self, active_seq_ids: Iterable[int]) -> None:
+    def discard_inactive(self, active_seq_ids: Iterable[int]) -> list[int]:
         active = {int(seq_id) for seq_id in active_seq_ids}
+        dropped = []
         for seq_id in list(self._proposals):
             if seq_id not in active:
                 self._proposals.pop(seq_id, None)
+                dropped.append(seq_id)
+        return dropped
 
     def get_many(self, seq_ids: Iterable[int]) -> list[BufferedProposal]:
         proposals = []
@@ -68,6 +79,26 @@ class ProposalBuffer:
         proposals = self.get_many(seq_ids)
         self.discard(seq_ids)
         return proposals
+
+    def inspect(self, seq_ids: Iterable[int]) -> dict:
+        requested_seq_ids = [int(seq_id) for seq_id in seq_ids]
+        hit_seq_ids = []
+        miss_seq_ids = []
+        invalid_seq_ids = []
+        for seq_id in requested_seq_ids:
+            proposal = self._proposals.get(seq_id)
+            if proposal is None:
+                miss_seq_ids.append(seq_id)
+            elif proposal.valid:
+                hit_seq_ids.append(seq_id)
+            else:
+                invalid_seq_ids.append(seq_id)
+        return {
+            "requested_seq_ids": requested_seq_ids,
+            "hit_seq_ids": hit_seq_ids,
+            "miss_seq_ids": miss_seq_ids,
+            "invalid_seq_ids": invalid_seq_ids,
+        }
 
     def has_all(self, seq_ids: Iterable[int]) -> bool:
         return all(int(seq_id) in self._proposals and self._proposals[int(seq_id)].valid for seq_id in seq_ids)
@@ -154,6 +185,7 @@ class DualBatchManager:
         target_batch_id: Optional[int] = None
         draft_batch_id: Optional[int] = None
         phase = "fallback"
+        fallback_reason: Optional[str] = None
 
         if len(active) == 2:
             active_pending = [batch_id for batch_id in pending_batch_ids if batch_id in active]
@@ -169,9 +201,11 @@ class DualBatchManager:
             if any(batch_id == only_batch_id for batch_id in pending_batch_ids):
                 target_batch_id = only_batch_id
                 draft_batch_id = None
+                fallback_reason = "single_active_batch_with_buffered_proposals"
             else:
                 target_batch_id = only_batch_id
                 draft_batch_id = only_batch_id
+                fallback_reason = "single_active_batch_without_buffered_proposals"
             phase = "fallback"
 
         target_home_set = self.batch_seq_ids(target_batch_id)
@@ -203,12 +237,16 @@ class DualBatchManager:
             normal_gamma=self.gamma,
             eager_gamma=0,
             step_id=self.step_id,
+            fallback_reason=fallback_reason,
+            steady_step=phase == "steady",
+            priming_step=phase == "priming",
         )
         plan_state = DualBatchPlanState(
             target_batch_id=target_batch_id,
             draft_batch_id=draft_batch_id,
             step_id=self.step_id,
             phase=phase,
+            fallback_reason=fallback_reason,
         )
         plan.validate_phase1c()
         self.step_id += 1

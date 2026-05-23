@@ -41,6 +41,23 @@ class StepPlan:
     eager_gamma: int = 0
     step_id: Optional[int] = None
     dual_batch_state: Optional[Any] = None
+    fallback_reason: Optional[str] = None
+    steady_step: bool = False
+    priming_step: bool = False
+
+    proposal_buffer_size_before: Optional[int] = None
+    proposal_buffer_size_after: Optional[int] = None
+    proposal_buffer_requested_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_hit_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_miss_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_consumed_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_dropped_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_invalid_seq_ids: List[int] = field(default_factory=list)
+    proposal_buffer_hit_count: int = 0
+    proposal_buffer_miss_count: int = 0
+    proposal_buffer_consumed_count: int = 0
+    proposal_buffer_dropped_count: int = 0
+    proposal_buffer_invalid_count: int = 0
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -122,4 +139,20 @@ class StepPlan:
             "normal_gamma": None if self.normal_gamma is None else int(self.normal_gamma),
             "eager_gamma": int(self.eager_gamma),
             "step_id": None if self.step_id is None else int(self.step_id),
+            "fallback_reason": self.fallback_reason,
+            "steady_step": bool(self.steady_step),
+            "priming_step": bool(self.priming_step),
+            "proposal_buffer_size_before": self.proposal_buffer_size_before,
+            "proposal_buffer_size_after": self.proposal_buffer_size_after,
+            "proposal_buffer_requested_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_requested_seq_ids],
+            "proposal_buffer_hit_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_hit_seq_ids],
+            "proposal_buffer_miss_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_miss_seq_ids],
+            "proposal_buffer_consumed_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_consumed_seq_ids],
+            "proposal_buffer_dropped_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_dropped_seq_ids],
+            "proposal_buffer_invalid_seq_ids": [int(seq_id) for seq_id in self.proposal_buffer_invalid_seq_ids],
+            "proposal_buffer_hit_count": int(self.proposal_buffer_hit_count),
+            "proposal_buffer_miss_count": int(self.proposal_buffer_miss_count),
+            "proposal_buffer_consumed_count": int(self.proposal_buffer_consumed_count),
+            "proposal_buffer_dropped_count": int(self.proposal_buffer_dropped_count),
+            "proposal_buffer_invalid_count": int(self.proposal_buffer_invalid_count),
         }
