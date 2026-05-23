@@ -28,6 +28,7 @@ from nano_pearl.pearl_engine.dual_batch import (
     EagerProposalBuffer,
     ProposalBuffer,
 )
+from nano_pearl.pearl_engine.proposal_payload import build_combined_proposal_payload
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -1145,39 +1146,24 @@ class ModelRunnerBase:
         return proposals
 
     def _combined_normal_payload(self, proposals: list[BufferedProposal]) -> list[int]:
-        header = []
-        tokens = []
-        for proposal in proposals:
-            header.extend(
-                [
-                    int(proposal.seq_id),
-                    int(proposal.home_batch_id),
-                    int(proposal.pre_verify),
-                    int(len(proposal.to_be_verified_token_ids)),
-                    int(proposal.proposal_len),
-                ]
-            )
-            tokens.extend(int(token) for token in proposal.to_be_verified_token_ids)
-            tokens.extend(int(token) for token in proposal.proposal_token_ids)
-        return header + tokens
+        return build_combined_proposal_payload(
+            normal_proposals=proposals,
+            eager_proposals=[],
+            plan_id=0,
+            step_id=None,
+            draft_batch_id=None,
+            gamma=self.gamma,
+        )["normal_payload"]
 
     def _combined_eager_payload(self, proposals: list[EagerBufferedProposal]) -> list[int]:
-        header = []
-        tokens = []
-        for proposal in proposals:
-            header.extend(
-                [
-                    int(proposal.seq_id),
-                    int(proposal.home_batch_id),
-                    int(proposal.eager_len),
-                    int(proposal.eager_base_len),
-                    int(proposal.source_plan_id),
-                    int(proposal.source_step_id),
-                    int(proposal.source_home_batch_id),
-                ]
-            )
-            tokens.extend(int(token) for token in proposal.eager_token_ids)
-        return header + tokens
+        return build_combined_proposal_payload(
+            normal_proposals=[],
+            eager_proposals=proposals,
+            plan_id=0,
+            step_id=None,
+            draft_batch_id=None,
+            gamma=self.gamma,
+        )["eager_payload"]
 
     def _send_combined_dual_proposals(
         self,
@@ -1187,17 +1173,29 @@ class ModelRunnerBase:
         expected_normal_seq_ids: list[int],
         expected_eager_seq_ids: list[int],
     ) -> None:
-        actual_normal_seq_ids = [int(proposal.seq_id) for proposal in normal_proposals]
-        actual_eager_seq_ids = [int(proposal.seq_id) for proposal in eager_proposals]
+        payload = build_combined_proposal_payload(
+            normal_proposals=normal_proposals,
+            eager_proposals=eager_proposals,
+            plan_id=plan.plan_id,
+            step_id=plan.step_id,
+            draft_batch_id=plan.draft_batch_id,
+            gamma=self.gamma,
+        )
+        actual_normal_seq_ids = list(payload["normal_seq_ids"])
+        actual_eager_seq_ids = list(payload["eager_seq_ids"])
         plan.send_expected_normal_seq_ids = list(expected_normal_seq_ids)
         plan.send_actual_normal_seq_ids = list(actual_normal_seq_ids)
         plan.send_expected_eager_seq_ids = list(expected_eager_seq_ids)
         plan.send_actual_eager_seq_ids = list(actual_eager_seq_ids)
-        plan.send_combined_payload_kind = "combined"
-        plan.send_combined_payload_plan_id = int(plan.plan_id)
-        plan.send_combined_payload_step_id = None if plan.step_id is None else int(plan.step_id)
+        plan.send_combined_payload_kind = payload["kind"]
+        plan.send_combined_payload_plan_id = int(payload["plan_id"])
+        plan.send_combined_payload_step_id = None if payload["step_id"] < 0 else int(payload["step_id"])
         if expected_eager_seq_ids and not actual_eager_seq_ids:
             plan.eager_draft_empty_reason = "draft_eager_set_nonempty_but_no_eager_proposals"
+        assert payload["kind"] == "combined", self._proposal_assertion_message(
+            plan,
+            f"send-side payload kind mismatch: expected=combined, actual={payload['kind']}",
+        )
         assert actual_normal_seq_ids == list(expected_normal_seq_ids), self._proposal_assertion_message(
             plan,
             f"send normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, actual={actual_normal_seq_ids}, "
@@ -1215,13 +1213,13 @@ class ModelRunnerBase:
             )
         if self.tp_params.local_rank != 0:
             return
-        normal_payload = self._combined_normal_payload(normal_proposals)
-        eager_payload = self._combined_eager_payload(eager_proposals)
-        payload = normal_payload + eager_payload
+        normal_payload = payload["normal_payload"]
+        eager_payload = payload["eager_payload"]
+        flat_payload = payload["flat_payload"]
         meta = torch.tensor(
             [
                 1,  # proposal_message_kind="combined"
-                len(payload),
+                len(flat_payload),
                 int(self.gamma),
                 int(plan.plan_id),
                 -1 if plan.step_id is None else int(plan.step_id),
@@ -1234,7 +1232,7 @@ class ModelRunnerBase:
             dtype=torch.int64,
             device="cuda",
         )
-        payload_tensor = torch.tensor(payload, dtype=torch.int64, device="cuda")
+        payload_tensor = torch.tensor(flat_payload, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta[1].item()) > 0:
             dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
@@ -2338,8 +2336,17 @@ class DraftModelRunner(ModelRunnerBase):
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
         draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
 
-        expected_normal_seq_ids = list(plan.normal_proposal_refresh_seq_ids or plan.draft_home_set)
-        expected_eager_seq_ids = list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
+        is_normal_refresh_fallback = plan.plan_phase == "fallback" and bool(plan.normal_proposal_refresh_seq_ids)
+        expected_normal_seq_ids = (
+            list(plan.normal_proposal_refresh_seq_ids)
+            if is_normal_refresh_fallback
+            else list(plan.draft_home_set)
+        )
+        expected_eager_seq_ids = (
+            []
+            if is_normal_refresh_fallback
+            else list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
+        )
         normal_seq_ids = [int(seq.seq_id) for seq in draft_seqs]
         eager_seq_ids = [int(seq.seq_id) for seq in draft_eager_seqs]
         assert normal_seq_ids == expected_normal_seq_ids, self._proposal_assertion_message(
