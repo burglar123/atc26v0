@@ -889,6 +889,39 @@ class ModelRunnerBase:
             plan.validate_phase1c()
         return plan
 
+    def _log_h2_steady_lane_transition(self, plan: StepPlan) -> None:
+        """Log H2 steady lane transition state at end of step for debugging.
+
+        Records current plan sets, buffer contents, eager outcomes, and
+        the expected lane migration due to repair_required flags so that
+        target_home_set / buffer consistency can be verified across steps.
+        """
+        if plan.plan_phase != "steady" or not self.global_config.enable_eager_execution:
+            return
+        role = "draft" if self.is_draft else "target"
+        running = self.scheduler.running
+        repair_migrations = []
+        for seq in running:
+            if seq.repair_required and seq.repair_lane_id is not None and seq.repair_lane_id != seq.home_batch_id:
+                repair_migrations.append({
+                    "seq_id": int(seq.seq_id),
+                    "from_batch": int(seq.home_batch_id) if seq.home_batch_id is not None else -1,
+                    "to_batch": int(seq.repair_lane_id),
+                    "last_eager_result": getattr(seq, "last_eager_result", "unknown"),
+                })
+        home_batch_ids = self.dual_batch_manager.home_batch_ids()
+        _step_id = plan.step_id if plan.step_id is not None else -1
+        logger.info(
+            "H2 lane transition: role=%s plan_id=%s step_id=%s "
+            "target_home=%s draft_home=%s target_eager=%s draft_eager=%s "
+            "buffer_keys=%s eager_keys=%s repair_migrations=%s home_batches=%s",
+            role, plan.plan_id, _step_id,
+            [int(s) for s in plan.target_home_set], [int(s) for s in plan.draft_home_set],
+            [int(s) for s in plan.target_eager_set], [int(s) for s in plan.draft_eager_set],
+            self.dual_proposal_buffer.pending_seq_ids(), self.eager_proposal_buffer.keys(),
+            repair_migrations, {str(k): int(v) for k, v in home_batch_ids.items()},
+        )
+
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:
         if not seq_ids:
             return []
@@ -2984,7 +3017,9 @@ class DraftModelRunner(ModelRunnerBase):
                     )
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record)
-    
+
+        self._log_h2_steady_lane_transition(plan)
+
     def pearl_step(self):
         trace_record = None
         for _ in range(self.gamma):
@@ -3237,9 +3272,32 @@ class TargetModelRunner(ModelRunnerBase):
             accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
             target_overlap = overlap_seq_ids & {int(s.seq_id) for s in seqs}
             discarded = []
+            seq_by_id = {int(s.seq_id): s for s in seqs}
             for seq_id in target_overlap:
                 self.dual_proposal_buffer.discard([seq_id])
                 discarded.append(int(seq_id))
+                # H2 lane transition: rejected overlap seqs must be
+                # marked repair_required on TARGET so both ranks agree
+                # on lane migration in the next step.  Without this the
+                # TARGET rank keeps the seq in target_home_set while
+                # the DRAFT rank migrates it, causing target_home_set
+                # divergence and missing-proposal assertion failures.
+                if seq_id not in accepted_set:
+                    s = seq_by_id.get(seq_id)
+                    if s is not None:
+                        s.repair_required = True
+                        s.repair_lane_id = int(plan.target_batch_id) if plan.target_batch_id is not None else None
+                        s.last_eager_result = "reject"
+            rejected_overlap = [seq_id for seq_id in target_overlap if seq_id not in accepted_set]
+            if rejected_overlap:
+                plan.repair_scheduled_seq_ids = list(
+                    set(plan.repair_scheduled_seq_ids) | set(rejected_overlap)
+                )
+                for seq_id in rejected_overlap:
+                    plan.repair_lane_by_seq_id[int(seq_id)] = int(plan.target_batch_id) if plan.target_batch_id is not None else -1
+                plan.eager_partial_or_reject_seq_ids = list(
+                    set(plan.eager_partial_or_reject_seq_ids) | set(rejected_overlap)
+                )
             plan.overlap_normal_proposal_discarded_seq_ids = list(
                 set(plan.overlap_normal_proposal_discarded_seq_ids) | set(discarded)
             )
@@ -3430,6 +3488,8 @@ class TargetModelRunner(ModelRunnerBase):
 
             if target_eager_seqs:
                 self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
+
+        self._log_h2_steady_lane_transition(plan)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.
