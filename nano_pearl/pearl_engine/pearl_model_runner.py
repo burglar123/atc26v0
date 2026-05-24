@@ -782,6 +782,15 @@ class ModelRunnerBase:
     def _prepare_dual_batch_state(self):
         self.dual_batch_manager.gamma = int(self.gamma)
         self.dual_batch_manager.update_running(self.scheduler.running)
+        # H2 repair lane migration: move repair_required seqs to repair_lane
+        for seq in self.scheduler.running:
+            if seq.repair_required and seq.repair_lane_id is not None and seq.repair_lane_id != seq.home_batch_id:
+                old_batch = seq.home_batch_id
+                self.dual_batch_manager.assign(seq, int(seq.repair_lane_id))
+                if old_batch is not None and old_batch in self.dual_batch_manager.batches:
+                    if seq.seq_id in self.dual_batch_manager.batches[old_batch].seq_ids:
+                        self.dual_batch_manager.batches[old_batch].seq_ids.remove(seq.seq_id)
+                seq.home_batch_id = int(seq.repair_lane_id)
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
         dropped_normal = self.dual_proposal_buffer.discard_inactive(active_seq_ids)
         dropped_eager = self.eager_proposal_buffer.discard_inactive(active_seq_ids)
@@ -835,6 +844,15 @@ class ModelRunnerBase:
                     plan.fallback_reason = "unknown_fallback_condition"
             if plan.dual_batch_state is not None:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
+        # H2 repair exclusion: exclude repair_required seqs from target_home_set
+        repair_excluded = []
+        for seq_id in list(plan.target_home_set):
+            seqs = self.scheduler.find_by_seq_ids([seq_id])
+            if seqs and seqs[0].repair_required:
+                plan.target_home_set.remove(seq_id)
+                repair_excluded.append(int(seq_id))
+        if repair_excluded:
+            plan.repair_scheduled_seq_ids = repair_excluded
         self._annotate_eager_execution_plan(plan)
         plan.proposal_buffer_keys_after_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
         self._handle_missing_normal_proposals_after_eager(plan)
@@ -921,7 +939,8 @@ class ModelRunnerBase:
             f"{self.dual_proposal_buffer.pending_seq_ids()}, eager_buffer_keys={self.eager_proposal_buffer.keys()}"
         )
 
-    def _build_buffered_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
+    def _build_buffered_proposals(self, seqs: list[Sequence], plan: StepPlan,
+                                  base_lens: dict[int, int] | None = None) -> list[BufferedProposal]:
         proposals = []
         for seq in seqs:
             proposal_tokens = list(seq.token_ids[-self.gamma:])
@@ -938,6 +957,7 @@ class ModelRunnerBase:
                 plan,
                 f"to_be_verified length mismatch for seq_id={seq.seq_id}",
             )
+            base_len = int(base_lens.get(seq.seq_id, len(seq) - self.gamma)) if base_lens else int(len(seq) - self.gamma)
             proposals.append(
                 BufferedProposal(
                     seq_id=int(seq.seq_id),
@@ -946,6 +966,7 @@ class ModelRunnerBase:
                     proposal_token_ids=[int(x) for x in proposal_tokens],
                     to_be_verified_token_ids=to_be_verified,
                     proposal_len=int(self.gamma),
+                    base_len=base_len,
                     pre_verify=bool(seq.pre_verify),
                     plan_id=int(plan.plan_id),
                     valid=True,
@@ -1145,6 +1166,7 @@ class ModelRunnerBase:
     def _send_combined_dual_proposals(
         self,
         normal_proposals: list[BufferedProposal],
+        conditional_normal_proposals: list[BufferedProposal],
         eager_proposals: list[EagerBufferedProposal],
         plan: StepPlan,
         expected_normal_seq_ids: list[int],
@@ -1152,6 +1174,7 @@ class ModelRunnerBase:
     ) -> None:
         payload = build_combined_proposal_payload(
             normal_proposals=normal_proposals,
+            conditional_normal_proposals=conditional_normal_proposals,
             eager_proposals=eager_proposals,
             plan_id=plan.plan_id,
             step_id=plan.step_id,
@@ -1159,6 +1182,7 @@ class ModelRunnerBase:
             gamma=self.gamma,
         )
         actual_normal_seq_ids = list(payload["normal_seq_ids"])
+        actual_conditional_seq_ids = list(payload["conditional_normal_seq_ids"])
         actual_eager_seq_ids = list(payload["eager_seq_ids"])
         plan.send_expected_normal_seq_ids = list(expected_normal_seq_ids)
         plan.send_actual_normal_seq_ids = list(actual_normal_seq_ids)
@@ -1173,15 +1197,18 @@ class ModelRunnerBase:
             plan,
             f"send-side payload kind mismatch: expected=combined, actual={payload['kind']}",
         )
-        assert actual_normal_seq_ids == list(expected_normal_seq_ids), self._proposal_assertion_message(
-            plan,
-            f"send normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, actual={actual_normal_seq_ids}, "
-            f"actual_eager_seq_ids={actual_eager_seq_ids}",
-        )
+        # normal + conditional together cover all draft_home_set seqs
+        assert actual_normal_seq_ids + actual_conditional_seq_ids == list(expected_normal_seq_ids), \
+            self._proposal_assertion_message(
+                plan,
+                f"send normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, "
+                f"normal={actual_normal_seq_ids}, conditional={actual_conditional_seq_ids}, "
+                f"eager={actual_eager_seq_ids}",
+            )
         assert actual_eager_seq_ids == list(expected_eager_seq_ids), self._proposal_assertion_message(
             plan,
             f"send eager proposal seq_id mismatch: expected={expected_eager_seq_ids}, actual={actual_eager_seq_ids}, "
-            f"actual_normal_seq_ids={actual_normal_seq_ids}",
+            f"normal={actual_normal_seq_ids}",
         )
         if expected_eager_seq_ids and not actual_eager_seq_ids:
             assert False, self._proposal_assertion_message(
@@ -1191,6 +1218,7 @@ class ModelRunnerBase:
         if self.tp_params.local_rank != 0:
             return
         normal_payload = payload["normal_payload"]
+        conditional_payload = payload["conditional_normal_payload"]
         eager_payload = payload["eager_payload"]
         flat_payload = payload["flat_payload"]
         meta = torch.tensor(
@@ -1203,6 +1231,8 @@ class ModelRunnerBase:
                 -1 if plan.draft_batch_id is None else int(plan.draft_batch_id),
                 len(normal_proposals),
                 len(normal_payload),
+                len(conditional_normal_proposals),
+                len(conditional_payload),
                 len(eager_proposals),
                 len(eager_payload),
             ],
@@ -1221,15 +1251,15 @@ class ModelRunnerBase:
         proposal_plan_id: int,
         expected_seq_ids: list[int],
     ) -> list[BufferedProposal]:
-        header_len = n * 5
+        header_len = n * 6
         headers = payload[:header_len]
         token_data = payload[header_len:]
         proposals = []
         token_offset = 0
         seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
         for idx in range(n):
-            base = idx * 5
-            seq_id, home_batch_id, pre_verify, to_verify_len, proposal_len = headers[base:base + 5]
+            base = idx * 6
+            seq_id, home_batch_id, base_len, pre_verify, to_verify_len, proposal_len = headers[base:base + 6]
             to_verify = [int(x) for x in token_data[token_offset:token_offset + to_verify_len]]
             token_offset += to_verify_len
             proposal_tokens = [int(x) for x in token_data[token_offset:token_offset + proposal_len]]
@@ -1243,6 +1273,7 @@ class ModelRunnerBase:
                     proposal_token_ids=proposal_tokens,
                     to_be_verified_token_ids=to_verify,
                     proposal_len=int(proposal_len),
+                    base_len=int(base_len),
                     pre_verify=bool(pre_verify),
                     plan_id=int(proposal_plan_id),
                     valid=True,
@@ -1352,8 +1383,8 @@ class ModelRunnerBase:
         expected_normal_seq_ids: list[int],
         expected_eager_seq_ids: list[int],
         plan: StepPlan,
-    ) -> tuple[list[BufferedProposal], list[EagerBufferedProposal]]:
-        meta = torch.zeros(10, dtype=torch.int64, device="cuda")
+    ) -> tuple[list[BufferedProposal], list[BufferedProposal], list[EagerBufferedProposal]]:
+        meta = torch.zeros(12, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         (
             proposal_kind,
@@ -1364,6 +1395,8 @@ class ModelRunnerBase:
             batch_id,
             normal_n,
             normal_payload_len,
+            conditional_n,
+            conditional_payload_len,
             eager_n,
             eager_payload_len,
         ) = [int(x) for x in meta.tolist()]
@@ -1380,10 +1413,19 @@ class ModelRunnerBase:
             dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         payload = payload_tensor.tolist()
         normal_payload = payload[:normal_payload_len]
-        eager_payload = payload[normal_payload_len:normal_payload_len + eager_payload_len]
+        conditional_start = normal_payload_len
+        conditional_payload = payload[conditional_start:conditional_start + conditional_payload_len]
+        eager_start = conditional_start + conditional_payload_len
+        eager_payload = payload[eager_start:eager_start + eager_payload_len]
         normal_proposals = self._parse_combined_normal_payload(
             normal_payload,
             normal_n,
+            proposal_plan_id,
+            expected_normal_seq_ids,
+        )
+        conditional_proposals = self._parse_combined_normal_payload(
+            conditional_payload,
+            conditional_n,
             proposal_plan_id,
             expected_normal_seq_ids,
         )
@@ -1394,19 +1436,23 @@ class ModelRunnerBase:
             plan,
         )
         received_normal_seq_ids = [proposal.seq_id for proposal in normal_proposals]
+        received_conditional_seq_ids = [proposal.seq_id for proposal in conditional_proposals]
         received_eager_seq_ids = [proposal.seq_id for proposal in eager_proposals]
         plan.expected_normal_receive_seq_ids = list(expected_normal_seq_ids)
         plan.received_normal_seq_ids = list(received_normal_seq_ids)
+        plan.received_conditional_normal_seq_ids = list(received_conditional_seq_ids)
         plan.received_eager_seq_ids = list(received_eager_seq_ids)
         plan.proposal_message_kind = "combined"
         plan.proposal_message_plan_id = int(proposal_plan_id)
         plan.proposal_message_step_id = int(proposal_step_id)
-        assert received_normal_seq_ids == list(expected_normal_seq_ids), self._proposal_assertion_message(
-            plan,
-            f"normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, received={received_normal_seq_ids}, "
-            f"received_eager_seq_ids={received_eager_seq_ids}, batch_id={batch_id}, "
-            f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
-        )
+        assert received_normal_seq_ids + received_conditional_seq_ids == list(expected_normal_seq_ids), \
+            self._proposal_assertion_message(
+                plan,
+                f"normal+conditional proposal seq_id mismatch: expected={expected_normal_seq_ids}, "
+                f"normal={received_normal_seq_ids}, conditional={received_conditional_seq_ids}, "
+                f"received_eager_seq_ids={received_eager_seq_ids}, batch_id={batch_id}, "
+                f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
+            )
 
         # --- eager receive: producer-authoritative for Phase 1H-lite ---
         plan.target_local_expected_eager_seq_ids = list(expected_eager_seq_ids)
@@ -1451,11 +1497,12 @@ class ModelRunnerBase:
         plan.local_plan_draft_eager_set_after_receive = list(plan.draft_eager_set)
         # --- end eager receive ---
 
-        return normal_proposals, eager_proposals
+        return normal_proposals, conditional_proposals, eager_proposals
 
     def _apply_combined_proposal_trace_fields(self, trace_record: dict, plan: StepPlan) -> None:
         trace_record["expected_normal_receive_seq_ids"] = list(plan.expected_normal_receive_seq_ids)
         trace_record["received_normal_seq_ids"] = list(plan.received_normal_seq_ids)
+        trace_record["received_conditional_normal_seq_ids"] = list(plan.received_conditional_normal_seq_ids)
         trace_record["received_eager_seq_ids"] = list(plan.received_eager_seq_ids)
         trace_record["target_local_expected_eager_seq_ids"] = list(plan.target_local_expected_eager_seq_ids)
         trace_record["eager_receive_policy"] = plan.eager_receive_policy
@@ -2408,6 +2455,36 @@ class DraftModelRunner(ModelRunnerBase):
                     seq.append_token(revise_token[idx])
         return accepted_lens, invalidated_lens
 
+    def _draft_conditional_after_eager(
+        self, seqs: list[Sequence], plan: StepPlan
+    ) -> tuple[list[BufferedProposal], list[dict]]:
+        """Re-draft normal proposals from post-eager prefix for overlap seqs after eager full-accept."""
+        if not seqs:
+            return [], []
+        base_lens = {seq.seq_id: len(seq) for seq in seqs}
+        draft_records = []
+        for _ in range(self.gamma):
+            self._allocate_decode_slots_for_dual(seqs, plan, "dual_conditional_draft")
+            trace_record = self._trace_dual_batch_schedule(seqs, plan, "dual_conditional_draft")
+            draft_records.append(trace_record)
+            trace_record["draft_tokens_generated"] = len(seqs)
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, False)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            torch.cuda.synchronize()
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+            self._mark_trace_end(trace_record)
+        proposals = self._build_buffered_proposals(seqs, plan, base_lens=base_lens)
+        for trace_record in draft_records:
+            self._finalize_record_profile(trace_record)
+        return proposals, draft_records
+
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
@@ -2437,22 +2514,35 @@ class DraftModelRunner(ModelRunnerBase):
             f"draft eager seq_id mismatch before send packaging: expected={expected_eager_seq_ids}, actual={eager_seq_ids}",
         )
 
+        # H2: detect overlap between target_eager_set and draft_home_set (steady only)
+        h2_steady = plan.plan_phase == "steady" and self.global_config.enable_eager_execution
+        target_eager_seq_ids = [int(seq.seq_id) for seq in target_eager_seqs]
+        draft_seq_ids = [int(seq.seq_id) for seq in draft_seqs]
+        overlap_seq_ids = sorted(set(target_eager_seq_ids) & set(draft_seq_ids))
+        if overlap_seq_ids:
+            plan.target_eager_draft_home_overlap_seq_ids = overlap_seq_ids
+        overlap_set = set(overlap_seq_ids)
+
+        # === Phase 1: Normal draft (local) ===
         normal_proposals = []
         draft_records = []
         if draft_seqs:
             normal_proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
+            # H2: split normal proposals — exclude overlap seqs from buffer
+            if h2_steady:
+                store_proposals = [p for p in normal_proposals if p.seq_id not in overlap_set]
+            else:
+                store_proposals = normal_proposals
             if plan.plan_phase in {"priming", "steady"}:
-                self.dual_proposal_buffer.store(normal_proposals)
+                self.dual_proposal_buffer.store(store_proposals)
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
 
+        # === Phase 2: Eager draft (local) ===
         eager_proposals = []
         eager_trace_record = None
         if draft_eager_seqs and self.global_config.enable_eager_execution:
-            # Phase 1H-lite debug assertion: eager draft must not corrupt
-            # the normal proposal buffer.  target_home_set proposals must
-            # remain available for the next steady step.
             _before_keys = self.dual_proposal_buffer.pending_seq_ids()
             _before_has = self.dual_proposal_buffer.has_all(plan.target_home_set)
             assert _before_has, self._proposal_assertion_message(
@@ -2485,118 +2575,209 @@ class DraftModelRunner(ModelRunnerBase):
             plan.eager_draft_skipped_reason = "eager_execution_disabled"
             plan.eager_draft_failed_seq_ids = list(plan.draft_eager_set)
 
-        if draft_seqs or expected_eager_seq_ids:
-            self._send_combined_dual_proposals(
-                normal_proposals,
-                eager_proposals,
-                plan,
-                expected_normal_seq_ids,
-                expected_eager_seq_ids,
-            )
-            for trace_record in draft_records:
-                self._apply_combined_send_trace_fields(trace_record, plan)
-            if eager_trace_record is not None:
-                self._apply_combined_send_trace_fields(eager_trace_record, plan)
+        conditional_proposals = []
+        cond_draft_records = []
 
-        if target_seqs:
-            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
-            trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
-            trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
-            torch.cuda.synchronize()
-            self._mark_trace_start(trace_record)
-            verify_res = self._receive_verify_result(target_seqs)
-            accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
-            consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
-            trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
-            trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
-            trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
-            # Phase 1H-lite debug assertion: eager promote/discard must
-            # not remove normal proposals still needed for future steps.
-            _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-            self._promote_or_discard_eager_after_normal(
-                plan,
-                accepted_lens,
-                invalidated_lens,
-                trace_record,
-                count_tokens=False,
-            )
-            _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-            assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
-                plan,
-                f"dual_proposal_buffer keys changed during eager promote/discard: "
-                f"before={_pre_promote_keys}, after={_post_promote_keys}",
-            )
-            torch.cuda.synchronize()
-            self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+        if h2_steady:
+            # === H2 steady ordering: recv verify → recv eager → draft conditional → send ===
 
-        if target_eager_seqs:
-            trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
-
-            eager_ready = self.eager_proposal_buffer.get_many(
-                [seq.seq_id for seq in target_eager_seqs], ready_only=True
-            )
-            _eager_base_by_seq = {int(p.seq_id): int(p.eager_base_len) for p in eager_ready}
-
-            # Phase 1H-lite: for seqs in both target_eager_set and
-            # draft_home_set, the normal draft appended gamma tokens
-            # after the eager base was captured.  Roll them back so the
-            # eager verify base check (eager_base_len == len(seq))
-            # passes.
-            overlap_seq_ids = set(plan.target_eager_draft_home_overlap_seq_ids)
-            overlap_seqs = [s for s in target_eager_seqs if s.seq_id in overlap_seq_ids]
-            _overlap_rolled_back = {}
-            for s in overlap_seqs:
-                _overlap_rolled_back[s.seq_id] = list(s.token_ids[-self.gamma:])
-                s.rollback_tokens(self.gamma)
-                _expected_base = _eager_base_by_seq.get(int(s.seq_id))
-                assert _expected_base is not None, self._proposal_assertion_message(
-                    plan,
-                    f"overlap seq_id={s.seq_id} missing eager_base_len in eager_ready",
+            # Phase 3: Receive normal verify result (blocks until TARGET broadcasts)
+            if target_seqs:
+                trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+                trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
+                trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
+                torch.cuda.synchronize()
+                self._mark_trace_start(trace_record)
+                verify_res = self._receive_verify_result(target_seqs)
+                accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+                consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+                trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+                trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                self._promote_or_discard_eager_after_normal(
+                    plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
                 )
-                assert len(s) == _expected_base, self._proposal_assertion_message(
+                _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
                     plan,
-                    f"overlap rollback failed for seq_id={s.seq_id}: "
-                    f"expected_len={_expected_base}, got={len(s)}",
+                    f"dual_proposal_buffer keys changed during eager promote/discard: "
+                    f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
-            eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
-            self._apply_eager_verify_result(
-                target_eager_seqs,
-                eager_ready,
-                eager_verify_res,
-                plan,
-                trace_record,
-                count_tokens=False,
-            )
+            # Phase 4: Receive eager verify result (blocks until TARGET broadcasts)
+            if target_eager_seqs:
+                trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
 
-            # Phase 1H-lite conditional invalidation for overlapping seqs.
-            # Discard normal proposals regardless of eager accept/reject:
-            # the normal proposal base is stale in both cases.
-            if overlap_seqs:
-                accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
-                discarded = []
+                eager_ready = self.eager_proposal_buffer.get_many(
+                    [seq.seq_id for seq in target_eager_seqs], ready_only=True
+                )
+                _eager_base_by_seq = {int(p.seq_id): int(p.eager_base_len) for p in eager_ready}
+
+                overlap_seqs = [s for s in target_eager_seqs if s.seq_id in overlap_set]
+                _overlap_rolled_back = {}
                 for s in overlap_seqs:
-                    self.dual_proposal_buffer.discard([s.seq_id])
-                    discarded.append(int(s.seq_id))
-                    if s.seq_id not in accepted_set:
-                        # Eager rejected: re-apply normal draft tokens to
-                        # restore seq state even though the proposal is
-                        # discarded.
-                        for token_id in _overlap_rolled_back.get(s.seq_id, []):
-                            s.append_token(int(token_id))
-                plan.overlap_normal_proposal_kept_seq_ids = []
-                plan.overlap_normal_proposal_discarded_seq_ids = discarded
-                if set(discarded) & accepted_set:
-                    plan.overlap_normal_proposal_discard_reason = "eager_accepted_base_mismatch"
-                else:
-                    plan.overlap_normal_proposal_discard_reason = "eager_rejected_or_partial"
-                trace_record["overlap_normal_proposal_kept_seq_ids"] = []
-                trace_record["overlap_normal_proposal_discarded_seq_ids"] = discarded
-                trace_record["overlap_normal_proposal_discard_reason"] = (
-                    plan.overlap_normal_proposal_discard_reason
+                    _overlap_rolled_back[s.seq_id] = list(s.token_ids[-self.gamma:])
+                    s.rollback_tokens(self.gamma)
+                    _expected_base = _eager_base_by_seq.get(int(s.seq_id))
+                    assert _expected_base is not None, self._proposal_assertion_message(
+                        plan, f"overlap seq_id={s.seq_id} missing eager_base_len in eager_ready",
+                    )
+                    assert len(s) == _expected_base, self._proposal_assertion_message(
+                        plan,
+                        f"overlap rollback failed for seq_id={s.seq_id}: "
+                        f"expected_len={_expected_base}, got={len(s)}",
+                    )
+
+                eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
+                self._apply_eager_verify_result(
+                    target_eager_seqs, eager_ready, eager_verify_res, plan, trace_record, count_tokens=False,
                 )
-            torch.cuda.synchronize()
-            self._mark_trace_end(trace_record)
+
+                # Phase 5: H2 overlap handling — conditional draft + repair marking
+                if overlap_seqs:
+                    accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
+                    conditional_seqs = [s for s in overlap_seqs if s.seq_id in accepted_set]
+                    repair_seqs = [s for s in overlap_seqs if s.seq_id not in accepted_set]
+
+                    self.dual_proposal_buffer.discard([s.seq_id for s in overlap_seqs])
+
+                    for s in repair_seqs:
+                        s.repair_required = True
+                        s.repair_lane_id = int(plan.target_batch_id) if plan.target_batch_id is not None else None
+                        s.last_eager_result = "reject"
+                    plan.repair_scheduled_seq_ids = [int(s.seq_id) for s in repair_seqs]
+                    plan.repair_lane_by_seq_id = {int(s.seq_id): int(plan.target_batch_id) if plan.target_batch_id is not None else -1 for s in repair_seqs}
+                    plan.eager_partial_or_reject_seq_ids = [int(s.seq_id) for s in repair_seqs]
+                    plan.overlap_normal_proposal_discarded_seq_ids = [int(s.seq_id) for s in overlap_seqs]
+                    plan.overlap_normal_proposal_discard_reason = "H2_eager_verify_outcome"
+
+                    if conditional_seqs:
+                        for s in conditional_seqs:
+                            s.last_eager_result = "full_accept"
+                        plan.eager_full_accept_seq_ids = [int(s.seq_id) for s in conditional_seqs]
+                        plan.conditional_normal_seq_ids = [int(s.seq_id) for s in conditional_seqs]
+                        plan.conditional_normal_base_len_by_seq_id = {int(s.seq_id): len(s) for s in conditional_seqs}
+                        conditional_proposals, cond_draft_records = self._draft_conditional_after_eager(
+                            conditional_seqs, plan
+                        )
+
+                    trace_record["overlap_normal_proposal_discarded_seq_ids"] = [int(s.seq_id) for s in overlap_seqs]
+                    trace_record["overlap_normal_proposal_discard_reason"] = "H2_eager_verify_outcome"
+                    trace_record["repair_scheduled_seq_ids"] = [int(s.seq_id) for s in repair_seqs]
+                    trace_record["conditional_normal_seq_ids"] = [int(s.seq_id) for s in conditional_seqs]
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record)
+
+            # Phase 6: Send combined proposals (unconditional + conditional + eager)
+            unconditional_normal = [p for p in normal_proposals if p.seq_id not in overlap_set]
+            if draft_seqs or expected_eager_seq_ids:
+                self._send_combined_dual_proposals(
+                    normal_proposals=unconditional_normal,
+                    conditional_normal_proposals=conditional_proposals,
+                    eager_proposals=eager_proposals,
+                    plan=plan,
+                    expected_normal_seq_ids=expected_normal_seq_ids,
+                    expected_eager_seq_ids=expected_eager_seq_ids,
+                )
+                for trace_record in draft_records:
+                    self._apply_combined_send_trace_fields(trace_record, plan)
+                if eager_trace_record is not None:
+                    self._apply_combined_send_trace_fields(eager_trace_record, plan)
+                for trace_record in cond_draft_records:
+                    self._apply_combined_send_trace_fields(trace_record, plan)
+        else:
+            # === Legacy ordering (fallback/priming): send → recv verify ===
+            if draft_seqs or expected_eager_seq_ids:
+                self._send_combined_dual_proposals(
+                    normal_proposals=normal_proposals,
+                    conditional_normal_proposals=[],
+                    eager_proposals=eager_proposals,
+                    plan=plan,
+                    expected_normal_seq_ids=expected_normal_seq_ids,
+                    expected_eager_seq_ids=expected_eager_seq_ids,
+                )
+                for trace_record in draft_records:
+                    self._apply_combined_send_trace_fields(trace_record, plan)
+                if eager_trace_record is not None:
+                    self._apply_combined_send_trace_fields(eager_trace_record, plan)
+
+            if target_seqs:
+                trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+                trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
+                trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
+                torch.cuda.synchronize()
+                self._mark_trace_start(trace_record)
+                verify_res = self._receive_verify_result(target_seqs)
+                accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+                consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+                trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+                trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                self._promote_or_discard_eager_after_normal(
+                    plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
+                )
+                _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
+                    plan,
+                    f"dual_proposal_buffer keys changed during eager promote/discard: "
+                    f"before={_pre_promote_keys}, after={_post_promote_keys}",
+                )
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+            if target_eager_seqs:
+                trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
+                eager_ready = self.eager_proposal_buffer.get_many(
+                    [seq.seq_id for seq in target_eager_seqs], ready_only=True
+                )
+                _eager_base_by_seq = {int(p.seq_id): int(p.eager_base_len) for p in eager_ready}
+
+                overlap_seqs = [s for s in target_eager_seqs if s.seq_id in overlap_set]
+                _overlap_rolled_back = {}
+                for s in overlap_seqs:
+                    _overlap_rolled_back[s.seq_id] = list(s.token_ids[-self.gamma:])
+                    s.rollback_tokens(self.gamma)
+                    _expected_base = _eager_base_by_seq.get(int(s.seq_id))
+                    assert _expected_base is not None, self._proposal_assertion_message(
+                        plan, f"overlap seq_id={s.seq_id} missing eager_base_len in eager_ready",
+                    )
+                    assert len(s) == _expected_base, self._proposal_assertion_message(
+                        plan,
+                        f"overlap rollback failed for seq_id={s.seq_id}: "
+                        f"expected_len={_expected_base}, got={len(s)}",
+                    )
+
+                eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
+                self._apply_eager_verify_result(
+                    target_eager_seqs, eager_ready, eager_verify_res, plan, trace_record, count_tokens=False,
+                )
+
+                if overlap_seqs:
+                    accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
+                    discarded = []
+                    for s in overlap_seqs:
+                        self.dual_proposal_buffer.discard([s.seq_id])
+                        discarded.append(int(s.seq_id))
+                        if s.seq_id not in accepted_set:
+                            for token_id in _overlap_rolled_back.get(s.seq_id, []):
+                                s.append_token(int(token_id))
+                    plan.overlap_normal_proposal_kept_seq_ids = []
+                    plan.overlap_normal_proposal_discarded_seq_ids = discarded
+                    if set(discarded) & accepted_set:
+                        plan.overlap_normal_proposal_discard_reason = "eager_accepted_base_mismatch"
+                    else:
+                        plan.overlap_normal_proposal_discard_reason = "eager_rejected_or_partial"
+                    trace_record["overlap_normal_proposal_kept_seq_ids"] = []
+                    trace_record["overlap_normal_proposal_discarded_seq_ids"] = discarded
+                    trace_record["overlap_normal_proposal_discard_reason"] = (
+                        plan.overlap_normal_proposal_discard_reason
+                    )
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record)
     
     def pearl_step(self):
         trace_record = None
@@ -2867,11 +3048,8 @@ class TargetModelRunner(ModelRunnerBase):
             plan,
             f"target_eager_set overlaps target_home_set: {target_eager_seq_ids}",
         )
-        # Phase 1H-lite: target_eager_set may overlap draft_home_set.
-        # The overlapping seq has a promoted eager proposal that needs
-        # verification AND belongs to the draft batch (normal proposal
-        # needed for next step).  Conditional invalidation after eager
-        # verify handles base mismatches.
+        # H2: detect overlap between target_eager_set and draft_home_set
+        h2_steady = plan.plan_phase == "steady" and self.global_config.enable_eager_execution
         overlap_eager_draft = sorted(set(target_eager_seq_ids) & set(draft_seq_ids))
         if overlap_eager_draft:
             plan.target_eager_draft_home_overlap_seq_ids = overlap_eager_draft
@@ -2900,71 +3078,107 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, False)
 
-        received_proposals = []
-        received_eager_proposals = []
         expected_eager_seq_ids = list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
-        if draft_seq_ids or expected_eager_seq_ids:
-            received_proposals, received_eager_proposals = self._receive_combined_dual_proposals(
-                draft_seq_ids,
-                expected_eager_seq_ids,
-                plan,
-            )
-            if fallback_same_batch:
-                target_proposals = received_proposals
+
+        if h2_steady:
+            # === H2 steady ordering: verify → broadcast → eager verify → broadcast → recv ===
+            # Phase A: Normal verify (broadcasts result, DRAFT receives)
+            if target_seqs:
+                self._validate_proposals_for_target(target_proposals, target_seqs, plan)
+                consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
+                trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+                trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                accepted_lens, invalidated_lens = self.verify_from_proposals(
+                    logits, target_seqs, temperatures, target_proposals, plan,
+                )
+                _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                self._promote_or_discard_eager_after_normal(
+                    plan, accepted_lens, invalidated_lens, trace_record, count_tokens=True,
+                )
+                _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
+                    plan,
+                    f"dual_proposal_buffer keys changed during eager promote/discard: "
+                    f"before={_pre_promote_keys}, after={_post_promote_keys}",
+                )
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+            # Phase B: Eager verify sidecar (broadcasts result, DRAFT receives)
+            if target_eager_seqs:
+                self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
+
+            # Phase C: Receive combined proposals (blocks until DRAFT sends)
+            if draft_seq_ids or expected_eager_seq_ids:
+                received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
+                    draft_seq_ids, expected_eager_seq_ids, plan,
+                )
+                if received_normal:
+                    self.dual_proposal_buffer.store(received_normal)
+                if received_conditional:
+                    self.dual_proposal_buffer.store(received_conditional)
+                if received_eager:
+                    self.eager_proposal_buffer.store(received_eager)
+                plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
+                plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
+        else:
+            # === Legacy ordering (fallback/priming): recv → verify → broadcast ===
+            received_normal = []
+            received_conditional = []
+            received_eager = []
+            if draft_seq_ids or expected_eager_seq_ids:
+                received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
+                    draft_seq_ids, expected_eager_seq_ids, plan,
+                )
+                if fallback_same_batch:
+                    target_proposals = received_normal + received_conditional
+                    if trace_record is not None:
+                        trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
+                        trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
+                else:
+                    if received_normal:
+                        self.dual_proposal_buffer.store(received_normal)
+                    if received_conditional:
+                        self.dual_proposal_buffer.store(received_conditional)
+                if received_eager:
+                    self.eager_proposal_buffer.store(received_eager)
+                plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
+                plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
                 if trace_record is not None:
-                    trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
-                    trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
-            else:
-                if received_proposals:
-                    self.dual_proposal_buffer.store(received_proposals)
-            if received_eager_proposals:
-                self.eager_proposal_buffer.store(received_eager_proposals)
-            plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
-            plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
-            if trace_record is not None:
-                self._apply_combined_proposal_trace_fields(trace_record, plan)
+                    self._apply_combined_proposal_trace_fields(trace_record, plan)
 
-        if target_seqs:
-            self._validate_proposals_for_target(target_proposals, target_seqs, plan)
-            consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
-            if fallback_same_batch:
-                consumed_seq_ids = [proposal.seq_id for proposal in target_proposals]
-            trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
-            trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
-            trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
-            accepted_lens, invalidated_lens = self.verify_from_proposals(
-                logits,
-                target_seqs,
-                temperatures,
-                target_proposals,
-                plan,
-            )
-            # Phase 1H-lite debug assertion: eager promote/discard must
-            # not remove normal proposals from dual_proposal_buffer.
-            _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-            self._promote_or_discard_eager_after_normal(
-                plan,
-                accepted_lens,
-                invalidated_lens,
-                trace_record,
-                count_tokens=True,
-            )
-            _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-            assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
-                plan,
-                f"dual_proposal_buffer keys changed during eager promote/discard: "
-                f"before={_pre_promote_keys}, after={_post_promote_keys}",
-            )
-            torch.cuda.synchronize()
-            self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
-        elif received_proposals or received_eager_proposals:
-            priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
-            priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
-            self._apply_combined_proposal_trace_fields(priming_record, plan)
-            self._finalize_record_profile(priming_record)
+            if target_seqs:
+                self._validate_proposals_for_target(target_proposals, target_seqs, plan)
+                consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
+                if fallback_same_batch:
+                    consumed_seq_ids = [proposal.seq_id for proposal in target_proposals]
+                trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+                trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                accepted_lens, invalidated_lens = self.verify_from_proposals(
+                    logits, target_seqs, temperatures, target_proposals, plan,
+                )
+                _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                self._promote_or_discard_eager_after_normal(
+                    plan, accepted_lens, invalidated_lens, trace_record, count_tokens=True,
+                )
+                _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+                assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
+                    plan,
+                    f"dual_proposal_buffer keys changed during eager promote/discard: "
+                    f"before={_pre_promote_keys}, after={_post_promote_keys}",
+                )
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            elif received_normal or received_conditional or received_eager:
+                priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
+                priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                self._apply_combined_proposal_trace_fields(priming_record, plan)
+                self._finalize_record_profile(priming_record)
 
-        if target_eager_seqs:
-            self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
+            if target_eager_seqs:
+                self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.

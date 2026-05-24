@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Pure helpers for dual-batch normal/eager proposal message packaging."""
+"""Pure helpers for dual-batch normal/eager/conditional proposal message packaging."""
 
 
 def _proposal_seq_ids(proposals) -> list[int]:
@@ -17,6 +17,7 @@ def encode_normal_proposals(proposals) -> list[int]:
             [
                 int(proposal.seq_id),
                 int(proposal.home_batch_id),
+                int(proposal.base_len),
                 int(proposal.pre_verify),
                 int(len(to_verify)),
                 int(proposal.proposal_len),
@@ -50,6 +51,7 @@ def encode_eager_proposals(proposals) -> list[int]:
 def build_combined_proposal_payload(
     *,
     normal_proposals,
+    conditional_normal_proposals,
     eager_proposals,
     plan_id: int,
     step_id: int | None,
@@ -57,6 +59,7 @@ def build_combined_proposal_payload(
     gamma: int,
 ) -> dict:
     normal_payload = encode_normal_proposals(normal_proposals)
+    conditional_payload = encode_normal_proposals(conditional_normal_proposals)
     eager_payload = encode_eager_proposals(eager_proposals)
     return {
         "kind": "combined",
@@ -65,8 +68,10 @@ def build_combined_proposal_payload(
         "draft_batch_id": -1 if draft_batch_id is None else int(draft_batch_id),
         "gamma": int(gamma),
         "normal_seq_ids": _proposal_seq_ids(normal_proposals),
-        "normal_payload": normal_payload,
+        "conditional_normal_seq_ids": _proposal_seq_ids(conditional_normal_proposals),
         "eager_seq_ids": _proposal_seq_ids(eager_proposals),
+        "normal_payload": normal_payload,
+        "conditional_normal_payload": conditional_payload,
         "eager_payload": eager_payload,
-        "flat_payload": normal_payload + eager_payload,
+        "flat_payload": normal_payload + conditional_payload + eager_payload,
     }

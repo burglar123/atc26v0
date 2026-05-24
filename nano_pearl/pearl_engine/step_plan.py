@@ -129,6 +129,20 @@ class StepPlan:
     overlap_normal_proposal_kept_seq_ids: List[int] = field(default_factory=list)
     overlap_normal_proposal_discarded_seq_ids: List[int] = field(default_factory=list)
     overlap_normal_proposal_discard_reason: Optional[str] = None
+    # H2 overlap continuation trace fields
+    lane_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    repair_required_seq_ids: List[int] = field(default_factory=list)
+    repair_lane_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    repair_lane_source: Optional[str] = None
+    conditional_normal_seq_ids: List[int] = field(default_factory=list)
+    conditional_normal_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    overlap_normal_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    repair_scheduled_seq_ids: List[int] = field(default_factory=list)
+    repair_completed_seq_ids: List[int] = field(default_factory=list)
+    migrated_lane_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_full_accept_seq_ids: List[int] = field(default_factory=list)
+    eager_partial_or_reject_seq_ids: List[int] = field(default_factory=list)
+    received_conditional_normal_seq_ids: List[int] = field(default_factory=list)
     eager_draft_empty_reason: Optional[str] = None
     proposal_message_kind: Optional[str] = None
     proposal_message_plan_id: Optional[int] = None
@@ -450,6 +464,20 @@ class StepPlan:
                 int(seq_id) for seq_id in self.overlap_normal_proposal_discarded_seq_ids
             ],
             "overlap_normal_proposal_discard_reason": self.overlap_normal_proposal_discard_reason,
+            # H2 overlap continuation trace
+            "lane_id_by_seq_id": {str(k): int(v) for k, v in self.lane_id_by_seq_id.items()},
+            "repair_required_seq_ids": [int(s) for s in self.repair_required_seq_ids],
+            "repair_lane_by_seq_id": {str(k): int(v) for k, v in self.repair_lane_by_seq_id.items()},
+            "repair_lane_source": self.repair_lane_source,
+            "conditional_normal_seq_ids": [int(s) for s in self.conditional_normal_seq_ids],
+            "conditional_normal_base_len_by_seq_id": {str(k): int(v) for k, v in self.conditional_normal_base_len_by_seq_id.items()},
+            "overlap_normal_discard_reason_by_seq_id": {str(k): v for k, v in self.overlap_normal_discard_reason_by_seq_id.items()},
+            "repair_scheduled_seq_ids": [int(s) for s in self.repair_scheduled_seq_ids],
+            "repair_completed_seq_ids": [int(s) for s in self.repair_completed_seq_ids],
+            "migrated_lane_by_seq_id": {str(k): int(v) for k, v in self.migrated_lane_by_seq_id.items()},
+            "eager_full_accept_seq_ids": [int(s) for s in self.eager_full_accept_seq_ids],
+            "eager_partial_or_reject_seq_ids": [int(s) for s in self.eager_partial_or_reject_seq_ids],
+            "received_conditional_normal_seq_ids": [int(s) for s in self.received_conditional_normal_seq_ids],
             "proposal_message_kind": self.proposal_message_kind,
             "proposal_message_plan_id": self.proposal_message_plan_id,
             "proposal_message_step_id": self.proposal_message_step_id,

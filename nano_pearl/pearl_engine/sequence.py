@@ -61,6 +61,10 @@ class Sequence:
         self.pre_verify = True
         self.num_acc_tokens = []
         self.cur_acc_tokens = 0
+        # H2 eager overlap continuation (persistent across steps)
+        self.repair_required = False
+        self.repair_lane_id = None
+        self.last_eager_result = None
 
     def __len__(self):
         return self.num_tokens
@@ -191,7 +195,8 @@ class Sequence:
                 self.arrival_offset_sec,
                 self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
                 self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
-                self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
+                self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id,
+                self.repair_required, self.repair_lane_id, self.last_eager_result, self.trace_stats,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
@@ -205,7 +210,10 @@ class Sequence:
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = fields
             self.home_batch_id = None
-        else:
+            self.repair_required = False
+            self.repair_lane_id = None
+            self.last_eager_result = None
+        elif len(fields) == 26:
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
              self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
@@ -213,6 +221,18 @@ class Sequence:
              self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats) = fields
+            self.repair_required = False
+            self.repair_lane_id = None
+            self.last_eager_result = None
+        else:
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.arrival_offset_sec,
+             self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id,
+             self.repair_required, self.repair_lane_id, self.last_eager_result, self.trace_stats) = fields
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

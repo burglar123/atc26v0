@@ -30,6 +30,7 @@ class BufferedProposal:
     proposal_len: int
     pre_verify: bool
     plan_id: int
+    base_len: int = 0
     valid: bool = True
 
 
