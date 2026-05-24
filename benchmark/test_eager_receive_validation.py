@@ -519,6 +519,175 @@ def test_overlap_trace_fields_in_trace_dict():
     assert d.get("overlap_normal_proposal_discard_reason") == "eager_accepted_base_mismatch", f"got {d.get('overlap_normal_proposal_discard_reason')}"
 
 
+# --- H2 Eager Lifecycle Ordering Tests ---
+
+
+def test_eager_buffer_ready_only_filter():
+    """get_many(ready_only=True) returns only ready, non-consumed proposals."""
+    buf = EagerProposalBuffer()
+    p1 = _make_eager_proposal(1)
+    p2 = _make_eager_proposal(2)
+    p3 = _make_eager_proposal(3)
+    buf.store([p1, p2, p3])
+
+    buf.mark_ready(1)
+    buf.mark_ready(3)
+
+    ready = buf.get_many([1, 2, 3], ready_only=True)
+    ready_ids = sorted(p.seq_id for p in ready)
+    assert ready_ids == [1, 3], f"expected ready=[1,3], got {ready_ids}"
+
+    all_proposals = buf.get_many([1, 2, 3], ready_only=False)
+    all_ids = sorted(p.seq_id for p in all_proposals)
+    assert all_ids == [1, 2, 3], f"expected all=[1,2,3], got {all_ids}"
+
+
+def test_eager_buffer_discard_removes_from_ready():
+    """Discarded proposals are not returned by get_many."""
+    buf = EagerProposalBuffer()
+    p1 = _make_eager_proposal(1)
+    p2 = _make_eager_proposal(2)
+    buf.store([p1, p2])
+    buf.mark_ready(1)
+    buf.mark_ready(2)
+
+    buf.discard([1])
+    ready = buf.get_many([1, 2], ready_only=True)
+    ready_ids = sorted(p.seq_id for p in ready)
+    assert ready_ids == [2], f"expected ready=[2] after discard, got {ready_ids}"
+
+
+def test_promote_non_overlap_eager_proposals():
+    """Non-overlap seqs (not in normal verify result) are promoted by default."""
+    buf = EagerProposalBuffer()
+    p1 = _make_eager_proposal(1)  # overlap seq (in verify result)
+    p2 = _make_eager_proposal(2)  # non-overlap seq (NOT in verify result)
+    buf.store([p1, p2])
+
+    draft_eager_set = [1, 2]
+    accepted_lens = {1: 2}  # seq 1 accepted 2 tokens
+    invalidated_lens = {1: 0}
+    running_seq_ids = {1, 2}
+
+    promoted = []
+    discarded = []
+    for seq_id in draft_eager_set:
+        proposal = buf.get(seq_id)
+        assert proposal is not None, f"missing proposal for seq_id={seq_id}"
+        in_normal_verify = int(seq_id) in accepted_lens or int(seq_id) in invalidated_lens
+        if not in_normal_verify:
+            full_accept = int(seq_id) in running_seq_ids
+        else:
+            full_accept = (
+                int(seq_id) in running_seq_ids
+                and int(invalidated_lens.get(seq_id, 0)) == 0
+                and int(accepted_lens.get(seq_id, 0)) > 0
+            )
+        if full_accept:
+            buf.mark_ready(seq_id)
+            promoted.append(int(seq_id))
+        else:
+            buf.discard([seq_id])
+            discarded.append(int(seq_id))
+
+    assert 1 in promoted, f"overlap seq 1 (full accept) should be promoted, got promoted={promoted}"
+    assert 2 in promoted, f"non-overlap seq 2 should be promoted by default, got promoted={promoted}, discarded={discarded}"
+    assert len(discarded) == 0, f"no seqs should be discarded, got discarded={discarded}"
+
+
+def test_promote_discard_mixed_overlap_and_rejected():
+    """Overlap seq rejected in normal verify -> discarded; non-overlap -> promoted."""
+    buf = EagerProposalBuffer()
+    p1 = _make_eager_proposal(1)  # overlap seq, REJECTED
+    p2 = _make_eager_proposal(2)  # non-overlap seq
+    p3 = _make_eager_proposal(3)  # overlap seq, ACCEPTED
+    buf.store([p1, p2, p3])
+
+    draft_eager_set = [1, 2, 3]
+    accepted_lens = {1: 0, 3: 2}  # seq 1 rejected, seq 3 accepted
+    invalidated_lens = {1: 2, 3: 0}
+    running_seq_ids = {1, 2, 3}
+
+    promoted = []
+    discarded = []
+    for seq_id in draft_eager_set:
+        proposal = buf.get(seq_id)
+        assert proposal is not None
+        in_normal_verify = int(seq_id) in accepted_lens or int(seq_id) in invalidated_lens
+        if not in_normal_verify:
+            full_accept = int(seq_id) in running_seq_ids
+        else:
+            full_accept = (
+                int(seq_id) in running_seq_ids
+                and int(invalidated_lens.get(seq_id, 0)) == 0
+                and int(accepted_lens.get(seq_id, 0)) > 0
+            )
+        if full_accept:
+            buf.mark_ready(seq_id)
+            promoted.append(int(seq_id))
+        else:
+            buf.discard([seq_id])
+            discarded.append(int(seq_id))
+
+    assert 1 in discarded, f"rejected overlap seq 1 should be discarded, got discarded={discarded}"
+    assert 2 in promoted, f"non-overlap seq 2 should be promoted, got promoted={promoted}"
+    assert 3 in promoted, f"accepted overlap seq 3 should be promoted, got promoted={promoted}"
+
+
+def test_eager_lifecycle_trace_fields_default():
+    """New H2 eager lifecycle trace fields have correct defaults."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        target_eager_set=[],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    assert plan.eager_draft_attempted_seq_ids == []
+    assert plan.eager_draft_generated_seq_ids == []
+    assert plan.eager_draft_skipped_seq_ids == []
+    assert plan.eager_draft_skipped_reason_by_seq_id == {}
+    assert plan.eager_buffer_keys_before_eager_draft == []
+    assert plan.eager_ready_seq_ids_before_send == []
+    assert plan.eager_sent_seq_ids == []
+
+
+def test_eager_lifecycle_trace_fields_in_trace_dict():
+    """New H2 eager lifecycle trace fields appear in to_trace_dict()."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        target_eager_set=[],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    plan.eager_draft_attempted_seq_ids = [4, 6]
+    plan.eager_draft_generated_seq_ids = [4, 6]
+    plan.eager_buffer_keys_before_eager_draft = [1, 3]
+    plan.eager_ready_seq_ids_before_send = [4, 6]
+    plan.eager_sent_seq_ids = [4, 6]
+    d = plan.to_trace_dict()
+    assert d.get("eager_draft_attempted_seq_ids") == [4, 6], f"got {d.get('eager_draft_attempted_seq_ids')}"
+    assert d.get("eager_draft_generated_seq_ids") == [4, 6], f"got {d.get('eager_draft_generated_seq_ids')}"
+    assert d.get("eager_buffer_keys_before_eager_draft") == [1, 3], f"got {d.get('eager_buffer_keys_before_eager_draft')}"
+    assert d.get("eager_ready_seq_ids_before_send") == [4, 6], f"got {d.get('eager_ready_seq_ids_before_send')}"
+    assert d.get("eager_sent_seq_ids") == [4, 6], f"got {d.get('eager_sent_seq_ids')}"
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -543,6 +712,12 @@ if __name__ == "__main__":
         test_overlap_target_eager_subset_constraint,
         test_overlap_trace_fields_default,
         test_overlap_trace_fields_in_trace_dict,
+        test_eager_buffer_ready_only_filter,
+        test_eager_buffer_discard_removes_from_ready,
+        test_promote_non_overlap_eager_proposals,
+        test_promote_discard_mixed_overlap_and_rejected,
+        test_eager_lifecycle_trace_fields_default,
+        test_eager_lifecycle_trace_fields_in_trace_dict,
     ]
     passed = 0
     for test in tests:

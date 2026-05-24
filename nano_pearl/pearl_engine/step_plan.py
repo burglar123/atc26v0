@@ -123,8 +123,15 @@ class StepPlan:
     send_combined_payload_kind: Optional[str] = None
     send_combined_payload_plan_id: Optional[int] = None
     send_combined_payload_step_id: Optional[int] = None
+    eager_draft_attempted_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_generated_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_skipped_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_skipped_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     eager_draft_skipped_reason: Optional[str] = None
     eager_draft_failed_seq_ids: List[int] = field(default_factory=list)
+    eager_buffer_keys_before_eager_draft: List[int] = field(default_factory=list)
+    eager_ready_seq_ids_before_send: List[int] = field(default_factory=list)
+    eager_sent_seq_ids: List[int] = field(default_factory=list)
     target_eager_draft_home_overlap_seq_ids: List[int] = field(default_factory=list)
     overlap_normal_proposal_kept_seq_ids: List[int] = field(default_factory=list)
     overlap_normal_proposal_discarded_seq_ids: List[int] = field(default_factory=list)
@@ -449,10 +456,24 @@ class StepPlan:
             "send_combined_payload_kind": self.send_combined_payload_kind,
             "send_combined_payload_plan_id": self.send_combined_payload_plan_id,
             "send_combined_payload_step_id": self.send_combined_payload_step_id,
+            "eager_draft_attempted_seq_ids": [int(seq_id) for seq_id in self.eager_draft_attempted_seq_ids],
+            "eager_draft_generated_seq_ids": [int(seq_id) for seq_id in self.eager_draft_generated_seq_ids],
+            "eager_draft_skipped_seq_ids": [int(seq_id) for seq_id in self.eager_draft_skipped_seq_ids],
+            "eager_draft_skipped_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.eager_draft_skipped_reason_by_seq_id.items()
+            },
             "eager_draft_skipped_reason": self.eager_draft_skipped_reason,
             "eager_draft_failed_seq_ids": [
                 int(seq_id) for seq_id in self.eager_draft_failed_seq_ids
             ],
+            "eager_buffer_keys_before_eager_draft": [
+                int(seq_id) for seq_id in self.eager_buffer_keys_before_eager_draft
+            ],
+            "eager_ready_seq_ids_before_send": [
+                int(seq_id) for seq_id in self.eager_ready_seq_ids_before_send
+            ],
+            "eager_sent_seq_ids": [int(seq_id) for seq_id in self.eager_sent_seq_ids],
             "eager_draft_empty_reason": self.eager_draft_empty_reason,
             "target_eager_draft_home_overlap_seq_ids": [
                 int(seq_id) for seq_id in self.target_eager_draft_home_overlap_seq_ids

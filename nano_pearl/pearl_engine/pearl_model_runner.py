@@ -1136,9 +1136,9 @@ class ModelRunnerBase:
                 )
             )
         received_seq_ids = [proposal.seq_id for proposal in proposals]
-        assert received_seq_ids == list(expected_seq_ids), self._proposal_assertion_message(
+        assert set(received_seq_ids).issubset(set(expected_seq_ids)), self._proposal_assertion_message(
             plan,
-            f"eager proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, "
+            f"eager proposal seq_ids not subset of expected: expected={expected_seq_ids}, received={received_seq_ids}, "
             f"source_plan_id={proposal_plan_id}, source_step_id={proposal_step_id}",
         )
         return proposals
@@ -1188,6 +1188,7 @@ class ModelRunnerBase:
         plan.send_actual_normal_seq_ids = list(actual_normal_seq_ids)
         plan.send_expected_eager_seq_ids = list(expected_eager_seq_ids)
         plan.send_actual_eager_seq_ids = list(actual_eager_seq_ids)
+        plan.eager_sent_seq_ids = list(actual_eager_seq_ids)
         plan.send_combined_payload_kind = payload["kind"]
         plan.send_combined_payload_plan_id = int(payload["plan_id"])
         plan.send_combined_payload_step_id = None if payload["step_id"] < 0 else int(payload["step_id"])
@@ -1205,9 +1206,9 @@ class ModelRunnerBase:
                 f"normal={actual_normal_seq_ids}, conditional={actual_conditional_seq_ids}, "
                 f"eager={actual_eager_seq_ids}",
             )
-        assert actual_eager_seq_ids == list(expected_eager_seq_ids), self._proposal_assertion_message(
+        assert set(actual_eager_seq_ids).issubset(set(expected_eager_seq_ids)), self._proposal_assertion_message(
             plan,
-            f"send eager proposal seq_id mismatch: expected={expected_eager_seq_ids}, actual={actual_eager_seq_ids}, "
+            f"send eager proposal seq_ids not subset of expected: expected={expected_eager_seq_ids}, actual={actual_eager_seq_ids}, "
             f"normal={actual_normal_seq_ids}",
         )
         if expected_eager_seq_ids and not actual_eager_seq_ids:
@@ -1612,11 +1613,15 @@ class ModelRunnerBase:
                 plan,
                 f"missing eager proposal for selected seq_id={seq_id}",
             )
-            full_accept = (
-                int(seq_id) in running_seq_ids
-                and int(invalidated_lens.get(seq_id, 0)) == 0
-                and int(accepted_lens.get(seq_id, 0)) > 0
-            )
+            in_normal_verify = int(seq_id) in accepted_lens or int(seq_id) in invalidated_lens
+            if not in_normal_verify:
+                full_accept = int(seq_id) in running_seq_ids
+            else:
+                full_accept = (
+                    int(seq_id) in running_seq_ids
+                    and int(invalidated_lens.get(seq_id, 0)) == 0
+                    and int(accepted_lens.get(seq_id, 0)) > 0
+                )
             if full_accept:
                 self.eager_proposal_buffer.mark_ready(seq_id)
                 promoted_seq_ids.append(int(seq_id))
@@ -2543,6 +2548,8 @@ class DraftModelRunner(ModelRunnerBase):
         eager_proposals = []
         eager_trace_record = None
         if draft_eager_seqs and self.global_config.enable_eager_execution:
+            plan.eager_draft_attempted_seq_ids = list(plan.draft_eager_set)
+            plan.eager_buffer_keys_before_eager_draft = self.eager_proposal_buffer.keys()
             _before_keys = self.dual_proposal_buffer.pending_seq_ids()
             _before_has = self.dual_proposal_buffer.has_all(plan.target_home_set)
             assert _before_has, self._proposal_assertion_message(
@@ -2553,6 +2560,15 @@ class DraftModelRunner(ModelRunnerBase):
 
             eager_proposals, eager_trace_record = self._draft_eager_proposals(draft_eager_seqs, plan)
             self.eager_proposal_buffer.store(eager_proposals)
+
+            _generated_eager_seq_ids = sorted(p.seq_id for p in eager_proposals)
+            _expected_eager_seq_ids = sorted(plan.draft_eager_set)
+            plan.eager_draft_generated_seq_ids = _generated_eager_seq_ids
+            assert _generated_eager_seq_ids == _expected_eager_seq_ids, self._proposal_assertion_message(
+                plan,
+                f"eager draft generated seq_ids mismatch: "
+                f"expected={_expected_eager_seq_ids}, generated={_generated_eager_seq_ids}",
+            )
 
             _after_keys = self.dual_proposal_buffer.pending_seq_ids()
             _after_has = self.dual_proposal_buffer.has_all(plan.target_home_set)
@@ -2574,6 +2590,10 @@ class DraftModelRunner(ModelRunnerBase):
         elif plan.draft_eager_set and not self.global_config.enable_eager_execution:
             plan.eager_draft_skipped_reason = "eager_execution_disabled"
             plan.eager_draft_failed_seq_ids = list(plan.draft_eager_set)
+            plan.eager_draft_skipped_seq_ids = list(plan.draft_eager_set)
+            plan.eager_draft_skipped_reason_by_seq_id = {
+                int(seq_id): "eager_execution_disabled" for seq_id in plan.draft_eager_set
+            }
 
         conditional_proposals = []
         cond_draft_records = []
@@ -2674,10 +2694,15 @@ class DraftModelRunner(ModelRunnerBase):
             # Phase 6: Send combined proposals (unconditional + conditional + eager)
             unconditional_normal = [p for p in normal_proposals if p.seq_id not in overlap_set]
             if draft_seqs or expected_eager_seq_ids:
+                eager_ready_for_send = self.eager_proposal_buffer.get_many(
+                    plan.draft_eager_set, ready_only=True,
+                ) if plan.draft_eager_set else []
+                _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
+                plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
                 self._send_combined_dual_proposals(
                     normal_proposals=unconditional_normal,
                     conditional_normal_proposals=conditional_proposals,
-                    eager_proposals=eager_proposals,
+                    eager_proposals=eager_ready_for_send,
                     plan=plan,
                     expected_normal_seq_ids=expected_normal_seq_ids,
                     expected_eager_seq_ids=expected_eager_seq_ids,
@@ -3091,16 +3116,6 @@ class TargetModelRunner(ModelRunnerBase):
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 accepted_lens, invalidated_lens = self.verify_from_proposals(
                     logits, target_seqs, temperatures, target_proposals, plan,
-                )
-                _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-                self._promote_or_discard_eager_after_normal(
-                    plan, accepted_lens, invalidated_lens, trace_record, count_tokens=True,
-                )
-                _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
-                assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
-                    plan,
-                    f"dual_proposal_buffer keys changed during eager promote/discard: "
-                    f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
