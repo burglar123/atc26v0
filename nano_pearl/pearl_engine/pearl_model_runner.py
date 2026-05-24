@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pickle
 import torch
 import time
@@ -21,7 +23,12 @@ from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
-from nano_pearl.pearl_engine.dual_batch import BufferedProposal, DualBatchManager, ProposalBuffer
+from nano_pearl.pearl_engine.dual_batch import (
+    BufferedProposal,
+    DualBatchManager,
+    EagerProposalBuffer,
+    ProposalBuffer,
+)
 from transformers import AutoTokenizer
 from tqdm import trange
 
@@ -118,6 +125,7 @@ class ModelRunnerBase:
         self.active_decode_ready_mode = False
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
+        self.eager_proposal_buffer = EagerProposalBuffer()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -523,6 +531,23 @@ class ModelRunnerBase:
             "draft_fraction_of_active": draft_fraction_of_active,
             "split_imbalance": split_imbalance,
             "target_to_draft_size_ratio": target_to_draft_size_ratio,
+            "enable_eager_execution": bool(getattr(self.global_config, "enable_eager_execution", False)),
+            "eager_execution_enabled": False,
+            "eager_buffer_size_before": self.eager_proposal_buffer.size(),
+            "eager_buffer_size_after": self.eager_proposal_buffer.size(),
+            "eager_promoted_seq_ids": [],
+            "eager_discarded_seq_ids": [],
+            "eager_verified_seq_ids": [],
+            "eager_accepted_seq_ids": [],
+            "eager_rejected_seq_ids": [],
+            "eager_tokens_generated": 0,
+            "eager_tokens_promoted": 0,
+            "eager_tokens_discarded": 0,
+            "eager_tokens_verified": 0,
+            "eager_tokens_accepted": 0,
+            "eager_tokens_rejected": 0,
+            "eager_tokens_invalidated": 0,
+            "eager_waste_rate": 0.0,
         }
 
     def _finalize_record_profile(self, record: dict):
@@ -623,6 +648,7 @@ class ModelRunnerBase:
             decode_ready_mode=self.active_decode_ready_mode,
             pending_proposal_seq_ids=self.dual_proposal_buffer.pending_seq_ids(),
             pending_batch_ids=self.dual_proposal_buffer.pending_batch_ids(),
+            enable_eager_execution=bool(getattr(self.global_config, "enable_eager_execution", False)),
         )
         buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
@@ -1067,6 +1093,7 @@ class ModelRunnerBase:
         self.active_decode_ready_mode = False
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
+        self.eager_proposal_buffer.clear()
         dist.barrier()
 
     def prepare_decode_ready(self):

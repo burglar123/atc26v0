@@ -1,5 +1,26 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+
+def _int_list(values: List[int]) -> List[int]:
+    return [int(value) for value in values]
+
+
+def _trace_int_value(value: Any, allow_none: bool = False) -> Any:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return [int(item) for item in value]
+    return int(value)
+
+
+def _trace_mapping(mapping: Dict[int, Any], value_fn) -> Dict[str, Any]:
+    return {
+        str(seq_id): value_fn(value)
+        for seq_id, value in mapping.items()
+    }
 
 
 @dataclass
@@ -39,6 +60,15 @@ class StepPlan:
     buffered_proposal_seq_ids: List[int] = field(default_factory=list)
     normal_gamma: Optional[int] = None
     eager_gamma: int = 0
+    eager_new_selected_set: List[int] = field(default_factory=list)
+    eager_continuing_set: List[int] = field(default_factory=list)
+    eager_active_seq_ids: List[int] = field(default_factory=list)
+    eager_ready_seq_ids: List[int] = field(default_factory=list)
+    eager_proposal_ids_by_seq_id: Dict[int, Any] = field(default_factory=dict)
+    eager_parent_proposal_ids_by_seq_id: Dict[int, Any] = field(default_factory=dict)
+    eager_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_base_pre_verify_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    eager_parent_kind_by_seq_id: Dict[int, str] = field(default_factory=dict)
     step_id: Optional[int] = None
     dual_batch_state: Optional[Any] = None
     fallback_reason: Optional[str] = None
@@ -128,15 +158,108 @@ class StepPlan:
                     f"expected {self.normal_gamma}, got {budget.normal_gamma}"
                 )
 
+    def _inferred_gamma_for_eager_validation(self) -> int | None:
+        if self.normal_gamma is not None:
+            return int(self.normal_gamma)
+        budget_gammas = {
+            int(budget.normal_gamma)
+            for budget in self.budgets.values()
+            if budget.normal_gamma is not None
+        }
+        if len(budget_gammas) == 1:
+            return next(iter(budget_gammas))
+        if self.eager_gamma:
+            return int(self.eager_gamma)
+        return None
+
+    def validate_phase1h_eager_scaffold(self, enable_eager_execution: bool):
+        target_home = set(int(seq_id) for seq_id in self.target_home_set)
+        draft_home = set(int(seq_id) for seq_id in self.draft_home_set)
+        target_eager = set(int(seq_id) for seq_id in self.target_eager_set)
+        draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
+
+        assert not (target_eager & target_home), (
+            f"target_eager_set cannot overlap target_home_set: "
+            f"{sorted(target_eager & target_home)}"
+        )
+        assert not (target_eager & draft_home), (
+            f"target_eager_set cannot overlap draft_home_set: "
+            f"{sorted(target_eager & draft_home)}"
+        )
+        assert not (draft_eager & draft_home), (
+            f"draft_eager_set cannot overlap draft_home_set: "
+            f"{sorted(draft_eager & draft_home)}"
+        )
+
+        eager_new_selected = set(int(seq_id) for seq_id in self.eager_new_selected_set)
+        draft_eager_set_new = set(
+            int(seq_id) for seq_id in getattr(self, "draft_eager_set_new", [])
+        )
+        represented_new = eager_new_selected | draft_eager_set_new
+        assert represented_new <= target_home, (
+            f"new eager selections must be a subset of target_home_set: "
+            f"extra={sorted(represented_new - target_home)}"
+        )
+
+        eager_continuing = set(int(seq_id) for seq_id in self.eager_continuing_set)
+        continuing_eager_set = set(
+            int(seq_id) for seq_id in getattr(self, "continuing_eager_set", [])
+        )
+        represented_continuing = eager_continuing | continuing_eager_set
+        assert represented_continuing <= target_eager, (
+            f"continuing eager set must be a subset of target_eager_set: "
+            f"extra={sorted(represented_continuing - target_eager)}"
+        )
+
+        gamma = self._inferred_gamma_for_eager_validation()
+        if self.eager_gamma and gamma is not None:
+            assert int(self.eager_gamma) in {0, int(gamma)}, (
+                f"plan eager_gamma must be 0 or gamma={gamma}, got {self.eager_gamma}"
+            )
+        for seq_id, budget in self.budgets.items():
+            eager_gamma = int(budget.eager_gamma)
+            if gamma is None:
+                assert eager_gamma == 0, (
+                    f"cannot validate nonzero eager budget without gamma for seq_id={seq_id}: "
+                    f"eager_gamma={eager_gamma}"
+                )
+            else:
+                assert eager_gamma in {0, int(gamma)}, (
+                    f"eager budget must be 0 or gamma={gamma} for seq_id={seq_id}, "
+                    f"got {eager_gamma}"
+                )
+
+        eager_list_fields = [
+            self.target_eager_set,
+            self.draft_eager_set,
+            self.eager_new_selected_set,
+            self.eager_continuing_set,
+            self.eager_active_seq_ids,
+            self.eager_ready_seq_ids,
+            list(getattr(self, "draft_eager_set_new", [])),
+            list(getattr(self, "continuing_eager_set", [])),
+        ]
+        eager_mapping_fields = [
+            self.eager_proposal_ids_by_seq_id,
+            self.eager_parent_proposal_ids_by_seq_id,
+            self.eager_base_len_by_seq_id,
+            self.eager_base_pre_verify_by_seq_id,
+            self.eager_parent_kind_by_seq_id,
+        ]
+        has_eager_scaffold = any(eager_list_fields) or any(eager_mapping_fields)
+        assert bool(enable_eager_execution) or not has_eager_scaffold, (
+            "non-empty eager scaffold fields require eager trace/execution to be enabled"
+        )
+
     def to_trace_dict(self) -> dict:
         return {
             "plan_id": int(self.plan_id),
             "iteration_id": int(self.iteration_id),
             "execution_mode": self.execution_mode,
-            "target_home_set": [int(seq_id) for seq_id in self.target_home_set],
-            "target_eager_set": [int(seq_id) for seq_id in self.target_eager_set],
-            "draft_home_set": [int(seq_id) for seq_id in self.draft_home_set],
-            "draft_eager_set": [int(seq_id) for seq_id in self.draft_eager_set],
+            "target_home_set": _int_list(self.target_home_set),
+            "target_eager_set": _int_list(self.target_eager_set),
+            "draft_home_set": _int_list(self.draft_home_set),
+            "draft_eager_set": _int_list(self.draft_eager_set),
             "budgets": {
                 str(seq_id): budget.to_trace_dict()
                 for seq_id, budget in self.budgets.items()
@@ -155,6 +278,30 @@ class StepPlan:
             "buffered_proposal_seq_ids": [int(seq_id) for seq_id in self.buffered_proposal_seq_ids],
             "normal_gamma": None if self.normal_gamma is None else int(self.normal_gamma),
             "eager_gamma": int(self.eager_gamma),
+            "eager_new_selected_set": _int_list(self.eager_new_selected_set),
+            "eager_continuing_set": _int_list(self.eager_continuing_set),
+            "eager_active_seq_ids": _int_list(self.eager_active_seq_ids),
+            "eager_ready_seq_ids": _int_list(self.eager_ready_seq_ids),
+            "eager_proposal_ids_by_seq_id": _trace_mapping(
+                self.eager_proposal_ids_by_seq_id,
+                lambda value: _trace_int_value(value, allow_none=True),
+            ),
+            "eager_parent_proposal_ids_by_seq_id": _trace_mapping(
+                self.eager_parent_proposal_ids_by_seq_id,
+                lambda value: _trace_int_value(value, allow_none=True),
+            ),
+            "eager_base_len_by_seq_id": _trace_mapping(
+                self.eager_base_len_by_seq_id,
+                lambda value: int(value),
+            ),
+            "eager_base_pre_verify_by_seq_id": _trace_mapping(
+                self.eager_base_pre_verify_by_seq_id,
+                lambda value: bool(value),
+            ),
+            "eager_parent_kind_by_seq_id": _trace_mapping(
+                self.eager_parent_kind_by_seq_id,
+                lambda value: str(value),
+            ),
             "step_id": None if self.step_id is None else int(self.step_id),
             "fallback_reason": self.fallback_reason,
             "steady_step": bool(self.steady_step),

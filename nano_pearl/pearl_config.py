@@ -1,9 +1,51 @@
+from __future__ import annotations
+
 import os
 from nano_pearl.utils.pearl_logger import logger, get_model_name
 from dataclasses import dataclass
 from typing import ClassVar
 from transformers import AutoConfig
 import torch.distributed as dist
+
+
+PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
+    "Phase 1H-0 only adds eager scaffolding; eager execution is not implemented yet."
+)
+
+
+def validate_eager_gamma(config, gamma: int) -> bool:
+    gamma = int(gamma)
+    if gamma <= 0:
+        raise ValueError(f"global gamma must be positive for eager execution, got {gamma}")
+
+    eager_gamma = getattr(config, "eager_gamma", None)
+    if eager_gamma is None:
+        eager_gamma = getattr(config, "max_eager_tokens_per_request", None)
+    if eager_gamma is None:
+        raise ValueError("eager_gamma is required for eager execution validation")
+    eager_gamma = int(eager_gamma)
+
+    max_tokens_per_request = int(getattr(config, "max_eager_tokens_per_request", 0) or 0)
+    max_tokens_per_step = int(getattr(config, "max_eager_tokens_per_step", 0) or 0)
+    max_requests_per_step = int(getattr(config, "max_eager_requests_per_step", 0) or 0)
+
+    if eager_gamma != gamma:
+        raise ValueError(f"eager_gamma must equal global gamma={gamma}, got {eager_gamma}")
+    if max_tokens_per_request != gamma:
+        raise ValueError(
+            f"max_eager_tokens_per_request must equal global gamma={gamma}, got {max_tokens_per_request}"
+        )
+    if max_tokens_per_step <= 0 or max_tokens_per_step % gamma != 0:
+        raise ValueError(
+            f"max_eager_tokens_per_step must be a positive multiple of gamma={gamma}, "
+            f"got {max_tokens_per_step}"
+        )
+    if max_requests_per_step * gamma > max_tokens_per_step:
+        raise ValueError(
+            "max_eager_requests_per_step * gamma must be <= max_eager_tokens_per_step, "
+            f"got {max_requests_per_step} * {gamma} > {max_tokens_per_step}"
+        )
+    return True
 
 
 @dataclass
@@ -85,6 +127,11 @@ class PEARLConfig:
     enforce_eager: bool = False
     gamma: int = -1
     execution_mode: str = "parallel_pearl"
+    enable_eager_execution: bool = False
+    eager_policy: str = "none"
+    max_eager_requests_per_step: int = 0
+    max_eager_tokens_per_step: int = 0
+    max_eager_tokens_per_request: int = 0
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -92,6 +139,19 @@ class PEARLConfig:
                 f"Invalid execution_mode={self.execution_mode!r}. "
                 f"Expected one of {sorted(self.ALLOWED_EXECUTION_MODES)}."
             )
+        self.enable_eager_execution = bool(self.enable_eager_execution)
+        self.eager_policy = str(self.eager_policy)
+        for field_name in (
+            "max_eager_requests_per_step",
+            "max_eager_tokens_per_step",
+            "max_eager_tokens_per_request",
+        ):
+            value = int(getattr(self, field_name))
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative, got {value}")
+            setattr(self, field_name, value)
+        if self.enable_eager_execution:
+            raise NotImplementedError(PHASE_1H0_EAGER_NOT_IMPLEMENTED)
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))
@@ -109,6 +169,11 @@ class PEARLConfig:
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
+        logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
+        logger.info(f"Eager_Policy={self.eager_policy}")
+        logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
+        logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")
+        logger.info(f"Max_Eager_Tokens_Per_Request={self.max_eager_tokens_per_request}")
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len

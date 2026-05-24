@@ -132,6 +132,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "target_tensor_parallel_size": args.target_tp,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "execution_mode": args.execution_mode,
+        "enable_eager_execution": args.enable_eager_execution,
+        "eager_policy": args.eager_policy,
+        "max_eager_requests_per_step": args.max_eager_requests_per_step,
+        "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
+        "max_eager_tokens_per_request": args.max_eager_tokens_per_request,
     }
 
     # Try new named-path style with gamma.
@@ -145,15 +150,24 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
     except TypeError:
         pass
 
-    # Older PEARLConfig variants may not expose execution_mode yet.
-    common_kwargs.pop("execution_mode", None)
+    # Older PEARLConfig variants may not expose execution/eager scaffolding yet.
+    legacy_kwargs = dict(common_kwargs)
+    for key in (
+        "execution_mode",
+        "enable_eager_execution",
+        "eager_policy",
+        "max_eager_requests_per_step",
+        "max_eager_tokens_per_step",
+        "max_eager_tokens_per_request",
+    ):
+        legacy_kwargs.pop(key, None)
 
     try:
         return PEARLConfig(
             draft_model_path=args.draft_model,
             target_model_path=args.target_model,
             gamma=args.gamma,
-            **common_kwargs,
+            **legacy_kwargs,
         )
     except TypeError:
         pass
@@ -164,7 +178,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
             args.draft_model,
             args.target_model,
             gamma=args.gamma,
-            **common_kwargs,
+            **legacy_kwargs,
         )
     except TypeError:
         pass
@@ -173,7 +187,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
     return PEARLConfig(
         args.draft_model,
         args.target_model,
-        **common_kwargs,
+        **legacy_kwargs,
     )
 
 
@@ -1400,6 +1414,20 @@ def main() -> None:
             "parallel_pearl, or Phase 1C dual_batch_pearl (default: parallel_pearl)."
         ),
     )
+    parser.add_argument(
+        "--enable-eager-execution",
+        action="store_true",
+        help="Enable future continuous eager execution. Phase 1H-0 raises NotImplementedError.",
+    )
+    parser.add_argument(
+        "--eager-policy",
+        type=str,
+        default="none",
+        help="Future eager execution policy selector (default: none).",
+    )
+    parser.add_argument("--max-eager-requests-per-step", type=int, default=0)
+    parser.add_argument("--max-eager-tokens-per-step", type=int, default=0)
+    parser.add_argument("--max-eager-tokens-per-request", type=int, default=0)
     parser.add_argument(
         "--decode-ready",
         "--prefill-elided",

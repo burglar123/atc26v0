@@ -1,8 +1,28 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
+
+
+LANE_NORMAL = "normal"
+LANE_EAGER = "eager"
+PROPOSAL_LANES = {LANE_NORMAL, LANE_EAGER}
+
+EAGER_STATE_DRAFTED_PENDING_PARENT = "DRAFTED_PENDING_PARENT"
+EAGER_STATE_READY_TO_VERIFY = "READY_TO_VERIFY"
+EAGER_STATE_VERIFYING = "VERIFYING"
+EAGER_STATE_CONSUMED = "CONSUMED"
+EAGER_STATE_DISCARDED = "DISCARDED"
+EAGER_PROPOSAL_STATES = {
+    EAGER_STATE_DRAFTED_PENDING_PARENT,
+    EAGER_STATE_READY_TO_VERIFY,
+    EAGER_STATE_VERIFYING,
+    EAGER_STATE_CONSUMED,
+    EAGER_STATE_DISCARDED,
+}
 
 
 @dataclass
@@ -31,6 +51,59 @@ class BufferedProposal:
     pre_verify: bool
     plan_id: int
     valid: bool = True
+
+
+@dataclass
+class EagerProposal:
+    proposal_id: int
+    seq_id: int
+    request_id: str | int
+    lane: str = LANE_EAGER
+    parent_proposal_id: int | None = None
+    parent_kind: str = LANE_NORMAL
+    parent_step_id: int | None = None
+    source_step_id: int = 0
+    source_plan_id: int = 0
+    home_batch_id: int = 0
+    base_len: int = 0
+    base_pre_verify: bool = True
+    base_num_completion_tokens: int = 0
+    proposal_token_ids: list[int] = field(default_factory=list)
+    to_be_verified_token_ids: list[int] = field(default_factory=list)
+    proposal_len: int = 0
+    state: str = EAGER_STATE_DRAFTED_PENDING_PARENT
+    valid: bool = True
+
+    def __post_init__(self):
+        self.proposal_id = int(self.proposal_id)
+        self.seq_id = int(self.seq_id)
+        if self.lane != LANE_EAGER:
+            raise ValueError(f"EagerProposal lane must be {LANE_EAGER!r}, got {self.lane!r}")
+        if self.parent_kind not in PROPOSAL_LANES:
+            raise ValueError(f"Invalid eager parent_kind={self.parent_kind!r}")
+        if self.state not in EAGER_PROPOSAL_STATES:
+            raise ValueError(f"Invalid eager proposal state={self.state!r}")
+        if self.parent_proposal_id is not None:
+            self.parent_proposal_id = int(self.parent_proposal_id)
+        if self.parent_step_id is not None:
+            self.parent_step_id = int(self.parent_step_id)
+        self.source_step_id = int(self.source_step_id)
+        self.source_plan_id = int(self.source_plan_id)
+        self.home_batch_id = int(self.home_batch_id)
+        self.base_len = int(self.base_len)
+        self.base_pre_verify = bool(self.base_pre_verify)
+        self.base_num_completion_tokens = int(self.base_num_completion_tokens)
+        self.proposal_token_ids = [int(token_id) for token_id in self.proposal_token_ids]
+        self.to_be_verified_token_ids = [int(token_id) for token_id in self.to_be_verified_token_ids]
+        if self.proposal_len == 0 and self.proposal_token_ids:
+            self.proposal_len = len(self.proposal_token_ids)
+        self.proposal_len = int(self.proposal_len)
+        if self.proposal_token_ids and self.proposal_len != len(self.proposal_token_ids):
+            raise ValueError(
+                f"EagerProposal proposal_len={self.proposal_len} does not match "
+                f"proposal_token_ids length={len(self.proposal_token_ids)}"
+            )
+        self.valid = bool(self.valid)
 
 
 class ProposalBuffer:
@@ -110,6 +183,259 @@ class ProposalBuffer:
         return sorted({proposal.home_batch_id for proposal in self._proposals.values() if proposal.valid})
 
 
+class EagerProposalBuffer:
+    """Proposal-id keyed buffer for future eager proposals.
+
+    This buffer is intentionally separate from ProposalBuffer. Phase 1H-0 only
+    exercises it through synthetic tests; runtime dual-batch execution does not
+    read from or write to it yet.
+    """
+
+    def __init__(self):
+        self._proposals: Dict[int, EagerProposal] = {}
+        self._discard_reasons: Dict[int, str] = {}
+
+    def clear(self) -> None:
+        self._proposals.clear()
+        self._discard_reasons.clear()
+
+    def size(self) -> int:
+        return sum(1 for proposal in self._proposals.values() if proposal.valid)
+
+    def store(self, proposal: EagerProposal) -> None:
+        if not isinstance(proposal, EagerProposal):
+            raise TypeError(f"EagerProposalBuffer.store expected EagerProposal, got {type(proposal).__name__}")
+        proposal_id = int(proposal.proposal_id)
+        if proposal_id in self._proposals:
+            raise ValueError(f"duplicate eager proposal_id={proposal_id}")
+        if proposal.lane != LANE_EAGER:
+            raise ValueError(f"eager proposal must use lane={LANE_EAGER!r}")
+        self._proposals[proposal_id] = proposal
+
+    def _get(self, proposal_id: int) -> EagerProposal:
+        proposal_id = int(proposal_id)
+        if proposal_id not in self._proposals:
+            raise KeyError(f"unknown eager proposal_id={proposal_id}")
+        return self._proposals[proposal_id]
+
+    def mark_ready(self, proposal_id: int) -> EagerProposal:
+        proposal = self._get(proposal_id)
+        if proposal.state in {EAGER_STATE_DISCARDED, EAGER_STATE_CONSUMED}:
+            raise ValueError(f"cannot mark eager proposal_id={proposal_id} ready from state={proposal.state}")
+        proposal.state = EAGER_STATE_READY_TO_VERIFY
+        proposal.valid = True
+        return proposal
+
+    def mark_consumed(self, proposal_id: int) -> EagerProposal:
+        proposal = self._get(proposal_id)
+        if proposal.state == EAGER_STATE_DISCARDED:
+            raise ValueError(f"cannot consume discarded eager proposal_id={proposal_id}")
+        proposal.state = EAGER_STATE_CONSUMED
+        proposal.valid = False
+        return proposal
+
+    def discard(self, proposal_id: int, reason: str) -> EagerProposal:
+        proposal = self._get(proposal_id)
+        proposal.state = EAGER_STATE_DISCARDED
+        proposal.valid = False
+        self._discard_reasons[int(proposal_id)] = str(reason)
+        return proposal
+
+    def discard_by_seq_id(self, seq_id: int, reason: str) -> list[int]:
+        seq_id = int(seq_id)
+        discarded = []
+        for proposal_id, proposal in self._proposals.items():
+            if proposal.seq_id == seq_id and proposal.valid:
+                self.discard(proposal_id, reason)
+                discarded.append(proposal_id)
+        return sorted(discarded)
+
+    def get_ready_by_seq_ids(self, seq_ids: Iterable[int]) -> list[EagerProposal]:
+        requested = [int(seq_id) for seq_id in seq_ids]
+        requested_set = set(requested)
+        ready = [
+            proposal
+            for proposal in self._proposals.values()
+            if proposal.valid
+            and proposal.state == EAGER_STATE_READY_TO_VERIFY
+            and proposal.seq_id in requested_set
+        ]
+        order = {seq_id: idx for idx, seq_id in enumerate(requested)}
+        return sorted(ready, key=lambda proposal: (order.get(proposal.seq_id, len(order)), proposal.proposal_id))
+
+    def pending_seq_ids(self) -> list[int]:
+        return sorted({
+            proposal.seq_id
+            for proposal in self._proposals.values()
+            if proposal.valid and proposal.state == EAGER_STATE_DRAFTED_PENDING_PARENT
+        })
+
+    def ready_seq_ids(self) -> list[int]:
+        return sorted({
+            proposal.seq_id
+            for proposal in self._proposals.values()
+            if proposal.valid and proposal.state == EAGER_STATE_READY_TO_VERIFY
+        })
+
+    def inspect(self) -> dict:
+        state_counts: dict[str, int] = {state: 0 for state in EAGER_PROPOSAL_STATES}
+        proposals = []
+        for proposal_id, proposal in sorted(self._proposals.items()):
+            state_counts[proposal.state] = state_counts.get(proposal.state, 0) + 1
+            proposals.append(eager_proposal_to_trace_dict(proposal))
+        return {
+            "size": self.size(),
+            "pending_seq_ids": self.pending_seq_ids(),
+            "ready_seq_ids": self.ready_seq_ids(),
+            "state_counts": state_counts,
+            "discard_reasons": {str(k): v for k, v in sorted(self._discard_reasons.items())},
+            "proposals": proposals,
+        }
+
+
+def eager_proposal_to_trace_dict(proposal: EagerProposal) -> dict[str, Any]:
+    return {
+        "proposal_id": int(proposal.proposal_id),
+        "seq_id": int(proposal.seq_id),
+        "request_id": proposal.request_id,
+        "lane": proposal.lane,
+        "parent_proposal_id": proposal.parent_proposal_id,
+        "parent_kind": proposal.parent_kind,
+        "parent_step_id": proposal.parent_step_id,
+        "source_step_id": int(proposal.source_step_id),
+        "source_plan_id": int(proposal.source_plan_id),
+        "home_batch_id": int(proposal.home_batch_id),
+        "base_len": int(proposal.base_len),
+        "base_pre_verify": bool(proposal.base_pre_verify),
+        "base_num_completion_tokens": int(proposal.base_num_completion_tokens),
+        "proposal_token_ids": [int(token_id) for token_id in proposal.proposal_token_ids],
+        "to_be_verified_token_ids": [int(token_id) for token_id in proposal.to_be_verified_token_ids],
+        "proposal_len": int(proposal.proposal_len),
+        "state": proposal.state,
+        "valid": bool(proposal.valid),
+    }
+
+
+def serialize_eager_proposal_meta(
+    proposals: Iterable[EagerProposal],
+    gamma: int | None = None,
+    plan_id: int | None = None,
+) -> tuple[dict[str, Any], list[int]]:
+    proposals = list(proposals)
+    payload: list[int] = []
+    proposal_lens = []
+    to_verify_lens = []
+    for proposal in proposals:
+        proposal_lens.append(int(proposal.proposal_len))
+        to_verify_lens.append(len(proposal.to_be_verified_token_ids))
+        payload.extend(int(token_id) for token_id in proposal.to_be_verified_token_ids)
+        payload.extend(int(token_id) for token_id in proposal.proposal_token_ids)
+
+    inferred_gamma = gamma
+    if inferred_gamma is None:
+        inferred_gamma = proposals[0].proposal_len if proposals else 0
+    inferred_plan_id = plan_id
+    if inferred_plan_id is None:
+        inferred_plan_id = proposals[0].source_plan_id if proposals else -1
+
+    meta = {
+        "num_proposals": len(proposals),
+        "payload_length": len(payload),
+        "gamma": int(inferred_gamma),
+        "plan_id": int(inferred_plan_id),
+        "proposal_ids": [int(proposal.proposal_id) for proposal in proposals],
+        "seq_ids": [int(proposal.seq_id) for proposal in proposals],
+        "request_ids": [proposal.request_id for proposal in proposals],
+        "parent_ids": [proposal.parent_proposal_id for proposal in proposals],
+        "parent_kinds": [proposal.parent_kind for proposal in proposals],
+        "parent_step_ids": [proposal.parent_step_id for proposal in proposals],
+        "source_step_ids": [int(proposal.source_step_id) for proposal in proposals],
+        "source_plan_ids": [int(proposal.source_plan_id) for proposal in proposals],
+        "home_batch_ids": [int(proposal.home_batch_id) for proposal in proposals],
+        "base_lens": [int(proposal.base_len) for proposal in proposals],
+        "base_pre_verify": [bool(proposal.base_pre_verify) for proposal in proposals],
+        "base_num_completion_tokens": [int(proposal.base_num_completion_tokens) for proposal in proposals],
+        "proposal_lens": proposal_lens,
+        "to_verify_lens": to_verify_lens,
+        "lane_kinds": [proposal.lane for proposal in proposals],
+        "states": [proposal.state for proposal in proposals],
+        "valid": [bool(proposal.valid) for proposal in proposals],
+    }
+    return meta, payload
+
+
+def _meta_list(meta: dict[str, Any], key: str, n: int, default: Any = None) -> list[Any]:
+    value = meta.get(key)
+    if value is None:
+        return [default for _ in range(n)]
+    if not isinstance(value, list) or len(value) != n:
+        raise ValueError(f"eager meta field {key!r} must be a list of length {n}")
+    return value
+
+
+def deserialize_eager_proposal_meta(meta: dict[str, Any], payload: Iterable[int]) -> list[EagerProposal]:
+    payload = [int(token_id) for token_id in payload]
+    n = int(meta.get("num_proposals", 0))
+    payload_length = int(meta.get("payload_length", 0))
+    if payload_length != len(payload):
+        raise ValueError(f"eager payload length mismatch: meta={payload_length}, payload={len(payload)}")
+
+    proposal_ids = _meta_list(meta, "proposal_ids", n)
+    seq_ids = _meta_list(meta, "seq_ids", n)
+    request_ids = _meta_list(meta, "request_ids", n)
+    parent_ids = _meta_list(meta, "parent_ids", n)
+    parent_kinds = _meta_list(meta, "parent_kinds", n, LANE_NORMAL)
+    parent_step_ids = _meta_list(meta, "parent_step_ids", n)
+    source_step_ids = _meta_list(meta, "source_step_ids", n, 0)
+    source_plan_ids = _meta_list(meta, "source_plan_ids", n, meta.get("plan_id", 0))
+    home_batch_ids = _meta_list(meta, "home_batch_ids", n, 0)
+    base_lens = _meta_list(meta, "base_lens", n, 0)
+    base_pre_verify = _meta_list(meta, "base_pre_verify", n, True)
+    base_num_completion_tokens = _meta_list(meta, "base_num_completion_tokens", n, 0)
+    proposal_lens = _meta_list(meta, "proposal_lens", n, int(meta.get("gamma", 0)))
+    to_verify_lens = _meta_list(meta, "to_verify_lens", n, 0)
+    lane_kinds = _meta_list(meta, "lane_kinds", n, LANE_EAGER)
+    states = _meta_list(meta, "states", n, EAGER_STATE_DRAFTED_PENDING_PARENT)
+    valid_flags = _meta_list(meta, "valid", n, True)
+
+    proposals = []
+    offset = 0
+    for idx in range(n):
+        to_verify_len = int(to_verify_lens[idx])
+        proposal_len = int(proposal_lens[idx])
+        to_verify = payload[offset:offset + to_verify_len]
+        offset += to_verify_len
+        proposal_tokens = payload[offset:offset + proposal_len]
+        offset += proposal_len
+        if len(to_verify) != to_verify_len or len(proposal_tokens) != proposal_len:
+            raise ValueError(f"eager payload ended while decoding proposal index={idx}")
+        proposals.append(
+            EagerProposal(
+                proposal_id=int(proposal_ids[idx]),
+                seq_id=int(seq_ids[idx]),
+                request_id=request_ids[idx],
+                lane=lane_kinds[idx],
+                parent_proposal_id=parent_ids[idx],
+                parent_kind=parent_kinds[idx],
+                parent_step_id=parent_step_ids[idx],
+                source_step_id=int(source_step_ids[idx]),
+                source_plan_id=int(source_plan_ids[idx]),
+                home_batch_id=int(home_batch_ids[idx]),
+                base_len=int(base_lens[idx]),
+                base_pre_verify=bool(base_pre_verify[idx]),
+                base_num_completion_tokens=int(base_num_completion_tokens[idx]),
+                proposal_token_ids=proposal_tokens,
+                to_be_verified_token_ids=to_verify,
+                proposal_len=proposal_len,
+                state=states[idx],
+                valid=bool(valid_flags[idx]),
+            )
+        )
+    if offset != len(payload):
+        raise ValueError(f"eager payload has trailing tokens: decoded={offset}, payload={len(payload)}")
+    return proposals
+
+
 class DualBatchManager:
     """Assign sticky home batches and produce breadth-only A/B StepPlans."""
 
@@ -180,6 +506,7 @@ class DualBatchManager:
         decode_ready_mode: bool,
         pending_proposal_seq_ids: list[int],
         pending_batch_ids: list[int],
+        enable_eager_execution: bool = False,
     ) -> StepPlan:
         active = self.active_batch_ids()
         target_batch_id: Optional[int] = None
@@ -285,7 +612,10 @@ class DualBatchManager:
             phase=phase,
             fallback_reason=fallback_reason,
         )
-        plan.validate_phase1c()
+        if enable_eager_execution:
+            plan.validate_phase1h_eager_scaffold(enable_eager_execution=True)
+        else:
+            plan.validate_phase1c()
         self.step_id += 1
         plan.dual_batch_state = plan_state
         return plan

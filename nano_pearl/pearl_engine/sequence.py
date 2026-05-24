@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from copy import copy
 from enum import Enum, auto
 from itertools import count
 import time
+from typing import Any
 
 from ..layers.sampler import SamplingParams
 
@@ -217,3 +220,38 @@ class Sequence:
             self.token_ids = state[-1]
         else:
             self.last_token = state[-1]
+
+
+def _sequence_status_name(seq: Sequence) -> str:
+    status = getattr(seq, "status", None)
+    return status.name if isinstance(status, SequenceStatus) else str(status)
+
+
+def make_sequence_checkpoint(seq: Sequence) -> dict[str, Any]:
+    return {
+        "seq_id": int(seq.seq_id),
+        "request_id": seq.request_id,
+        "len": int(len(seq)),
+        "pre_verify": bool(seq.pre_verify),
+        "num_completion_tokens": int(seq.num_completion_tokens),
+        "cur_acc_tokens": int(seq.cur_acc_tokens),
+        "status": _sequence_status_name(seq),
+        "home_batch_id": seq.home_batch_id,
+    }
+
+
+def assert_sequence_matches_checkpoint(seq: Sequence, checkpoint: dict[str, Any]) -> None:
+    current = make_sequence_checkpoint(seq)
+    mismatches = []
+    for key, expected in checkpoint.items():
+        actual = current.get(key)
+        if actual != expected:
+            mismatches.append(f"{key}: expected={expected!r}, actual={actual!r}")
+    assert not mismatches, (
+        f"sequence checkpoint mismatch for seq_id={current.get('seq_id')}: "
+        + "; ".join(mismatches)
+    )
+
+
+def trace_sequence_checkpoint(seq: Sequence) -> dict[str, Any]:
+    return make_sequence_checkpoint(seq)
