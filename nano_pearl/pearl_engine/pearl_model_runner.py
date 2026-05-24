@@ -922,6 +922,123 @@ class ModelRunnerBase:
             repair_migrations, {str(k): int(v) for k, v in home_batch_ids.items()},
         )
 
+    def _sync_h2_plan_fields(self, plan: StepPlan) -> None:
+        """Broadcast authoritative H2 plan fields from DRAFT to TARGET.
+
+        DRAFT is the sole authority for fields that determine what proposals
+        are generated and sent: draft_eager_set, expected_eager_proposal_seq_ids,
+        expected_normal_proposal_seq_ids, excluded_normal_proposal_seq_ids.
+        TARGET must not derive these independently from local buffer state.
+        """
+        if plan.plan_phase != "steady" or not self.global_config.enable_eager_execution:
+            return
+
+        src_rank = self.global_config.draft_config.master_rank
+        is_source = self.is_draft and self.tp_params.local_rank == 0
+
+        # Serialize four lists: [num_fields, len0, data0..., len1, data1..., ...]
+        if is_source:
+            fields = [
+                [int(s) for s in plan.draft_eager_set],
+                [int(s) for s in plan.expected_eager_proposal_seq_ids],
+                [int(s) for s in plan.expected_normal_proposal_seq_ids],
+                [int(s) for s in plan.excluded_normal_proposal_seq_ids],
+            ]
+            packed = [len(fields)]
+            for f in fields:
+                packed.append(len(f))
+                packed.extend(f)
+        else:
+            packed = []
+
+        # Meta broadcast: total packed size
+        if is_source:
+            meta = torch.tensor([len(packed)], dtype=torch.int64, device="cuda")
+        else:
+            meta = torch.zeros(1, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=src_rank, group=self.verify_group)
+        total = int(meta.item())
+        if total == 0:
+            return
+
+        # Payload broadcast
+        if is_source:
+            data = torch.tensor(packed, dtype=torch.int64, device="cuda")
+        else:
+            data = torch.zeros(total, dtype=torch.int64, device="cuda")
+        dist.broadcast(data, src=src_rank, group=self.verify_group)
+
+        # TARGET overwrites plan fields
+        if not is_source:
+            arr = data.tolist()
+            num_fields = arr[0]
+            idx = 1
+            if num_fields >= 1:
+                n = arr[idx]; idx += 1
+                plan.draft_eager_set = arr[idx:idx + n]; idx += n
+            if num_fields >= 2:
+                n = arr[idx]; idx += 1
+                plan.expected_eager_proposal_seq_ids = arr[idx:idx + n]; idx += n
+            if num_fields >= 3:
+                n = arr[idx]; idx += 1
+                plan.expected_normal_proposal_seq_ids = arr[idx:idx + n]; idx += n
+            if num_fields >= 4:
+                n = arr[idx]; idx += 1
+                plan.excluded_normal_proposal_seq_ids = arr[idx:idx + n]; idx += n
+                plan.excluded_normal_proposal_reason = (
+                    "covered_by_target_eager_result" if arr[idx - n:idx] else ""
+                )
+
+    def _debug_check_h2_plan_consistency(self, plan: StepPlan) -> None:
+        """Fail-fast debug check: all_gather key plan fields and assert equality.
+
+        Activated by TORCH_DISTRIBUTED_DEBUG=DETAIL.  Catches plan divergence
+        between DRAFT and TARGET ranks immediately after construction instead
+        of letting it cascade into obscure buffer/proposal mismatches later.
+        """
+        if plan.plan_phase != "steady" or not self.global_config.enable_eager_execution:
+            return
+        debug_env = os.environ.get("TORCH_DISTRIBUTED_DEBUG", "")
+        if debug_env != "DETAIL":
+            return
+
+        # Pack a fixed-size tensor: each rank writes its key fields into a
+        # row, then all_gather so every rank can compare.
+        max_seqs = max(1, len(self.scheduler.running))
+        row_len = 4 + 4 * max_seqs  # 4 lengths + 4 padded lists
+        local = torch.zeros(row_len, dtype=torch.int64, device="cuda")
+        local[0] = len(plan.draft_eager_set)
+        local[1] = len(plan.expected_eager_proposal_seq_ids)
+        local[2] = len(plan.expected_normal_proposal_seq_ids)
+        local[3] = len(plan.excluded_normal_proposal_seq_ids)
+        for offset, field in [
+            (4, plan.draft_eager_set),
+            (4 + max_seqs, plan.expected_eager_proposal_seq_ids),
+            (4 + 2 * max_seqs, plan.expected_normal_proposal_seq_ids),
+            (4 + 3 * max_seqs, plan.excluded_normal_proposal_seq_ids),
+        ]:
+            for i, v in enumerate(field):
+                if i < max_seqs:
+                    local[offset + i] = int(v)
+
+        world = dist.get_world_size(group=self.verify_group)
+        gathered = [torch.zeros_like(local) for _ in range(world)]
+        dist.all_gather(gathered, local, group=self.verify_group)
+
+        # Compare every pair of ranks — all must be identical
+        for i in range(world):
+            for j in range(i + 1, world):
+                if not torch.equal(gathered[i], gathered[j]):
+                    logger.warning(
+                        "H2 plan divergence: rank %d != rank %d: "
+                        "draft_eager=%s vs %s, expected_normal=%s vs %s",
+                        i, j,
+                        gathered[i][4:4 + int(gathered[i][0])].tolist(),
+                        gathered[j][4:4 + int(gathered[j][0])].tolist(),
+                        gathered[i][4 + 2 * max_seqs:4 + 2 * max_seqs + int(gathered[i][2])].tolist(),
+                        gathered[j][4 + 2 * max_seqs:4 + 2 * max_seqs + int(gathered[j][2])].tolist(),
+                    )
+
     def _resolve_dual_seq_ids(self, seq_ids: list[int], plan: StepPlan, label: str) -> list[Sequence]:
         if not seq_ids:
             return []
@@ -2689,6 +2806,8 @@ class DraftModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
+        self._sync_h2_plan_fields(plan)
+        self._debug_check_h2_plan_consistency(plan)
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
         target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "draft_apply_eager_verify")
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
@@ -3316,6 +3435,8 @@ class TargetModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
+        self._sync_h2_plan_fields(plan)
+        self._debug_check_h2_plan_consistency(plan)
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")
         target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "dual_eager_verify")
         draft_seq_ids = list(plan.draft_home_set)
