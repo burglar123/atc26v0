@@ -838,6 +838,180 @@ def test_send_eager_subset_assertion_accepts_empty():
         f"[] should be subset of [1,5]"
 
 
+# --- Source-authoritative eager verify meta+payload protocol tests ---
+
+
+def _simulate_eager_result_broadcast(source_cols: int, receiver_local_len: int):
+    """Simulate the source-authoritative meta+payload eager verify protocol.
+
+    Returns (meta, payload) as dict for inspection.  The receiver must allocate
+    from the source meta, NOT from receiver_local_len.
+    """
+    rows = 6
+    numel = rows * source_cols
+    meta = [rows, source_cols, numel]
+
+    # Receiver side: parse meta, allocate from source metadata
+    _r_rows, r_cols, r_numel = meta
+    assert r_cols == source_cols, "receiver cols must equal source cols from meta"
+    # Receiver allocates based on source meta, not local length
+    if r_numel > 0:
+        payload = list(range(r_numel))  # placeholder
+    else:
+        payload = []
+
+    return {
+        "meta": meta,
+        "source_cols": source_cols,
+        "receiver_local_len": receiver_local_len,
+        "receiver_allocated_cols": r_cols,
+        "payload_len": len(payload),
+        "payload_skipped": r_numel == 0,
+    }
+
+
+def test_eager_protocol_source_cols_zero_receiver_nonzero():
+    """Source has cols=0, receiver local target_eager_seqs length > 0.
+
+    Receiver must still allocate [6,0] from source meta, not from local length.
+    """
+    result = _simulate_eager_result_broadcast(source_cols=0, receiver_local_len=3)
+    assert result["receiver_allocated_cols"] == 0, \
+        f"receiver must allocate 0 cols from source meta, got {result['receiver_allocated_cols']}"
+    assert result["payload_skipped"] is True
+
+
+def test_eager_protocol_source_cols_one_receiver_zero():
+    """Source has cols=1, receiver local target_eager_seqs length == 0.
+
+    Receiver must allocate [6,1] from source meta.
+    """
+    result = _simulate_eager_result_broadcast(source_cols=1, receiver_local_len=0)
+    assert result["receiver_allocated_cols"] == 1, \
+        f"receiver must allocate 1 col from source meta, got {result['receiver_allocated_cols']}"
+    assert result["payload_skipped"] is False
+    assert result["payload_len"] == 6
+
+
+def test_eager_protocol_both_cols_zero():
+    """Both sides have cols=0."""
+    result = _simulate_eager_result_broadcast(source_cols=0, receiver_local_len=0)
+    assert result["receiver_allocated_cols"] == 0
+    assert result["payload_skipped"] is True
+
+
+def test_eager_protocol_both_cols_positive():
+    """Both sides have cols>0."""
+    result = _simulate_eager_result_broadcast(source_cols=2, receiver_local_len=2)
+    assert result["receiver_allocated_cols"] == 2
+    assert result["payload_skipped"] is False
+    assert result["payload_len"] == 12  # 6 * 2
+
+
+def test_eager_protocol_payload_skip_driven_by_source_meta():
+    """Payload skip is driven only by source meta.numel, never by local state."""
+    # Source cols=0 → meta.numel=0 → payload skipped regardless of local len
+    for local_len in [0, 1, 3, 5]:
+        result = _simulate_eager_result_broadcast(source_cols=0, receiver_local_len=local_len)
+        assert result["payload_skipped"] is True, \
+            f"payload must be skipped when source numel=0 (local_len={local_len})"
+
+    # Source cols>0 → meta.numel>0 → payload NOT skipped regardless of local len
+    for local_len in [0, 1, 3]:
+        result = _simulate_eager_result_broadcast(source_cols=2, receiver_local_len=local_len)
+        assert result["payload_skipped"] is False, \
+            f"payload must NOT be skipped when source numel>0 (local_len={local_len})"
+
+
+def test_eager_protocol_receiver_ignores_local_length():
+    """Receiver allocation must always equal source_cols from meta, never local length."""
+    for source_cols in [0, 1, 3]:
+        for local_len in [0, 1, 2, 4]:
+            if local_len == source_cols:
+                continue  # skip the matching case
+            result = _simulate_eager_result_broadcast(source_cols=source_cols, receiver_local_len=local_len)
+            assert result["receiver_allocated_cols"] == source_cols, \
+                f"source_cols={source_cols}, local_len={local_len}: receiver used {result['receiver_allocated_cols']}"
+
+
+# --- H2 schedule shape-mismatch prevention tests ---
+
+
+def test_h2_eager_shape_divergence_target_empty_source_nonempty():
+    """TARGET eager set empty on source, non-empty on receiver: no shape mismatch.
+
+    The source-authoritative meta ensures both ranks use source_cols, not local state.
+    """
+    source_cols = 1  # TARGET rank has 1 eager result
+    receiver_local_len = 0  # DRAFT rank thinks there are 0 target eager seqs
+
+    result = _simulate_eager_result_broadcast(source_cols=source_cols, receiver_local_len=receiver_local_len)
+    assert result["receiver_allocated_cols"] == source_cols, \
+        f"receiver must follow source meta ({source_cols}), not local state ({receiver_local_len})"
+    assert result["payload_skipped"] is False
+
+
+def test_h2_eager_shape_divergence_source_empty_target_nonempty():
+    """TARGET eager set non-empty on source, empty on receiver: no shape mismatch."""
+    source_cols = 0  # TARGET rank has no eager results
+    receiver_local_len = 3  # DRAFT rank thinks there are 3 target eager seqs
+
+    result = _simulate_eager_result_broadcast(source_cols=source_cols, receiver_local_len=receiver_local_len)
+    assert result["receiver_allocated_cols"] == source_cols, \
+        f"receiver must follow source meta ({source_cols}), not local state ({receiver_local_len})"
+    assert result["payload_skipped"] is True
+
+
+# --- Source code checks for source-authoritative protocol ---
+
+
+def test_receive_eager_verify_result_uses_meta_broadcast():
+    """_receive_eager_verify_result must broadcast meta before allocating payload."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+
+    fn_start = src.find("def _receive_eager_verify_result(self, seqs:")
+    assert fn_start != -1, "missing _receive_eager_verify_result definition"
+    fn_end = src.find("def _apply_eager_verify_result(", fn_start)
+    fn_body = src[fn_start:fn_end]
+
+    # Must contain the meta broadcast
+    assert "torch.zeros(3, dtype=torch.int64" in fn_body, \
+        "_receive_eager_verify_result must allocate meta tensor of size 3"
+    assert "Source-authoritative meta+payload" in fn_body or "source-authoritative" in fn_body.lower(), \
+        "_receive_eager_verify_result must document source-authoritative protocol"
+
+    # Must NOT allocate based on len(seqs) for the broadcast tensor
+    lines = fn_body.split("\n")
+    verify_res_alloc = [l for l in lines if "verify_res = torch." in l and "zeros" in l]
+    if verify_res_alloc:
+        assert "len(seqs)" not in verify_res_alloc[0], \
+            f"_receive_eager_verify_result must not allocate verify_res from len(seqs): {verify_res_alloc[0]}"
+
+    # Must have payload broadcast inside numel > 0 check
+    assert "if numel > 0:" in fn_body, \
+        "_receive_eager_verify_result must condition payload broadcast on numel > 0"
+
+
+def test_build_eager_verify_result_uses_meta_broadcast():
+    """_build_eager_verify_result must use source-authoritative meta+payload."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+
+    fn_start = src.find("def _build_eager_verify_result(")
+    assert fn_start != -1, "missing _build_eager_verify_result definition"
+    fn_end = src.find("def _run_eager_verify_sidecar(", fn_start)
+    fn_body = src[fn_start:fn_end]
+
+    # Must contain source-authoritative meta
+    assert "Source-authoritative meta+payload" in fn_body or "source-authoritative" in fn_body.lower(), \
+        "_build_eager_verify_result must document source-authoritative protocol"
+    assert 'meta = torch.tensor([6, cols, numel]' in fn_body, \
+        "_build_eager_verify_result must broadcast meta [rows, cols, numel]"
+    assert "dist.broadcast(meta, src=" in fn_body, \
+        "_build_eager_verify_result must broadcast meta before payload"
+    assert "if numel > 0:" in fn_body, \
+        "_build_eager_verify_result must condition payload broadcast on numel > 0"
+
+
 def test_h2_schedule_draft_order_via_verify_group():
     """DRAFT H2 steady: recv normal → recv eager → send combined, all via verify_group.
 
@@ -923,9 +1097,9 @@ def test_h2_schedule_target_order_via_verify_group():
     eager_send_pos = h2_block.find("_run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan, group=self.verify_group)")
     assert eager_send_pos != -1, "TARGET H2: missing _run_eager_verify_sidecar with group=self.verify_group"
 
-    # Also check the else-branch
-    empty_eager_bcast = h2_block.find('dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)')
-    assert empty_eager_bcast != -1, "TARGET H2: empty eager result broadcast missing group=self.verify_group"
+    # Also check the else-branch (now uses source-authoritative meta broadcast)
+    empty_eager_bcast = h2_block.find('dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)')
+    assert empty_eager_bcast != -1, "TARGET H2: empty eager result broadcast missing group=self.verify_group (meta protocol)"
 
     # 3. Combined recv via verify_group
     combined_recv_pos = h2_block.find("_receive_combined_dual_proposals(")
@@ -956,8 +1130,8 @@ def test_h2_empty_broadcasts_are_unconditional():
 
     # TARGET side: empty normal broadcast
     assert 'verify_res = torch.zeros((4, 0)' in src, "missing empty normal verify tensor creation"
-    # TARGET side: empty eager broadcast
-    assert 'eager_verify_res = torch.zeros((6, 0)' in src, "missing empty eager verify tensor creation"
+    # TARGET side: empty eager broadcast now uses source-authoritative meta [6,0,0]
+    assert 'meta = torch.tensor([6, 0, 0]' in src, "missing empty eager verify meta tensor creation"
 
     # DRAFT side: receive calls accept group=self.verify_group even when target_seqs is empty
     # The _receive_verify_result call is unconditional (outside if/else)
@@ -1012,6 +1186,16 @@ if __name__ == "__main__":
         test_h2_schedule_draft_order_via_verify_group,
         test_h2_schedule_target_order_via_verify_group,
         test_h2_empty_broadcasts_are_unconditional,
+        test_eager_protocol_source_cols_zero_receiver_nonzero,
+        test_eager_protocol_source_cols_one_receiver_zero,
+        test_eager_protocol_both_cols_zero,
+        test_eager_protocol_both_cols_positive,
+        test_eager_protocol_payload_skip_driven_by_source_meta,
+        test_eager_protocol_receiver_ignores_local_length,
+        test_h2_eager_shape_divergence_target_empty_source_nonempty,
+        test_h2_eager_shape_divergence_source_empty_target_nonempty,
+        test_receive_eager_verify_result_uses_meta_broadcast,
+        test_build_eager_verify_result_uses_meta_broadcast,
     ]
     passed = 0
     for test in tests:

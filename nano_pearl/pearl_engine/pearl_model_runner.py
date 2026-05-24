@@ -1656,8 +1656,17 @@ class ModelRunnerBase:
             self._finalize_record_profile(trace_record)
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
-        verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
+        # Source-authoritative meta+payload protocol: receiver allocates based on
+        # the broadcast meta, NOT on local len(seqs).  This prevents shape mismatch
+        # when rank0 and rank1 disagree on target_eager_set contents.
+        meta = torch.zeros(3, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=group)
+        rows, cols, numel = [int(x) for x in meta.tolist()]
+        if numel > 0:
+            verify_res = torch.empty((rows, cols), dtype=torch.int64, device="cuda")
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
+        else:
+            verify_res = torch.empty((rows, cols), dtype=torch.int64, device="cuda")
         return verify_res
 
     def _apply_eager_verify_result(
@@ -1780,6 +1789,10 @@ class ModelRunnerBase:
         normal_seq_ids: list[int] | None = None,
         conditional_normal_seq_ids: list[int] | None = None,
         eager_seq_ids: list[int] | None = None,
+        meta_rows: int | None = None,
+        meta_cols: int | None = None,
+        meta_numel: int | None = None,
+        local_pre_meta_target_eager_set: list[int] | None = None,
     ) -> None:
         """Log collective trace for H2 NCCL ordering debugging.
 
@@ -1794,6 +1807,16 @@ class ModelRunnerBase:
                 if "eager_result" in event or "normal_result" in event
                 else self.global_config.draft_config.master_rank
             )
+            meta_parts = []
+            if meta_rows is not None:
+                meta_parts.append(f"meta_rows={meta_rows}")
+            if meta_cols is not None:
+                meta_parts.append(f"meta_cols={meta_cols}")
+            if meta_numel is not None:
+                meta_parts.append(f"meta_numel={meta_numel}")
+            if local_pre_meta_target_eager_set is not None:
+                meta_parts.append(f"local_pre_meta_target_eager_set={local_pre_meta_target_eager_set}")
+            meta_str = " ".join(meta_parts)
             logger.info(
                 f"{tag} {event} rank={self.rank} step={plan.step_id} "
                 f"plan={plan.plan_id} phase={plan.plan_phase} src={src_rank} "
@@ -1803,6 +1826,7 @@ class ModelRunnerBase:
                 f"draft_home_set={[int(s) for s in plan.draft_home_set]} "
                 f"target_eager_set={[int(s) for s in plan.target_eager_set]} "
                 f"draft_eager_set={[int(s) for s in plan.draft_eager_set]}"
+                f"{' ' + meta_str if meta_str else ''}"
                 f"{' eager_result_empty=True' if eager_result_empty else ''}"
                 f"{' normal_seq_ids=' + str([int(s) for s in normal_seq_ids]) if normal_seq_ids is not None else ''}"
                 f"{' conditional_seq_ids=' + str([int(s) for s in conditional_normal_seq_ids]) if conditional_normal_seq_ids is not None else ''}"
@@ -1814,6 +1838,50 @@ class ModelRunnerBase:
                     handler.flush()
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _debug_check_eager_bcast_consistency(self, plan: StepPlan, local_cols: int) -> None:
+        """Debug-only gather of both ranks' target_eager_set before eager broadcast.
+
+        Uses a fixed-size all_gather so it cannot itself cause a shape mismatch.
+        Only active when TORCH_DISTRIBUTED_DEBUG=DETAIL is set.
+        """
+        import os
+        if os.environ.get("TORCH_DISTRIBUTED_DEBUG", "") != "DETAIL":
+            return
+        try:
+            max_sets = 32
+            tensor = torch.zeros(3 + max_sets, dtype=torch.int64, device="cuda")
+            tensor[0] = int(plan.step_id)
+            tensor[1] = int(plan.plan_id)
+            tensor[2] = int(local_cols)
+            for i, sid in enumerate(sorted(plan.target_eager_set)[:max_sets]):
+                tensor[3 + i] = int(sid)
+            gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, tensor)
+            rows_data = []
+            for rank_idx, t in enumerate(gathered):
+                tlist = t.tolist()
+                rows_data.append({
+                    "rank": rank_idx,
+                    "step_id": int(tlist[0]),
+                    "plan_id": int(tlist[1]),
+                    "cols": int(tlist[2]),
+                    "target_eager_set": [int(x) for x in tlist[3:] if int(x) != 0],
+                })
+            cols_vals = sorted({r["cols"] for r in rows_data})
+            if len(cols_vals) > 1:
+                logger.warning(
+                    f"[H2_EAGER_DEBUG] eager broadcast shape MISMATCH detected: "
+                    f"per_rank={rows_data}",
+                    color="red",
+                )
+                for handler in logger.handlers:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2698,11 +2766,16 @@ class DraftModelRunner(ModelRunnerBase):
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
             # Phase 4: Receive eager verify result (UNCONDITIONAL)
             _n_target_eager = len(target_eager_seqs)
+            self._debug_check_eager_bcast_consistency(plan, _n_target_eager)
             self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
-                                  tensor_numel=6 * _n_target_eager, tensor_dtype="int64")
+                                  tensor_numel=6 * _n_target_eager, tensor_dtype="int64",
+                                  local_pre_meta_target_eager_set=[int(s) for s in plan.target_eager_set])
             eager_verify_res = self._receive_eager_verify_result(target_eager_seqs, group=self.verify_group)
+            _actual_rows, _actual_cols = eager_verify_res.shape
             self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
-                                  tensor_numel=6 * _n_target_eager, tensor_dtype="int64")
+                                  tensor_numel=int(_actual_rows * _actual_cols), tensor_dtype="int64",
+                                  meta_rows=int(_actual_rows), meta_cols=int(_actual_cols),
+                                  meta_numel=int(_actual_rows * _actual_cols))
             if target_eager_seqs:
                 trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
 
@@ -3024,7 +3097,8 @@ class TargetModelRunner(ModelRunnerBase):
         *,
         group=None,
     ) -> torch.Tensor:
-        verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
+        cols = len(seqs)
+        verify_res = torch.zeros((6, cols), dtype=torch.int64, device="cuda")
         if self.tp_params.local_rank == 0:
             row_indices = []
             token_ids = []
@@ -3070,7 +3144,15 @@ class TargetModelRunner(ModelRunnerBase):
                 offset += eager_len
             if rows:
                 verify_res = torch.tensor(rows, dtype=torch.int64, device="cuda").T.contiguous()
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
+
+        # Source-authoritative meta+payload broadcast: receiver must allocate
+        # from the source meta, not from local target_eager_set length.
+        is_source = self.rank == self.global_config.target_config.master_rank
+        numel = int(6 * cols) if is_source else 0
+        meta = torch.tensor([6, cols, numel], dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=group)
+        if numel > 0:
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
         return verify_res
 
     def _run_eager_verify_sidecar(
@@ -3213,19 +3295,29 @@ class TargetModelRunner(ModelRunnerBase):
                                       tensor_numel=0, tensor_dtype="int64")
 
             # Phase B: Eager verify broadcast (UNCONDITIONAL)
+            self._debug_check_eager_bcast_consistency(plan, len(target_eager_seqs))
             if target_eager_seqs:
+                _n_eager_cols = len(target_eager_seqs)
                 self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
-                                      tensor_numel=6 * len(target_eager_seqs), tensor_dtype="int64")
+                                      tensor_numel=6 * _n_eager_cols, tensor_dtype="int64",
+                                      meta_rows=6, meta_cols=_n_eager_cols, meta_numel=6 * _n_eager_cols,
+                                      local_pre_meta_target_eager_set=[int(s) for s in plan.target_eager_set])
                 self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan, group=self.verify_group)
                 self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
-                                      tensor_numel=6 * len(target_eager_seqs), tensor_dtype="int64")
+                                      tensor_numel=6 * _n_eager_cols, tensor_dtype="int64",
+                                      meta_rows=6, meta_cols=_n_eager_cols, meta_numel=6 * _n_eager_cols)
             else:
-                eager_verify_res = torch.zeros((6, 0), dtype=torch.int64, device="cuda")
+                # Source-authoritative meta+payload: send meta [6,0,0] so
+                # receiver allocates [6,0] regardless of its local state.
                 self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
-                                      tensor_numel=0, tensor_dtype="int64")
-                dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)
+                                      tensor_numel=0, tensor_dtype="int64",
+                                      meta_rows=6, meta_cols=0, meta_numel=0,
+                                      local_pre_meta_target_eager_set=[int(s) for s in plan.target_eager_set])
+                meta = torch.tensor([6, 0, 0], dtype=torch.int64, device="cuda")
+                dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
                 self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
-                                      tensor_numel=0, tensor_dtype="int64")
+                                      tensor_numel=0, tensor_dtype="int64",
+                                      meta_rows=6, meta_cols=0, meta_numel=0)
 
             # Phase C: Receive combined proposals (UNCONDITIONAL)
             received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
@@ -3237,6 +3329,13 @@ class TargetModelRunner(ModelRunnerBase):
                 self.dual_proposal_buffer.store(received_conditional)
             if received_eager:
                 self.eager_proposal_buffer.store(received_eager)
+                # Mark received eager proposals as ready: the DRAFT rank
+                # already filtered for ready_only before sending, so every
+                # received eager proposal is implicitly ready for the next
+                # step's _populate_eager_fields.  Without this the TARGET
+                # eager_proposal_buffer diverges from the DRAFT side.
+                for ep in received_eager:
+                    self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
             plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
             plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
         else:
