@@ -85,6 +85,11 @@ def main() -> int:
         target_home = as_int_set(record.get("target_home_set"))
         draft_home = as_int_set(record.get("draft_home_set"))
         target_eager = as_int_set(record.get("target_eager_set"))
+        received_eager = as_int_set(record.get("received_eager_seq_ids"))
+        eager_validation_passed = record.get("eager_receive_validation_passed")
+        eager_receive_policy = record.get("eager_receive_policy")
+        local_draft_eager_before = as_int_set(record.get("local_plan_draft_eager_set_before_receive"))
+        local_draft_eager_after = as_int_set(record.get("local_plan_draft_eager_set_after_receive"))
         budget_by_seq = record.get("eager_budget_by_seq_id") or {}
         max_requests = int(record.get("max_eager_requests_per_step") or 0)
         max_tokens_step = int(record.get("max_eager_tokens_per_step") or 0)
@@ -111,11 +116,49 @@ def main() -> int:
                 f"record[{idx}] target_eager_set contains seqs without earlier promotion: "
                 f"{sorted(target_eager - seen_promoted_seq_ids)}"
             )
-        if draft_eager != selected:
-            errors.append(
-                f"record[{idx}] draft_eager_set must equal selected eager seqs: "
-                f"draft_eager={sorted(draft_eager)}, selected={sorted(selected)}"
-            )
+
+        # Phase 1H-lite producer-authoritative eager: draft_eager_set may differ
+        # from selected when received_eager_seq_ids overwrites it on the target
+        # side.  For trace-only mode, draft_eager_set must still equal selected.
+        if eager_receive_policy == "producer_authoritative":
+            if eager_validation_passed is False:
+                errors.append(
+                    f"record[{idx}] eager receive validation failed: "
+                    f"{record.get('eager_receive_validation_error')}"
+                )
+            if received_eager and received_eager - target_home:
+                errors.append(
+                    f"record[{idx}] received_eager_seq_ids outside target_home_set: "
+                    f"{sorted(received_eager - target_home)}"
+                )
+            if received_eager & draft_home:
+                errors.append(
+                    f"record[{idx}] received_eager_seq_ids overlaps draft_home_set: "
+                    f"{sorted(received_eager & draft_home)}"
+                )
+            if received_eager & target_eager:
+                errors.append(
+                    f"record[{idx}] received_eager_seq_ids overlaps target_eager_set: "
+                    f"{sorted(received_eager & target_eager)}"
+                )
+            if len(received_eager) > max_requests:
+                errors.append(
+                    f"record[{idx}] received {len(received_eager)} eager seqs above cap {max_requests}"
+                )
+            if local_draft_eager_after and local_draft_eager_after != received_eager:
+                errors.append(
+                    f"record[{idx}] local_plan_draft_eager_set_after_receive "
+                    f"must equal received_eager_seq_ids: "
+                    f"after={sorted(local_draft_eager_after)}, "
+                    f"received={sorted(received_eager)}"
+                )
+        else:
+            if draft_eager != selected:
+                errors.append(
+                    f"record[{idx}] draft_eager_set must equal selected eager seqs: "
+                    f"draft_eager={sorted(draft_eager)}, selected={sorted(selected)}"
+                )
+
         if len(selected) > max_requests:
             errors.append(f"record[{idx}] selected {len(selected)} eager seqs above cap {max_requests}")
         if eager_total_budget > max_tokens_step:

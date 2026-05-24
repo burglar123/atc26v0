@@ -105,10 +105,17 @@ class StepPlan:
     proposal_buffer_keys_after_eager_selection: List[int] = field(default_factory=list)
     proposal_buffer_keys_after_eager_draft: List[int] = field(default_factory=list)
     missing_normal_proposal_seq_ids: List[int] = field(default_factory=list)
+    missing_normal_proposal_reason: Optional[str] = None
     normal_proposal_refresh_seq_ids: List[int] = field(default_factory=list)
     expected_normal_receive_seq_ids: List[int] = field(default_factory=list)
     received_normal_seq_ids: List[int] = field(default_factory=list)
     received_eager_seq_ids: List[int] = field(default_factory=list)
+    target_local_expected_eager_seq_ids: List[int] = field(default_factory=list)
+    eager_receive_policy: Optional[str] = None
+    eager_receive_validation_passed: bool = False
+    eager_receive_validation_error: Optional[str] = None
+    local_plan_draft_eager_set_before_receive: List[int] = field(default_factory=list)
+    local_plan_draft_eager_set_after_receive: List[int] = field(default_factory=list)
     send_expected_normal_seq_ids: List[int] = field(default_factory=list)
     send_actual_normal_seq_ids: List[int] = field(default_factory=list)
     send_expected_eager_seq_ids: List[int] = field(default_factory=list)
@@ -371,6 +378,7 @@ class StepPlan:
             "missing_normal_proposal_seq_ids": [
                 int(seq_id) for seq_id in self.missing_normal_proposal_seq_ids
             ],
+            "missing_normal_proposal_reason": self.missing_normal_proposal_reason,
             "normal_proposal_refresh_seq_ids": [
                 int(seq_id) for seq_id in self.normal_proposal_refresh_seq_ids
             ],
@@ -382,6 +390,18 @@ class StepPlan:
             ],
             "received_eager_seq_ids": [
                 int(seq_id) for seq_id in self.received_eager_seq_ids
+            ],
+            "target_local_expected_eager_seq_ids": [
+                int(seq_id) for seq_id in self.target_local_expected_eager_seq_ids
+            ],
+            "eager_receive_policy": self.eager_receive_policy,
+            "eager_receive_validation_passed": bool(self.eager_receive_validation_passed),
+            "eager_receive_validation_error": self.eager_receive_validation_error,
+            "local_plan_draft_eager_set_before_receive": [
+                int(seq_id) for seq_id in self.local_plan_draft_eager_set_before_receive
+            ],
+            "local_plan_draft_eager_set_after_receive": [
+                int(seq_id) for seq_id in self.local_plan_draft_eager_set_after_receive
             ],
             "send_expected_normal_seq_ids": [
                 int(seq_id) for seq_id in self.send_expected_normal_seq_ids

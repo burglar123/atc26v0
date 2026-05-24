@@ -666,52 +666,20 @@ class ModelRunnerBase:
             plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
             return
 
-        # Phase 1H-lite keeps normal and eager buffers separate. If a ready
-        # eager sidecar caused a seq to skip normal drafting in the previous
-        # round, refresh its normal proposal explicitly instead of verifying a
-        # partially populated target batch.
-        plan.plan_phase = "fallback"
-        plan.steady_step = False
-        plan.priming_step = False
-        plan.fallback_reason = "missing_normal_proposal_after_eager"
-        plan.target_batch_id = None
-        plan.target_home_set = []
-        plan.target_eager_set = []
-        plan.draft_batch_id = plan.home_batch_ids.get(missing[0]) if missing else None
-        plan.draft_home_set = list(missing)
-        plan.draft_eager_set = []
+        # Phase 1H-lite: record missing normal proposals for diagnostics,
+        # but do NOT rewrite plan.phase / target_home_set / draft_home_set /
+        # target_eager_set / draft_eager_set based on local buffer state.
+        # Local buffer inspection can differ between draft and target ranks;
+        # mutating IPC-relevant plan fields here causes rank divergence.
+        # If normal proposals are genuinely missing at verification time,
+        # the has_all assertion in the verify path will fire with a clear
+        # diagnostic message.
+        plan.missing_normal_proposal_reason = (
+            "eager_sidecar_skip: missing buffered normal proposals after eager selection"
+        )
         plan.normal_proposal_refresh_seq_ids = list(missing)
-        dropped_refresh = self.dual_proposal_buffer.discard(missing)
-        plan.proposal_buffer_dropped_seq_ids = sorted(set(plan.proposal_buffer_dropped_seq_ids) | set(dropped_refresh))
-        plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
-        plan.fallback_has_target_batch = False
-        plan.fallback_has_draft_batch = bool(missing)
-        plan.fallback_active_batch_count = int(plan.active_batch_count)
-        plan.fallback_active_seq_count = int(plan.active_seq_count)
-        plan.fallback_pending_proposal_count = self.dual_proposal_buffer.size()
-        plan.fallback_target_seq_count = 0
-        plan.fallback_draft_seq_count = len(missing)
         plan.fallback_buffer_hit_count = len(inspect["hit_seq_ids"])
         plan.fallback_buffer_miss_count = len(missing)
-        for seq_id in list(plan.budgets):
-            plan.budgets[seq_id].eager_gamma = 0
-        for seq_id in missing:
-            plan.budgets.setdefault(seq_id, RequestBudget(normal_gamma=self.gamma, eager_gamma=0))
-        target_home_size = len(plan.target_home_set)
-        draft_home_size = len(plan.draft_home_set)
-        plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
-        plan.draft_fraction_of_active = draft_home_size / max(1, int(plan.active_seq_count))
-        plan.split_imbalance = abs(target_home_size - draft_home_size) / max(1, target_home_size + draft_home_size)
-        plan.target_to_draft_size_ratio = target_home_size / max(1, draft_home_size)
-
-        refreshed_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
-        plan.proposal_buffer_requested_seq_ids = refreshed_inspect["requested_seq_ids"]
-        plan.proposal_buffer_hit_seq_ids = refreshed_inspect["hit_seq_ids"]
-        plan.proposal_buffer_miss_seq_ids = refreshed_inspect["miss_seq_ids"]
-        plan.proposal_buffer_invalid_seq_ids = refreshed_inspect["invalid_seq_ids"]
-        plan.proposal_buffer_hit_count = len(plan.proposal_buffer_hit_seq_ids)
-        plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
-        plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
 
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
         plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
@@ -938,9 +906,13 @@ class ModelRunnerBase:
 
     def _proposal_assertion_message(self, plan: StepPlan, detail: str) -> str:
         return (
-            f"{detail}: plan_id={plan.plan_id}, target_home_set={plan.target_home_set}, "
+            f"{detail}: plan_id={plan.plan_id}, step_id={plan.step_id}, "
+            f"plan_phase={plan.plan_phase}, target_home_set={plan.target_home_set}, "
             f"draft_home_set={plan.draft_home_set}, target_eager_set={plan.target_eager_set}, "
-            f"draft_eager_set={plan.draft_eager_set}, buffered_proposal_seq_ids="
+            f"draft_eager_set={plan.draft_eager_set}, "
+            f"missing_normal_proposal_seq_ids={plan.missing_normal_proposal_seq_ids}, "
+            f"missing_normal_proposal_reason={plan.missing_normal_proposal_reason}, "
+            f"buffered_proposal_seq_ids="
             f"{self.dual_proposal_buffer.pending_seq_ids()}, eager_buffer_keys={self.eager_proposal_buffer.keys()}"
         )
 
@@ -1312,6 +1284,64 @@ class ModelRunnerBase:
             )
         return proposals
 
+    def _validate_received_eager_seq_ids(
+        self,
+        received_eager_seq_ids: list[int],
+        eager_proposals: list[EagerBufferedProposal],
+        plan: StepPlan,
+    ) -> str | None:
+        """Validate producer-authoritative eager seq_ids on the receive side.
+
+        Returns an error string if validation fails, None if it passes.
+        """
+        received_set = set(received_eager_seq_ids)
+        target_home = set(plan.target_home_set)
+        draft_home = set(plan.draft_home_set)
+        target_eager = set(plan.target_eager_set)
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+
+        if not received_set.issubset(target_home):
+            return (
+                f"received_eager_seq_ids must be subset of target_home_set: "
+                f"received={sorted(received_set)}, "
+                f"outside_target_home={sorted(received_set - target_home)}"
+            )
+        if received_set & draft_home:
+            return (
+                f"received_eager_seq_ids must not overlap draft_home_set: "
+                f"overlap={sorted(received_set & draft_home)}"
+            )
+        if received_set & target_eager:
+            return (
+                f"received_eager_seq_ids must not overlap target_eager_set: "
+                f"overlap={sorted(received_set & target_eager)}"
+            )
+        if len(received_eager_seq_ids) > plan.max_eager_requests_per_step:
+            return (
+                f"received eager count {len(received_eager_seq_ids)} exceeds "
+                f"max_eager_requests_per_step={plan.max_eager_requests_per_step}"
+            )
+
+        total_eager_tokens = 0
+        for proposal in eager_proposals:
+            seq_id = int(proposal.seq_id)
+            eager_len = int(proposal.eager_len)
+            total_eager_tokens += eager_len
+            if eager_len > plan.max_eager_tokens_per_request:
+                return (
+                    f"eager proposal for seq_id={seq_id} has length {eager_len} "
+                    f"above max_eager_tokens_per_request={plan.max_eager_tokens_per_request}"
+                )
+            if seq_id not in running_seq_ids:
+                return f"eager proposal seq_id={seq_id} is not in running set (finished or missing)"
+        if total_eager_tokens > plan.max_eager_tokens_per_step:
+            return (
+                f"total eager tokens {total_eager_tokens} exceeds "
+                f"max_eager_tokens_per_step={plan.max_eager_tokens_per_step}"
+            )
+
+        return None
+
     def _receive_combined_dual_proposals(
         self,
         expected_normal_seq_ids: list[int],
@@ -1372,18 +1402,62 @@ class ModelRunnerBase:
             f"received_eager_seq_ids={received_eager_seq_ids}, batch_id={batch_id}, "
             f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
         )
-        assert received_eager_seq_ids == list(expected_eager_seq_ids), self._proposal_assertion_message(
-            plan,
-            f"eager proposal seq_id mismatch: expected={expected_eager_seq_ids}, received={received_eager_seq_ids}, "
-            f"received_normal_seq_ids={received_normal_seq_ids}, batch_id={batch_id}, "
-            f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
-        )
+
+        # --- eager receive: producer-authoritative for Phase 1H-lite ---
+        plan.target_local_expected_eager_seq_ids = list(expected_eager_seq_ids)
+        plan.local_plan_draft_eager_set_before_receive = list(plan.draft_eager_set)
+        plan.eager_receive_policy = "producer_authoritative"
+
+        if received_eager_seq_ids:
+            if not self.global_config.enable_eager_execution:
+                plan.eager_receive_validation_passed = False
+                plan.eager_receive_validation_error = (
+                    "received eager proposals but eager execution is disabled"
+                )
+                assert False, self._proposal_assertion_message(
+                    plan,
+                    f"eager receive validation failed: {plan.eager_receive_validation_error}, "
+                    f"received={received_eager_seq_ids}",
+                )
+            if plan.plan_phase != "steady":
+                plan.eager_receive_validation_passed = False
+                plan.eager_receive_validation_error = (
+                    f"received eager proposals outside steady phase: phase={plan.plan_phase}"
+                )
+                assert False, self._proposal_assertion_message(
+                    plan,
+                    f"eager receive validation failed: {plan.eager_receive_validation_error}, "
+                    f"received={received_eager_seq_ids}",
+                )
+            validation_error = self._validate_received_eager_seq_ids(
+                received_eager_seq_ids, eager_proposals, plan
+            )
+            if validation_error:
+                plan.eager_receive_validation_passed = False
+                plan.eager_receive_validation_error = validation_error
+                assert False, self._proposal_assertion_message(
+                    plan,
+                    f"eager receive validation failed: {validation_error}, "
+                    f"received={received_eager_seq_ids}",
+                )
+            plan.eager_receive_validation_passed = True
+            plan.draft_eager_set = list(received_eager_seq_ids)
+
+        plan.local_plan_draft_eager_set_after_receive = list(plan.draft_eager_set)
+        # --- end eager receive ---
+
         return normal_proposals, eager_proposals
 
     def _apply_combined_proposal_trace_fields(self, trace_record: dict, plan: StepPlan) -> None:
         trace_record["expected_normal_receive_seq_ids"] = list(plan.expected_normal_receive_seq_ids)
         trace_record["received_normal_seq_ids"] = list(plan.received_normal_seq_ids)
         trace_record["received_eager_seq_ids"] = list(plan.received_eager_seq_ids)
+        trace_record["target_local_expected_eager_seq_ids"] = list(plan.target_local_expected_eager_seq_ids)
+        trace_record["eager_receive_policy"] = plan.eager_receive_policy
+        trace_record["eager_receive_validation_passed"] = bool(plan.eager_receive_validation_passed)
+        trace_record["eager_receive_validation_error"] = plan.eager_receive_validation_error
+        trace_record["local_plan_draft_eager_set_before_receive"] = list(plan.local_plan_draft_eager_set_before_receive)
+        trace_record["local_plan_draft_eager_set_after_receive"] = list(plan.local_plan_draft_eager_set_after_receive)
         trace_record["proposal_message_kind"] = plan.proposal_message_kind
         trace_record["proposal_message_plan_id"] = plan.proposal_message_plan_id
         trace_record["proposal_message_step_id"] = plan.proposal_message_step_id
