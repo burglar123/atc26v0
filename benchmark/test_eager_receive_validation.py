@@ -40,11 +40,11 @@ def _load_dual_batch():
     mod.__dict__["__name__"] = "nano_pearl.pearl_engine.dual_batch"
     sys.modules["nano_pearl.pearl_engine.dual_batch"] = mod
     exec(src, mod.__dict__)
-    return mod.EagerBufferedProposal, mod.ProposalBuffer, mod.EagerProposalBuffer
+    return mod.EagerBufferedProposal, mod.BufferedProposal, mod.ProposalBuffer, mod.EagerProposalBuffer
 
 
 StepPlan, RequestBudget = _load_step_plan()
-EagerBufferedProposal, ProposalBuffer, EagerProposalBuffer = _load_dual_batch()
+EagerBufferedProposal, BufferedProposal, ProposalBuffer, EagerProposalBuffer = _load_dual_batch()
 
 
 # --- Standalone validation function that mirrors _validate_received_eager_seq_ids ---
@@ -308,6 +308,88 @@ def test_divergence_case_invalid():
     assert ok, f"error should mention target_home_set or draft_home_set, got: {err}"
 
 
+# --- Phase 1H-lite normal buffer preservation ---
+
+
+def test_draft_home_set_preserved_when_target_eager_overlaps():
+    """Seq in both draft_home_set and target_eager_set — must stay in draft_home_set.
+
+    After the fix in _annotate_eager_execution_plan, a seq with a promoted
+    eager proposal stays in draft_home_set so its normal proposal is still
+    generated.  validate_phase1h_eager_execution must accept the overlap.
+    """
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[1, 4, 6, 8],
+        target_eager_set=[1],  # seq 1 has ready eager proposal AND needs normal draft
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    # Must not raise — the fix allows target_eager_set to overlap draft_home_set.
+    plan.validate_phase1h_eager_execution()
+    # Verify the seq is still in both sets.
+    assert 1 in plan.target_eager_set, "seq 1 must be in target_eager_set"
+    assert 1 in plan.draft_home_set, "seq 1 must remain in draft_home_set for normal proposal generation"
+
+
+def test_target_eager_and_target_home_still_disjoint():
+    """target_eager_set and target_home_set must remain disjoint (different batches)."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        target_eager_set=[1],  # overlap with target_home — this is invalid
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    try:
+        plan.validate_phase1h_eager_execution()
+        assert False, "expected assertion error for target_eager_set overlapping target_home_set"
+    except AssertionError as e:
+        assert "target_home_set" in str(e), \
+            f"error should mention target_home_set, got: {e}"
+
+
+def test_normal_buffer_has_all_after_eager_store():
+    """EagerProposalBuffer.store does not affect ProposalBuffer contents."""
+    normal_buf = ProposalBuffer()
+    eager_buf = EagerProposalBuffer()
+
+    normal_proposal = BufferedProposal(
+        seq_id=1,
+        request_id="r1",
+        home_batch_id=0,
+        proposal_token_ids=[101, 102],
+        to_be_verified_token_ids=[101],
+        proposal_len=2,
+        pre_verify=False,
+        plan_id=0,
+        valid=True,
+    )
+    normal_buf.store([normal_proposal])
+    assert normal_buf.has_all([1]), "normal buffer must have seq 1 before eager store"
+
+    eager_proposal = _make_eager_proposal(1, eager_len=3)
+    eager_buf.store([eager_proposal])
+
+    # Eager store must not affect normal buffer.
+    assert normal_buf.has_all([1]), "normal buffer must still have seq 1 after eager store"
+    assert eager_buf.get(1) is not None, "eager buffer must have seq 1"
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -324,6 +406,9 @@ if __name__ == "__main__":
         test_eager_receive_finished_seq,
         test_divergence_case_valid,
         test_divergence_case_invalid,
+        test_draft_home_set_preserved_when_target_eager_overlaps,
+        test_target_eager_and_target_home_still_disjoint,
+        test_normal_buffer_has_all_after_eager_store,
     ]
     passed = 0
     for test in tests:

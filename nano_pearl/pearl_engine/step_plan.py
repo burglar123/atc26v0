@@ -243,10 +243,23 @@ class StepPlan:
             f"target_eager_set must be disjoint from target_home_set, got target_eager_set={self.target_eager_set}, "
             f"target_home_set={self.target_home_set}"
         )
-        assert set(self.target_eager_set).isdisjoint(self.draft_home_set), (
-            f"target_eager_set must be disjoint from draft_home_set, got target_eager_set={self.target_eager_set}, "
-            f"draft_home_set={self.draft_home_set}"
-        )
+        # Phase 1H-lite: target_eager_set may overlap draft_home_set.
+        # A seq with a promoted eager proposal still needs normal
+        # proposals generated for the next steady step.  The eager
+        # verification path and normal draft path are independent.
+        if set(self.target_eager_set) & set(self.draft_home_set):
+            assert self.plan_phase == "steady", (
+                f"target_eager_set overlaps draft_home_set outside steady phase: "
+                f"target_eager_set={self.target_eager_set}, draft_home_set={self.draft_home_set}"
+            )
+            overlap = sorted(set(self.target_eager_set) & set(self.draft_home_set))
+            assert set(self.target_eager_set).issubset(
+                set(self.target_home_set) | set(self.draft_home_set)
+            ), (
+                f"target_eager_set must be a subset of (target_home_set ∪ draft_home_set): "
+                f"target_eager_set={self.target_eager_set}, target_home_set={self.target_home_set}, "
+                f"draft_home_set={self.draft_home_set}"
+            )
         if self.plan_phase == "steady":
             assert self.target_batch_id != self.draft_batch_id, (
                 f"Steady dual-batch plan must use different batches, got target_batch_id={self.target_batch_id}, "

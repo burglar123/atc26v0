@@ -632,7 +632,12 @@ class ModelRunnerBase:
             f"target_eager_set overlaps target_home_set: {overlap_home}",
         )
         plan.target_eager_set = list(target_eager_set)
-        plan.draft_home_set = [seq_id for seq_id in plan.draft_home_set if seq_id not in set(target_eager_set)]
+        # Phase 1H-lite: do NOT remove target_eager_set seqs from
+        # draft_home_set.  These seqs still need normal proposals
+        # generated and sent to the target rank so they are available
+        # in the next steady step when the batch rotates.  Eager
+        # verification runs after normal drafting in the same step
+        # and uses eager_proposal_buffer, not dual_proposal_buffer.
         target_home_size = len(plan.target_home_set)
         draft_home_size = len(plan.draft_home_set)
         plan.target_fraction_of_active = target_home_size / max(1, int(plan.active_seq_count))
@@ -2445,8 +2450,33 @@ class DraftModelRunner(ModelRunnerBase):
         eager_proposals = []
         eager_trace_record = None
         if draft_eager_seqs and self.global_config.enable_eager_execution:
+            # Phase 1H-lite debug assertion: eager draft must not corrupt
+            # the normal proposal buffer.  target_home_set proposals must
+            # remain available for the next steady step.
+            _before_keys = self.dual_proposal_buffer.pending_seq_ids()
+            _before_has = self.dual_proposal_buffer.has_all(plan.target_home_set)
+            assert _before_has, self._proposal_assertion_message(
+                plan,
+                f"dual_proposal_buffer missing target_home_set proposals BEFORE eager draft: "
+                f"target_home_set={plan.target_home_set}, buffer_keys={_before_keys}",
+            )
+
             eager_proposals, eager_trace_record = self._draft_eager_proposals(draft_eager_seqs, plan)
             self.eager_proposal_buffer.store(eager_proposals)
+
+            _after_keys = self.dual_proposal_buffer.pending_seq_ids()
+            _after_has = self.dual_proposal_buffer.has_all(plan.target_home_set)
+            assert _after_has, self._proposal_assertion_message(
+                plan,
+                f"dual_proposal_buffer missing target_home_set proposals AFTER eager draft: "
+                f"target_home_set={plan.target_home_set}, "
+                f"draft_eager_set={plan.draft_eager_set}, "
+                f"draft_home_set={plan.draft_home_set}, "
+                f"buffer_keys_before={_before_keys}, "
+                f"buffer_keys_after={_after_keys}, "
+                f"eager_buffer_keys_before={self.eager_proposal_buffer.keys()}",
+            )
+
             if eager_trace_record is not None:
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
                 eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
@@ -2480,12 +2510,21 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            # Phase 1H-lite debug assertion: eager promote/discard must
+            # not remove normal proposals still needed for future steps.
+            _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
             self._promote_or_discard_eager_after_normal(
                 plan,
                 accepted_lens,
                 invalidated_lens,
                 trace_record,
                 count_tokens=False,
+            )
+            _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+            assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
+                plan,
+                f"dual_proposal_buffer keys changed during eager promote/discard: "
+                f"before={_pre_promote_keys}, after={_post_promote_keys}",
             )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
@@ -2808,12 +2847,21 @@ class TargetModelRunner(ModelRunnerBase):
                 target_proposals,
                 plan,
             )
+            # Phase 1H-lite debug assertion: eager promote/discard must
+            # not remove normal proposals from dual_proposal_buffer.
+            _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
             self._promote_or_discard_eager_after_normal(
                 plan,
                 accepted_lens,
                 invalidated_lens,
                 trace_record,
                 count_tokens=True,
+            )
+            _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
+            assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
+                plan,
+                f"dual_proposal_buffer keys changed during eager promote/discard: "
+                f"before={_pre_promote_keys}, after={_post_promote_keys}",
             )
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
