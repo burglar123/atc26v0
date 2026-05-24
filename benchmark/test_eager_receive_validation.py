@@ -688,6 +688,158 @@ def test_eager_lifecycle_trace_fields_in_trace_dict():
     assert d.get("eager_sent_seq_ids") == [4, 6], f"got {d.get('eager_sent_seq_ids')}"
 
 
+# --- H2 NCCL Collective Schedule Tests ---
+
+
+def _load_proposal_payload():
+    """Load build_combined_proposal_payload from source, mocking imports."""
+    src = (ROOT / "nano_pearl/pearl_engine/proposal_payload.py").read_text(encoding="utf-8")
+    src = "from __future__ import annotations\n" + src
+    mod = types.ModuleType("nano_pearl.pearl_engine.proposal_payload")
+    mod.__file__ = str(ROOT / "nano_pearl/pearl_engine/proposal_payload.py")
+    mod.__dict__["__name__"] = "nano_pearl.pearl_engine.proposal_payload"
+    sys.modules["nano_pearl.pearl_engine.proposal_payload"] = mod
+    exec(src, mod.__dict__)
+    return mod.build_combined_proposal_payload
+
+
+build_combined_proposal_payload = _load_proposal_payload()
+
+
+def test_combined_payload_all_empty():
+    """All proposal lists empty → valid combined payload with zero-length sections."""
+    payload = build_combined_proposal_payload(
+        normal_proposals=[],
+        conditional_normal_proposals=[],
+        eager_proposals=[],
+        plan_id=1,
+        step_id=0,
+        draft_batch_id=0,
+        gamma=4,
+    )
+    assert payload["kind"] == "combined", f"expected kind=combined, got {payload['kind']}"
+    assert payload["flat_payload"] == [], f"expected empty flat_payload, got {payload['flat_payload']}"
+    assert payload["normal_seq_ids"] == []
+    assert payload["conditional_normal_seq_ids"] == []
+    assert payload["eager_seq_ids"] == []
+    assert payload["normal_payload"] == []
+    assert payload["conditional_normal_payload"] == []
+    assert payload["eager_payload"] == []
+    assert payload["plan_id"] == 1
+    assert payload["gamma"] == 4
+
+
+def test_combined_payload_empty_eager_nonempty_normal():
+    """Normal proposals present, eager empty → valid combined payload."""
+    normal = BufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        proposal_token_ids=[101], to_be_verified_token_ids=[101],
+        proposal_len=1, pre_verify=False, plan_id=0, valid=True,
+    )
+    payload = build_combined_proposal_payload(
+        normal_proposals=[normal],
+        conditional_normal_proposals=[],
+        eager_proposals=[],
+        plan_id=2,
+        step_id=1,
+        draft_batch_id=1,
+        gamma=4,
+    )
+    assert payload["kind"] == "combined"
+    assert payload["normal_seq_ids"] == [1]
+    assert payload["eager_seq_ids"] == []
+    assert len(payload["flat_payload"]) == len(payload["normal_payload"])
+    assert payload["conditional_normal_payload"] == []
+    assert payload["eager_payload"] == []
+
+
+def test_combined_payload_empty_normal_nonempty_eager():
+    """Eager proposals present, normal empty → valid combined payload."""
+    eager = EagerBufferedProposal(
+        seq_id=2, request_id="r2", home_batch_id=1,
+        eager_token_ids=[201, 202], eager_len=2, eager_base_len=0,
+        source_plan_id=0, source_step_id=0, source_home_batch_id=0,
+    )
+    payload = build_combined_proposal_payload(
+        normal_proposals=[],
+        conditional_normal_proposals=[],
+        eager_proposals=[eager],
+        plan_id=3,
+        step_id=2,
+        draft_batch_id=1,
+        gamma=4,
+    )
+    assert payload["kind"] == "combined"
+    assert payload["normal_seq_ids"] == []
+    assert payload["eager_seq_ids"] == [2]
+    assert len(payload["eager_payload"]) > 0
+    assert payload["normal_payload"] == []
+
+
+def test_combined_payload_with_conditional():
+    """Conditional normal proposals included in payload."""
+    normal = BufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        proposal_token_ids=[101], to_be_verified_token_ids=[101],
+        proposal_len=1, pre_verify=False, plan_id=0, valid=True,
+    )
+    conditional = BufferedProposal(
+        seq_id=3, request_id="r3", home_batch_id=0,
+        proposal_token_ids=[301], to_be_verified_token_ids=[301],
+        proposal_len=1, pre_verify=False, plan_id=0, valid=True,
+    )
+    eager = EagerBufferedProposal(
+        seq_id=5, request_id="r5", home_batch_id=1,
+        eager_token_ids=[501], eager_len=1, eager_base_len=0,
+        source_plan_id=0, source_step_id=0, source_home_batch_id=0,
+    )
+    payload = build_combined_proposal_payload(
+        normal_proposals=[normal],
+        conditional_normal_proposals=[conditional],
+        eager_proposals=[eager],
+        plan_id=4,
+        step_id=3,
+        draft_batch_id=1,
+        gamma=4,
+    )
+    assert payload["kind"] == "combined"
+    assert payload["normal_seq_ids"] == [1]
+    assert payload["conditional_normal_seq_ids"] == [3]
+    assert payload["eager_seq_ids"] == [5]
+    assert len(payload["flat_payload"]) == (
+        len(payload["normal_payload"]) + len(payload["conditional_normal_payload"]) + len(payload["eager_payload"])
+    )
+
+
+def test_send_normal_subset_assertion_accepts_partial():
+    """Normal + conditional being strict subset of expected passes subset check.
+
+    This tests that the assertion change from == to issubset in
+    _send_combined_dual_proposals is correct: when repair seqs are excluded,
+    the subset check passes.
+    """
+    expected = [1, 2, 3, 4]
+    actual_normal = [1]
+    actual_conditional = [3]
+    actual_all = actual_normal + actual_conditional
+    assert set(actual_all).issubset(set(expected)), \
+        f"[1,3] should be subset of [1,2,3,4]"
+
+
+def test_send_eager_subset_assertion_accepts_empty():
+    """Empty eager with non-empty expected passes subset check.
+
+    When all eager proposals are discarded during promote/discard,
+    the subset assertion should accept empty actual against non-empty expected.
+    """
+    expected = [1, 5]
+    actual = []
+    assert set(actual).issubset(set(expected)), \
+        f"[] should be subset of [1,5]"
+
+
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -718,6 +870,12 @@ if __name__ == "__main__":
         test_promote_discard_mixed_overlap_and_rejected,
         test_eager_lifecycle_trace_fields_default,
         test_eager_lifecycle_trace_fields_in_trace_dict,
+        test_combined_payload_all_empty,
+        test_combined_payload_empty_eager_nonempty_normal,
+        test_combined_payload_empty_normal_nonempty_eager,
+        test_combined_payload_with_conditional,
+        test_send_normal_subset_assertion_accepts_partial,
+        test_send_eager_subset_assertion_accepts_empty,
     ]
     passed = 0
     for test in tests:

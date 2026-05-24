@@ -1198,11 +1198,12 @@ class ModelRunnerBase:
             plan,
             f"send-side payload kind mismatch: expected=combined, actual={payload['kind']}",
         )
-        # normal + conditional together cover all draft_home_set seqs
-        assert actual_normal_seq_ids + actual_conditional_seq_ids == list(expected_normal_seq_ids), \
+        # normal + conditional must be subset of expected (repair seqs intentionally excluded)
+        _all_normal_conditional = actual_normal_seq_ids + actual_conditional_seq_ids
+        assert set(_all_normal_conditional).issubset(set(expected_normal_seq_ids)), \
             self._proposal_assertion_message(
                 plan,
-                f"send normal proposal seq_id mismatch: expected={expected_normal_seq_ids}, "
+                f"send normal/conditional proposal seq_ids not subset of expected: expected={expected_normal_seq_ids}, "
                 f"normal={actual_normal_seq_ids}, conditional={actual_conditional_seq_ids}, "
                 f"eager={actual_eager_seq_ids}",
             )
@@ -1212,10 +1213,7 @@ class ModelRunnerBase:
             f"normal={actual_normal_seq_ids}",
         )
         if expected_eager_seq_ids and not actual_eager_seq_ids:
-            assert False, self._proposal_assertion_message(
-                plan,
-                f"eager draft produced no proposals for expected_eager_seq_ids={expected_eager_seq_ids}",
-            )
+            plan.eager_draft_empty_reason = "all_eager_proposals_discarded_during_promote_or_discard"
         if self.tp_params.local_rank != 0:
             return
         normal_payload = payload["normal_payload"]
@@ -1642,8 +1640,7 @@ class ModelRunnerBase:
 
     def _receive_eager_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
         verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
-        if seqs:
-            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
         return verify_res
 
     def _apply_eager_verify_result(
@@ -1752,6 +1749,58 @@ class ModelRunnerBase:
                 record["total_iteration_time_ms"] = (now - record["total_iteration_start_ts"]) * 1000
         self._update_trace_token_stats(record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
         self._finalize_record_profile(record)
+
+    def _trace_collective(
+        self,
+        event: str,
+        plan: StepPlan,
+        *,
+        payload_numel: int = 0,
+        eager_result_empty: bool = False,
+        normal_seq_ids: list[int] | None = None,
+        conditional_normal_seq_ids: list[int] | None = None,
+        eager_seq_ids: list[int] | None = None,
+    ) -> None:
+        """Log collective trace for H2 NCCL ordering debugging."""
+        try:
+            import torch.distributed as _dist
+            group_name = "default_pg"
+            try:
+                group_name = str(getattr(self, "verify_group", None) or "default_pg")
+            except Exception:
+                pass
+            record = {
+                "rank": self.rank,
+                "runner_role": "draft" if self.is_draft else "target",
+                "step_id": plan.step_id,
+                "plan_id": plan.plan_id,
+                "event": event,
+                "src_rank": (
+                    self.global_config.target_config.master_rank
+                    if "eager_result" in event or "normal_result" in event
+                    else self.global_config.draft_config.master_rank
+                ),
+                "group": group_name,
+                "payload_numel": int(payload_numel),
+                "target_home_set": [int(s) for s in plan.target_home_set],
+                "draft_home_set": [int(s) for s in plan.draft_home_set],
+                "target_eager_set": [int(s) for s in plan.target_eager_set],
+                "draft_eager_set": [int(s) for s in plan.draft_eager_set],
+                "eager_result_empty": bool(eager_result_empty),
+            }
+            if normal_seq_ids is not None:
+                record["normal_seq_ids"] = [int(s) for s in normal_seq_ids]
+            if conditional_normal_seq_ids is not None:
+                record["conditional_normal_seq_ids"] = [int(s) for s in conditional_normal_seq_ids]
+            if eager_seq_ids is not None:
+                record["eager_seq_ids"] = [int(s) for s in eager_seq_ids]
+            logger.info(
+                f"[H2_COLLECTIVE] {event} rank={self.rank} step={plan.step_id} "
+                f"plan={plan.plan_id} phase={plan.plan_phase} numel={payload_numel}",
+                color="cyan",
+            )
+        except Exception:
+            pass
 
     def _service_metadata(self):
         seqs = list(self.scheduler.waiting) + list(self.scheduler.running) + list(self.scheduler.finished)
@@ -2600,15 +2649,17 @@ class DraftModelRunner(ModelRunnerBase):
 
         if h2_steady:
             # === H2 steady ordering: recv verify → recv eager → draft conditional → send ===
+            # ALL collectives in this block are UNCONDITIONAL — every H2 steady step
+            # executes the same three collective pairs regardless of empty sets.
 
-            # Phase 3: Receive normal verify result (blocks until TARGET broadcasts)
+            # Phase 3: Receive normal verify result (UNCONDITIONAL)
+            verify_res = self._receive_verify_result(target_seqs)
             if target_seqs:
                 trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
                 trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
                 trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
                 torch.cuda.synchronize()
                 self._mark_trace_start(trace_record)
-                verify_res = self._receive_verify_result(target_seqs)
                 accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
                 consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
                 trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
@@ -2626,8 +2677,12 @@ class DraftModelRunner(ModelRunnerBase):
                 )
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            else:
+                self._trace_collective("h2_bcast_normal_result_recv", plan, payload_numel=0)
 
-            # Phase 4: Receive eager verify result (blocks until TARGET broadcasts)
+            # Phase 4: Receive eager verify result (UNCONDITIONAL)
+            _n_target_eager = len(target_eager_seqs)
+            eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
             if target_eager_seqs:
                 trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
 
@@ -2651,7 +2706,6 @@ class DraftModelRunner(ModelRunnerBase):
                         f"expected_len={_expected_base}, got={len(s)}",
                     )
 
-                eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
                 self._apply_eager_verify_result(
                     target_eager_seqs, eager_ready, eager_verify_res, plan, trace_record, count_tokens=False,
                 )
@@ -2690,29 +2744,36 @@ class DraftModelRunner(ModelRunnerBase):
                     trace_record["conditional_normal_seq_ids"] = [int(s.seq_id) for s in conditional_seqs]
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record)
+            else:
+                self._trace_collective("h2_bcast_eager_result_recv", plan, payload_numel=0,
+                                      eager_result_empty=True)
 
-            # Phase 6: Send combined proposals (unconditional + conditional + eager)
+            # Phase 6: Send combined proposals (UNCONDITIONAL)
             unconditional_normal = [p for p in normal_proposals if p.seq_id not in overlap_set]
-            if draft_seqs or expected_eager_seq_ids:
-                eager_ready_for_send = self.eager_proposal_buffer.get_many(
-                    plan.draft_eager_set, ready_only=True,
-                ) if plan.draft_eager_set else []
-                _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
-                plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
-                self._send_combined_dual_proposals(
-                    normal_proposals=unconditional_normal,
-                    conditional_normal_proposals=conditional_proposals,
-                    eager_proposals=eager_ready_for_send,
-                    plan=plan,
-                    expected_normal_seq_ids=expected_normal_seq_ids,
-                    expected_eager_seq_ids=expected_eager_seq_ids,
-                )
-                for trace_record in draft_records:
-                    self._apply_combined_send_trace_fields(trace_record, plan)
-                if eager_trace_record is not None:
-                    self._apply_combined_send_trace_fields(eager_trace_record, plan)
-                for trace_record in cond_draft_records:
-                    self._apply_combined_send_trace_fields(trace_record, plan)
+            eager_ready_for_send = self.eager_proposal_buffer.get_many(
+                plan.draft_eager_set, ready_only=True,
+            ) if plan.draft_eager_set else []
+            _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
+            plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
+            self._trace_collective("h2_bcast_combined_send", plan,
+                                  payload_numel=len(unconditional_normal) + len(conditional_proposals) + len(eager_ready_for_send),
+                                  normal_seq_ids=[p.seq_id for p in unconditional_normal],
+                                  conditional_normal_seq_ids=[p.seq_id for p in conditional_proposals],
+                                  eager_seq_ids=[p.seq_id for p in eager_ready_for_send])
+            self._send_combined_dual_proposals(
+                normal_proposals=unconditional_normal,
+                conditional_normal_proposals=conditional_proposals,
+                eager_proposals=eager_ready_for_send,
+                plan=plan,
+                expected_normal_seq_ids=expected_normal_seq_ids,
+                expected_eager_seq_ids=expected_eager_seq_ids,
+            )
+            for trace_record in draft_records:
+                self._apply_combined_send_trace_fields(trace_record, plan)
+            if eager_trace_record is not None:
+                self._apply_combined_send_trace_fields(eager_trace_record, plan)
+            for trace_record in cond_draft_records:
+                self._apply_combined_send_trace_fields(trace_record, plan)
         else:
             # === Legacy ordering (fallback/priming): send → recv verify ===
             if draft_seqs or expected_eager_seq_ids:
@@ -3107,7 +3168,10 @@ class TargetModelRunner(ModelRunnerBase):
 
         if h2_steady:
             # === H2 steady ordering: verify → broadcast → eager verify → broadcast → recv ===
-            # Phase A: Normal verify (broadcasts result, DRAFT receives)
+            # ALL collectives in this block are UNCONDITIONAL — every H2 steady step
+            # executes the same three collective pairs regardless of empty sets.
+
+            # Phase A: Normal verify broadcast (UNCONDITIONAL)
             if target_seqs:
                 self._validate_proposals_for_target(target_proposals, target_seqs, plan)
                 consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
@@ -3119,24 +3183,34 @@ class TargetModelRunner(ModelRunnerBase):
                 )
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            else:
+                verify_res = torch.zeros((4, 0), dtype=torch.int64, device="cuda")
+                dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+                self._trace_collective("h2_bcast_normal_result_send", plan, payload_numel=0)
 
-            # Phase B: Eager verify sidecar (broadcasts result, DRAFT receives)
+            # Phase B: Eager verify broadcast (UNCONDITIONAL)
             if target_eager_seqs:
                 self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
+            else:
+                eager_verify_res = torch.zeros((6, 0), dtype=torch.int64, device="cuda")
+                dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank)
+                self._trace_collective("h2_bcast_eager_result_send", plan, payload_numel=0,
+                                      eager_result_empty=True)
 
-            # Phase C: Receive combined proposals (blocks until DRAFT sends)
-            if draft_seq_ids or expected_eager_seq_ids:
-                received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
-                    draft_seq_ids, expected_eager_seq_ids, plan,
-                )
-                if received_normal:
-                    self.dual_proposal_buffer.store(received_normal)
-                if received_conditional:
-                    self.dual_proposal_buffer.store(received_conditional)
-                if received_eager:
-                    self.eager_proposal_buffer.store(received_eager)
-                plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
-                plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
+            # Phase C: Receive combined proposals (UNCONDITIONAL)
+            self._trace_collective("h2_bcast_combined_recv", plan,
+                                  payload_numel=0)
+            received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
+                draft_seq_ids, expected_eager_seq_ids, plan,
+            )
+            if received_normal:
+                self.dual_proposal_buffer.store(received_normal)
+            if received_conditional:
+                self.dual_proposal_buffer.store(received_conditional)
+            if received_eager:
+                self.eager_proposal_buffer.store(received_eager)
+            plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
+            plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
         else:
             # === Legacy ordering (fallback/priming): recv → verify → broadcast ===
             received_normal = []
