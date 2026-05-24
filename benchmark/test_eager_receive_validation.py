@@ -838,6 +838,139 @@ def test_send_eager_subset_assertion_accepts_empty():
         f"[] should be subset of [1,5]"
 
 
+def test_h2_schedule_draft_order_via_verify_group():
+    """DRAFT H2 steady: recv normal → recv eager → send combined, all via verify_group.
+
+    Scans pearl_model_runner.py source for the H2 steady block on the DRAFT side
+    and asserts the three-collective ordering and group= usage.
+    """
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+
+    # Locate the H2 steady block on the DRAFT side ("if h2_steady:" inside
+    # DraftModelRunner.dual_batch_pearl_step).  We search for the comment marker
+    # that starts the H2 collective block.
+    h2_section_start = src.find("# Phase 3: Receive normal verify result (UNCONDITIONAL)")
+    assert h2_section_start != -1, "missing DRAFT H2 Phase 3 marker"
+
+    # Find the end of the H2 steady block (next "else:" for legacy)
+    h2_section_end = src.find("# === Legacy ordering", h2_section_start)
+    assert h2_section_end != -1, "missing DRAFT H2 legacy ordering marker"
+
+    h2_block = src[h2_section_start:h2_section_end]
+
+    # 1. Normal result recv via verify_group
+    normal_recv_pos = h2_block.find("_receive_verify_result(target_seqs, group=self.verify_group)")
+    assert normal_recv_pos != -1, "DRAFT H2: missing _receive_verify_result with group=self.verify_group"
+
+    # 2. Eager result recv via verify_group
+    eager_recv_pos = h2_block.find("_receive_eager_verify_result(target_eager_seqs, group=self.verify_group)")
+    assert eager_recv_pos != -1, "DRAFT H2: missing _receive_eager_verify_result with group=self.verify_group"
+
+    # 3. Combined send — verify inside _send_combined_dual_proposals uses verify_group
+    #    (checked indirectly via the function body below)
+    combined_send_call = h2_block.find("_send_combined_dual_proposals(")
+    assert combined_send_call != -1, "DRAFT H2: missing _send_combined_dual_proposals call"
+
+    # Ordering: normal recv < eager recv < combined send
+    assert normal_recv_pos < eager_recv_pos < combined_send_call, \
+        f"DRAFT H2 order violation: normal_recv={normal_recv_pos}, eager_recv={eager_recv_pos}, combined_send={combined_send_call}"
+
+    # Verify _send_combined_dual_proposals broadcasts use verify_group
+    send_fn_start = src.find("def _send_combined_dual_proposals(")
+    send_fn_end = src.find("def _parse_combined_normal_payload(", send_fn_start)
+    send_fn = src[send_fn_start:send_fn_end]
+    meta_bcast = send_fn.find("dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)")
+    assert meta_bcast != -1, "_send_combined_dual_proposals meta broadcast missing group=self.verify_group"
+    payload_bcast = send_fn.find("dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)")
+    assert payload_bcast != -1, "_send_combined_dual_proposals payload broadcast missing group=self.verify_group"
+
+    # Verify ALL three collectives are unconditional (no if-guard that could skip them).
+    # The comment marker lives just above Phase 3 in the source.
+    draft_h2_header = src[h2_section_start - 200:h2_section_start]
+    assert "ALL collectives in this block are UNCONDITIONAL" in draft_h2_header, \
+        "DRAFT H2: unconditional comment marker missing"
+
+
+def test_h2_schedule_target_order_via_verify_group():
+    """TARGET H2 steady: send normal → send eager → recv combined, all via verify_group."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+
+    # Locate the H2 steady block on the TARGET side
+    h2_section_start = src.find("# Phase A: Normal verify broadcast (UNCONDITIONAL)")
+    assert h2_section_start != -1, "missing TARGET H2 Phase A marker"
+
+    h2_section_end = src.find("# === Legacy ordering", h2_section_start)
+    assert h2_section_end != -1, "missing TARGET H2 legacy ordering marker"
+
+    h2_block = src[h2_section_start:h2_section_end]
+
+    # 1. Normal verify broadcast via verify_group on TARGET
+    normal_send_pos = h2_block.find("verify_from_proposals(")
+    assert normal_send_pos != -1, "TARGET H2: missing verify_from_proposals call for normal send"
+
+    # Verify group= in verify_from_proposals call (appears after the function name)
+    normal_group_pos = h2_block.find("group=self.verify_group", normal_send_pos)
+    assert normal_group_pos != -1, "TARGET H2: verify_from_proposals missing group=self.verify_group"
+    # The group= should be within a reasonable distance of the call
+    assert normal_group_pos - normal_send_pos < 500, \
+        "TARGET H2: group=self.verify_group too far from verify_from_proposals"
+
+    # Also check the else-branch (empty target_seqs) still broadcasts via verify_group
+    empty_normal_bcast = h2_block.find('dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)')
+    assert empty_normal_bcast != -1, "TARGET H2: empty normal result broadcast missing group=self.verify_group"
+
+    # 2. Eager verify broadcast via verify_group on TARGET
+    eager_send_pos = h2_block.find("_run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan, group=self.verify_group)")
+    assert eager_send_pos != -1, "TARGET H2: missing _run_eager_verify_sidecar with group=self.verify_group"
+
+    # Also check the else-branch
+    empty_eager_bcast = h2_block.find('dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)')
+    assert empty_eager_bcast != -1, "TARGET H2: empty eager result broadcast missing group=self.verify_group"
+
+    # 3. Combined recv via verify_group
+    combined_recv_pos = h2_block.find("_receive_combined_dual_proposals(")
+    assert combined_recv_pos != -1, "TARGET H2: missing _receive_combined_dual_proposals call"
+
+    # Ordering: normal send < eager send < combined recv
+    assert normal_send_pos < eager_send_pos < combined_recv_pos, \
+        f"TARGET H2 order violation: normal_send={normal_send_pos}, eager_send={eager_send_pos}, combined_recv={combined_recv_pos}"
+
+    # Verify _receive_combined_dual_proposals broadcasts use verify_group
+    recv_fn_start = src.find("def _receive_combined_dual_proposals(")
+    recv_fn_end = src.find("def _parse_combined_normal_payload(", recv_fn_start)
+    recv_fn = src[recv_fn_start:recv_fn_end]
+    recv_meta_bcast = recv_fn.find("dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)")
+    assert recv_meta_bcast != -1, "_receive_combined_dual_proposals meta broadcast missing group=self.verify_group"
+    recv_payload_bcast = recv_fn.find("dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)")
+    assert recv_payload_bcast != -1, "_receive_combined_dual_proposals payload broadcast missing group=self.verify_group"
+
+    # Verify unconditional — check header before Phase A
+    target_h2_header = src[h2_section_start - 200:h2_section_start]
+    assert "ALL collectives in this block are UNCONDITIONAL" in target_h2_header, \
+        "TARGET H2: unconditional comment marker missing"
+
+
+def test_h2_empty_broadcasts_are_unconditional():
+    """Both else-branches (empty sets) still execute dist.broadcast with verify_group."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+
+    # TARGET side: empty normal broadcast
+    assert 'verify_res = torch.zeros((4, 0)' in src, "missing empty normal verify tensor creation"
+    # TARGET side: empty eager broadcast
+    assert 'eager_verify_res = torch.zeros((6, 0)' in src, "missing empty eager verify tensor creation"
+
+    # DRAFT side: receive calls accept group=self.verify_group even when target_seqs is empty
+    # The _receive_verify_result call is unconditional (outside if/else)
+    draft_h2_start = src.find("# Phase 3: Receive normal verify result (UNCONDITIONAL)")
+    draft_h2_end = src.find("# Phase 6: Send combined proposals (UNCONDITIONAL)", draft_h2_start)
+    draft_h2_block = src[draft_h2_start:draft_h2_end]
+    # Both receive calls should appear before any if/else that conditions on target_seqs
+    recv_normal_line = draft_h2_block.find("_receive_verify_result(target_seqs, group=self.verify_group)")
+    recv_eager_line = draft_h2_block.find("_receive_eager_verify_result(target_eager_seqs, group=self.verify_group)")
+    # The "if target_seqs:" block should come AFTER the recv call
+    if_seqs_pos = draft_h2_block.find("if target_seqs:")
+    assert recv_normal_line < if_seqs_pos, \
+        "DRAFT H2: _receive_verify_result must be called BEFORE the if target_seqs: guard"
 
 
 # --- runner ---
@@ -876,6 +1009,9 @@ if __name__ == "__main__":
         test_combined_payload_with_conditional,
         test_send_normal_subset_assertion_accepts_partial,
         test_send_eager_subset_assertion_accepts_empty,
+        test_h2_schedule_draft_order_via_verify_group,
+        test_h2_schedule_target_order_via_verify_group,
+        test_h2_empty_broadcasts_are_unconditional,
     ]
     passed = 0
     for test in tests:

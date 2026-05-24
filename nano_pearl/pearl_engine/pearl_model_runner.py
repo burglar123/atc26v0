@@ -1239,9 +1239,18 @@ class ModelRunnerBase:
             device="cuda",
         )
         payload_tensor = torch.tensor(flat_payload, dtype=torch.int64, device="cuda")
+        self._trace_collective("h2_combined_meta_bcast", plan, prefix="before",
+                              tensor_numel=12, tensor_dtype="int64")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        self._trace_collective("h2_combined_meta_bcast", plan, prefix="after",
+                              tensor_numel=12, tensor_dtype="int64")
         if int(meta[1].item()) > 0:
+            _payload_len = int(meta[1].item())
+            self._trace_collective("h2_combined_payload_bcast", plan, prefix="before",
+                                  tensor_numel=_payload_len, tensor_dtype="int64")
             dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            self._trace_collective("h2_combined_payload_bcast", plan, prefix="after",
+                                  tensor_numel=_payload_len, tensor_dtype="int64")
 
     def _parse_combined_normal_payload(
         self,
@@ -1384,7 +1393,11 @@ class ModelRunnerBase:
         plan: StepPlan,
     ) -> tuple[list[BufferedProposal], list[BufferedProposal], list[EagerBufferedProposal]]:
         meta = torch.zeros(12, dtype=torch.int64, device="cuda")
+        self._trace_collective("h2_combined_meta_bcast", plan, prefix="before",
+                              tensor_numel=12, tensor_dtype="int64")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        self._trace_collective("h2_combined_meta_bcast", plan, prefix="after",
+                              tensor_numel=12, tensor_dtype="int64")
         (
             proposal_kind,
             payload_len,
@@ -1409,7 +1422,11 @@ class ModelRunnerBase:
         )
         payload_tensor = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
         if payload_len > 0:
+            self._trace_collective("h2_combined_payload_bcast", plan, prefix="before",
+                                  tensor_numel=int(payload_len), tensor_dtype="int64")
             dist.broadcast(payload_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            self._trace_collective("h2_combined_payload_bcast", plan, prefix="after",
+                                  tensor_numel=int(payload_len), tensor_dtype="int64")
         payload = payload_tensor.tolist()
         normal_payload = payload[:normal_payload_len]
         conditional_start = normal_payload_len
@@ -1638,9 +1655,9 @@ class ModelRunnerBase:
                 trace_record["eager_tokens_discarded"] = discarded_tokens
             self._finalize_record_profile(trace_record)
 
-    def _receive_eager_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
+    def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
         return verify_res
 
     def _apply_eager_verify_result(
@@ -1755,50 +1772,48 @@ class ModelRunnerBase:
         event: str,
         plan: StepPlan,
         *,
-        payload_numel: int = 0,
+        prefix: str = "before",
+        tensor_numel: int = 0,
+        tensor_dtype: str = "int64",
+        group_label: str = "verify_group",
         eager_result_empty: bool = False,
         normal_seq_ids: list[int] | None = None,
         conditional_normal_seq_ids: list[int] | None = None,
         eager_seq_ids: list[int] | None = None,
     ) -> None:
-        """Log collective trace for H2 NCCL ordering debugging."""
+        """Log collective trace for H2 NCCL ordering debugging.
+
+        Each call site pairs a BEFORE log (prefix=\"before\") with an AFTER log
+        (prefix=\"after\") around the dist.broadcast, with handler flush so the
+        record survives a subsequent hang.
+        """
         try:
-            import torch.distributed as _dist
-            group_name = "default_pg"
-            try:
-                group_name = str(getattr(self, "verify_group", None) or "default_pg")
-            except Exception:
-                pass
-            record = {
-                "rank": self.rank,
-                "runner_role": "draft" if self.is_draft else "target",
-                "step_id": plan.step_id,
-                "plan_id": plan.plan_id,
-                "event": event,
-                "src_rank": (
-                    self.global_config.target_config.master_rank
-                    if "eager_result" in event or "normal_result" in event
-                    else self.global_config.draft_config.master_rank
-                ),
-                "group": group_name,
-                "payload_numel": int(payload_numel),
-                "target_home_set": [int(s) for s in plan.target_home_set],
-                "draft_home_set": [int(s) for s in plan.draft_home_set],
-                "target_eager_set": [int(s) for s in plan.target_eager_set],
-                "draft_eager_set": [int(s) for s in plan.draft_eager_set],
-                "eager_result_empty": bool(eager_result_empty),
-            }
-            if normal_seq_ids is not None:
-                record["normal_seq_ids"] = [int(s) for s in normal_seq_ids]
-            if conditional_normal_seq_ids is not None:
-                record["conditional_normal_seq_ids"] = [int(s) for s in conditional_normal_seq_ids]
-            if eager_seq_ids is not None:
-                record["eager_seq_ids"] = [int(s) for s in eager_seq_ids]
+            tag = f"[H2_COLLECTIVE_{prefix.upper()}]"
+            src_rank = (
+                self.global_config.target_config.master_rank
+                if "eager_result" in event or "normal_result" in event
+                else self.global_config.draft_config.master_rank
+            )
             logger.info(
-                f"[H2_COLLECTIVE] {event} rank={self.rank} step={plan.step_id} "
-                f"plan={plan.plan_id} phase={plan.plan_phase} numel={payload_numel}",
+                f"{tag} {event} rank={self.rank} step={plan.step_id} "
+                f"plan={plan.plan_id} phase={plan.plan_phase} src={src_rank} "
+                f"group={group_label} tensor_numel={int(tensor_numel)} "
+                f"tensor_dtype={tensor_dtype} "
+                f"target_home_set={[int(s) for s in plan.target_home_set]} "
+                f"draft_home_set={[int(s) for s in plan.draft_home_set]} "
+                f"target_eager_set={[int(s) for s in plan.target_eager_set]} "
+                f"draft_eager_set={[int(s) for s in plan.draft_eager_set]}"
+                f"{' eager_result_empty=True' if eager_result_empty else ''}"
+                f"{' normal_seq_ids=' + str([int(s) for s in normal_seq_ids]) if normal_seq_ids is not None else ''}"
+                f"{' conditional_seq_ids=' + str([int(s) for s in conditional_normal_seq_ids]) if conditional_normal_seq_ids is not None else ''}"
+                f"{' eager_seq_ids=' + str([int(s) for s in eager_seq_ids]) if eager_seq_ids is not None else ''}",
                 color="cyan",
             )
+            for handler in logger.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2464,9 +2479,9 @@ class DraftModelRunner(ModelRunnerBase):
         self._finalize_record_profile(trace_record)
         return proposals, trace_record
 
-    def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
+    def _receive_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
         return verify_res
 
     def _apply_verify_result(self, seqs: list[Sequence], verify_res: torch.Tensor):
@@ -2653,7 +2668,11 @@ class DraftModelRunner(ModelRunnerBase):
             # executes the same three collective pairs regardless of empty sets.
 
             # Phase 3: Receive normal verify result (UNCONDITIONAL)
-            verify_res = self._receive_verify_result(target_seqs)
+            self._trace_collective("h2_normal_result_bcast", plan, prefix="before",
+                                  tensor_numel=4 * len(target_seqs), tensor_dtype="int64")
+            verify_res = self._receive_verify_result(target_seqs, group=self.verify_group)
+            self._trace_collective("h2_normal_result_bcast", plan, prefix="after",
+                                  tensor_numel=4 * len(target_seqs), tensor_dtype="int64")
             if target_seqs:
                 trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
                 trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
@@ -2677,12 +2696,13 @@ class DraftModelRunner(ModelRunnerBase):
                 )
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
-            else:
-                self._trace_collective("h2_bcast_normal_result_recv", plan, payload_numel=0)
-
             # Phase 4: Receive eager verify result (UNCONDITIONAL)
             _n_target_eager = len(target_eager_seqs)
-            eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
+            self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
+                                  tensor_numel=6 * _n_target_eager, tensor_dtype="int64")
+            eager_verify_res = self._receive_eager_verify_result(target_eager_seqs, group=self.verify_group)
+            self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
+                                  tensor_numel=6 * _n_target_eager, tensor_dtype="int64")
             if target_eager_seqs:
                 trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
 
@@ -2744,9 +2764,6 @@ class DraftModelRunner(ModelRunnerBase):
                     trace_record["conditional_normal_seq_ids"] = [int(s.seq_id) for s in conditional_seqs]
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record)
-            else:
-                self._trace_collective("h2_bcast_eager_result_recv", plan, payload_numel=0,
-                                      eager_result_empty=True)
 
             # Phase 6: Send combined proposals (UNCONDITIONAL)
             unconditional_normal = [p for p in normal_proposals if p.seq_id not in overlap_set]
@@ -2755,11 +2772,6 @@ class DraftModelRunner(ModelRunnerBase):
             ) if plan.draft_eager_set else []
             _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
             plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
-            self._trace_collective("h2_bcast_combined_send", plan,
-                                  payload_numel=len(unconditional_normal) + len(conditional_proposals) + len(eager_ready_for_send),
-                                  normal_seq_ids=[p.seq_id for p in unconditional_normal],
-                                  conditional_normal_seq_ids=[p.seq_id for p in conditional_proposals],
-                                  eager_seq_ids=[p.seq_id for p in eager_ready_for_send])
             self._send_combined_dual_proposals(
                 normal_proposals=unconditional_normal,
                 conditional_normal_proposals=conditional_proposals,
@@ -3009,6 +3021,8 @@ class TargetModelRunner(ModelRunnerBase):
         temperatures: torch.Tensor,
         proposals: list[EagerBufferedProposal],
         plan: StepPlan,
+        *,
+        group=None,
     ) -> torch.Tensor:
         verify_res = torch.zeros((6, len(seqs)), dtype=torch.int64, device="cuda")
         if self.tp_params.local_rank == 0:
@@ -3056,7 +3070,7 @@ class TargetModelRunner(ModelRunnerBase):
                 offset += eager_len
             if rows:
                 verify_res = torch.tensor(rows, dtype=torch.int64, device="cuda").T.contiguous()
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
         return verify_res
 
     def _run_eager_verify_sidecar(
@@ -3064,6 +3078,8 @@ class TargetModelRunner(ModelRunnerBase):
         seqs: list[Sequence],
         proposals: list[EagerBufferedProposal],
         plan: StepPlan,
+        *,
+        group=None,
     ) -> None:
         if not seqs:
             return
@@ -3077,7 +3093,7 @@ class TargetModelRunner(ModelRunnerBase):
         self._mark_trace_start(trace_record)
         trace_record["eager_verify_start_ts"] = trace_record.get("verify_start_ts")
         logits = self.run_model(input_ids, positions, False)
-        verify_res = self._build_eager_verify_result(logits, seqs, temperatures, proposals, plan)
+        verify_res = self._build_eager_verify_result(logits, seqs, temperatures, proposals, plan, group=group)
         self._apply_eager_verify_result(
             seqs,
             proposals,
@@ -3178,28 +3194,40 @@ class TargetModelRunner(ModelRunnerBase):
                 trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
                 trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                self._trace_collective("h2_normal_result_bcast", plan, prefix="before",
+                                      tensor_numel=4 * len(target_seqs), tensor_dtype="int64")
                 accepted_lens, invalidated_lens = self.verify_from_proposals(
                     logits, target_seqs, temperatures, target_proposals, plan,
+                    group=self.verify_group,
                 )
+                self._trace_collective("h2_normal_result_bcast", plan, prefix="after",
+                                      tensor_numel=4 * len(target_seqs), tensor_dtype="int64")
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
             else:
                 verify_res = torch.zeros((4, 0), dtype=torch.int64, device="cuda")
-                dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
-                self._trace_collective("h2_bcast_normal_result_send", plan, payload_numel=0)
+                self._trace_collective("h2_normal_result_bcast", plan, prefix="before",
+                                      tensor_numel=0, tensor_dtype="int64")
+                dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)
+                self._trace_collective("h2_normal_result_bcast", plan, prefix="after",
+                                      tensor_numel=0, tensor_dtype="int64")
 
             # Phase B: Eager verify broadcast (UNCONDITIONAL)
             if target_eager_seqs:
-                self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan)
+                self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
+                                      tensor_numel=6 * len(target_eager_seqs), tensor_dtype="int64")
+                self._run_eager_verify_sidecar(target_eager_seqs, eager_proposals, plan, group=self.verify_group)
+                self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
+                                      tensor_numel=6 * len(target_eager_seqs), tensor_dtype="int64")
             else:
                 eager_verify_res = torch.zeros((6, 0), dtype=torch.int64, device="cuda")
-                dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank)
-                self._trace_collective("h2_bcast_eager_result_send", plan, payload_numel=0,
-                                      eager_result_empty=True)
+                self._trace_collective("h2_eager_result_bcast", plan, prefix="before",
+                                      tensor_numel=0, tensor_dtype="int64")
+                dist.broadcast(eager_verify_res, src=self.global_config.target_config.master_rank, group=self.verify_group)
+                self._trace_collective("h2_eager_result_bcast", plan, prefix="after",
+                                      tensor_numel=0, tensor_dtype="int64")
 
             # Phase C: Receive combined proposals (UNCONDITIONAL)
-            self._trace_collective("h2_bcast_combined_recv", plan,
-                                  payload_numel=0)
             received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
                 draft_seq_ids, expected_eager_seq_ids, plan,
             )
@@ -3313,6 +3341,8 @@ class TargetModelRunner(ModelRunnerBase):
         temperatures: torch.Tensor,
         proposals: list[BufferedProposal],
         plan: StepPlan,
+        *,
+        group=None,
     ):
         self._validate_proposals_for_target(proposals, seqs, plan)
         to_be_verified_tokens = []
@@ -3321,10 +3351,10 @@ class TargetModelRunner(ModelRunnerBase):
             to_be_verified_tokens.extend(proposal.to_be_verified_token_ids)
             next_round_input.extend(proposal.proposal_token_ids)
         msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
-        return self._verify_from_message(logits, seqs, temperatures, msg, len(to_be_verified_tokens))
+        return self._verify_from_message(logits, seqs, temperatures, msg, len(to_be_verified_tokens), group=group)
 
     @torch.inference_mode()
-    def _verify_from_message(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, msg: torch.Tensor, num_to_be_verified_tokens: int):
+    def _verify_from_message(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, msg: torch.Tensor, num_to_be_verified_tokens: int, *, group=None):
         """Refer to the verification logic in the draft model verification function."""
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
@@ -3382,7 +3412,7 @@ class TargetModelRunner(ModelRunnerBase):
         
             verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
         
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
 
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
