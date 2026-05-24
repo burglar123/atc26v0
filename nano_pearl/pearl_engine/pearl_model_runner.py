@@ -707,6 +707,18 @@ class ModelRunnerBase:
         for seq in self.scheduler.find_by_seq_ids(plan.target_home_set):
             if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
                 continue
+            # H2 eager sidecar is incompatible with post-verify seqs: DRAFT has
+            # already rolled forward and generated the next speculative window
+            # while TARGET may still be verifying the previous one. The pipeline
+            # boundary mismatch causes eager_base_len != local_seq_len at
+            # TARGET receive time. Skip post-verify seqs until explicit state-
+            # boundary fields (verified_prefix_len, post_verify_window_start,
+            # etc.) are added.
+            if not seq.pre_verify:
+                _sid = int(seq.seq_id)
+                plan.eager_draft_skipped_seq_ids.append(_sid)
+                plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_post_verify_seq"
+                continue
             score, reason = self._eager_candidate_score(seq, now)
             if score <= 0.0 or score <= threshold:
                 continue
@@ -2917,6 +2929,20 @@ class DraftModelRunner(ModelRunnerBase):
         target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "draft_apply_eager_verify")
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
         draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
+
+        # Debug: log all skipped eager candidates with reason and seq state.
+        _skipped = list(plan.eager_draft_skipped_seq_ids)
+        if _skipped:
+            _running_map = {int(s.seq_id): s for s in self.scheduler.running}
+            plan.eager_skip_debug = []
+            for _sid in _skipped:
+                _seq = _running_map.get(int(_sid))
+                plan.eager_skip_debug.append({
+                    "seq_id": int(_sid),
+                    "pre_verify": bool(_seq.pre_verify) if _seq is not None else None,
+                    "len_seq": int(len(_seq)) if _seq is not None else -1,
+                    "skip_reason": plan.eager_draft_skipped_reason_by_seq_id.get(int(_sid), "unknown"),
+                })
 
         is_normal_refresh_fallback = plan.plan_phase == "fallback" and bool(plan.normal_proposal_refresh_seq_ids)
         # Draft-side validation: ALL draft_home_set seqs get normal proposals drafted.
