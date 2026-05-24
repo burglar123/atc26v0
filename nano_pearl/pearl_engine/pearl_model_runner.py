@@ -854,6 +854,32 @@ class ModelRunnerBase:
         if repair_excluded:
             plan.repair_scheduled_seq_ids = repair_excluded
         self._annotate_eager_execution_plan(plan)
+        # --- H2-aware expected proposal sets ---
+        # In H2 steady, seqs in target_eager_set are covered by the eager verify
+        # result broadcast (h2_eager_result_bcast) and must be excluded from
+        # normal/conditional proposal expectations.  Without this exclusion the
+        # receiver-side assertion normal+conditional==draft_home_set fails.
+        if plan.plan_phase == "steady" and self.global_config.enable_eager_execution:
+            _target_eager = set(plan.target_eager_set)
+            plan.expected_eager_proposal_seq_ids = list(plan.draft_eager_set)
+            plan.expected_normal_proposal_seq_ids = [
+                s for s in plan.draft_home_set if s not in _target_eager
+            ]
+            plan.expected_conditional_proposal_seq_ids = []
+            plan.excluded_normal_proposal_seq_ids = [
+                s for s in plan.draft_home_set if s in _target_eager
+            ]
+            plan.excluded_normal_proposal_reason = (
+                "covered_by_target_eager_result" if plan.excluded_normal_proposal_seq_ids else ""
+            )
+        else:
+            plan.expected_eager_proposal_seq_ids = (
+                list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
+            )
+            plan.expected_normal_proposal_seq_ids = list(plan.draft_home_set)
+            plan.expected_conditional_proposal_seq_ids = []
+            plan.excluded_normal_proposal_seq_ids = []
+            plan.excluded_normal_proposal_reason = ""
         plan.proposal_buffer_keys_after_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
         self._handle_missing_normal_proposals_after_eager(plan)
         self._annotate_eager_trace_plan(plan)
@@ -1461,13 +1487,19 @@ class ModelRunnerBase:
         plan.proposal_message_kind = "combined"
         plan.proposal_message_plan_id = int(proposal_plan_id)
         plan.proposal_message_step_id = int(proposal_step_id)
-        assert received_normal_seq_ids + received_conditional_seq_ids == list(expected_normal_seq_ids), \
+        _received_all_normal = received_normal_seq_ids + received_conditional_seq_ids
+        _expected_all = list(expected_normal_seq_ids)
+        assert _received_all_normal == _expected_all, \
             self._proposal_assertion_message(
                 plan,
                 f"normal+conditional proposal seq_id mismatch: expected={expected_normal_seq_ids}, "
                 f"normal={received_normal_seq_ids}, conditional={received_conditional_seq_ids}, "
                 f"received_eager_seq_ids={received_eager_seq_ids}, batch_id={batch_id}, "
-                f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}",
+                f"proposal_plan_id={proposal_plan_id}, proposal_step_id={proposal_step_id}, "
+                f"excluded_normal={plan.excluded_normal_proposal_seq_ids}, "
+                f"excluded_reason={plan.excluded_normal_proposal_reason}, "
+                f"draft_home_set={plan.draft_home_set}, "
+                f"target_eager_set={plan.target_eager_set}",
             )
 
         # --- eager receive: producer-authoritative for Phase 1H-lite ---
@@ -2630,6 +2662,9 @@ class DraftModelRunner(ModelRunnerBase):
         draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
 
         is_normal_refresh_fallback = plan.plan_phase == "fallback" and bool(plan.normal_proposal_refresh_seq_ids)
+        # Draft-side validation: ALL draft_home_set seqs get normal proposals drafted.
+        # H2 steady may later filter out overlap seqs before sending, but the draft
+        # step itself covers every seq in draft_home_set.
         expected_normal_seq_ids = (
             list(plan.normal_proposal_refresh_seq_ids)
             if is_normal_refresh_fallback
@@ -2850,7 +2885,7 @@ class DraftModelRunner(ModelRunnerBase):
                 conditional_normal_proposals=conditional_proposals,
                 eager_proposals=eager_ready_for_send,
                 plan=plan,
-                expected_normal_seq_ids=expected_normal_seq_ids,
+                expected_normal_seq_ids=list(plan.expected_normal_proposal_seq_ids),
                 expected_eager_seq_ids=expected_eager_seq_ids,
             )
             for trace_record in draft_records:
@@ -3321,7 +3356,7 @@ class TargetModelRunner(ModelRunnerBase):
 
             # Phase C: Receive combined proposals (UNCONDITIONAL)
             received_normal, received_conditional, received_eager = self._receive_combined_dual_proposals(
-                draft_seq_ids, expected_eager_seq_ids, plan,
+                list(plan.expected_normal_proposal_seq_ids), expected_eager_seq_ids, plan,
             )
             if received_normal:
                 self.dual_proposal_buffer.store(received_normal)

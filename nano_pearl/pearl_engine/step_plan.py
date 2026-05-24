@@ -109,7 +109,16 @@ class StepPlan:
     normal_proposal_refresh_seq_ids: List[int] = field(default_factory=list)
     expected_normal_receive_seq_ids: List[int] = field(default_factory=list)
     received_normal_seq_ids: List[int] = field(default_factory=list)
+    received_conditional_normal_seq_ids: List[int] = field(default_factory=list)
     received_eager_seq_ids: List[int] = field(default_factory=list)
+    # H2-aware expected proposal sets (populated during plan construction).
+    # In H2 steady, seqs in target_eager_set are covered by the eager verify
+    # result broadcast and are excluded from normal/conditional expectations.
+    expected_normal_proposal_seq_ids: List[int] = field(default_factory=list)
+    expected_conditional_proposal_seq_ids: List[int] = field(default_factory=list)
+    expected_eager_proposal_seq_ids: List[int] = field(default_factory=list)
+    excluded_normal_proposal_seq_ids: List[int] = field(default_factory=list)
+    excluded_normal_proposal_reason: str = ""
     target_local_expected_eager_seq_ids: List[int] = field(default_factory=list)
     eager_receive_policy: Optional[str] = None
     eager_receive_validation_passed: bool = False
@@ -426,9 +435,25 @@ class StepPlan:
             "received_normal_seq_ids": [
                 int(seq_id) for seq_id in self.received_normal_seq_ids
             ],
+            "received_conditional_normal_seq_ids": [
+                int(seq_id) for seq_id in self.received_conditional_normal_seq_ids
+            ],
             "received_eager_seq_ids": [
                 int(seq_id) for seq_id in self.received_eager_seq_ids
             ],
+            "expected_normal_proposal_seq_ids": [
+                int(seq_id) for seq_id in self.expected_normal_proposal_seq_ids
+            ],
+            "expected_conditional_proposal_seq_ids": [
+                int(seq_id) for seq_id in self.expected_conditional_proposal_seq_ids
+            ],
+            "expected_eager_proposal_seq_ids": [
+                int(seq_id) for seq_id in self.expected_eager_proposal_seq_ids
+            ],
+            "excluded_normal_proposal_seq_ids": [
+                int(seq_id) for seq_id in self.excluded_normal_proposal_seq_ids
+            ],
+            "excluded_normal_proposal_reason": self.excluded_normal_proposal_reason,
             "target_local_expected_eager_seq_ids": [
                 int(seq_id) for seq_id in self.target_local_expected_eager_seq_ids
             ],

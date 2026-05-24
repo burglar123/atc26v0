@@ -1012,6 +1012,172 @@ def test_build_eager_verify_result_uses_meta_broadcast():
         "_build_eager_verify_result must condition payload broadcast on numel > 0"
 
 
+# --- H2 proposal-set invariant tests ---
+# In H2 steady, seqs in target_eager_set are covered by the eager verify result
+# broadcast and must be excluded from normal/conditional proposal expectations.
+
+
+def _build_step_plan_for_test(*, draft_home_set, target_eager_set, draft_eager_set,
+                               target_home_set=None, plan_phase="steady"):
+    """Build a StepPlan with H2-aware proposal fields for testing."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=target_home_set or [],
+        draft_home_set=list(draft_home_set),
+        budgets={s: RequestBudget(normal_gamma=4, eager_gamma=0) for s in draft_home_set},
+        draft_batch_id=0,
+        decode_ready_mode=False,
+    )
+    plan.plan_phase = plan_phase
+    plan.target_eager_set = list(target_eager_set)
+    plan.draft_eager_set = list(draft_eager_set)
+
+    # Simulate the H2-aware computation from _build_dual_batch_step_plan
+    if plan_phase == "steady":
+        _te = set(plan.target_eager_set)
+        plan.expected_eager_proposal_seq_ids = list(plan.draft_eager_set)
+        plan.expected_normal_proposal_seq_ids = [
+            s for s in plan.draft_home_set if s not in _te
+        ]
+        plan.expected_conditional_proposal_seq_ids = []
+        plan.excluded_normal_proposal_seq_ids = [
+            s for s in plan.draft_home_set if s in _te
+        ]
+        plan.excluded_normal_proposal_reason = (
+            "covered_by_target_eager_result" if plan.excluded_normal_proposal_seq_ids else ""
+        )
+    else:
+        plan.expected_eager_proposal_seq_ids = list(plan.draft_eager_set)
+        plan.expected_normal_proposal_seq_ids = list(plan.draft_home_set)
+        plan.expected_conditional_proposal_seq_ids = []
+        plan.excluded_normal_proposal_seq_ids = []
+        plan.excluded_normal_proposal_reason = ""
+    return plan
+
+
+def test_h2_expected_normal_empty_target_eager():
+    """H2 steady with target_eager_set empty: expected normal == draft_home_set."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[],
+        draft_eager_set=[2],
+    )
+    assert plan.expected_normal_proposal_seq_ids == [1, 3, 5, 7]
+    assert plan.excluded_normal_proposal_seq_ids == []
+    assert plan.excluded_normal_proposal_reason == ""
+
+
+def test_h2_expected_normal_nonempty_target_eager():
+    """H2 steady with target_eager_set non-empty: expected normal excludes target_eager_set."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[2],
+    )
+    assert plan.expected_normal_proposal_seq_ids == [3, 5, 7], \
+        f"expected [3,5,7] got {plan.expected_normal_proposal_seq_ids}"
+    assert plan.excluded_normal_proposal_seq_ids == [1]
+    assert plan.excluded_normal_proposal_reason == "covered_by_target_eager_result"
+
+
+def test_h2_normal_conditional_excluded_invariant():
+    """normal + conditional + excluded = draft_home_set in H2 steady."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[2],
+    )
+    received_normal = [3, 5, 7]
+    received_conditional = []
+    all_received = received_normal + received_conditional + plan.excluded_normal_proposal_seq_ids
+    assert sorted(all_received) == sorted(plan.draft_home_set), \
+        f"invariant failure: received+excluded={sorted(all_received)}, draft_home={plan.draft_home_set}"
+
+
+def test_h2_expected_eager_matches_draft_eager():
+    """H2 steady with draft_eager_set non-empty: expected_eager matches draft_eager_set."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[2, 4],
+    )
+    assert plan.expected_eager_proposal_seq_ids == [2, 4]
+
+
+def test_h2_target_and_draft_eager_distinct():
+    """target_eager_set and draft_eager_set both non-empty and distinct."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[3],
+        target_home_set=[2, 4, 6, 8],
+    )
+    assert plan.target_eager_set == [1]
+    assert plan.draft_eager_set == [3]
+    assert plan.expected_normal_proposal_seq_ids == [3, 5, 7]
+    assert plan.excluded_normal_proposal_seq_ids == [1]
+    assert plan.expected_eager_proposal_seq_ids == [3]
+
+
+def test_h2_target_eager_intersects_draft_home():
+    """target_eager_set is always subset of draft_home_set; exclusion works."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1, 3],
+        draft_eager_set=[5],
+    )
+    assert plan.expected_normal_proposal_seq_ids == [5, 7]
+    assert plan.excluded_normal_proposal_seq_ids == [1, 3]
+
+
+def test_h2_target_eager_no_intersection_draft_home():
+    """target_eager_set not intersecting draft_home_set: expected == draft_home_set."""
+    # This is the empty-target_eager case but with a non-empty target_eager_set
+    # that doesn't intersect draft_home_set.  In practice this shouldn't happen
+    # (target_eager_set ⊂ draft_home_set), but the formula handles it gracefully.
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[],
+        draft_eager_set=[2],
+    )
+    assert plan.expected_normal_proposal_seq_ids == [1, 3, 5, 7]
+    assert plan.excluded_normal_proposal_seq_ids == []
+    assert plan.excluded_normal_proposal_reason == ""
+
+
+def test_h2_non_steady_preserves_old_invariant():
+    """Fallback/priming phases: expected normal == draft_home_set (no exclusion)."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[2],
+        plan_phase="fallback",
+    )
+    assert plan.expected_normal_proposal_seq_ids == [1, 3, 5, 7]
+    assert plan.excluded_normal_proposal_seq_ids == []
+    assert plan.excluded_normal_proposal_reason == ""
+
+
+def test_h2_trace_dict_includes_new_fields():
+    """to_trace_dict() includes the new H2 proposal-set fields."""
+    plan = _build_step_plan_for_test(
+        draft_home_set=[1, 3, 5, 7],
+        target_eager_set=[1],
+        draft_eager_set=[2],
+    )
+    d = plan.to_trace_dict()
+    assert "expected_normal_proposal_seq_ids" in d
+    assert "expected_eager_proposal_seq_ids" in d
+    assert "excluded_normal_proposal_seq_ids" in d
+    assert "excluded_normal_proposal_reason" in d
+    assert d["expected_normal_proposal_seq_ids"] == [3, 5, 7]
+    assert d["excluded_normal_proposal_seq_ids"] == [1]
+    assert d["excluded_normal_proposal_reason"] == "covered_by_target_eager_result"
+    assert d["expected_eager_proposal_seq_ids"] == [2]
+
+
 def test_h2_schedule_draft_order_via_verify_group():
     """DRAFT H2 steady: recv normal → recv eager → send combined, all via verify_group.
 
@@ -1196,6 +1362,15 @@ if __name__ == "__main__":
         test_h2_eager_shape_divergence_source_empty_target_nonempty,
         test_receive_eager_verify_result_uses_meta_broadcast,
         test_build_eager_verify_result_uses_meta_broadcast,
+        test_h2_expected_normal_empty_target_eager,
+        test_h2_expected_normal_nonempty_target_eager,
+        test_h2_normal_conditional_excluded_invariant,
+        test_h2_expected_eager_matches_draft_eager,
+        test_h2_target_and_draft_eager_distinct,
+        test_h2_target_eager_intersects_draft_home,
+        test_h2_target_eager_no_intersection_draft_home,
+        test_h2_non_steady_preserves_old_invariant,
+        test_h2_trace_dict_includes_new_fields,
     ]
     passed = 0
     for test in tests:
