@@ -42,6 +42,7 @@ def encode_eager_proposals(proposals) -> list[int]:
                 int(proposal.source_plan_id),
                 int(proposal.source_step_id),
                 int(proposal.source_home_batch_id),
+                int(getattr(proposal, 'original_eager_base_len_at_generation', -1)),
             ]
         )
         tokens.extend(eager_tokens)

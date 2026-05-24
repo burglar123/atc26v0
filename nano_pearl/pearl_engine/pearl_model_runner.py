@@ -1528,15 +1528,16 @@ class ModelRunnerBase:
         expected_seq_ids: list[int],
         plan: StepPlan,
     ) -> list[EagerBufferedProposal]:
-        header_len = n * 7
+        header_fields = 8
+        header_len = n * header_fields
         headers = payload[:header_len]
         token_data = payload[header_len:]
         proposals = []
         token_offset = 0
         seq_lookup = {seq.seq_id: seq for seq in self.scheduler.find_by_seq_ids(expected_seq_ids)} if expected_seq_ids else {}
         for idx in range(n):
-            base = idx * 7
-            seq_id, home_batch_id, eager_len, eager_base_len, source_plan_id, source_step_id, source_home_batch_id = headers[base:base + 7]
+            base = idx * header_fields
+            seq_id, home_batch_id, eager_len, eager_base_len, source_plan_id, source_step_id, source_home_batch_id, original_eager_base_len_at_generation = headers[base:base + header_fields]
             eager_token_ids = [int(x) for x in token_data[token_offset:token_offset + eager_len]]
             token_offset += eager_len
             seq = seq_lookup.get(seq_id)
@@ -1556,6 +1557,7 @@ class ModelRunnerBase:
                     policy=plan.eager_policy,
                     valid=True,
                     ready=False,
+                    original_eager_base_len_at_generation=int(original_eager_base_len_at_generation),
                 )
             )
         return proposals
@@ -2774,6 +2776,7 @@ class DraftModelRunner(ModelRunnerBase):
                     policy=plan.eager_policy,
                     valid=True,
                     ready=False,
+                    original_eager_base_len_at_generation=int(base_lens[seq.seq_id]),
                 )
             )
 
@@ -2784,6 +2787,17 @@ class DraftModelRunner(ModelRunnerBase):
                 plan,
                 f"eager draft rollback failed for seq_id={seq.seq_id}: expected_len={base_lens[seq.seq_id]}, got={len(seq)}",
             )
+        # Critical invariant: original_eager_base_len_at_generation == len(seq)
+        # at the moment the snapshot was taken. This must hold for every proposal.
+        for proposal in proposals:
+            _gen_len = base_lens[proposal.seq_id]
+            assert int(proposal.original_eager_base_len_at_generation) == int(_gen_len), \
+                self._proposal_assertion_message(
+                    plan,
+                    f"original_eager_base_len_at_generation invariant violated for seq_id={proposal.seq_id}: "
+                    f"stored={proposal.original_eager_base_len_at_generation}, "
+                    f"base_lens_at_generation={_gen_len}",
+                )
 
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record)
@@ -2801,6 +2815,29 @@ class DraftModelRunner(ModelRunnerBase):
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
         return verify_res
+
+    @staticmethod
+    def _classify_len_delta(delta: int, acc: bool | None, was_pre_verify: bool | None, gamma: int) -> str:
+        """Classify seq length delta from normal verify into semantic categories."""
+        if delta == 0:
+            if acc is True:
+                return "full_accept_no_bonus_draft_side"
+            elif acc is False:
+                return "reject_no_net_change"
+            return "no_change_unknown_acc"
+        if delta > 0:
+            if acc is True and delta == gamma and was_pre_verify is False:
+                return "full_accept_bonus_tokens_target_side"
+            if acc is True and delta == 1 and was_pre_verify is True:
+                return "pre_verify_full_accept_single_token"
+            if acc is False:
+                return f"partial_reject_net_positive_delta_{delta}"
+            return f"positive_delta_{delta}_acc_{acc}_pre_verify_{was_pre_verify}"
+        if delta < 0:
+            if acc is False:
+                return f"reject_with_rollback_delta_{delta}"
+            return f"negative_delta_{delta}_unexpected_acc_{acc}"
+        return f"unclassified_delta_{delta}"
 
     def _apply_verify_result(self, seqs: list[Sequence], verify_res: torch.Tensor):
         acc, rollout, revise_token, finish = verify_res.tolist()
@@ -2973,13 +3010,21 @@ class DraftModelRunner(ModelRunnerBase):
             if eager_trace_record is not None:
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
                 eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
+                # Per-proposal debug instrumentation: capture full lifecycle state
+                _draft_eager_seq_map = {int(s.seq_id): s for s in draft_eager_seqs}
                 eager_trace_record["eager_proposals_generated"] = [
                     {
                         "seq_id": int(p.seq_id),
-                        "eager_base_len": int(p.eager_base_len),
+                        "step_id": int(plan.step_id) if plan.step_id is not None else -1,
+                        "plan_id": int(plan.plan_id),
+                        "len_seq_before_generation": int(len(_draft_eager_seq_map.get(int(p.seq_id)))) if int(p.seq_id) in _draft_eager_seq_map else -1,
+                        "eager_base_len_written": int(p.eager_base_len),
+                        "original_eager_base_len_at_generation": int(p.original_eager_base_len_at_generation),
                         "eager_len": int(p.eager_len),
                         "home_batch_id": int(p.home_batch_id),
                         "source_home_batch_id": int(p.source_home_batch_id),
+                        "normal_verify_already_applied": False,
+                        "seq_pre_verify": bool(_draft_eager_seq_map.get(int(p.seq_id)).pre_verify) if int(p.seq_id) in _draft_eager_seq_map else None,
                     }
                     for p in eager_proposals
                 ]
@@ -3010,9 +3055,57 @@ class DraftModelRunner(ModelRunnerBase):
                 trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
                 trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
                 trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
+                # --- instrumentation: before normal verify ---
+                _pre_verify_snapshot = {}
+                _draft_eager_seq_ids = {int(s.seq_id) for s in draft_eager_seqs}
+                _target_seq_map = {int(s.seq_id): s for s in target_seqs}
+                _verify_tensor = verify_res.tolist()
+                _acc, _rollout, _revise, _finish = _verify_tensor
+                for idx, seq in enumerate(target_seqs):
+                    _sid = int(seq.seq_id)
+                    if _sid in _draft_eager_seq_ids:
+                        _pre_verify_snapshot[_sid] = {
+                            "seq_id": _sid,
+                            "len_before_verify": int(len(seq)),
+                            "verify_acc": bool(_acc[idx]),
+                            "verify_rollout": int(_rollout[idx]),
+                            "verify_revise_token": int(_revise[idx]),
+                            "verify_finish": bool(_finish[idx]),
+                            "pre_verify": bool(seq.pre_verify),
+                        }
+                if _pre_verify_snapshot:
+                    trace_record["pre_verify_snapshot_draft_eager"] = _pre_verify_snapshot
+                # --- end instrumentation ---
                 torch.cuda.synchronize()
                 self._mark_trace_start(trace_record)
                 accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+                # --- instrumentation: after normal verify ---
+                _post_verify_deltas = {}
+                for seq in target_seqs:
+                    _sid = int(seq.seq_id)
+                    if _sid in _draft_eager_seq_ids:
+                        _pre = _pre_verify_snapshot.get(_sid, {})
+                        _old_len = _pre.get("len_before_verify", -1)
+                        _new_len = int(len(seq))
+                        _delta = _new_len - _old_len
+                        _acc_flag = _pre.get("verify_acc", None)
+                        _was_pre_verify = _pre.get("pre_verify", None)
+                        _classification = _classify_len_delta(
+                            _delta, _acc_flag, _was_pre_verify, int(self.gamma),
+                        )
+                        _post_verify_deltas[_sid] = {
+                            "seq_id": _sid,
+                            "old_len": _old_len,
+                            "new_len": _new_len,
+                            "delta_len": _delta,
+                            "classification": _classification,
+                            "verify_acc": _acc_flag,
+                            "accepted_len": int(accepted_lens.get(_sid, -1)),
+                            "invalidated_len": int(invalidated_lens.get(_sid, -1)),
+                        }
+                if _post_verify_deltas:
+                    trace_record["post_verify_deltas_draft_eager"] = _post_verify_deltas
+                # --- end instrumentation ---
                 consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
                 trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
                 trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
@@ -3027,11 +3120,11 @@ class DraftModelRunner(ModelRunnerBase):
                     f"dual_proposal_buffer keys changed during eager promote/discard: "
                     f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
-                # Fixup eager_base_len: eager proposals were generated in Phase 2
-                # (before normal verify), so their base_len reflects speculative
-                # pre-verify seq length. After Phase 3 normal verify, seqs may
-                # have been rolled back; update base_len to committed length.
-                if draft_eager_seqs and self.global_config.enable_eager_execution:
+                # Fixup eager_base_len: gated behind --disable-eager-base-len-fixup.
+                # When disabled (default), the original eager_base_len from Phase 2
+                # is preserved so we can compare against TARGET local seq length.
+                if (draft_eager_seqs and self.global_config.enable_eager_execution
+                        and not self.global_config.disable_eager_base_len_fixup):
                     fixups = []
                     for seq in draft_eager_seqs:
                         proposal = self.eager_proposal_buffer.get(seq.seq_id)
@@ -3044,10 +3137,30 @@ class DraftModelRunner(ModelRunnerBase):
                                     "seq_id": int(seq.seq_id),
                                     "old_eager_base_len": old_base,
                                     "new_eager_base_len": new_base,
+                                    "original_eager_base_len_at_generation": int(proposal.original_eager_base_len_at_generation),
                                 })
                     if fixups:
                         trace_record["eager_base_len_fixups"] = fixups
                         plan.eager_base_len_fixups = fixups
+                elif draft_eager_seqs and self.global_config.enable_eager_execution:
+                    # Instrumentation-only path: record what WOULD have been fixed up
+                    _would_fixup = []
+                    for seq in draft_eager_seqs:
+                        proposal = self.eager_proposal_buffer.get(seq.seq_id)
+                        if proposal is not None and not proposal.consumed:
+                            old_base = int(proposal.eager_base_len)
+                            new_base = int(len(seq))
+                            if old_base != new_base:
+                                _would_fixup.append({
+                                    "seq_id": int(seq.seq_id),
+                                    "current_eager_base_len": old_base,
+                                    "would_fixup_to": new_base,
+                                    "original_eager_base_len_at_generation": int(proposal.original_eager_base_len_at_generation),
+                                    "fixup_skipped": True,
+                                })
+                    if _would_fixup:
+                        trace_record["eager_base_len_fixup_skipped"] = _would_fixup
+                        plan.eager_base_len_fixup_skipped = _would_fixup
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
             # Phase 4: Receive eager verify result (UNCONDITIONAL)
@@ -3131,6 +3244,23 @@ class DraftModelRunner(ModelRunnerBase):
             ) if plan.draft_eager_set else []
             _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
             plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
+            # --- instrumentation: before send ---
+            _draft_running_map = {int(s.seq_id): s for s in self.scheduler.running}
+            _before_send_eager_info = []
+            for p in eager_ready_for_send:
+                _sid = int(p.seq_id)
+                _seq = _draft_running_map.get(_sid)
+                _before_send_eager_info.append({
+                    "seq_id": _sid,
+                    "eager_base_len_current": int(p.eager_base_len),
+                    "original_eager_base_len_at_generation": int(p.original_eager_base_len_at_generation),
+                    "current_seq_len": int(len(_seq)) if _seq is not None else -1,
+                    "fixup_applied": int(p.eager_base_len) != int(p.original_eager_base_len_at_generation),
+                    "eager_len": int(p.eager_len),
+                })
+            if _before_send_eager_info:
+                plan.before_send_eager_info = _before_send_eager_info
+            # --- end instrumentation ---
             self._send_combined_dual_proposals(
                 normal_proposals=unconditional_normal,
                 conditional_normal_proposals=conditional_proposals,
@@ -3168,7 +3298,54 @@ class DraftModelRunner(ModelRunnerBase):
                 torch.cuda.synchronize()
                 self._mark_trace_start(trace_record)
                 verify_res = self._receive_verify_result(target_seqs)
+                # --- instrumentation: before normal verify (legacy) ---
+                _pre_verify_snapshot_l = {}
+                _draft_eager_seq_ids_l = {int(s.seq_id) for s in draft_eager_seqs}
+                _verify_tensor_l = verify_res.tolist()
+                _acc_l, _rollout_l, _revise_l, _finish_l = _verify_tensor_l
+                for idx, seq in enumerate(target_seqs):
+                    _sid = int(seq.seq_id)
+                    if _sid in _draft_eager_seq_ids_l:
+                        _pre_verify_snapshot_l[_sid] = {
+                            "seq_id": _sid,
+                            "len_before_verify": int(len(seq)),
+                            "verify_acc": bool(_acc_l[idx]),
+                            "verify_rollout": int(_rollout_l[idx]),
+                            "verify_revise_token": int(_revise_l[idx]),
+                            "verify_finish": bool(_finish_l[idx]),
+                            "pre_verify": bool(seq.pre_verify),
+                        }
+                if _pre_verify_snapshot_l:
+                    trace_record["pre_verify_snapshot_draft_eager"] = _pre_verify_snapshot_l
+                # --- end instrumentation ---
                 accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+                # --- instrumentation: after normal verify (legacy) ---
+                _post_verify_deltas_l = {}
+                for seq in target_seqs:
+                    _sid = int(seq.seq_id)
+                    if _sid in _draft_eager_seq_ids_l:
+                        _pre = _pre_verify_snapshot_l.get(_sid, {})
+                        _old_len = _pre.get("len_before_verify", -1)
+                        _new_len = int(len(seq))
+                        _delta = _new_len - _old_len
+                        _acc_flag = _pre.get("verify_acc", None)
+                        _was_pre_verify = _pre.get("pre_verify", None)
+                        _classification = self._classify_len_delta(
+                            _delta, _acc_flag, _was_pre_verify, int(self.gamma),
+                        )
+                        _post_verify_deltas_l[_sid] = {
+                            "seq_id": _sid,
+                            "old_len": _old_len,
+                            "new_len": _new_len,
+                            "delta_len": _delta,
+                            "classification": _classification,
+                            "verify_acc": _acc_flag,
+                            "accepted_len": int(accepted_lens.get(_sid, -1)),
+                            "invalidated_len": int(invalidated_lens.get(_sid, -1)),
+                        }
+                if _post_verify_deltas_l:
+                    trace_record["post_verify_deltas_draft_eager"] = _post_verify_deltas_l
+                # --- end instrumentation ---
                 consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
                 trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
                 trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
@@ -3183,10 +3360,9 @@ class DraftModelRunner(ModelRunnerBase):
                     f"dual_proposal_buffer keys changed during eager promote/discard: "
                     f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
-                # Fixup eager_base_len: eager proposals were generated before
-                # normal verify, so their base_len may be stale. Update to
-                # committed length after normal verify is applied.
-                if draft_eager_seqs and self.global_config.enable_eager_execution:
+                # Fixup eager_base_len: gated behind --disable-eager-base-len-fixup.
+                if (draft_eager_seqs and self.global_config.enable_eager_execution
+                        and not self.global_config.disable_eager_base_len_fixup):
                     fixups = []
                     for seq in draft_eager_seqs:
                         proposal = self.eager_proposal_buffer.get(seq.seq_id)
@@ -3199,10 +3375,29 @@ class DraftModelRunner(ModelRunnerBase):
                                     "seq_id": int(seq.seq_id),
                                     "old_eager_base_len": old_base,
                                     "new_eager_base_len": new_base,
+                                    "original_eager_base_len_at_generation": int(proposal.original_eager_base_len_at_generation),
                                 })
                     if fixups:
                         trace_record["eager_base_len_fixups"] = fixups
                         plan.eager_base_len_fixups = fixups
+                elif draft_eager_seqs and self.global_config.enable_eager_execution:
+                    _would_fixup_l = []
+                    for seq in draft_eager_seqs:
+                        proposal = self.eager_proposal_buffer.get(seq.seq_id)
+                        if proposal is not None and not proposal.consumed:
+                            old_base = int(proposal.eager_base_len)
+                            new_base = int(len(seq))
+                            if old_base != new_base:
+                                _would_fixup_l.append({
+                                    "seq_id": int(seq.seq_id),
+                                    "current_eager_base_len": old_base,
+                                    "would_fixup_to": new_base,
+                                    "original_eager_base_len_at_generation": int(proposal.original_eager_base_len_at_generation),
+                                    "fixup_skipped": True,
+                                })
+                    if _would_fixup_l:
+                        trace_record["eager_base_len_fixup_skipped"] = _would_fixup_l
+                        plan.eager_base_len_fixup_skipped = _would_fixup_l
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -3669,23 +3864,50 @@ class TargetModelRunner(ModelRunnerBase):
                 # eager_proposal_buffer diverges from the DRAFT side.
                 for ep in received_eager:
                     self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
-                # Fail-fast: verify eager_base_len matches local seq length
-                # at receive time, before the proposal enters the buffer.
+                # Instrumentation + fail-fast: record full lifecycle state at receive.
                 _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
+                _target_receive_eager_info = []
+                for ep in received_eager:
+                    _sid = int(ep.seq_id)
+                    _seq = _running_ids.get(_sid)
+                    _ep_base = int(ep.eager_base_len)
+                    _seq_len = int(len(_seq)) if _seq is not None else -1
+                    _orig_base = int(ep.original_eager_base_len_at_generation)
+                    _info = {
+                        "seq_id": _sid,
+                        "local_seq_len_at_receive": _seq_len,
+                        "received_eager_base_len": _ep_base,
+                        "received_original_eager_base_len_at_generation": _orig_base,
+                        "received_eager_len": int(ep.eager_len),
+                        "source_step_id": int(ep.source_step_id),
+                        "source_plan_id": int(ep.source_plan_id),
+                        "source_home_batch_id": int(ep.source_home_batch_id),
+                        "base_len_diverged_from_original": _ep_base != _orig_base,
+                        "pre_verify": bool(_seq.pre_verify) if _seq is not None else None,
+                    }
+                    _target_receive_eager_info.append(_info)
+                if _target_receive_eager_info:
+                    plan.t_eager_receive_info = _target_receive_eager_info
+                # Fail-fast: verify eager_base_len matches local seq length.
                 for ep in received_eager:
                     _sid = int(ep.seq_id)
                     _seq = _running_ids.get(_sid)
                     if _seq is not None:
                         _ep_base = int(ep.eager_base_len)
                         _seq_len = int(len(_seq))
+                        _orig_base = int(ep.original_eager_base_len_at_generation)
                         assert _ep_base == _seq_len, self._proposal_assertion_message(
                             plan,
                             f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
                             f"eager_base_len={_ep_base}, local_seq_len={_seq_len}, "
+                            f"original_eager_base_len_at_generation={_orig_base}, "
                             f"eager_len={ep.eager_len}, "
                             f"source_plan_id={ep.source_plan_id}, "
                             f"source_step_id={ep.source_step_id}, "
-                            f"source_home_batch_id={ep.source_home_batch_id}",
+                            f"source_home_batch_id={ep.source_home_batch_id}, "
+                            f"pre_verify={bool(_seq.pre_verify)}, "
+                            f"fixup_skipped={getattr(plan, 'eager_base_len_fixup_skipped', None)}, "
+                            f"before_send_info={getattr(plan, 'before_send_eager_info', None)}",
                         )
             plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
             plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
@@ -3710,22 +3932,46 @@ class TargetModelRunner(ModelRunnerBase):
                         self.dual_proposal_buffer.store(received_conditional)
                 if received_eager:
                     self.eager_proposal_buffer.store(received_eager)
-                    # Fail-fast: verify eager_base_len matches local seq length at receive time.
-                    _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
+                    # Instrumentation + fail-fast at receive (legacy).
+                    _running_ids_l = {int(s.seq_id): s for s in self.scheduler.running}
+                    _legacy_receive_info = []
                     for ep in received_eager:
                         _sid = int(ep.seq_id)
-                        _seq = _running_ids.get(_sid)
+                        _seq = _running_ids_l.get(_sid)
+                        _ep_base = int(ep.eager_base_len)
+                        _seq_len = int(len(_seq)) if _seq is not None else -1
+                        _orig_base = int(ep.original_eager_base_len_at_generation)
+                        _legacy_receive_info.append({
+                            "seq_id": _sid,
+                            "local_seq_len_at_receive": _seq_len,
+                            "received_eager_base_len": _ep_base,
+                            "received_original_eager_base_len_at_generation": _orig_base,
+                            "received_eager_len": int(ep.eager_len),
+                            "source_step_id": int(ep.source_step_id),
+                            "source_plan_id": int(ep.source_plan_id),
+                            "source_home_batch_id": int(ep.source_home_batch_id),
+                            "base_len_diverged_from_original": _ep_base != _orig_base,
+                            "pre_verify": bool(_seq.pre_verify) if _seq is not None else None,
+                        })
+                    if _legacy_receive_info:
+                        plan.t_eager_receive_info = _legacy_receive_info
+                    for ep in received_eager:
+                        _sid = int(ep.seq_id)
+                        _seq = _running_ids_l.get(_sid)
                         if _seq is not None:
                             _ep_base = int(ep.eager_base_len)
                             _seq_len = int(len(_seq))
+                            _orig_base = int(ep.original_eager_base_len_at_generation)
                             assert _ep_base == _seq_len, self._proposal_assertion_message(
                                 plan,
                                 f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
                                 f"eager_base_len={_ep_base}, local_seq_len={_seq_len}, "
+                                f"original_eager_base_len_at_generation={_orig_base}, "
                                 f"eager_len={ep.eager_len}, "
                                 f"source_plan_id={ep.source_plan_id}, "
                                 f"source_step_id={ep.source_step_id}, "
-                                f"source_home_batch_id={ep.source_home_batch_id}",
+                                f"source_home_batch_id={ep.source_home_batch_id}, "
+                                f"pre_verify={bool(_seq.pre_verify)}",
                             )
                 plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
                 plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()

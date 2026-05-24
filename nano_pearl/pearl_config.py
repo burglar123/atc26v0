@@ -92,6 +92,7 @@ class PEARLConfig:
     eager_policy: str = "none"
     eager_accept_threshold: float = 0.0
     enable_eager_execution: bool = False
+    disable_eager_base_len_fixup: bool = True
 
     def __post_init__(self):
         if self.enable_eager_execution:

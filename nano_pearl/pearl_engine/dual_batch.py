@@ -51,6 +51,7 @@ class EagerBufferedProposal:
     valid: bool = True
     ready: bool = False
     consumed: bool = False
+    original_eager_base_len_at_generation: int = -1
 
 
 class ProposalBuffer:
