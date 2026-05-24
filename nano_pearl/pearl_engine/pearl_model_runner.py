@@ -1833,7 +1833,13 @@ class ModelRunnerBase:
             assert int(proposal.eager_base_len) == int(len(seq)), self._proposal_assertion_message(
                 plan,
                 f"eager proposal base length mismatch for seq_id={seq.seq_id}: "
-                f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}",
+                f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}, "
+                f"eager_len={proposal.eager_len}, "
+                f"home_batch_id={proposal.home_batch_id}, "
+                f"source_plan_id={proposal.source_plan_id}, "
+                f"source_step_id={proposal.source_step_id}, "
+                f"source_home_batch_id={proposal.source_home_batch_id}, "
+                f"eager_base_len_fixups={getattr(plan, 'eager_base_len_fixups', None)}",
             )
             assert int(proposal.eager_len) == len(proposal.eager_token_ids), self._proposal_assertion_message(
                 plan,
@@ -1942,7 +1948,13 @@ class ModelRunnerBase:
                 assert int(proposal.eager_base_len) == int(len(seq)), self._proposal_assertion_message(
                     plan,
                     f"eager apply base length mismatch for seq_id={seq.seq_id}: "
-                    f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}",
+                    f"proposal_base={proposal.eager_base_len}, current_len={len(seq)}, "
+                    f"eager_len={proposal.eager_len}, "
+                    f"home_batch_id={proposal.home_batch_id}, "
+                    f"source_plan_id={proposal.source_plan_id}, "
+                    f"source_step_id={proposal.source_step_id}, "
+                    f"source_home_batch_id={proposal.source_home_batch_id}, "
+                    f"eager_base_len_fixups={getattr(plan, 'eager_base_len_fixups', None)}",
                 )
                 for token_id in proposal.eager_token_ids:
                     seq.append_token(int(token_id))
@@ -2961,6 +2973,16 @@ class DraftModelRunner(ModelRunnerBase):
             if eager_trace_record is not None:
                 eager_trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
                 eager_trace_record["proposal_buffer_keys_after_eager_draft"] = self.dual_proposal_buffer.pending_seq_ids()
+                eager_trace_record["eager_proposals_generated"] = [
+                    {
+                        "seq_id": int(p.seq_id),
+                        "eager_base_len": int(p.eager_base_len),
+                        "eager_len": int(p.eager_len),
+                        "home_batch_id": int(p.home_batch_id),
+                        "source_home_batch_id": int(p.source_home_batch_id),
+                    }
+                    for p in eager_proposals
+                ]
                 self._finalize_record_profile(eager_trace_record)
         elif plan.draft_eager_set and not self.global_config.enable_eager_execution:
             plan.eager_draft_skipped_reason = "eager_execution_disabled"
@@ -3005,6 +3027,27 @@ class DraftModelRunner(ModelRunnerBase):
                     f"dual_proposal_buffer keys changed during eager promote/discard: "
                     f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
+                # Fixup eager_base_len: eager proposals were generated in Phase 2
+                # (before normal verify), so their base_len reflects speculative
+                # pre-verify seq length. After Phase 3 normal verify, seqs may
+                # have been rolled back; update base_len to committed length.
+                if draft_eager_seqs and self.global_config.enable_eager_execution:
+                    fixups = []
+                    for seq in draft_eager_seqs:
+                        proposal = self.eager_proposal_buffer.get(seq.seq_id)
+                        if proposal is not None and not proposal.consumed:
+                            old_base = int(proposal.eager_base_len)
+                            new_base = int(len(seq))
+                            if old_base != new_base:
+                                proposal.eager_base_len = new_base
+                                fixups.append({
+                                    "seq_id": int(seq.seq_id),
+                                    "old_eager_base_len": old_base,
+                                    "new_eager_base_len": new_base,
+                                })
+                    if fixups:
+                        trace_record["eager_base_len_fixups"] = fixups
+                        plan.eager_base_len_fixups = fixups
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
             # Phase 4: Receive eager verify result (UNCONDITIONAL)
@@ -3140,6 +3183,26 @@ class DraftModelRunner(ModelRunnerBase):
                     f"dual_proposal_buffer keys changed during eager promote/discard: "
                     f"before={_pre_promote_keys}, after={_post_promote_keys}",
                 )
+                # Fixup eager_base_len: eager proposals were generated before
+                # normal verify, so their base_len may be stale. Update to
+                # committed length after normal verify is applied.
+                if draft_eager_seqs and self.global_config.enable_eager_execution:
+                    fixups = []
+                    for seq in draft_eager_seqs:
+                        proposal = self.eager_proposal_buffer.get(seq.seq_id)
+                        if proposal is not None and not proposal.consumed:
+                            old_base = int(proposal.eager_base_len)
+                            new_base = int(len(seq))
+                            if old_base != new_base:
+                                proposal.eager_base_len = new_base
+                                fixups.append({
+                                    "seq_id": int(seq.seq_id),
+                                    "old_eager_base_len": old_base,
+                                    "new_eager_base_len": new_base,
+                                })
+                    if fixups:
+                        trace_record["eager_base_len_fixups"] = fixups
+                        plan.eager_base_len_fixups = fixups
                 torch.cuda.synchronize()
                 self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -3606,6 +3669,24 @@ class TargetModelRunner(ModelRunnerBase):
                 # eager_proposal_buffer diverges from the DRAFT side.
                 for ep in received_eager:
                     self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
+                # Fail-fast: verify eager_base_len matches local seq length
+                # at receive time, before the proposal enters the buffer.
+                _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
+                for ep in received_eager:
+                    _sid = int(ep.seq_id)
+                    _seq = _running_ids.get(_sid)
+                    if _seq is not None:
+                        _ep_base = int(ep.eager_base_len)
+                        _seq_len = int(len(_seq))
+                        assert _ep_base == _seq_len, self._proposal_assertion_message(
+                            plan,
+                            f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
+                            f"eager_base_len={_ep_base}, local_seq_len={_seq_len}, "
+                            f"eager_len={ep.eager_len}, "
+                            f"source_plan_id={ep.source_plan_id}, "
+                            f"source_step_id={ep.source_step_id}, "
+                            f"source_home_batch_id={ep.source_home_batch_id}",
+                        )
             plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
             plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
         else:
@@ -3629,6 +3710,23 @@ class TargetModelRunner(ModelRunnerBase):
                         self.dual_proposal_buffer.store(received_conditional)
                 if received_eager:
                     self.eager_proposal_buffer.store(received_eager)
+                    # Fail-fast: verify eager_base_len matches local seq length at receive time.
+                    _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
+                    for ep in received_eager:
+                        _sid = int(ep.seq_id)
+                        _seq = _running_ids.get(_sid)
+                        if _seq is not None:
+                            _ep_base = int(ep.eager_base_len)
+                            _seq_len = int(len(_seq))
+                            assert _ep_base == _seq_len, self._proposal_assertion_message(
+                                plan,
+                                f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
+                                f"eager_base_len={_ep_base}, local_seq_len={_seq_len}, "
+                                f"eager_len={ep.eager_len}, "
+                                f"source_plan_id={ep.source_plan_id}, "
+                                f"source_step_id={ep.source_step_id}, "
+                                f"source_home_batch_id={ep.source_home_batch_id}",
+                            )
                 plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
                 plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
                 if trace_record is not None:
