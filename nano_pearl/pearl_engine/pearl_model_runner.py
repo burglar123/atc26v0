@@ -3090,7 +3090,7 @@ class DraftModelRunner(ModelRunnerBase):
                         _delta = _new_len - _old_len
                         _acc_flag = _pre.get("verify_acc", None)
                         _was_pre_verify = _pre.get("pre_verify", None)
-                        _classification = _classify_len_delta(
+                        _classification = self._classify_len_delta(
                             _delta, _acc_flag, _was_pre_verify, int(self.gamma),
                         )
                         _post_verify_deltas[_sid] = {
