@@ -2531,8 +2531,35 @@ class DraftModelRunner(ModelRunnerBase):
 
         if target_eager_seqs:
             trace_record = self._trace_dual_batch_schedule(target_eager_seqs, plan, "draft_apply_eager_verify")
+
+            eager_ready = self.eager_proposal_buffer.get_many(
+                [seq.seq_id for seq in target_eager_seqs], ready_only=True
+            )
+            _eager_base_by_seq = {int(p.seq_id): int(p.eager_base_len) for p in eager_ready}
+
+            # Phase 1H-lite: for seqs in both target_eager_set and
+            # draft_home_set, the normal draft appended gamma tokens
+            # after the eager base was captured.  Roll them back so the
+            # eager verify base check (eager_base_len == len(seq))
+            # passes.
+            overlap_seq_ids = set(plan.target_eager_draft_home_overlap_seq_ids)
+            overlap_seqs = [s for s in target_eager_seqs if s.seq_id in overlap_seq_ids]
+            _overlap_rolled_back = {}
+            for s in overlap_seqs:
+                _overlap_rolled_back[s.seq_id] = list(s.token_ids[-self.gamma:])
+                s.rollback_tokens(self.gamma)
+                _expected_base = _eager_base_by_seq.get(int(s.seq_id))
+                assert _expected_base is not None, self._proposal_assertion_message(
+                    plan,
+                    f"overlap seq_id={s.seq_id} missing eager_base_len in eager_ready",
+                )
+                assert len(s) == _expected_base, self._proposal_assertion_message(
+                    plan,
+                    f"overlap rollback failed for seq_id={s.seq_id}: "
+                    f"expected_len={_expected_base}, got={len(s)}",
+                )
+
             eager_verify_res = self._receive_eager_verify_result(target_eager_seqs)
-            eager_ready = self.eager_proposal_buffer.get_many([seq.seq_id for seq in target_eager_seqs], ready_only=True)
             self._apply_eager_verify_result(
                 target_eager_seqs,
                 eager_ready,
@@ -2541,6 +2568,35 @@ class DraftModelRunner(ModelRunnerBase):
                 trace_record,
                 count_tokens=False,
             )
+
+            # Phase 1H-lite conditional invalidation for overlapping seqs.
+            # Discard normal proposals regardless of eager accept/reject:
+            # the normal proposal base is stale in both cases.
+            if overlap_seqs:
+                accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
+                discarded = []
+                for s in overlap_seqs:
+                    self.dual_proposal_buffer.discard([s.seq_id])
+                    discarded.append(int(s.seq_id))
+                    if s.seq_id not in accepted_set:
+                        # Eager rejected: re-apply normal draft tokens to
+                        # restore seq state even though the proposal is
+                        # discarded.
+                        for token_id in _overlap_rolled_back.get(s.seq_id, []):
+                            s.append_token(int(token_id))
+                plan.overlap_normal_proposal_kept_seq_ids = []
+                plan.overlap_normal_proposal_discarded_seq_ids = discarded
+                if set(discarded) & accepted_set:
+                    plan.overlap_normal_proposal_discard_reason = "eager_accepted_base_mismatch"
+                else:
+                    plan.overlap_normal_proposal_discard_reason = "eager_rejected_or_partial"
+                trace_record["overlap_normal_proposal_kept_seq_ids"] = []
+                trace_record["overlap_normal_proposal_discarded_seq_ids"] = discarded
+                trace_record["overlap_normal_proposal_discard_reason"] = (
+                    plan.overlap_normal_proposal_discard_reason
+                )
+            torch.cuda.synchronize()
+            self._mark_trace_end(trace_record)
     
     def pearl_step(self):
         trace_record = None
@@ -2770,6 +2826,34 @@ class TargetModelRunner(ModelRunnerBase):
             trace_record["eager_verify_time_ms"] = (
                 trace_record["eager_verify_end_ts"] - trace_record["eager_verify_start_ts"]
             ) * 1000
+
+        # Phase 1H-lite: conditional invalidation for overlapping seqs
+        # (target_eager_set ∩ draft_home_set).  On the TARGET side the
+        # sequence was not mutated by normal draft, but the normal
+        # proposal sent by the draft rank is stale regardless of eager
+        # accept/reject outcome.
+        overlap_seq_ids = set(plan.target_eager_draft_home_overlap_seq_ids)
+        if overlap_seq_ids:
+            accepted_set = set(trace_record.get("eager_accepted_seq_ids", []))
+            target_overlap = overlap_seq_ids & {int(s.seq_id) for s in seqs}
+            discarded = []
+            for seq_id in target_overlap:
+                self.dual_proposal_buffer.discard([seq_id])
+                discarded.append(int(seq_id))
+            plan.overlap_normal_proposal_discarded_seq_ids = list(
+                set(plan.overlap_normal_proposal_discarded_seq_ids) | set(discarded)
+            )
+            if discarded and not plan.overlap_normal_proposal_discard_reason:
+                if set(discarded) & accepted_set:
+                    plan.overlap_normal_proposal_discard_reason = "eager_accepted_base_mismatch"
+                else:
+                    plan.overlap_normal_proposal_discard_reason = "eager_rejected_or_partial"
+            trace_record["overlap_normal_proposal_kept_seq_ids"] = []
+            trace_record["overlap_normal_proposal_discarded_seq_ids"] = discarded
+            trace_record["overlap_normal_proposal_discard_reason"] = (
+                plan.overlap_normal_proposal_discard_reason
+            )
+
         self._finalize_record_profile(trace_record)
 
     def dual_batch_pearl_step(self):
@@ -2779,10 +2863,18 @@ class TargetModelRunner(ModelRunnerBase):
         draft_seq_ids = list(plan.draft_home_set)
         target_seq_ids = [seq.seq_id for seq in target_seqs]
         target_eager_seq_ids = [seq.seq_id for seq in target_eager_seqs]
-        assert set(target_eager_seq_ids).isdisjoint(draft_seq_ids), self._proposal_assertion_message(
+        assert set(target_eager_seq_ids).isdisjoint(target_seq_ids), self._proposal_assertion_message(
             plan,
-            f"target_eager_set overlaps draft_home_set: {target_eager_seq_ids}",
+            f"target_eager_set overlaps target_home_set: {target_eager_seq_ids}",
         )
+        # Phase 1H-lite: target_eager_set may overlap draft_home_set.
+        # The overlapping seq has a promoted eager proposal that needs
+        # verification AND belongs to the draft batch (normal proposal
+        # needed for next step).  Conditional invalidation after eager
+        # verify handles base mismatches.
+        overlap_eager_draft = sorted(set(target_eager_seq_ids) & set(draft_seq_ids))
+        if overlap_eager_draft:
+            plan.target_eager_draft_home_overlap_seq_ids = overlap_eager_draft
         fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"
 
         target_proposals = []

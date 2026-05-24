@@ -390,6 +390,135 @@ def test_normal_buffer_has_all_after_eager_store():
     assert eager_buf.get(1) is not None, "eager buffer must have seq 1"
 
 
+# --- Phase 1H-lite overlap scenario tests ---
+
+
+def test_overlap_rejected_without_eager_execution():
+    """target_eager_set ∩ draft_home_set must fail if eager_execution_enabled=False."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[1, 4, 6, 8],
+        target_eager_set=[1],  # overlaps draft_home_set
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=False,  # NOT enabled
+        eager_execution_enabled=False,
+    )
+    try:
+        plan.validate_phase1h_eager_execution()
+        assert False, "expected assertion error for overlap without eager execution"
+    except AssertionError as e:
+        assert "eager execution" in str(e).lower(), (
+            f"error should mention eager execution, got: {e}"
+        )
+
+
+def test_overlap_fails_outside_steady_phase():
+    """target_eager_set ∩ draft_home_set must fail if plan_phase is not steady."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[1, 4, 6, 8],
+        target_eager_set=[1],  # overlaps draft_home_set
+        dual_batch_enabled=True,
+        plan_phase="priming",  # NOT steady
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    try:
+        plan.validate_phase1h_eager_execution()
+        assert False, "expected assertion error for overlap outside steady phase"
+    except AssertionError as e:
+        assert "steady" in str(e).lower(), (
+            f"error should mention steady, got: {e}"
+        )
+
+
+def test_overlap_target_eager_subset_constraint():
+    """target_eager_set must be subset of target_home_set ∪ draft_home_set.
+
+    The subset check only fires when there IS overlap with draft_home_set,
+    so we include an overlapping seq along with an invalid one.
+    """
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[1, 4, 6, 8],
+        target_eager_set=[1, 9],  # 1 overlaps draft_home, 9 outside both
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    try:
+        plan.validate_phase1h_eager_execution()
+        assert False, "expected assertion error for target_eager outside target_home ∪ draft_home"
+    except AssertionError as e:
+        assert "subset" in str(e).lower(), (
+            f"error should mention subset constraint, got: {e}"
+        )
+
+
+def test_overlap_trace_fields_default():
+    """New trace fields have correct defaults."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        target_eager_set=[],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    assert plan.target_eager_draft_home_overlap_seq_ids == []
+    assert plan.overlap_normal_proposal_kept_seq_ids == []
+    assert plan.overlap_normal_proposal_discarded_seq_ids == []
+    assert plan.overlap_normal_proposal_discard_reason is None
+
+
+def test_overlap_trace_fields_in_trace_dict():
+    """New trace fields appear in to_trace_dict()."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        target_eager_set=[],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+        target_batch_id=0,
+        draft_batch_id=1,
+        enable_eager_execution=True,
+        eager_execution_enabled=True,
+    )
+    plan.target_eager_draft_home_overlap_seq_ids = [1]
+    plan.overlap_normal_proposal_discarded_seq_ids = [1]
+    plan.overlap_normal_proposal_discard_reason = "eager_accepted_base_mismatch"
+    d = plan.to_trace_dict()
+    assert d.get("target_eager_draft_home_overlap_seq_ids") == [1], f"got {d.get('target_eager_draft_home_overlap_seq_ids')}"
+    assert d.get("overlap_normal_proposal_discarded_seq_ids") == [1], f"got {d.get('overlap_normal_proposal_discarded_seq_ids')}"
+    assert d.get("overlap_normal_proposal_discard_reason") == "eager_accepted_base_mismatch", f"got {d.get('overlap_normal_proposal_discard_reason')}"
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -409,6 +538,11 @@ if __name__ == "__main__":
         test_draft_home_set_preserved_when_target_eager_overlaps,
         test_target_eager_and_target_home_still_disjoint,
         test_normal_buffer_has_all_after_eager_store,
+        test_overlap_rejected_without_eager_execution,
+        test_overlap_fails_outside_steady_phase,
+        test_overlap_target_eager_subset_constraint,
+        test_overlap_trace_fields_default,
+        test_overlap_trace_fields_in_trace_dict,
     ]
     passed = 0
     for test in tests:

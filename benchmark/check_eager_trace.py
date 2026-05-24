@@ -108,7 +108,34 @@ def main() -> int:
         if target_eager and not execution_enabled:
             errors.append(f"record[{idx}] target_eager_set must be empty, got {sorted(target_eager)}")
         if target_eager & draft_home:
-            errors.append(f"record[{idx}] target_eager_set overlaps draft_home_set: {sorted(target_eager & draft_home)}")
+            # Phase 1H-lite: overlap is allowed when eager execution is enabled.
+            # The overlapping seq has a promoted eager proposal AND still
+            # needs a normal proposal because it stays in draft_home_set.
+            if not execution_enabled:
+                errors.append(
+                    f"record[{idx}] target_eager_set overlaps draft_home_set without eager execution: "
+                    f"{sorted(target_eager & draft_home)}"
+                )
+            else:
+                overlap_kept = as_int_set(record.get("overlap_normal_proposal_kept_seq_ids"))
+                overlap_discarded = as_int_set(record.get("overlap_normal_proposal_discarded_seq_ids"))
+                traced_overlap = overlap_kept | overlap_discarded
+                if not traced_overlap:
+                    errors.append(
+                        f"record[{idx}] target_eager_set overlaps draft_home_set but "
+                        f"no overlap_normal_proposal trace fields set: "
+                        f"overlap={sorted(target_eager & draft_home)}"
+                    )
+                if traced_overlap != (target_eager & draft_home):
+                    errors.append(
+                        f"record[{idx}] traced overlap seqs don't match actual overlap: "
+                        f"traced={sorted(traced_overlap)}, actual={sorted(target_eager & draft_home)}"
+                    )
+                if not record.get("overlap_normal_proposal_discard_reason"):
+                    errors.append(
+                        f"record[{idx}] overlap_normal_proposal_discard_reason missing for overlap: "
+                        f"{sorted(target_eager & draft_home)}"
+                    )
         if target_eager & target_home:
             errors.append(f"record[{idx}] target_eager_set overlaps target_home_set: {sorted(target_eager & target_home)}")
         if target_eager and not target_eager <= seen_promoted_seq_ids:
