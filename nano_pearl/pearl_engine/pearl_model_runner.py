@@ -704,8 +704,21 @@ class ModelRunnerBase:
         now = time.time()
         scored = []
         threshold = float(self.global_config.eager_accept_threshold)
+        eager_candidate_debug = []
         for seq in self.scheduler.find_by_seq_ids(plan.target_home_set):
+            _sid = int(seq.seq_id)
+            _cand = {
+                "seq_id": _sid,
+                "pre_verify": bool(seq.pre_verify),
+                "len_seq": int(len(seq)),
+                "running": seq.seq_id in running_seq_ids,
+                "finished": seq.is_finished,
+                "has_pending_eager": self._has_pending_eager_state(seq),
+            }
             if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
+                _cand["selected"] = False
+                _cand["skip_reason"] = "not_running_or_finished_or_pending_eager"
+                eager_candidate_debug.append(_cand)
                 continue
             # H2 eager sidecar is incompatible with post-verify seqs: DRAFT has
             # already rolled forward and generated the next speculative window
@@ -715,9 +728,11 @@ class ModelRunnerBase:
             # boundary fields (verified_prefix_len, post_verify_window_start,
             # etc.) are added.
             if not seq.pre_verify:
-                _sid = int(seq.seq_id)
                 plan.eager_draft_skipped_seq_ids.append(_sid)
                 plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_post_verify_seq"
+                _cand["selected"] = False
+                _cand["skip_reason"] = "skip_post_verify_seq"
+                eager_candidate_debug.append(_cand)
                 continue
             score, reason = self._eager_candidate_score(seq, now)
             if score <= 0.0 or score <= threshold:
@@ -753,6 +768,28 @@ class ModelRunnerBase:
             remaining_tokens -= int(budget)
 
         plan.draft_eager_set = list(plan.eager_selected_seq_ids)
+        # Attach per-candidate debug info so the smoke test can verify the filter.
+        selected_set = set(plan.eager_selected_seq_ids)
+        for _p in scored:
+            _p_sid = _p[1]
+            _p_entry = next((c for c in eager_candidate_debug if c["seq_id"] == _p_sid), None)
+            if _p_entry is None:
+                _seq = next((s for s in self.scheduler.find_by_seq_ids([_p_sid])), None)
+                _p_entry = {
+                    "seq_id": _p_sid,
+                    "pre_verify": bool(_seq.pre_verify) if _seq is not None else None,
+                    "len_seq": int(len(_seq)) if _seq is not None else -1,
+                    "running": True,
+                    "finished": False,
+                    "has_pending_eager": False,
+                }
+                eager_candidate_debug.append(_p_entry)
+            _p_entry["score"] = _p[0]
+            _p_entry["selected"] = _p_sid in selected_set
+            _p_entry["skip_reason"] = "" if _p_sid in selected_set else (
+                "budget_or_limit_exceeded"
+            )
+        plan.eager_candidate_debug = eager_candidate_debug
 
     def _trace_schedule(self, seqs: list[Sequence], is_prefill: bool, runner_role: str):
         iteration_id, batch_id = self.scheduler.next_batch_id(runner_role)
@@ -881,6 +918,25 @@ class ModelRunnerBase:
         if repair_excluded:
             plan.repair_scheduled_seq_ids = repair_excluded
         self._annotate_eager_execution_plan(plan)
+        # _annotate_eager_trace_plan MUST run before expected-proposal-set
+        # computation: it is the authoritative source for plan.draft_eager_set
+        # and applies the post-verify filter (H2 eager sidecar is incompatible
+        # with pre_verify=False seqs).  expected_eager_proposal_seq_ids must
+        # reflect the filtered draft_eager_set.
+        self._annotate_eager_trace_plan(plan)
+        # Fail-fast: no post-verify seq in draft_eager_set after filtering.
+        if plan.draft_eager_set:
+            _running = self.scheduler.running
+            _running_by_id = {int(s.seq_id): s for s in _running}
+            for _sid in plan.draft_eager_set:
+                _seq = _running_by_id.get(int(_sid))
+                assert _seq is not None and _seq.pre_verify, self._proposal_assertion_message(
+                    plan,
+                    f"post-verify seq in draft_eager_set after filter: seq_id={_sid}, "
+                    f"pre_verify={getattr(_seq, 'pre_verify', None)}, "
+                    f"len_seq={getattr(_seq, '__len__', lambda: -1)() if _seq is not None else -1}",
+                )
+        plan.authoritative_draft_eager_set_after_filter = list(plan.draft_eager_set)
         # --- H2-aware expected proposal sets ---
         # In H2 steady, seqs in target_eager_set are covered by the eager verify
         # result broadcast (h2_eager_result_bcast) and must be excluded from
@@ -909,7 +965,6 @@ class ModelRunnerBase:
             plan.excluded_normal_proposal_reason = ""
         plan.proposal_buffer_keys_after_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
         self._handle_missing_normal_proposals_after_eager(plan)
-        self._annotate_eager_trace_plan(plan)
         # H2 steady invariant: every seq scheduled for normal verify MUST have
         # a buffered proposal.  Remove any that don't (safety filter) and log
         # diagnostics so the root cause can be traced.
@@ -3287,6 +3342,20 @@ class DraftModelRunner(ModelRunnerBase):
             if _before_send_eager_info:
                 plan.before_send_eager_info = _before_send_eager_info
             # --- end instrumentation ---
+            # Fail-fast: no eager proposal encoded for any post-verify seq.
+            for p in eager_ready_for_send:
+                _sid = int(p.seq_id)
+                _seq = _draft_running_map.get(_sid)
+                assert _seq is not None and _seq.pre_verify, self._proposal_assertion_message(
+                    plan,
+                    f"eager proposal encoded for post-verify seq at send: seq_id={_sid}, "
+                    f"pre_verify={getattr(_seq, 'pre_verify', None)}, "
+                    f"eager_base_len={p.eager_base_len}, "
+                    f"original_eager_base_len_at_generation={p.original_eager_base_len_at_generation}, "
+                    f"draft_eager_set={plan.draft_eager_set}",
+                )
+            encoded_eager_seq_ids = [int(p.seq_id) for p in eager_ready_for_send]
+            plan.encoded_eager_seq_ids = encoded_eager_seq_ids
             self._send_combined_dual_proposals(
                 normal_proposals=unconditional_normal,
                 conditional_normal_proposals=conditional_proposals,
@@ -3304,6 +3373,7 @@ class DraftModelRunner(ModelRunnerBase):
         else:
             # === Legacy ordering (fallback/priming): send → recv verify ===
             if draft_seqs or expected_eager_seq_ids:
+                plan.encoded_eager_seq_ids = [int(p.seq_id) for p in eager_proposals]
                 self._send_combined_dual_proposals(
                     normal_proposals=normal_proposals,
                     conditional_normal_proposals=[],
@@ -3914,7 +3984,26 @@ class TargetModelRunner(ModelRunnerBase):
                     _target_receive_eager_info.append(_info)
                 if _target_receive_eager_info:
                     plan.t_eager_receive_info = _target_receive_eager_info
-                # Fail-fast: verify eager_base_len matches local seq length.
+                # Fail-fast 1: no eager proposal for post-verify seq on TARGET.
+                for ep in received_eager:
+                    _sid = int(ep.seq_id)
+                    _seq = _running_ids.get(_sid)
+                    if _seq is not None and not _seq.pre_verify:
+                        assert False, self._proposal_assertion_message(
+                            plan,
+                            f"eager proposal received for post-verify seq on TARGET: "
+                            f"seq_id={_sid}, "
+                            f"target_seq_pre_verify_at_receive={bool(_seq.pre_verify)}, "
+                            f"draft_eager_set={plan.draft_eager_set}, "
+                            f"expected_eager_proposal_seq_ids={plan.expected_eager_proposal_seq_ids}, "
+                            f"source_step_id={ep.source_step_id}, "
+                            f"source_plan_id={ep.source_plan_id}, "
+                            f"source_home_batch_id={ep.source_home_batch_id}, "
+                            f"eager_base_len={ep.eager_base_len}, "
+                            f"original_eager_base_len_at_generation={ep.original_eager_base_len_at_generation}, "
+                            f"local_seq_len={len(_seq)}",
+                        )
+                # Fail-fast 2: verify eager_base_len matches local seq length.
                 for ep in received_eager:
                     _sid = int(ep.seq_id)
                     _seq = _running_ids.get(_sid)
