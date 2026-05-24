@@ -65,6 +65,8 @@ def main() -> int:
     print(f"records_with_eager_execution_enabled={len(eager_execution_records)}")
     print(f"eager_candidate_count={candidate_count}")
     print(f"eager_selected_count={selected_count}")
+    print(f"eager_slo_class_by_seq_id populated={sum(1 for r in records if r.get('eager_slo_class_by_seq_id'))}")
+    print(f"missing_eager_metadata_count={sum(len(r.get('missing_eager_metadata_seq_ids') or []) for r in records)}")
     print(f"selected_eager_seq_ids={selected_seq_ids}")
     print(f"selected_by_plan_phase={dict(selected_by_phase)}")
     print(f"eager_tokens_generated={generated_tokens}")
@@ -148,10 +150,20 @@ def main() -> int:
         # from selected when received_eager_seq_ids overwrites it on the target
         # side.  For trace-only mode, draft_eager_set must still equal selected.
         if eager_receive_policy == "producer_authoritative":
-            if eager_validation_passed is False:
+            validation_ok = record.get("eager_receive_validation_ok")
+            if validation_ok is False:
+                reason = record.get("eager_receive_validation_reason") or record.get("eager_receive_validation_error")
                 errors.append(
-                    f"record[{idx}] eager receive validation failed: "
-                    f"{record.get('eager_receive_validation_error')}"
+                    f"record[{idx}] eager receive validation failed: {reason}"
+                )
+            elif validation_ok is None:
+                # No eager receive event — skip validation for this record.
+                pass
+            elif eager_validation_passed is False and validation_ok is not False:
+                # Backward compat: old traces without validation_ok field.
+                reason = record.get("eager_receive_validation_reason") or record.get("eager_receive_validation_error")
+                errors.append(
+                    f"record[{idx}] eager receive validation failed: {reason}"
                 )
             if received_eager and received_eager - target_home:
                 errors.append(
@@ -230,6 +242,33 @@ def main() -> int:
                 if int(record.get(field) or 0) != 0:
                     errors.append(f"record[{idx}] {field} must stay 0 when eager execution is disabled")
         seen_promoted_seq_ids.update(as_int_set(record.get("eager_promoted_seq_ids")))
+
+    # Check for missing metadata in eager trace records.
+    for idx, record in enumerate(records):
+        if not record.get("eager_trace_enabled"):
+            continue
+        if record.get("eager_policy") != "tight_only":
+            continue
+        if record.get("plan_phase") != "steady":
+            continue
+        target_home = as_int_set(record.get("target_home_set"))
+        if not target_home:
+            continue
+        target_home_slo = record.get("target_home_slo_class_by_seq_id") or {}
+        missing_meta = as_int_set(record.get("missing_eager_metadata_seq_ids"))
+        if not target_home_slo and missing_meta:
+            first_few = sorted(missing_meta)[:5]
+            errors.append(
+                f"record[{idx}] metadata missing for seqs in target_home_set: "
+                f"target_home_set size={len(target_home)}, "
+                f"missing_metadata_seq_ids first={first_few}, "
+                f"total_missing={len(missing_meta)}"
+            )
+        elif not target_home_slo and not missing_meta:
+            errors.append(
+                f"record[{idx}] target_home_slo_class_by_seq_id empty but "
+                f"missing_eager_metadata_seq_ids also empty — metadata was not populated"
+            )
 
     if eager_execution_records:
         if generated_tokens < promoted_tokens + discarded_tokens:

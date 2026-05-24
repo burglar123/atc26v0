@@ -73,6 +73,13 @@ class StepPlan:
     eager_total_budget: int = 0
     eager_selection_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     eager_slo_class_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    # Rank-safe per-seq metadata snapshots (populated from DRAFT scheduler).
+    target_home_request_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_home_slo_class_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_home_slo_tpot_ms_by_seq_id: Dict[int, float] = field(default_factory=dict)
+    missing_eager_metadata_seq_ids: List[int] = field(default_factory=list)
+    eager_metadata_lookup_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    effective_enable_eager_trace: bool = False
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
@@ -123,6 +130,8 @@ class StepPlan:
     eager_receive_policy: Optional[str] = None
     eager_receive_validation_passed: bool = False
     eager_receive_validation_error: Optional[str] = None
+    eager_receive_validation_ok: Optional[bool] = None
+    eager_receive_validation_reason: Optional[str] = None
     local_plan_draft_eager_set_before_receive: List[int] = field(default_factory=list)
     local_plan_draft_eager_set_after_receive: List[int] = field(default_factory=list)
     send_expected_normal_seq_ids: List[int] = field(default_factory=list)
@@ -386,6 +395,26 @@ class StepPlan:
                 str(seq_id): str(slo_class)
                 for seq_id, slo_class in self.eager_slo_class_by_seq_id.items()
             },
+            "target_home_request_id_by_seq_id": {
+                str(seq_id): str(request_id)
+                for seq_id, request_id in self.target_home_request_id_by_seq_id.items()
+            },
+            "target_home_slo_class_by_seq_id": {
+                str(seq_id): str(slo_class)
+                for seq_id, slo_class in self.target_home_slo_class_by_seq_id.items()
+            },
+            "target_home_slo_tpot_ms_by_seq_id": {
+                str(seq_id): float(tpot_ms)
+                for seq_id, tpot_ms in self.target_home_slo_tpot_ms_by_seq_id.items()
+            },
+            "missing_eager_metadata_seq_ids": [
+                int(seq_id) for seq_id in self.missing_eager_metadata_seq_ids
+            ],
+            "eager_metadata_lookup_source_by_seq_id": {
+                str(seq_id): str(source)
+                for seq_id, source in self.eager_metadata_lookup_source_by_seq_id.items()
+            },
+            "effective_enable_eager_trace": bool(self.effective_enable_eager_trace),
             "max_eager_requests_per_step": int(self.max_eager_requests_per_step),
             "max_eager_tokens_per_step": int(self.max_eager_tokens_per_step),
             "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
@@ -460,6 +489,8 @@ class StepPlan:
             "eager_receive_policy": self.eager_receive_policy,
             "eager_receive_validation_passed": bool(self.eager_receive_validation_passed),
             "eager_receive_validation_error": self.eager_receive_validation_error,
+            "eager_receive_validation_ok": self.eager_receive_validation_ok,
+            "eager_receive_validation_reason": self.eager_receive_validation_reason,
             "local_plan_draft_eager_set_before_receive": [
                 int(seq_id) for seq_id in self.local_plan_draft_eager_set_before_receive
             ],

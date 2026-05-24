@@ -688,6 +688,7 @@ class ModelRunnerBase:
 
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
         plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
+        plan.effective_enable_eager_trace = plan.eager_trace_enabled
         plan.eager_policy = self.global_config.eager_policy
         plan.max_eager_requests_per_step = max(0, int(self.global_config.max_eager_requests_per_step))
         plan.max_eager_tokens_per_step = max(0, int(self.global_config.max_eager_tokens_per_step))
@@ -700,11 +701,27 @@ class ModelRunnerBase:
         ):
             return
 
+        # Populate rank-safe per-seq metadata snapshots for every seq in
+        # target_home_set BEFORE scoring.  This guarantees the trace always
+        # contains metadata diagnostics, even when local scheduler lookup
+        # fails on non-leader target ranks under TP>1.
         running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        target_home_set = set(plan.target_home_set)
+        for seq_id in sorted(target_home_set):
+            seqs_found = self.scheduler.find_by_seq_ids([seq_id])
+            if seqs_found:
+                seq = seqs_found[0]
+                plan.target_home_request_id_by_seq_id[seq_id] = str(getattr(seq, "request_id", None))
+                plan.target_home_slo_class_by_seq_id[seq_id] = str(getattr(seq, "slo_class", None))
+                plan.target_home_slo_tpot_ms_by_seq_id[seq_id] = float(getattr(seq, "slo_tpot_ms", None) or 0.0)
+                plan.eager_metadata_lookup_source_by_seq_id[seq_id] = "scheduler"
+            else:
+                plan.missing_eager_metadata_seq_ids.append(int(seq_id))
+                plan.eager_metadata_lookup_source_by_seq_id[seq_id] = "missing"
+
         now = time.time()
         scored = []
         threshold = float(self.global_config.eager_accept_threshold)
-        target_home_set = set(plan.target_home_set)
         eager_candidate_debug = []
         for seq in self.scheduler.find_by_seq_ids(plan.target_home_set):
             _sid = int(seq.seq_id)
@@ -722,20 +739,7 @@ class ModelRunnerBase:
                 _cand["skip_reason"] = "not_running_or_finished_or_pending_eager"
                 eager_candidate_debug.append(_cand)
                 continue
-            # H2 eager sidecar: do NOT select candidates from the current
-            # step's normal verify set (target_home_set). These seqs have
-            # unstable state boundaries — their len(seq) and pre_verify can
-            # change within the same step when the normal verify result is
-            # applied.  Eager proposals generated from an unstable prefix
-            # cause eager_base_len mismatches at TARGET receive time.
-            if _sid in target_home_set:
-                plan.eager_draft_skipped_seq_ids.append(_sid)
-                plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_current_normal_verify_seq"
-                _cand["selected"] = False
-                _cand["skip_reason"] = "skip_current_normal_verify_seq"
-                eager_candidate_debug.append(_cand)
-                continue
-            # Also skip post-verify seqs: DRAFT has already rolled forward
+            # Skip post-verify seqs: DRAFT has already rolled forward
             # and generated the next speculative window while TARGET may
             # still be verifying the previous one.
             if not seq.pre_verify:
@@ -1799,6 +1803,8 @@ class ModelRunnerBase:
                 plan.eager_receive_validation_error = (
                     "received eager proposals but eager execution is disabled"
                 )
+                plan.eager_receive_validation_ok = False
+                plan.eager_receive_validation_reason = plan.eager_receive_validation_error
                 assert False, self._proposal_assertion_message(
                     plan,
                     f"eager receive validation failed: {plan.eager_receive_validation_error}, "
@@ -1809,6 +1815,8 @@ class ModelRunnerBase:
                 plan.eager_receive_validation_error = (
                     f"received eager proposals outside steady phase: phase={plan.plan_phase}"
                 )
+                plan.eager_receive_validation_ok = False
+                plan.eager_receive_validation_reason = plan.eager_receive_validation_error
                 assert False, self._proposal_assertion_message(
                     plan,
                     f"eager receive validation failed: {plan.eager_receive_validation_error}, "
@@ -1820,13 +1828,21 @@ class ModelRunnerBase:
             if validation_error:
                 plan.eager_receive_validation_passed = False
                 plan.eager_receive_validation_error = validation_error
+                plan.eager_receive_validation_ok = False
+                plan.eager_receive_validation_reason = validation_error
                 assert False, self._proposal_assertion_message(
                     plan,
                     f"eager receive validation failed: {validation_error}, "
                     f"received={received_eager_seq_ids}",
                 )
             plan.eager_receive_validation_passed = True
+            plan.eager_receive_validation_ok = True
+            plan.eager_receive_validation_reason = "all validations passed"
             plan.draft_eager_set = list(received_eager_seq_ids)
+        else:
+            # No eager receive event — validation is not applicable.
+            plan.eager_receive_validation_ok = None
+            plan.eager_receive_validation_reason = "no_eager_receive_event"
 
         plan.local_plan_draft_eager_set_after_receive = list(plan.draft_eager_set)
         # --- end eager receive ---
@@ -1842,6 +1858,8 @@ class ModelRunnerBase:
         trace_record["eager_receive_policy"] = plan.eager_receive_policy
         trace_record["eager_receive_validation_passed"] = bool(plan.eager_receive_validation_passed)
         trace_record["eager_receive_validation_error"] = plan.eager_receive_validation_error
+        trace_record["eager_receive_validation_ok"] = plan.eager_receive_validation_ok
+        trace_record["eager_receive_validation_reason"] = plan.eager_receive_validation_reason
         trace_record["local_plan_draft_eager_set_before_receive"] = list(plan.local_plan_draft_eager_set_before_receive)
         trace_record["local_plan_draft_eager_set_after_receive"] = list(plan.local_plan_draft_eager_set_after_receive)
         trace_record["proposal_message_kind"] = plan.proposal_message_kind
