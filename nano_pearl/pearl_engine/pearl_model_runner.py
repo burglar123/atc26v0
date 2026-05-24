@@ -704,6 +704,7 @@ class ModelRunnerBase:
         now = time.time()
         scored = []
         threshold = float(self.global_config.eager_accept_threshold)
+        target_home_set = set(plan.target_home_set)
         eager_candidate_debug = []
         for seq in self.scheduler.find_by_seq_ids(plan.target_home_set):
             _sid = int(seq.seq_id)
@@ -714,19 +715,29 @@ class ModelRunnerBase:
                 "running": seq.seq_id in running_seq_ids,
                 "finished": seq.is_finished,
                 "has_pending_eager": self._has_pending_eager_state(seq),
+                "in_target_home_set": _sid in target_home_set,
             }
             if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
                 _cand["selected"] = False
                 _cand["skip_reason"] = "not_running_or_finished_or_pending_eager"
                 eager_candidate_debug.append(_cand)
                 continue
-            # H2 eager sidecar is incompatible with post-verify seqs: DRAFT has
-            # already rolled forward and generated the next speculative window
-            # while TARGET may still be verifying the previous one. The pipeline
-            # boundary mismatch causes eager_base_len != local_seq_len at
-            # TARGET receive time. Skip post-verify seqs until explicit state-
-            # boundary fields (verified_prefix_len, post_verify_window_start,
-            # etc.) are added.
+            # H2 eager sidecar: do NOT select candidates from the current
+            # step's normal verify set (target_home_set). These seqs have
+            # unstable state boundaries — their len(seq) and pre_verify can
+            # change within the same step when the normal verify result is
+            # applied.  Eager proposals generated from an unstable prefix
+            # cause eager_base_len mismatches at TARGET receive time.
+            if _sid in target_home_set:
+                plan.eager_draft_skipped_seq_ids.append(_sid)
+                plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_current_normal_verify_seq"
+                _cand["selected"] = False
+                _cand["skip_reason"] = "skip_current_normal_verify_seq"
+                eager_candidate_debug.append(_cand)
+                continue
+            # Also skip post-verify seqs: DRAFT has already rolled forward
+            # and generated the next speculative window while TARGET may
+            # still be verifying the previous one.
             if not seq.pre_verify:
                 plan.eager_draft_skipped_seq_ids.append(_sid)
                 plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_post_verify_seq"
