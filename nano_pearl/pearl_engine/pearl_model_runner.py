@@ -794,6 +794,17 @@ class ModelRunnerBase:
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
         dropped_normal = self.dual_proposal_buffer.discard_inactive(active_seq_ids)
         dropped_eager = self.eager_proposal_buffer.discard_inactive(active_seq_ids)
+        # Discard normal proposals whose home_batch_id no longer matches the
+        # seq's current home_batch_id (stale after repair lane migration).
+        seq_home = {int(s.seq_id): int(s.home_batch_id) for s in self.scheduler.running if s.home_batch_id is not None}
+        stale_normal = []
+        for p in self.dual_proposal_buffer.get_many(self.dual_proposal_buffer.pending_seq_ids()):
+            current_home = seq_home.get(int(p.seq_id))
+            if current_home is not None and int(p.home_batch_id) != current_home:
+                stale_normal.append(int(p.seq_id))
+        if stale_normal:
+            self.dual_proposal_buffer.discard(stale_normal)
+            dropped_normal = list(set(dropped_normal) | set(stale_normal))
         return dropped_normal, dropped_eager
 
     def _build_dual_batch_step_plan(self) -> StepPlan:
@@ -845,12 +856,16 @@ class ModelRunnerBase:
             if plan.dual_batch_state is not None:
                 plan.dual_batch_state.fallback_reason = plan.fallback_reason
         # H2 repair exclusion: exclude repair_required seqs from target_home_set
+        # and discard their stale buffered proposals.  Retained proposals
+        # pollute pending_batch_ids and prevent batch rotation, causing the
+        # next plan to select the same target_batch_id with now-unbuffered seqs.
         repair_excluded = []
         for seq_id in list(plan.target_home_set):
             seqs = self.scheduler.find_by_seq_ids([seq_id])
             if seqs and seqs[0].repair_required:
                 plan.target_home_set.remove(seq_id)
                 repair_excluded.append(int(seq_id))
+                self.dual_proposal_buffer.discard([seq_id])
         if repair_excluded:
             plan.repair_scheduled_seq_ids = repair_excluded
         self._annotate_eager_execution_plan(plan)
@@ -883,6 +898,47 @@ class ModelRunnerBase:
         plan.proposal_buffer_keys_after_eager_selection = self.dual_proposal_buffer.pending_seq_ids()
         self._handle_missing_normal_proposals_after_eager(plan)
         self._annotate_eager_trace_plan(plan)
+        # H2 steady invariant: every seq scheduled for normal verify MUST have
+        # a buffered proposal.  Remove any that don't (safety filter) and log
+        # diagnostics so the root cause can be traced.
+        if plan.plan_phase == "steady":
+            buffer_keys = set(self.dual_proposal_buffer.pending_seq_ids())
+            unbuffered = [s for s in plan.target_home_set if s not in buffer_keys]
+            if unbuffered:
+                # Build detailed diagnostics before mutating the plan
+                seq_home = {int(s.seq_id): int(s.home_batch_id) for s in self.scheduler.running if s.home_batch_id is not None}
+                repair_by_seq = {int(s.seq_id): s.repair_required for s in self.scheduler.running}
+                eager_by_seq = {int(s.seq_id): getattr(s, "last_eager_result", "none") for s in self.scheduler.running}
+                prev_consumed = getattr(plan, "proposal_buffer_consumed_seq_ids", [])
+                prev_received = getattr(plan, "received_normal_seq_ids", [])
+                logger.warning(
+                    "H2 steady target_home_set has seqs without buffered proposals: "
+                    "plan_id=%s step_id=%s unbuffered=%s target_home=%s draft_home=%s "
+                    "buffer_keys=%s eager_keys=%s home_batches=%s repair=%s eager_result=%s "
+                    "prev_consumed=%s prev_received=%s",
+                    plan.plan_id, plan.step_id, unbuffered,
+                    list(plan.target_home_set), list(plan.draft_home_set),
+                    sorted(buffer_keys), self.eager_proposal_buffer.keys(),
+                    {str(k): v for k, v in seq_home.items()},
+                    {str(k): v for k, v in repair_by_seq.items()},
+                    {str(k): v for k, v in eager_by_seq.items()},
+                    prev_consumed, prev_received,
+                )
+                for seq_id in unbuffered:
+                    plan.target_home_set.remove(seq_id)
+                plan.missing_normal_proposal_seq_ids = list(
+                    set(plan.missing_normal_proposal_seq_ids) | set(unbuffered)
+                )
+            # Debug invariant: after filtering, target_home_set must be subset of buffer
+            _post_filter_buffer = set(self.dual_proposal_buffer.pending_seq_ids())
+            _post_filter_target = set(plan.target_home_set)
+            assert _post_filter_target.issubset(_post_filter_buffer), \
+                self._proposal_assertion_message(
+                    plan,
+                    f"H2 steady invariant violation: target_home_set not subset of buffer_keys: "
+                    f"target_home={sorted(_post_filter_target)}, buffer_keys={sorted(_post_filter_buffer)}, "
+                    f"unbuffered_in_target={sorted(_post_filter_target - _post_filter_buffer)}",
+                )
         if self.global_config.enable_eager_execution:
             plan.validate_phase1h_eager_execution()
         else:
