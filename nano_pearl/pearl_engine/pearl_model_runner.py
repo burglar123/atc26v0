@@ -524,6 +524,10 @@ class ModelRunnerBase:
             "step_start_ts": None,
             "step_end_ts": None,
             "step_time_ms": 0.0,
+            "normal_proposal_transfer_called": False,
+            "eager_proposal_transfer_called": False,
+            "result_transfer_called": False,
+            "result_transfer_zero_result": False,
             "overlap_time_ms": 0.0,
             "overlap_ratio": None,
             "exposed_draft_time_ms": None,
@@ -1322,6 +1326,7 @@ class ModelRunnerBase:
         trace_record["draft_eager_buffer_size_after_transfer"] = self.eager_proposal_buffer.size()
         trace_record["eager_tokens_transferred"] = sum(int(proposal.proposal_len) for proposal in proposals)
         trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+        trace_record["eager_proposal_transfer_called"] = True
 
     def _send_eager_transfer_dry_run(
         self,
@@ -1597,12 +1602,17 @@ class ModelRunnerBase:
             int(result["proposal_len"]) for result in results
         )
         trace_record["eager_result_zero_result_step"] = len(results) == 0
-        if self.tp_params.local_rank != 0:
-            return
+        trace_record["result_transfer_called"] = True
+        trace_record["result_transfer_zero_result"] = len(results) == 0
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
-        if int(meta_values[1]) > 0:
-            payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+        broadcast_meta_values = [int(value) for value in meta.tolist()]
+        payload_len = int(broadcast_meta_values[1])
+        if payload_len > 0:
+            if self.rank == self.global_config.target_config.master_rank:
+                payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            else:
+                payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
 
     def _validate_eager_result_on_draft(
@@ -1777,6 +1787,8 @@ class ModelRunnerBase:
             int(result["proposal_len"]) for result in invalid
         )
         trace_record["eager_result_zero_result_step"] = len(results) == 0
+        trace_record["result_transfer_called"] = True
+        trace_record["result_transfer_zero_result"] = len(results) == 0
 
     def _local_sequence_by_id(self) -> dict[int, Sequence]:
         seq_by_id = {}
@@ -2546,7 +2558,7 @@ class ModelRunnerBase:
         plan: StepPlan,
         trace_record: dict,
         plan_context: dict[str, set[int]],
-    ) -> None:
+    ) -> list[EagerProposal]:
         ready_proposals = self._ready_eager_proposals()
         ready_size_before = len(ready_proposals)
         seq_by_id = self._local_sequence_by_id()
@@ -2670,13 +2682,6 @@ class ModelRunnerBase:
                 scheduled,
                 plan_context,
             )
-        if self._eager_result_transfer_dry_run_enabled():
-            plan.eager_result_transfer_dry_run_enabled = True
-            self._send_eager_result_transfer_dry_run(
-                plan,
-                trace_record,
-                scheduled,
-            )
 
         clear_reason_by_proposal_id = {
             str(proposal.proposal_id): "phase1h4c_scheduled_dry_run_no_verify_yet"
@@ -2776,6 +2781,7 @@ class ModelRunnerBase:
         trace_record["eager_tokens_deferred_dry_run"] = sum(
             int(proposal.proposal_len) for proposal in deferred
         )
+        return scheduled
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
         seq_by_id = self._local_sequence_by_id()
@@ -2902,8 +2908,9 @@ class ModelRunnerBase:
         target_ready_size_after_receive = len(self._ready_eager_proposals())
         trace_record["target_ready_buffer_size_after_receive"] = int(target_ready_size_after_receive)
         trace_record["target_ready_buffer_size_after_schedule"] = int(target_ready_size_after_receive)
+        scheduled_for_result_transfer: list[EagerProposal] = []
         if self._eager_schedule_dry_run_enabled():
-            self._schedule_ready_eager_dry_run(plan, trace_record, plan_context)
+            scheduled_for_result_transfer = self._schedule_ready_eager_dry_run(plan, trace_record, plan_context)
         else:
             self.eager_proposal_buffer.remove_many(
                 [proposal.proposal_id for proposal in validated + pending_ready]
@@ -3029,7 +3036,8 @@ class ModelRunnerBase:
             int(proposal.proposal_len) for proposal in dropped + pending_dropped
         )
         trace_record["eager_buffer_size_after"] = int(buffer_size_after_clear)
-        return proposals
+        trace_record["eager_proposal_transfer_called"] = True
+        return scheduled_for_result_transfer
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
@@ -4059,6 +4067,8 @@ class DraftModelRunner(ModelRunnerBase):
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
+            for trace_record in draft_records:
+                trace_record["normal_proposal_transfer_called"] = True
 
         if self._eager_draft_dry_run_enabled() and eager_draft_seqs:
             if draft_records:
@@ -4282,6 +4292,8 @@ class TargetModelRunner(ModelRunnerBase):
         received_proposals = []
         if draft_seq_ids:
             received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
+            if trace_record is not None:
+                trace_record["normal_proposal_transfer_called"] = True
             if fallback_same_batch:
                 target_proposals = received_proposals
                 if trace_record is not None:
@@ -4309,6 +4321,7 @@ class TargetModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
         elif received_proposals:
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
+            priming_record["normal_proposal_transfer_called"] = True
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             self._finalize_record_profile(priming_record)
 
@@ -4316,7 +4329,14 @@ class TargetModelRunner(ModelRunnerBase):
             transfer_trace_record = trace_record or priming_record
             if transfer_trace_record is None:
                 transfer_trace_record = self._trace_dual_batch_schedule([], plan, "eager_transfer_dry_run")
-            self._receive_eager_transfer_dry_run(plan, transfer_trace_record)
+            scheduled_for_result_transfer = self._receive_eager_transfer_dry_run(plan, transfer_trace_record)
+            if self._eager_result_transfer_dry_run_enabled():
+                plan.eager_result_transfer_dry_run_enabled = True
+                self._send_eager_result_transfer_dry_run(
+                    plan,
+                    transfer_trace_record,
+                    scheduled_for_result_transfer,
+                )
             self._finalize_record_profile(transfer_trace_record)
 
     def serialized_pearl_step(self):
