@@ -152,6 +152,7 @@ EAGER_ZERO_COUNTER_FIELDS = [
     "eager_tokens_invalidated",
     "eager_dry_run_tokens_generated",
     "eager_tokens_transferred",
+    "eager_tokens_transfer_pending",
     "eager_tokens_transfer_validated",
     "eager_tokens_transfer_dropped",
 ]
@@ -175,7 +176,15 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_transfer_received_proposal_ids",
     "eager_transfer_received_seq_ids",
     "eager_transfer_validated_proposal_ids",
+    "eager_transfer_pending_proposal_ids",
     "eager_transfer_dropped_proposal_ids",
+    "eager_pending_received_proposal_ids",
+    "eager_pending_received_seq_ids",
+    "eager_pending_base_not_reached_proposal_ids",
+    "eager_pending_base_not_reached_seq_ids",
+    "eager_pending_ready_proposal_ids",
+    "eager_pending_ready_seq_ids",
+    "eager_pending_dropped_proposal_ids",
 ]
 
 REQUIRED_EAGER_META_KEYS = [

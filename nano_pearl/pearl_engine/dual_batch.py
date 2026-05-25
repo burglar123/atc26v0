@@ -13,7 +13,9 @@ PROPOSAL_LANES = {LANE_NORMAL, LANE_EAGER}
 
 EAGER_STATE_DRAFTED_PENDING_PARENT = "DRAFTED_PENDING_PARENT"
 EAGER_STATE_DRAFTED_DRY_RUN = "DRAFTED_DRY_RUN"
+EAGER_STATE_PENDING_BASE_REACHED = "PENDING_BASE_REACHED"
 EAGER_STATE_READY_TO_VERIFY = "READY_TO_VERIFY"
+EAGER_STATE_READY_TO_VERIFY_DRY_RUN = "READY_TO_VERIFY_DRY_RUN"
 EAGER_STATE_TRANSFERRED_DRY_RUN = "TRANSFERRED_DRY_RUN"
 EAGER_STATE_VERIFYING = "VERIFYING"
 EAGER_STATE_CONSUMED = "CONSUMED"
@@ -21,7 +23,9 @@ EAGER_STATE_DISCARDED = "DISCARDED"
 EAGER_PROPOSAL_STATES = {
     EAGER_STATE_DRAFTED_PENDING_PARENT,
     EAGER_STATE_DRAFTED_DRY_RUN,
+    EAGER_STATE_PENDING_BASE_REACHED,
     EAGER_STATE_READY_TO_VERIFY,
+    EAGER_STATE_READY_TO_VERIFY_DRY_RUN,
     EAGER_STATE_TRANSFERRED_DRY_RUN,
     EAGER_STATE_VERIFYING,
     EAGER_STATE_CONSUMED,
@@ -194,9 +198,9 @@ class ProposalBuffer:
 class EagerProposalBuffer:
     """Proposal-id keyed buffer for future eager proposals.
 
-    This buffer is intentionally separate from ProposalBuffer. Phase 1H-0 only
-    exercises it through synthetic tests; runtime dual-batch execution does not
-    read from or write to it yet.
+    This buffer is intentionally separate from the seq-id keyed normal
+    ProposalBuffer so dry-run eager lifecycle state cannot leak into normal
+    dual-batch verification.
     """
 
     def __init__(self):
@@ -207,8 +211,23 @@ class EagerProposalBuffer:
         self._proposals.clear()
         self._discard_reasons.clear()
 
+    def remove(self, proposal_id: int) -> EagerProposal | None:
+        proposal_id = int(proposal_id)
+        self._discard_reasons.pop(proposal_id, None)
+        return self._proposals.pop(proposal_id, None)
+
+    def remove_many(self, proposal_ids: Iterable[int]) -> list[int]:
+        removed = []
+        for proposal_id in proposal_ids:
+            if self.remove(int(proposal_id)) is not None:
+                removed.append(int(proposal_id))
+        return sorted(removed)
+
     def size(self) -> int:
         return sum(1 for proposal in self._proposals.values() if proposal.valid)
+
+    def proposals(self) -> list[EagerProposal]:
+        return [proposal for proposal in self._proposals.values()]
 
     def store(self, proposal: EagerProposal) -> None:
         if not isinstance(proposal, EagerProposal):
@@ -265,7 +284,7 @@ class EagerProposalBuffer:
             proposal
             for proposal in self._proposals.values()
             if proposal.valid
-            and proposal.state == EAGER_STATE_READY_TO_VERIFY
+            and proposal.state in {EAGER_STATE_READY_TO_VERIFY, EAGER_STATE_READY_TO_VERIFY_DRY_RUN}
             and proposal.seq_id in requested_set
         ]
         order = {seq_id: idx for idx, seq_id in enumerate(requested)}
@@ -275,14 +294,16 @@ class EagerProposalBuffer:
         return sorted({
             proposal.seq_id
             for proposal in self._proposals.values()
-            if proposal.valid and proposal.state == EAGER_STATE_DRAFTED_PENDING_PARENT
+            if proposal.valid
+            and proposal.state in {EAGER_STATE_DRAFTED_PENDING_PARENT, EAGER_STATE_PENDING_BASE_REACHED}
         })
 
     def ready_seq_ids(self) -> list[int]:
         return sorted({
             proposal.seq_id
             for proposal in self._proposals.values()
-            if proposal.valid and proposal.state == EAGER_STATE_READY_TO_VERIFY
+            if proposal.valid
+            and proposal.state in {EAGER_STATE_READY_TO_VERIFY, EAGER_STATE_READY_TO_VERIFY_DRY_RUN}
         })
 
     def inspect(self) -> dict:
