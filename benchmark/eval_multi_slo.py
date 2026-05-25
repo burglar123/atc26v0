@@ -140,7 +140,12 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "eager_accept_threshold": float(args.eager_accept_threshold),
         "enable_eager_execution": bool(args.enable_eager_execution),
         "enable_continuous_eager_trace": bool(args.enable_continuous_eager_trace),
+        "enable_continuous_eager_draft_execution": bool(args.enable_continuous_eager_draft_execution),
     }
+
+    # Phase 1I-A: scaffold implies continuous trace.
+    if bool(args.enable_continuous_eager_draft_execution):
+        common_kwargs["enable_continuous_eager_trace"] = True
 
     # Try new named-path style with gamma.
     try:
@@ -163,6 +168,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
     common_kwargs.pop("eager_accept_threshold", None)
     common_kwargs.pop("enable_eager_execution", None)
     common_kwargs.pop("enable_continuous_eager_trace", None)
+    common_kwargs.pop("enable_continuous_eager_draft_execution", None)
 
     try:
         return PEARLConfig(
@@ -1459,6 +1465,15 @@ def main() -> None:
             "Trace/control-plane only — corrects candidate selection (post-verify=stable=selected), "
             "lane exclusion, and adds proposal state trace metadata. "
             "Does not execute eager drafting or verification."
+        ),
+    )
+    parser.add_argument(
+        "--enable-continuous-eager-draft-execution",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Phase 1I-A continuous eager draft-execution scaffold for dual_batch_pearl. "
+            "Implies continuous eager trace and does not run target eager verification."
         ),
     )
     parser.add_argument(
