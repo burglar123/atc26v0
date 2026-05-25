@@ -568,10 +568,18 @@ class ModelRunnerBase:
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
             "target_eager_set_dry_run": [],
+            "scheduled_target_eager_set_dry_run": [],
+            "scheduled_target_eager_proposal_ids_dry_run": [],
+            "scheduled_target_eager_seq_ids_dry_run": [],
+            "adjusted_draft_home_set_dry_run": [],
+            "excluded_from_draft_home_for_eager_dry_run": [],
             "eager_schedule_candidate_proposal_ids": [],
             "eager_schedule_candidate_seq_ids": [],
             "eager_scheduled_proposal_ids": [],
             "eager_scheduled_seq_ids": [],
+            "eager_schedule_deferred_proposal_ids": [],
+            "eager_schedule_deferred_seq_ids": [],
+            "eager_schedule_defer_reason_by_proposal_id": {},
             "eager_schedule_skipped_proposal_ids": [],
             "eager_schedule_skip_reason_by_proposal_id": {},
             "eager_schedule_clear_reason_by_proposal_id": {},
@@ -584,7 +592,12 @@ class ModelRunnerBase:
             "eager_schedule_proposal_len_by_proposal_id": {},
             "eager_schedule_to_verify_len_by_proposal_id": {},
             "eager_schedule_intersects_target_home": False,
+            "eager_schedule_intersects_original_draft_home": False,
+            "eager_schedule_intersects_adjusted_draft_home": False,
             "eager_schedule_intersects_draft_home": False,
+            "eager_schedule_ready_buffer_size_before": self.eager_proposal_buffer.size(),
+            "eager_schedule_ready_buffer_size_after": self.eager_proposal_buffer.size(),
+            "eager_schedule_ready_buffer_size_after_clear": self.eager_proposal_buffer.size(),
             "eager_ready_buffer_size_before_schedule": self.eager_proposal_buffer.size(),
             "eager_ready_buffer_size_after_schedule": self.eager_proposal_buffer.size(),
             "eager_ready_buffer_size_after_clear": self.eager_proposal_buffer.size(),
@@ -665,6 +678,7 @@ class ModelRunnerBase:
             "eager_tokens_transfer_dropped": 0,
             "eager_tokens_schedule_candidates": 0,
             "eager_tokens_scheduled_dry_run": 0,
+            "eager_tokens_deferred_dry_run": 0,
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -1449,7 +1463,9 @@ class ModelRunnerBase:
 
         candidates: list[EagerProposal] = []
         scheduled: list[EagerProposal] = []
+        deferred: list[EagerProposal] = []
         skipped: list[EagerProposal] = []
+        defer_reason_by_proposal_id: dict[int, str] = {}
         skip_reason_by_proposal_id: dict[int, str] = {}
         seen_seq_ids: set[int] = set()
         proposal_id_by_seq_id: dict[int, int] = {}
@@ -1477,19 +1493,9 @@ class ModelRunnerBase:
 
             reason = None
             if plan.plan_phase != "steady":
-                reason = "non_steady_phase"
+                reason = "defer_non_steady_phase"
             elif proposal.state != EAGER_STATE_READY_TO_VERIFY_DRY_RUN:
                 reason = "not_ready"
-            elif seq is None:
-                reason = "seq_not_found"
-            elif self.is_request_level_finished(seq, plan_context):
-                reason = "seq_finished_before_schedule"
-            elif self.is_speculative_span_invalidated(seq, plan_context):
-                reason = "seq_span_invalidated_before_schedule"
-            elif bool(getattr(seq, "pre_verify", True)):
-                reason = "seq_pre_verify"
-            elif int(len(seq)) != int(proposal.base_len):
-                reason = "base_not_reached" if int(len(seq)) < int(proposal.base_len) else "base_overshot_or_stale"
             elif bool(proposal.base_pre_verify):
                 reason = "invalid_base_pre_verify"
             elif int(proposal.proposal_len) != gamma:
@@ -1498,10 +1504,22 @@ class ModelRunnerBase:
                 reason = "invalid_to_verify_len"
             elif len(proposal.proposal_token_ids) != gamma:
                 reason = "invalid_proposal_token_len"
+            elif seq is None:
+                reason = "seq_not_found"
+            elif self.is_request_level_finished(seq, plan_context):
+                reason = "seq_finished_before_schedule"
+            elif self.is_speculative_span_invalidated(seq, plan_context):
+                reason = "seq_span_invalidated_before_schedule"
+            elif bool(getattr(seq, "pre_verify", True)):
+                reason = "seq_returned_pre_verify_before_schedule"
+            elif int(len(seq)) != int(proposal.base_len):
+                reason = (
+                    "base_mismatch_before_schedule"
+                    if int(len(seq)) < int(proposal.base_len)
+                    else "base_overshot_before_schedule"
+                )
             elif seq_id in target_home:
-                reason = "intersects_target_home"
-            elif seq_id in draft_home:
-                reason = "intersects_draft_home"
+                reason = "defer_intersects_target_home"
             elif seq_id in seen_seq_ids:
                 reason = "duplicate_ready_seq"
 
@@ -1509,6 +1527,9 @@ class ModelRunnerBase:
                 seen_seq_ids.add(seq_id)
                 scheduled.append(proposal)
                 proposal_id_by_seq_id[seq_id] = proposal_id
+            elif reason.startswith("defer_"):
+                deferred.append(proposal)
+                defer_reason_by_proposal_id[proposal_id] = reason
             else:
                 skipped.append(proposal)
                 skip_reason_by_proposal_id[proposal_id] = reason
@@ -1517,35 +1538,73 @@ class ModelRunnerBase:
             overflow = scheduled[max_requests:]
             scheduled = scheduled[:max_requests]
             for proposal in overflow:
-                skipped.append(proposal)
-                skip_reason_by_proposal_id[int(proposal.proposal_id)] = "max_eager_requests_per_step"
+                deferred.append(proposal)
+                defer_reason_by_proposal_id[int(proposal.proposal_id)] = "defer_max_eager_requests_per_step"
 
         scheduled_seq_ids = [int(proposal.seq_id) for proposal in scheduled]
         scheduled_proposal_ids = [int(proposal.proposal_id) for proposal in scheduled]
+        deferred_seq_ids = [int(proposal.seq_id) for proposal in deferred]
+        deferred_proposal_ids = [int(proposal.proposal_id) for proposal in deferred]
         skipped_proposal_ids = [int(proposal.proposal_id) for proposal in skipped]
-        target_eager_set_dry_run = list(scheduled_seq_ids)
-        plan.target_eager_set_dry_run = list(target_eager_set_dry_run)
+        scheduled_target_eager_set_dry_run = list(scheduled_seq_ids)
+        adjusted_draft_home_set_dry_run = [
+            int(seq_id) for seq_id in plan.draft_home_set if int(seq_id) not in set(scheduled_seq_ids)
+        ]
+        excluded_from_draft_home_for_eager_dry_run = sorted(set(scheduled_seq_ids) & draft_home)
+        plan.target_eager_set_dry_run = list(scheduled_target_eager_set_dry_run)
+        plan.scheduled_target_eager_set_dry_run = list(scheduled_target_eager_set_dry_run)
+        plan.scheduled_target_eager_proposal_ids_dry_run = list(scheduled_proposal_ids)
+        plan.scheduled_target_eager_seq_ids_dry_run = list(scheduled_seq_ids)
+        plan.adjusted_draft_home_set_dry_run = list(adjusted_draft_home_set_dry_run)
+        plan.excluded_from_draft_home_for_eager_dry_run = list(excluded_from_draft_home_for_eager_dry_run)
         plan.eager_schedule_dry_run_enabled = True
 
         clear_reason_by_proposal_id = {
-            str(proposal.proposal_id): "phase1h4c_schedule_dry_run_no_verify_yet"
-            for proposal in ready_proposals
+            str(proposal.proposal_id): "phase1h4c_scheduled_dry_run_no_verify_yet"
+            for proposal in scheduled
         }
+        clear_reason_by_proposal_id.update(
+            {
+                str(proposal.proposal_id): skip_reason_by_proposal_id.get(
+                    int(proposal.proposal_id),
+                    "phase1h4c_invalid_ready_no_verify_yet",
+                )
+                for proposal in skipped
+            }
+        )
+        for proposal in scheduled:
+            proposal.state = EAGER_STATE_TRANSFERRED_DRY_RUN
+            proposal.valid = False
+        for proposal in skipped:
+            proposal.state = EAGER_STATE_DISCARDED
+            proposal.valid = False
         ready_size_after_schedule = len(self._ready_eager_proposals())
-        self.eager_proposal_buffer.remove_many([proposal.proposal_id for proposal in ready_proposals])
+        self.eager_proposal_buffer.remove_many(
+            [proposal.proposal_id for proposal in scheduled + skipped]
+        )
         ready_size_after_clear = len(self._ready_eager_proposals())
 
         trace_record["enable_eager_schedule_dry_run"] = True
         trace_record["eager_schedule_dry_run_enabled"] = True
         trace_record["eager_schedule_step_id"] = None if plan.step_id is None else int(plan.step_id)
         trace_record["eager_schedule_plan_id"] = int(plan.plan_id)
-        trace_record["target_eager_set_dry_run"] = target_eager_set_dry_run
+        trace_record["target_eager_set_dry_run"] = scheduled_target_eager_set_dry_run
+        trace_record["scheduled_target_eager_set_dry_run"] = scheduled_target_eager_set_dry_run
+        trace_record["scheduled_target_eager_proposal_ids_dry_run"] = scheduled_proposal_ids
+        trace_record["scheduled_target_eager_seq_ids_dry_run"] = scheduled_seq_ids
+        trace_record["adjusted_draft_home_set_dry_run"] = adjusted_draft_home_set_dry_run
+        trace_record["excluded_from_draft_home_for_eager_dry_run"] = excluded_from_draft_home_for_eager_dry_run
         trace_record["eager_schedule_candidate_proposal_ids"] = [
             int(proposal.proposal_id) for proposal in candidates
         ]
         trace_record["eager_schedule_candidate_seq_ids"] = [int(proposal.seq_id) for proposal in candidates]
         trace_record["eager_scheduled_proposal_ids"] = scheduled_proposal_ids
         trace_record["eager_scheduled_seq_ids"] = scheduled_seq_ids
+        trace_record["eager_schedule_deferred_proposal_ids"] = deferred_proposal_ids
+        trace_record["eager_schedule_deferred_seq_ids"] = deferred_seq_ids
+        trace_record["eager_schedule_defer_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in defer_reason_by_proposal_id.items()
+        }
         trace_record["eager_schedule_skipped_proposal_ids"] = skipped_proposal_ids
         trace_record["eager_schedule_skip_reason_by_proposal_id"] = {
             str(proposal_id): reason for proposal_id, reason in skip_reason_by_proposal_id.items()
@@ -1575,8 +1634,16 @@ class ModelRunnerBase:
         trace_record["eager_schedule_to_verify_len_by_proposal_id"] = {
             str(proposal_id): value for proposal_id, value in to_verify_len_by_proposal_id.items()
         }
+        adjusted_draft_home = set(adjusted_draft_home_set_dry_run)
         trace_record["eager_schedule_intersects_target_home"] = bool(set(scheduled_seq_ids) & target_home)
-        trace_record["eager_schedule_intersects_draft_home"] = bool(set(scheduled_seq_ids) & draft_home)
+        trace_record["eager_schedule_intersects_original_draft_home"] = bool(set(scheduled_seq_ids) & draft_home)
+        trace_record["eager_schedule_intersects_adjusted_draft_home"] = bool(
+            set(scheduled_seq_ids) & adjusted_draft_home
+        )
+        trace_record["eager_schedule_intersects_draft_home"] = bool(set(scheduled_seq_ids) & adjusted_draft_home)
+        trace_record["eager_schedule_ready_buffer_size_before"] = int(ready_size_before)
+        trace_record["eager_schedule_ready_buffer_size_after"] = int(ready_size_after_schedule)
+        trace_record["eager_schedule_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
         trace_record["eager_ready_buffer_size_before_schedule"] = int(ready_size_before)
         trace_record["eager_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
         trace_record["eager_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
@@ -1586,11 +1653,21 @@ class ModelRunnerBase:
         trace_record["eager_tokens_scheduled_dry_run"] = sum(
             int(proposal.proposal_len) for proposal in scheduled
         )
+        trace_record["eager_tokens_deferred_dry_run"] = sum(
+            int(proposal.proposal_len) for proposal in deferred
+        )
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
         seq_by_id = self._local_sequence_by_id()
         plan_context = self._eager_transfer_plan_context(plan, trace_record)
         buffer_size_before_update = self.eager_proposal_buffer.size()
+        pending_size_before_update = len(
+            [
+                proposal
+                for proposal in self.eager_proposal_buffer.proposals()
+                if proposal.valid and proposal.state == EAGER_STATE_PENDING_BASE_REACHED
+            ]
+        )
         base_len_by_seq_id: dict[int, int] = {}
         base_pre_verify_by_seq_id: dict[int, bool] = {}
         current_len_by_seq_id: dict[int, int] = {}
@@ -1629,6 +1706,13 @@ class ModelRunnerBase:
             )
         )
         buffer_size_after_update = self.eager_proposal_buffer.size()
+        pending_size_after_update = len(
+            [
+                proposal
+                for proposal in self.eager_proposal_buffer.proposals()
+                if proposal.valid and proposal.state == EAGER_STATE_PENDING_BASE_REACHED
+            ]
+        )
 
         meta = torch.zeros(5, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
@@ -1688,6 +1772,13 @@ class ModelRunnerBase:
                 drop_reason_by_proposal_id[int(proposal.proposal_id)] = reason
 
         buffer_size_after_receive = self.eager_proposal_buffer.size()
+        pending_size_after_receive = len(
+            [
+                proposal
+                for proposal in self.eager_proposal_buffer.proposals()
+                if proposal.valid and proposal.state == EAGER_STATE_PENDING_BASE_REACHED
+            ]
+        )
         if self._eager_schedule_dry_run_enabled():
             self._schedule_ready_eager_dry_run(plan, trace_record, plan_context)
         else:
@@ -1786,10 +1877,10 @@ class ModelRunnerBase:
             str(proposal.proposal_id): pending_state_by_proposal_id.get(int(proposal.proposal_id), "discarded")
             for proposal in pending_dropped
         }
-        trace_record["eager_pending_buffer_size_before_update"] = int(buffer_size_before_update)
-        trace_record["eager_pending_buffer_size_after_update"] = int(buffer_size_after_update)
-        trace_record["eager_pending_buffer_size_after_receive"] = int(buffer_size_after_receive)
-        trace_record["eager_pending_buffer_size_after_clear"] = int(buffer_size_after_clear)
+        trace_record["eager_pending_buffer_size_before_update"] = int(pending_size_before_update)
+        trace_record["eager_pending_buffer_size_after_update"] = int(pending_size_after_update)
+        trace_record["eager_pending_buffer_size_after_receive"] = int(pending_size_after_receive)
+        trace_record["eager_pending_buffer_size_after_clear"] = int(len(active_pending))
         trace_record["eager_pending_current_len_by_seq_id"] = {
             str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
         }

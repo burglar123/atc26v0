@@ -157,6 +157,7 @@ EAGER_ZERO_COUNTER_FIELDS = [
     "eager_tokens_transfer_dropped",
     "eager_tokens_schedule_candidates",
     "eager_tokens_scheduled_dry_run",
+    "eager_tokens_deferred_dry_run",
 ]
 
 EAGER_EMPTY_LIST_FIELDS = [
@@ -181,10 +182,17 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_transfer_pending_proposal_ids",
     "eager_transfer_dropped_proposal_ids",
     "target_eager_set_dry_run",
+    "scheduled_target_eager_set_dry_run",
+    "scheduled_target_eager_proposal_ids_dry_run",
+    "scheduled_target_eager_seq_ids_dry_run",
+    "adjusted_draft_home_set_dry_run",
+    "excluded_from_draft_home_for_eager_dry_run",
     "eager_schedule_candidate_proposal_ids",
     "eager_schedule_candidate_seq_ids",
     "eager_scheduled_proposal_ids",
     "eager_scheduled_seq_ids",
+    "eager_schedule_deferred_proposal_ids",
+    "eager_schedule_deferred_seq_ids",
     "eager_schedule_skipped_proposal_ids",
     "eager_pending_received_proposal_ids",
     "eager_pending_received_seq_ids",

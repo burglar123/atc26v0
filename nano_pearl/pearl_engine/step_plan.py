@@ -44,6 +44,11 @@ class StepPlan:
     target_home_set: List[int] = field(default_factory=list)
     target_eager_set: List[int] = field(default_factory=list)
     target_eager_set_dry_run: List[int] = field(default_factory=list)
+    scheduled_target_eager_set_dry_run: List[int] = field(default_factory=list)
+    scheduled_target_eager_proposal_ids_dry_run: List[int] = field(default_factory=list)
+    scheduled_target_eager_seq_ids_dry_run: List[int] = field(default_factory=list)
+    adjusted_draft_home_set_dry_run: List[int] = field(default_factory=list)
+    excluded_from_draft_home_for_eager_dry_run: List[int] = field(default_factory=list)
     draft_home_set: List[int] = field(default_factory=list)
     draft_eager_set: List[int] = field(default_factory=list)
 
@@ -220,6 +225,18 @@ class StepPlan:
         draft_home = set(int(seq_id) for seq_id in self.draft_home_set)
         target_eager = set(int(seq_id) for seq_id in self.target_eager_set)
         target_eager_dry_run = set(int(seq_id) for seq_id in self.target_eager_set_dry_run)
+        scheduled_target_eager_dry_run = set(
+            int(seq_id) for seq_id in self.scheduled_target_eager_set_dry_run
+        )
+        scheduled_target_eager_seq_ids = set(
+            int(seq_id) for seq_id in self.scheduled_target_eager_seq_ids_dry_run
+        )
+        adjusted_draft_home_dry_run = set(
+            int(seq_id) for seq_id in self.adjusted_draft_home_set_dry_run
+        )
+        excluded_from_draft_home = set(
+            int(seq_id) for seq_id in self.excluded_from_draft_home_for_eager_dry_run
+        )
         draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
 
         assert not (target_eager & target_home), (
@@ -238,9 +255,28 @@ class StepPlan:
             f"target_eager_set_dry_run cannot overlap target_home_set: "
             f"{sorted(target_eager_dry_run & target_home)}"
         )
-        assert not (target_eager_dry_run & draft_home), (
-            f"target_eager_set_dry_run cannot overlap draft_home_set: "
-            f"{sorted(target_eager_dry_run & draft_home)}"
+        assert not (scheduled_target_eager_dry_run & target_home), (
+            f"scheduled_target_eager_set_dry_run cannot overlap target_home_set: "
+            f"{sorted(scheduled_target_eager_dry_run & target_home)}"
+        )
+        if self.adjusted_draft_home_set_dry_run:
+            assert not (target_eager_dry_run & adjusted_draft_home_dry_run), (
+                f"target_eager_set_dry_run cannot overlap adjusted_draft_home_set_dry_run: "
+                f"{sorted(target_eager_dry_run & adjusted_draft_home_dry_run)}"
+            )
+            assert not (scheduled_target_eager_dry_run & adjusted_draft_home_dry_run), (
+                "scheduled_target_eager_set_dry_run cannot overlap "
+                f"adjusted_draft_home_set_dry_run: "
+                f"{sorted(scheduled_target_eager_dry_run & adjusted_draft_home_dry_run)}"
+            )
+            assert adjusted_draft_home_dry_run == draft_home - excluded_from_draft_home, (
+                "adjusted_draft_home_set_dry_run must equal draft_home_set minus "
+                f"excluded_from_draft_home_for_eager_dry_run: adjusted={sorted(adjusted_draft_home_dry_run)}, "
+                f"expected={sorted(draft_home - excluded_from_draft_home)}"
+            )
+        assert excluded_from_draft_home <= draft_home, (
+            "excluded_from_draft_home_for_eager_dry_run must be a subset of draft_home_set: "
+            f"extra={sorted(excluded_from_draft_home - draft_home)}"
         )
 
         eager_new_selected = set(int(seq_id) for seq_id in self.eager_new_selected_set)
@@ -284,6 +320,11 @@ class StepPlan:
         eager_list_fields = [
             self.target_eager_set,
             self.target_eager_set_dry_run,
+            self.scheduled_target_eager_set_dry_run,
+            self.scheduled_target_eager_proposal_ids_dry_run,
+            self.scheduled_target_eager_seq_ids_dry_run,
+            self.adjusted_draft_home_set_dry_run,
+            self.excluded_from_draft_home_for_eager_dry_run,
             self.draft_eager_set,
             self.eager_new_selected_set,
             self.eager_continuing_set,
@@ -322,10 +363,21 @@ class StepPlan:
         )
         if enable_eager_schedule_dry_run:
             assert enable_eager_transfer_dry_run, "Phase 1H-4c schedule dry-run requires eager transfer dry-run"
+            assert target_eager_dry_run == scheduled_target_eager_dry_run == scheduled_target_eager_seq_ids, (
+                "Phase 1H-4c requires scheduled target eager dry-run sets to match: "
+                f"target_eager_set_dry_run={self.target_eager_set_dry_run}, "
+                f"scheduled_target_eager_set_dry_run={self.scheduled_target_eager_set_dry_run}, "
+                f"scheduled_target_eager_seq_ids_dry_run={self.scheduled_target_eager_seq_ids_dry_run}"
+            )
         else:
-            assert not target_eager_dry_run, (
-                f"target_eager_set_dry_run requires Phase 1H-4c schedule dry-run, "
-                f"got {self.target_eager_set_dry_run}"
+            assert not (
+                target_eager_dry_run
+                or scheduled_target_eager_dry_run
+                or scheduled_target_eager_seq_ids
+                or self.scheduled_target_eager_proposal_ids_dry_run
+                or excluded_from_draft_home
+            ), (
+                "target eager scheduling dry-run fields require Phase 1H-4c schedule dry-run"
             )
         if enable_eager_transfer_dry_run:
             assert enable_eager_promotion_dry_run, "Phase 1H-4 transfer dry-run requires eager promotion dry-run"
@@ -383,6 +435,17 @@ class StepPlan:
             "target_home_set": _int_list(self.target_home_set),
             "target_eager_set": _int_list(self.target_eager_set),
             "target_eager_set_dry_run": _int_list(self.target_eager_set_dry_run),
+            "scheduled_target_eager_set_dry_run": _int_list(self.scheduled_target_eager_set_dry_run),
+            "scheduled_target_eager_proposal_ids_dry_run": _int_list(
+                self.scheduled_target_eager_proposal_ids_dry_run
+            ),
+            "scheduled_target_eager_seq_ids_dry_run": _int_list(
+                self.scheduled_target_eager_seq_ids_dry_run
+            ),
+            "adjusted_draft_home_set_dry_run": _int_list(self.adjusted_draft_home_set_dry_run),
+            "excluded_from_draft_home_for_eager_dry_run": _int_list(
+                self.excluded_from_draft_home_for_eager_dry_run
+            ),
             "draft_home_set": _int_list(self.draft_home_set),
             "draft_eager_set": _int_list(self.draft_eager_set),
             "budgets": {
