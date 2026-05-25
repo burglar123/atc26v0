@@ -794,16 +794,14 @@ class ModelRunnerBase:
                     step_id=plan.step_id, plan_id=plan.plan_id,
                     base_len=len(_seq),
                 )
-                plan.continuous_eager_proposal_id_by_seq_id[_sid] = _new_pid
-                plan.continuous_eager_parent_proposal_id_by_seq_id[_sid] = _parent_pid
-                plan.continuous_eager_parent_kind_by_seq_id[_sid] = "eager"
-                plan.continuous_eager_proposal_state_by_seq_id[_sid] = "continue_pending"
                 plan.continuous_eager_base_len_by_seq_id[_sid] = int(len(_seq))
                 plan.continuous_eager_source_step_id_by_seq_id[_sid] = plan.step_id
                 plan.continuous_eager_source_plan_id_by_seq_id[_sid] = plan.plan_id
                 plan.continuous_eager_chain_depth_by_seq_id[_sid] = _chain + 1
                 # Populate draft_eager_continue_* metadata — the continuation
                 # proposal (eager_{k+1}) that DRAFT will generate in this step.
+                # Do NOT populate continuous_eager_proposal_* here — those are
+                # reserved for draft_eager_new_set proposals only (Option A).
                 plan.draft_eager_continue_proposal_id_by_seq_id[_sid] = _new_pid
                 plan.draft_eager_continue_parent_proposal_id_by_seq_id[_sid] = _parent_pid
                 plan.draft_eager_continue_proposal_state_by_seq_id[_sid] = "continue_pending"
@@ -2316,20 +2314,23 @@ class ModelRunnerBase:
         promoted: list[int] = []
         discarded: list[int] = []
         unknown: list[int] = []
+        promoted_pids: list[str] = []
+        discarded_pids: list[str] = []
+        unknown_pids: list[str] = []
         discard_reasons: dict[int, str] = {}
         promote_reasons: dict[int, str] = {}
 
         for seq_id in sorted(_trace_state.get_pending_seq_ids()):
             plan.continuous_eager_promotion_checked_seq_ids.append(int(seq_id))
 
+            _pid = _trace_state._latest_proposal_id.get(seq_id, "")
+
             in_normal_verify = seq_id in accepted_lens or seq_id in invalidated_lens
             if not in_normal_verify:
-                _trace_state.mark_pending_unknown(
-                    seq_id,
-                    _trace_state._latest_proposal_id.get(seq_id, ""),
-                    "not_in_normal_verify_batch",
-                )
+                _trace_state.mark_pending_unknown(seq_id, _pid, "not_in_normal_verify_batch")
                 unknown.append(int(seq_id))
+                if _pid:
+                    unknown_pids.append(str(_pid))
                 continue
 
             full_accept = (
@@ -2339,13 +2340,11 @@ class ModelRunnerBase:
             )
 
             if full_accept:
-                _trace_state.promote_pending(
-                    seq_id,
-                    _trace_state._latest_proposal_id.get(seq_id, ""),
-                    "normal_full_accept",
-                )
+                _trace_state.promote_pending(seq_id, _pid, "normal_full_accept")
                 promoted.append(int(seq_id))
                 promote_reasons[int(seq_id)] = "normal_full_accept"
+                if _pid:
+                    promoted_pids.append(str(_pid))
             else:
                 _inv = invalidated_lens.get(seq_id, 0)
                 _acc = accepted_lens.get(seq_id, 0)
@@ -2355,13 +2354,11 @@ class ModelRunnerBase:
                     reason = "normal_verify_zero_accept"
                 else:
                     reason = "normal_verify_partial_or_finished"
-                _trace_state.discard_pending(
-                    seq_id,
-                    _trace_state._latest_proposal_id.get(seq_id, ""),
-                    reason,
-                )
+                _trace_state.discard_pending(seq_id, _pid, reason)
                 discarded.append(int(seq_id))
                 discard_reasons[int(seq_id)] = reason
+                if _pid:
+                    discarded_pids.append(str(_pid))
 
         plan.continuous_eager_promoted_seq_ids = promoted
         plan.continuous_eager_discarded_seq_ids = discarded
@@ -2383,16 +2380,12 @@ class ModelRunnerBase:
             }
             trace_record["continuous_eager_trace_promoted_count"] = len(promoted)
             trace_record["continuous_eager_trace_discarded_count"] = len(discarded)
-            # Record per-seq state transitions so the trace JSON reflects the
-            # actual post-promotion state (ready/discarded/pending_parent_unknown).
-            _cont_state = dict(trace_record.get("continuous_eager_proposal_state_by_seq_id") or {})
-            for _sid in promoted:
-                _cont_state[str(_sid)] = "ready"
-            for _sid in discarded:
-                _cont_state[str(_sid)] = "discarded"
-            for _sid in unknown:
-                _cont_state[str(_sid)] = "pending_parent_unknown"
-            trace_record["continuous_eager_proposal_state_by_seq_id"] = _cont_state
+            # Direct proposal_id lists for evidence-chain validation —
+            # avoids lookups through per-seq maps that may be overwritten
+            # or inconsistent across DRAFT/VERIFY records.
+            trace_record["continuous_eager_promoted_proposal_ids"] = promoted_pids
+            trace_record["continuous_eager_discarded_proposal_ids"] = discarded_pids
+            trace_record["continuous_eager_unknown_proposal_ids"] = unknown_pids
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on

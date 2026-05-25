@@ -648,50 +648,55 @@ def main() -> int:
 
     # --- Cross-record evidence-chain validation ---
     # Every seq in target_eager_set_trace must have a prior promotion/ready event.
-    # Build an index: proposal_id -> set of records where it was promoted/readied.
+    # Build evidence sets from direct proposal_id lists (not per-seq lookups,
+    # which conflate target/draft proposals for the same seq).
     promoted_proposal_ids: set[str] = set()
     simulated_proposal_ids: set[str] = set()
     for r in continuous_records:
-        promoted = r.get("continuous_eager_promoted_seq_ids") or []
-        simulated = r.get("continuous_eager_promotion_simulated_seq_ids") or []
-        # Prefer target_eager_proposal_id_by_seq_id — for continuation seqs,
-        # this holds the ready proposal_id that was actually promoted.
-        # continuous_eager_proposal_id_by_seq_id may have been overwritten in
-        # step 5b with the new continuation proposal_id, which is not the one
-        # that was promoted.
-        target_pid_by_seq = r.get("target_eager_proposal_id_by_seq_id") or {}
-        cont_pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
-        for sid in promoted:
-            pid = target_pid_by_seq.get(str(sid), target_pid_by_seq.get(sid, ""))
-            if not pid:
-                pid = cont_pid_by_seq.get(str(sid), cont_pid_by_seq.get(sid, ""))
-            if pid:
-                promoted_proposal_ids.add(str(pid))
-        for sid in simulated:
-            pid = target_pid_by_seq.get(str(sid), target_pid_by_seq.get(sid, ""))
-            if not pid:
-                pid = cont_pid_by_seq.get(str(sid), cont_pid_by_seq.get(sid, ""))
-            if pid:
-                simulated_proposal_ids.add(str(pid))
+        for pid in (r.get("continuous_eager_promoted_proposal_ids") or []):
+            promoted_proposal_ids.add(str(pid))
+        for pid in (r.get("continuous_eager_promotion_simulated_seq_ids") or []):
+            # simulated_seq_ids may still use seq_ids; also check proposal lists.
+            pass
+        # Also collect from simulated_proposal_ids if present.
+        for pid in (r.get("continuous_eager_promotion_simulated_proposal_ids") or []):
+            simulated_proposal_ids.add(str(pid))
+        # Fallback: build from seq_id lists for records that don't have
+        # proposal_id lists yet (backward compat).
+        promoted_seqs = r.get("continuous_eager_promoted_seq_ids") or []
+        if promoted_seqs and not (r.get("continuous_eager_promoted_proposal_ids") or []):
+            target_pid_by_seq = r.get("target_eager_proposal_id_by_seq_id") or {}
+            cont_pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
+            for sid in promoted_seqs:
+                pid = target_pid_by_seq.get(str(sid), target_pid_by_seq.get(sid, ""))
+                if not pid:
+                    pid = cont_pid_by_seq.get(str(sid), cont_pid_by_seq.get(sid, ""))
+                if pid:
+                    promoted_proposal_ids.add(str(pid))
+        simulated_seqs = r.get("continuous_eager_promotion_simulated_seq_ids") or []
+        if simulated_seqs:
+            target_pid_by_seq = r.get("target_eager_proposal_id_by_seq_id") or {}
+            cont_pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
+            for sid in simulated_seqs:
+                pid = target_pid_by_seq.get(str(sid), target_pid_by_seq.get(sid, ""))
+                if not pid:
+                    pid = cont_pid_by_seq.get(str(sid), cont_pid_by_seq.get(sid, ""))
+                if pid:
+                    simulated_proposal_ids.add(str(pid))
 
     all_evidenced_ids = promoted_proposal_ids | simulated_proposal_ids
 
-    # Also track proposals that were ever in "ready" state (from trace state).
+    # Also track proposals in ready/target_trace_ready state from target_eager_*
+    # (consistent across DRAFT/VERIFY — set during annotation, not promotion).
     ready_proposal_ids: set[str] = set()
     for r in continuous_records:
-        # Check both target_eager_* (ready proposals) and continuous_eager_*
-        # (may show "ready" if set during promotion recording).
-        for (state_by_seq, pid_by_seq) in [
-            (r.get("target_eager_proposal_state_by_seq_id") or {},
-             r.get("target_eager_proposal_id_by_seq_id") or {}),
-            (r.get("continuous_eager_proposal_state_by_seq_id") or {},
-             r.get("continuous_eager_proposal_id_by_seq_id") or {}),
-        ]:
-            for key, state in state_by_seq.items():
-                if str(state) in ("ready", "target_trace_ready"):
-                    pid = pid_by_seq.get(key, pid_by_seq.get(str(key), ""))
-                    if pid:
-                        ready_proposal_ids.add(str(pid))
+        target_state_by_seq = r.get("target_eager_proposal_state_by_seq_id") or {}
+        target_pid_by_seq = r.get("target_eager_proposal_id_by_seq_id") or {}
+        for key, state in target_state_by_seq.items():
+            if str(state) in ("ready", "target_trace_ready"):
+                pid = target_pid_by_seq.get(key, target_pid_by_seq.get(str(key), ""))
+                if pid:
+                    ready_proposal_ids.add(str(pid))
     all_evidenced_ids |= ready_proposal_ids
 
     # Validate: every seq in target_eager_set_trace must have evidence.
@@ -736,17 +741,15 @@ def main() -> int:
         )
 
     # Validate: continue_pending proposals must have a parent that was promoted/ready.
+    # Uses draft_eager_continue_* fields (Option A: continuation metadata is split
+    # from generic continuous_eager_* maps).
     for r in continuous_records:
-        state_by_seq = r.get("continuous_eager_proposal_state_by_seq_id") or {}
-        parent_kind_by_seq = r.get("continuous_eager_parent_kind_by_seq_id") or {}
-        parent_id_by_seq = r.get("continuous_eager_parent_proposal_id_by_seq_id") or {}
-        for key, state in state_by_seq.items():
+        cont_state_by_seq = r.get("draft_eager_continue_proposal_state_by_seq_id") or {}
+        cont_parent_by_seq = r.get("draft_eager_continue_parent_proposal_id_by_seq_id") or {}
+        for key, state in cont_state_by_seq.items():
             if str(state) != "continue_pending":
                 continue
-            parent_kind = str(parent_kind_by_seq.get(key, parent_kind_by_seq.get(str(key), "")))
-            if parent_kind != "eager":
-                continue
-            parent_pid = str(parent_id_by_seq.get(key, parent_id_by_seq.get(str(key), "")))
+            parent_pid = str(cont_parent_by_seq.get(key, cont_parent_by_seq.get(str(key), "")))
             if parent_pid and parent_pid not in all_evidenced_ids:
                 errors.append(
                     f"continue_pending proposal {key} has parent_proposal_id={parent_pid} "
