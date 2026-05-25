@@ -115,6 +115,16 @@ def is_dual_record(record: dict[str, Any]) -> bool:
     )
 
 
+def is_draft_transfer_send_record(record: dict[str, Any], sent_ids: set[int], transferred_tokens: int) -> bool:
+    runner_role = str(record.get("runner_role") or "")
+    return (
+        bool(sent_ids)
+        or transferred_tokens > 0
+        or runner_role in {"dual_draft", "eager_transfer_dry_run"}
+        or int_value(record.get("draft_transfer_buffer_size_before_send"), 0) > 0
+    )
+
+
 def transfer_step_key(record: dict[str, Any]) -> tuple[int, int]:
     plan_id = int_value(record.get("eager_transfer_plan_id"), int_value(record.get("plan_id"), -1))
     step_id = int_value(record.get("eager_transfer_step_id"), int_value(record.get("step_id"), -1))
@@ -303,8 +313,19 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 f"record[{idx}] eager_tokens_transferred must equal eager_tokens_promoted on draft send rows: "
                 f"{transferred} != {promoted}"
             )
-        if int_value(record.get("draft_eager_buffer_size_after_transfer"), 0) != 0:
-            errors.append(f"record[{idx}] draft_eager_buffer_size_after_transfer must be 0")
+        if is_draft_transfer_send_record(record, sent_ids, transferred):
+            draft_after_send = int_value(
+                record.get(
+                    "draft_transfer_buffer_size_after_send",
+                    record.get("draft_eager_buffer_size_after_transfer"),
+                ),
+                0,
+            )
+            if draft_after_send != 0:
+                errors.append(
+                    f"record[{idx}] draft transfer send buffer must be 0 after send, "
+                    f"got {draft_after_send}"
+                )
         if int_value(record.get("target_eager_buffer_size_after_clear"), 0) < 0:
             errors.append(f"record[{idx}] target eager buffer size cannot be negative")
         if int_value(record.get("eager_pending_buffer_size_after_clear"), 0) < 0:
@@ -658,6 +679,12 @@ def synthetic_base_record() -> dict[str, Any]:
         "eager_tokens_transfer_pending": 0,
         "eager_tokens_transfer_validated": 0,
         "eager_tokens_transfer_dropped": 0,
+        "draft_transfer_buffer_size_before_send": 0,
+        "draft_transfer_buffer_size_after_send": 0,
+        "draft_eager_buffer_size_before_transfer": 0,
+        "draft_eager_buffer_size_after_transfer": 0,
+        "target_ready_buffer_size_after_receive": 0,
+        "target_ready_buffer_size_after_schedule": 0,
     }
     for field in ALWAYS_ZERO_COUNTER_FIELDS:
         record[field] = 0
@@ -752,7 +779,12 @@ def synthetic_transfer_record(num_proposals: int = 1) -> dict[str, Any]:
             "eager_pending_base_len_by_seq_id": {"1": 12} if num_proposals else {},
             "eager_pending_base_delta_by_seq_id": {"1": 0} if num_proposals else {},
             "eager_pending_state_by_proposal_id": {"101": "base_reached"} if num_proposals else {},
+            "draft_transfer_buffer_size_before_send": num_proposals,
+            "draft_transfer_buffer_size_after_send": 0,
+            "draft_eager_buffer_size_before_transfer": num_proposals,
             "draft_eager_buffer_size_after_transfer": 0,
+            "target_ready_buffer_size_after_receive": num_proposals,
+            "target_ready_buffer_size_after_schedule": 0,
             "target_eager_buffer_size_after_clear": 0,
             "eager_tokens_transferred": transferred,
             "eager_tokens_transfer_pending": 0,
@@ -925,6 +957,32 @@ def synthetic_split_transfer_records() -> list[dict[str, Any]]:
     return [draft, target]
 
 
+def synthetic_target_schedule_buffer_record() -> dict[str, Any]:
+    record = synthetic_transfer_record(0)
+    record.update(
+        {
+            "runner_role": "dual_verify",
+            "eager_transfer_step_id": 17,
+            "eager_transfer_plan_id": 57,
+            "draft_transfer_buffer_size_before_send": 0,
+            "draft_transfer_buffer_size_after_send": 0,
+            # Legacy field can be nonzero on target-side schedule rows from
+            # older traces; it reflects target ready/deferred proposals, not a
+            # draft send-buffer leak.
+            "draft_eager_buffer_size_after_transfer": 2,
+            "target_ready_buffer_size_after_receive": 2,
+            "target_ready_buffer_size_after_schedule": 2,
+            "eager_schedule_candidate_proposal_ids": [501, 502],
+            "eager_schedule_deferred_proposal_ids": [501, 502],
+            "eager_schedule_defer_reason_by_proposal_id": {
+                "501": "defer_intersects_target_home",
+                "502": "defer_intersects_target_home",
+            },
+        }
+    )
+    return record
+
+
 def run_synthetic_tests() -> None:
     proposal = make_proposal()
     meta, payload = serialize_eager_transfer_payload([proposal], gamma=4, plan_id=11, step_id=7)
@@ -992,31 +1050,34 @@ def run_synthetic_tests() -> None:
             active_in_plan=True,
         ),
         *synthetic_split_transfer_records(),
+        synthetic_target_schedule_buffer_record(),
     ]
     errors, _ = validate_records(valid_records)
     assert not errors, f"valid synthetic eager transfer records failed: {errors}"
 
+    split_target_idx = len(valid_records) - 2
+
     invalid = deepcopy(valid_records)
-    invalid[-1]["eager_transfer_received_proposal_ids"] = [999]
+    invalid[split_target_idx]["eager_transfer_received_proposal_ids"] = [999]
     errors, _ = validate_records(invalid)
     assert any("received proposal ids" in error for error in errors), "checker missed sent/received mismatch"
 
     invalid = deepcopy(valid_records)
-    invalid[-1]["eager_transfer_base_match_by_seq_id"] = {"1": False}
+    invalid[split_target_idx]["eager_transfer_base_match_by_seq_id"] = {"1": False}
     errors, _ = validate_records(invalid)
     assert any("base_len match" in error for error in errors), "checker missed base_len mismatch"
 
     invalid = deepcopy(valid_records)
-    invalid[-1]["eager_transfer_base_pre_verify_by_seq_id"] = {"1": True}
+    invalid[split_target_idx]["eager_transfer_base_pre_verify_by_seq_id"] = {"1": True}
     errors, _ = validate_records(invalid)
     assert any("base_pre_verify" in error for error in errors), "checker missed base_pre_verify mismatch"
 
     invalid = deepcopy(valid_records)
-    invalid[-1]["eager_transfer_validated_proposal_ids"] = []
-    invalid[-1]["eager_transfer_dropped_proposal_ids"] = [101]
-    invalid[-1]["eager_transfer_drop_reason_by_proposal_id"] = {"101": "seq_not_running"}
-    invalid[-1]["eager_tokens_transfer_validated"] = 0
-    invalid[-1]["eager_tokens_transfer_dropped"] = 4
+    invalid[split_target_idx]["eager_transfer_validated_proposal_ids"] = []
+    invalid[split_target_idx]["eager_transfer_dropped_proposal_ids"] = [101]
+    invalid[split_target_idx]["eager_transfer_drop_reason_by_proposal_id"] = {"101": "seq_not_running"}
+    invalid[split_target_idx]["eager_tokens_transfer_validated"] = 0
+    invalid[split_target_idx]["eager_tokens_transfer_dropped"] = 4
     errors, _ = validate_records(invalid)
     assert any("seq_not_running" in error for error in errors), "checker missed seq_not_running for present seq"
 

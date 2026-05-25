@@ -645,8 +645,12 @@ class ModelRunnerBase:
             "eager_pending_base_len_by_seq_id": {},
             "eager_pending_base_delta_by_seq_id": {},
             "eager_pending_state_by_proposal_id": {},
-            "draft_eager_buffer_size_before_transfer": self.eager_proposal_buffer.size(),
-            "draft_eager_buffer_size_after_transfer": self.eager_proposal_buffer.size(),
+            "draft_transfer_buffer_size_before_send": 0,
+            "draft_transfer_buffer_size_after_send": 0,
+            "draft_eager_buffer_size_before_transfer": 0,
+            "draft_eager_buffer_size_after_transfer": 0,
+            "target_ready_buffer_size_after_receive": 0,
+            "target_ready_buffer_size_after_schedule": 0,
             "target_eager_buffer_size_before_receive": self.eager_proposal_buffer.size(),
             "target_eager_buffer_size_after_receive": self.eager_proposal_buffer.size(),
             "target_eager_buffer_size_after_clear": self.eager_proposal_buffer.size(),
@@ -1182,6 +1186,8 @@ class ModelRunnerBase:
         trace_record["eager_transfer_payload_len"] = int(meta_values[1])
         trace_record["eager_transfer_sent_proposal_ids"] = [int(proposal.proposal_id) for proposal in proposals]
         trace_record["eager_transfer_sent_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+        trace_record["draft_transfer_buffer_size_before_send"] = int(buffer_size_before)
+        trace_record["draft_transfer_buffer_size_after_send"] = self.eager_proposal_buffer.size()
         trace_record["draft_eager_buffer_size_before_transfer"] = int(buffer_size_before)
         trace_record["draft_eager_buffer_size_after_transfer"] = self.eager_proposal_buffer.size()
         trace_record["eager_tokens_transferred"] = sum(int(proposal.proposal_len) for proposal in proposals)
@@ -1644,6 +1650,7 @@ class ModelRunnerBase:
         trace_record["eager_schedule_ready_buffer_size_before"] = int(ready_size_before)
         trace_record["eager_schedule_ready_buffer_size_after"] = int(ready_size_after_schedule)
         trace_record["eager_schedule_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
+        trace_record["target_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
         trace_record["eager_ready_buffer_size_before_schedule"] = int(ready_size_before)
         trace_record["eager_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
         trace_record["eager_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
@@ -1779,6 +1786,9 @@ class ModelRunnerBase:
                 if proposal.valid and proposal.state == EAGER_STATE_PENDING_BASE_REACHED
             ]
         )
+        target_ready_size_after_receive = len(self._ready_eager_proposals())
+        trace_record["target_ready_buffer_size_after_receive"] = int(target_ready_size_after_receive)
+        trace_record["target_ready_buffer_size_after_schedule"] = int(target_ready_size_after_receive)
         if self._eager_schedule_dry_run_enabled():
             self._schedule_ready_eager_dry_run(plan, trace_record, plan_context)
         else:
