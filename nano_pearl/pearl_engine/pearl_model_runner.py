@@ -35,6 +35,7 @@ from nano_pearl.pearl_engine.dual_batch import (
     EAGER_STATE_PENDING_BASE_REACHED,
     EAGER_STATE_READY_TO_VERIFY,
     EAGER_STATE_READY_TO_VERIFY_DRY_RUN,
+    EAGER_STATE_SCHEDULED_DRY_RUN,
     EAGER_STATE_TRANSFERRED_DRY_RUN,
     EagerProposal,
     EagerProposalBuffer,
@@ -565,6 +566,31 @@ class ModelRunnerBase:
                 getattr(self.global_config, "enable_eager_schedule_dry_run", False)
             ),
             "eager_schedule_dry_run_enabled": False,
+            "enable_eager_verify_dry_run": bool(
+                getattr(self.global_config, "enable_eager_verify_dry_run", False)
+            ),
+            "eager_verify_dry_run_enabled": False,
+            "eager_verify_dry_run_step_id": None,
+            "eager_verify_dry_run_plan_id": None,
+            "eager_verify_candidate_proposal_ids": [],
+            "eager_verify_candidate_seq_ids": [],
+            "eager_verify_skipped_proposal_ids": [],
+            "eager_verify_skip_reason_by_proposal_id": {},
+            "eager_verify_executed_proposal_ids": [],
+            "eager_verify_executed_seq_ids": [],
+            "eager_verify_accepted_len_by_seq_id": {},
+            "eager_verify_full_accept_by_seq_id": {},
+            "eager_verify_reject_position_by_seq_id": {},
+            "eager_verify_invalidated_len_by_seq_id": {},
+            "eager_verify_revised_token_by_seq_id": {},
+            "eager_verify_base_len_by_seq_id": {},
+            "eager_verify_current_len_by_seq_id": {},
+            "eager_verify_base_match_by_seq_id": {},
+            "eager_verify_seq_pre_verify_by_seq_id": {},
+            "eager_verify_seq_status_before_by_seq_id": {},
+            "eager_verify_seq_status_after_by_seq_id": {},
+            "eager_verify_mutation_detected_by_seq_id": {},
+            "eager_verify_checkpoint_ok_by_seq_id": {},
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
             "target_eager_set_dry_run": [],
@@ -683,6 +709,9 @@ class ModelRunnerBase:
             "eager_tokens_schedule_candidates": 0,
             "eager_tokens_scheduled_dry_run": 0,
             "eager_tokens_deferred_dry_run": 0,
+            "eager_tokens_verify_dry_run": 0,
+            "eager_tokens_verify_dry_run_full_accept": 0,
+            "eager_tokens_verify_dry_run_rejected": 0,
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -791,6 +820,9 @@ class ModelRunnerBase:
     def _eager_schedule_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_schedule_dry_run", False))
 
+    def _eager_verify_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_verify_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -801,7 +833,8 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled()
+        verify_dry_run_enabled = self._eager_verify_dry_run_enabled()
+        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled
         transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled() or schedule_dry_run_enabled
         promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled() or transfer_dry_run_enabled
         draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
@@ -813,6 +846,7 @@ class ModelRunnerBase:
         plan.enable_eager_promotion_dry_run = promotion_dry_run_enabled
         plan.enable_eager_transfer_dry_run = transfer_dry_run_enabled
         plan.enable_eager_schedule_dry_run = schedule_dry_run_enabled
+        plan.enable_eager_verify_dry_run = verify_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -848,6 +882,7 @@ class ModelRunnerBase:
                 enable_eager_promotion_dry_run=promotion_dry_run_enabled,
                 enable_eager_transfer_dry_run=transfer_dry_run_enabled,
                 enable_eager_schedule_dry_run=schedule_dry_run_enabled,
+                enable_eager_verify_dry_run=verify_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -934,6 +969,7 @@ class ModelRunnerBase:
             enable_eager_promotion_dry_run=promotion_dry_run_enabled,
             enable_eager_transfer_dry_run=transfer_dry_run_enabled,
             enable_eager_schedule_dry_run=schedule_dry_run_enabled,
+            enable_eager_verify_dry_run=verify_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1453,6 +1489,281 @@ class ModelRunnerBase:
             key=lambda proposal: (int(proposal.proposal_id), int(proposal.seq_id)),
         )
 
+    @torch.inference_mode()
+    def compute_pearl_verify_result_no_apply(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor | None,
+        proposals: list[EagerProposal],
+        gamma: int,
+        lane: str = LANE_EAGER,
+    ) -> dict[str, dict[int, int | bool]]:
+        """Compute PEARL verification results without mutating Sequence state."""
+        if lane != LANE_EAGER:
+            raise ValueError(f"unsupported no-apply verify lane={lane!r}")
+        to_be_verified_tokens: list[int] = []
+        for proposal in proposals:
+            to_be_verified_tokens.extend(int(token_id) for token_id in proposal.to_be_verified_token_ids)
+        num_to_be_verified_tokens = len(to_be_verified_tokens)
+        msg = torch.tensor(to_be_verified_tokens, dtype=torch.int64, device="cuda")
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+
+        if self.tp_params.local_rank == 0 and seqs:
+            r = torch.rand(num_to_be_verified_tokens, device="cuda")
+            target_logits = norm_logits(logits, temperatures)
+            target_prob = target_logits.gather(dim=1, index=msg.unsqueeze(1)).squeeze(1)
+            judge = (r <= target_prob).tolist()
+
+            revised_logits = logits.clone()
+            revised_logits.scatter_(1, msg.unsqueeze(1), -float("inf"))
+            revised_tokens = self.sampler(revised_logits, temperatures)
+
+            acc, rollout, revise_token, finish = [], [], [], []
+            v_idx = 0
+            for seq in seqs:
+                if seq.pre_verify:
+                    n = 1 if judge[v_idx] else 0
+                    acc.append(bool(judge[v_idx]))
+                    rollout.append(0 if judge[v_idx] else int(gamma))
+                    revise_token.append(int(revised_tokens[v_idx]))
+                    finish.append(
+                        (not seq.ignore_eos and judge[v_idx] and is_eos(to_be_verified_tokens[v_idx], self.scheduler.eos))
+                        or seq.num_completion_tokens >= seq.max_tokens - 1
+                    )
+                    v_idx += 1
+                    continue
+
+                n = int(gamma)
+                finish_flag = False
+                for j in range(v_idx, v_idx + int(gamma)):
+                    if not seq.ignore_eos and judge[j] and is_eos(to_be_verified_tokens[j], self.scheduler.eos):
+                        finish_flag = True
+                    if not judge[j]:
+                        n = j - v_idx
+                        break
+                acc.append(n == int(gamma))
+                rollout.append(int(gamma) - n)
+                revise_token.append(int(revised_tokens[n + v_idx]) if n < int(gamma) else -1)
+                finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, int(gamma)))
+                v_idx += int(gamma)
+
+            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=self.group)
+        acc, rollout, revise_token, _finish = verify_res.tolist()
+
+        accepted_len_by_seq_id: dict[int, int] = {}
+        invalidated_len_by_seq_id: dict[int, int] = {}
+        reject_position_by_seq_id: dict[int, int] = {}
+        revised_token_by_seq_id: dict[int, int] = {}
+        full_accept_by_seq_id: dict[int, bool] = {}
+        for idx, seq in enumerate(seqs):
+            seq_id = int(seq.seq_id)
+            if seq.pre_verify:
+                accepted_len = 1 if acc[idx] else 0
+            else:
+                accepted_len = int(gamma) if acc[idx] else int(gamma) - int(rollout[idx])
+            invalidated_len = 0 if acc[idx] else int(rollout[idx])
+            accepted_len_by_seq_id[seq_id] = int(accepted_len)
+            invalidated_len_by_seq_id[seq_id] = int(invalidated_len)
+            reject_position_by_seq_id[seq_id] = -1 if acc[idx] else int(accepted_len)
+            revised_token_by_seq_id[seq_id] = int(revise_token[idx])
+            full_accept_by_seq_id[seq_id] = bool(accepted_len == int(gamma))
+
+        return {
+            "accepted_len_by_seq_id": accepted_len_by_seq_id,
+            "invalidated_len_by_seq_id": invalidated_len_by_seq_id,
+            "reject_position_by_seq_id": reject_position_by_seq_id,
+            "revised_token_by_seq_id": revised_token_by_seq_id,
+            "full_accept_by_seq_id": full_accept_by_seq_id,
+        }
+
+    def _run_eager_verify_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        scheduled_proposals: list[EagerProposal],
+        plan_context: dict[str, set[int]],
+    ) -> None:
+        seq_by_id = self._local_sequence_by_id()
+        gamma = int(self.gamma)
+        scheduled_proposal_ids = {int(proposal.proposal_id) for proposal in scheduled_proposals}
+        scheduled_seq_ids = {int(seq_id) for seq_id in plan.scheduled_target_eager_seq_ids_dry_run}
+        adjusted_draft_home = {int(seq_id) for seq_id in plan.adjusted_draft_home_set_dry_run}
+
+        executed_proposals: list[EagerProposal] = []
+        executed_seqs: list[Sequence] = []
+        skipped_proposal_ids: list[int] = []
+        skip_reason_by_proposal_id: dict[int, str] = {}
+        base_len_by_seq_id: dict[int, int] = {}
+        current_len_by_seq_id: dict[int, int] = {}
+        base_match_by_seq_id: dict[int, bool] = {}
+        seq_pre_verify_by_seq_id: dict[int, bool] = {}
+        seq_status_before_by_seq_id: dict[int, str] = {}
+
+        for proposal in scheduled_proposals:
+            proposal_id = int(proposal.proposal_id)
+            seq_id = int(proposal.seq_id)
+            seq = seq_by_id.get(seq_id)
+            current_len = -1 if seq is None else int(len(seq))
+            base_len_by_seq_id[seq_id] = int(proposal.base_len)
+            current_len_by_seq_id[seq_id] = current_len
+            base_match_by_seq_id[seq_id] = seq is not None and current_len == int(proposal.base_len)
+            seq_pre_verify_by_seq_id[seq_id] = bool(getattr(seq, "pre_verify", True)) if seq is not None else True
+            seq_status_before_by_seq_id[seq_id] = self._sequence_status_name(seq)
+
+            reason = None
+            if proposal_id not in scheduled_proposal_ids:
+                reason = "not_scheduled_proposal"
+            elif seq_id not in scheduled_seq_ids:
+                reason = "not_scheduled_seq"
+            elif seq_id in {int(seq_id) for seq_id in plan.target_home_set}:
+                reason = "intersects_target_home"
+            elif seq_id in adjusted_draft_home:
+                reason = "intersects_adjusted_draft_home"
+            elif proposal.lane != LANE_EAGER:
+                reason = "invalid_lane"
+            elif proposal.state not in {EAGER_STATE_READY_TO_VERIFY_DRY_RUN, EAGER_STATE_SCHEDULED_DRY_RUN}:
+                reason = "invalid_state"
+            elif bool(proposal.base_pre_verify):
+                reason = "invalid_base_pre_verify"
+            elif int(proposal.proposal_len) != gamma:
+                reason = "invalid_proposal_len"
+            elif len(proposal.to_be_verified_token_ids) != gamma:
+                reason = "invalid_to_verify_len"
+            elif len(proposal.proposal_token_ids) != gamma:
+                reason = "invalid_proposal_token_len"
+            elif seq is None:
+                reason = "seq_not_found"
+            elif self.is_request_level_finished(seq, plan_context):
+                reason = "seq_finished_before_verify"
+            elif self.is_speculative_span_invalidated(seq, plan_context):
+                reason = "seq_span_invalidated_before_verify"
+            elif bool(getattr(seq, "pre_verify", True)):
+                reason = "seq_returned_pre_verify_before_verify"
+            elif int(len(seq)) != int(proposal.base_len):
+                reason = "base_mismatch_before_verify"
+
+            if reason is None:
+                proposal.state = EAGER_STATE_SCHEDULED_DRY_RUN
+                executed_proposals.append(proposal)
+                executed_seqs.append(seq)
+            else:
+                skipped_proposal_ids.append(proposal_id)
+                skip_reason_by_proposal_id[proposal_id] = reason
+
+        checkpoints = {int(seq.seq_id): make_sequence_checkpoint(seq) for seq in executed_seqs}
+        results: dict[str, dict[int, int | bool]] = {
+            "accepted_len_by_seq_id": {},
+            "invalidated_len_by_seq_id": {},
+            "reject_position_by_seq_id": {},
+            "revised_token_by_seq_id": {},
+            "full_accept_by_seq_id": {},
+        }
+        if executed_seqs:
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode(executed_seqs)
+            temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+            torch.cuda.synchronize()
+            logits = self.run_model(input_ids, positions, False)
+            results = self.compute_pearl_verify_result_no_apply(
+                logits,
+                executed_seqs,
+                temperatures,
+                executed_proposals,
+                gamma=gamma,
+                lane=LANE_EAGER,
+            )
+            torch.cuda.synchronize()
+
+        seq_status_after_by_seq_id: dict[int, str] = {}
+        mutation_detected_by_seq_id: dict[int, bool] = {}
+        checkpoint_ok_by_seq_id: dict[int, bool] = {}
+        for seq in executed_seqs:
+            seq_id = int(seq.seq_id)
+            seq_status_after_by_seq_id[seq_id] = self._sequence_status_name(seq)
+            try:
+                assert_sequence_matches_checkpoint(seq, checkpoints[seq_id])
+                checkpoint_ok_by_seq_id[seq_id] = True
+                mutation_detected_by_seq_id[seq_id] = False
+            except AssertionError:
+                checkpoint_ok_by_seq_id[seq_id] = False
+                mutation_detected_by_seq_id[seq_id] = True
+
+        trace_record["enable_eager_verify_dry_run"] = True
+        trace_record["eager_verify_dry_run_enabled"] = True
+        trace_record["eager_verify_dry_run_step_id"] = None if plan.step_id is None else int(plan.step_id)
+        trace_record["eager_verify_dry_run_plan_id"] = int(plan.plan_id)
+        trace_record["eager_verify_candidate_proposal_ids"] = [
+            int(proposal.proposal_id) for proposal in scheduled_proposals
+        ]
+        trace_record["eager_verify_candidate_seq_ids"] = [int(proposal.seq_id) for proposal in scheduled_proposals]
+        trace_record["eager_verify_skipped_proposal_ids"] = [int(proposal_id) for proposal_id in skipped_proposal_ids]
+        trace_record["eager_verify_skip_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in skip_reason_by_proposal_id.items()
+        }
+        trace_record["eager_verify_executed_proposal_ids"] = [
+            int(proposal.proposal_id) for proposal in executed_proposals
+        ]
+        trace_record["eager_verify_executed_seq_ids"] = [int(seq.seq_id) for seq in executed_seqs]
+        trace_record["eager_verify_accepted_len_by_seq_id"] = {
+            str(seq_id): int(value)
+            for seq_id, value in results["accepted_len_by_seq_id"].items()
+        }
+        trace_record["eager_verify_full_accept_by_seq_id"] = {
+            str(seq_id): bool(value)
+            for seq_id, value in results["full_accept_by_seq_id"].items()
+        }
+        trace_record["eager_verify_reject_position_by_seq_id"] = {
+            str(seq_id): int(value)
+            for seq_id, value in results["reject_position_by_seq_id"].items()
+        }
+        trace_record["eager_verify_invalidated_len_by_seq_id"] = {
+            str(seq_id): int(value)
+            for seq_id, value in results["invalidated_len_by_seq_id"].items()
+        }
+        trace_record["eager_verify_revised_token_by_seq_id"] = {
+            str(seq_id): int(value)
+            for seq_id, value in results["revised_token_by_seq_id"].items()
+        }
+        trace_record["eager_verify_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_verify_current_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
+        }
+        trace_record["eager_verify_base_match_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_match_by_seq_id.items()
+        }
+        trace_record["eager_verify_seq_pre_verify_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_pre_verify_by_seq_id.items()
+        }
+        trace_record["eager_verify_seq_status_before_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_status_before_by_seq_id.items()
+        }
+        trace_record["eager_verify_seq_status_after_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_status_after_by_seq_id.items()
+        }
+        trace_record["eager_verify_mutation_detected_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in mutation_detected_by_seq_id.items()
+        }
+        trace_record["eager_verify_checkpoint_ok_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in checkpoint_ok_by_seq_id.items()
+        }
+        trace_record["eager_tokens_verify_dry_run"] = sum(
+            int(proposal.proposal_len) for proposal in executed_proposals
+        )
+        trace_record["eager_tokens_verify_dry_run_full_accept"] = sum(
+            int(proposal.proposal_len)
+            for proposal in executed_proposals
+            if bool(results["full_accept_by_seq_id"].get(int(proposal.seq_id), False))
+        )
+        trace_record["eager_tokens_verify_dry_run_rejected"] = sum(
+            int(proposal.proposal_len)
+            for proposal in executed_proposals
+            if not bool(results["full_accept_by_seq_id"].get(int(proposal.seq_id), False))
+        )
+
     def _schedule_ready_eager_dry_run(
         self,
         plan: StepPlan,
@@ -1564,6 +1875,15 @@ class ModelRunnerBase:
         plan.adjusted_draft_home_set_dry_run = list(adjusted_draft_home_set_dry_run)
         plan.excluded_from_draft_home_for_eager_dry_run = list(excluded_from_draft_home_for_eager_dry_run)
         plan.eager_schedule_dry_run_enabled = True
+        plan.enable_eager_verify_dry_run = self._eager_verify_dry_run_enabled()
+        if self._eager_verify_dry_run_enabled():
+            plan.eager_verify_dry_run_enabled = True
+            self._run_eager_verify_dry_run(
+                plan,
+                trace_record,
+                scheduled,
+                plan_context,
+            )
 
         clear_reason_by_proposal_id = {
             str(proposal.proposal_id): "phase1h4c_scheduled_dry_run_no_verify_yet"
