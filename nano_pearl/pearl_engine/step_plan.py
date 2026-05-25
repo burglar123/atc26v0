@@ -47,6 +47,8 @@ class StepPlan:
 
     # Phase 1I-A: continuous eager draft-execution scaffold executed set.
     draft_eager_new_set_executed: List[int] = field(default_factory=list)
+    # Invariant: always empty (continue set is never executed).
+    draft_eager_continue_set_executed: List[int] = field(default_factory=list)
 
     budgets: Dict[int, RequestBudget] = field(default_factory=dict)
 
@@ -491,6 +493,9 @@ class StepPlan:
             "draft_home_set_executed": [int(seq_id) for seq_id in self.draft_home_set_executed],
             "draft_eager_set_executed": [int(seq_id) for seq_id in self.draft_eager_set_executed],
             "target_eager_set_executed": [int(seq_id) for seq_id in self.target_eager_set_executed],
+            "draft_eager_continue_set_executed": [
+                int(seq_id) for seq_id in self.draft_eager_continue_set_executed
+            ],
             # Phase 1I-A scaffold executed set.
             "draft_eager_new_set_executed": [int(seq_id) for seq_id in self.draft_eager_new_set_executed],
             "budgets": {

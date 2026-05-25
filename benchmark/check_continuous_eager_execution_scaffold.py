@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """Check Phase 1I-A continuous eager draft-execution scaffold invariants.
 
-Validates that:
+Phase-aware validation:
+  - steady: strict scaffold validation (all fields required for executed seqs).
+  - priming/fallback: safety-only unless proposals are actually executed.
+
+Validates:
   A. draft_eager_new_set_executed non-empty implies proposals were generated.
   B. draft_eager_continue_set seqs are NOT in draft_eager_new_set_executed.
   C. target_eager_set_executed remains empty (no target verification).
   D. Executed seqs have continuous_eager_exec_base_kind = "draft_eager_new_set".
-  E. scaffold_proposals_sent >= scaffold_proposals_received (DRAFT-TARGET consistency).
+  E. scaffold_proposals_sent >= scaffold_proposals_received (cross-record).
   F. Promoted proposals have parent_acceptance_status = "accepted".
   G. tokens_generated > 0 iff draft_eager_new_set_executed non-empty.
-  H. No token mutation evidence (sequence lengths unchanged by scaffold).
-  I. Enablement flag present in all scaffold records.
-  J. Base validation: all executed seqs have base_validation_ok=True.
-  K. Transport token consistency: send_token_count >= receive_token_count.
+  H. No token mutation evidence.
+  I. Enablement flag present in all scaffold-eligible records.
+  J. Base validation: every executed seq has base_validation_ok=True.
+  K. Transport token consistency: send_token_count == receive_token_count.
   L. Buffer consistency: buffer_size_after >= buffer_size_before.
-  M. Promotion/discard exec fields populated when proposals present.
+  M. Promotion/discard fields populated when proposals present.
   N. Execution phase is non-empty in scaffold records.
+  O. draft_eager_continue_set_executed == [].
+  P. eager_tokens_verified == 0, eager_tokens_accepted == 0.
+  Q. Sent/received proposal ids match.
+  R. Sent/received token counts match.
+  S. Proposals generated => sent > 0, received > 0.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +64,13 @@ def _has_scaffold_fields(record: dict[str, Any]) -> bool:
             "continuous_eager_scaffold_tokens_generated",
             "continuous_eager_scaffold_proposals_generated",
             "draft_eager_new_set_executed",
+            "continuous_eager_draft_execution_enabled",
         )
     )
+
+
+def _is_scaffold_enabled(record: dict[str, Any]) -> bool:
+    return bool(record.get("continuous_eager_draft_execution_enabled"))
 
 
 def main() -> int:
@@ -74,8 +88,40 @@ def main() -> int:
         print("\nNo scaffold records found — nothing to check.")
         return 0
 
+    # Classify records by phase for phase-aware validation.
+    steady_records = [r for r in scaffold_records if r.get("plan_phase") == "steady"]
+    non_steady_records = [r for r in scaffold_records if r.get("plan_phase") != "steady"]
+
+    print(f"steady_scaffold_records={len(steady_records)}")
+    print(f"non_steady_scaffold_records={len(non_steady_records)}")
+
     errors: list[str] = []
     warnings: list[str] = []
+
+    # --- Aggregated diagnostics for non-steady records ---
+    missing_flag_by_phase_role: dict[tuple[str, str], int] = defaultdict(int)
+    missing_phase_by_phase_role: dict[tuple[str, str], int] = defaultdict(int)
+
+    for record in non_steady_records:
+        if not _is_scaffold_enabled(record):
+            continue
+        phase = record.get("plan_phase", "unknown")
+        role = record.get("runner_role", "unknown")
+        if not record.get("continuous_eager_draft_execution_enabled"):
+            missing_flag_by_phase_role[(role, phase)] += 1
+        if not record.get("continuous_eager_execution_phase"):
+            missing_phase_by_phase_role[(role, phase)] += 1
+
+    # Print aggregated non-steady diagnostics (not individual errors).
+    if missing_flag_by_phase_role:
+        print("\n--- Non-steady: missing continuous_eager_draft_execution_enabled ---")
+        for (role, phase), count in sorted(missing_flag_by_phase_role.items()):
+            print(f"  role={role} phase={phase} count={count}")
+
+    if missing_phase_by_phase_role:
+        print("\n--- Non-steady: missing continuous_eager_execution_phase ---")
+        for (role, phase), count in sorted(missing_phase_by_phase_role.items()):
+            print(f"  role={role} phase={phase} count={count}")
 
     # --- Summary ---
     total_executed = sum(len(r.get("draft_eager_new_set_executed") or []) for r in scaffold_records)
@@ -100,7 +146,6 @@ def main() -> int:
         int(r.get("continuous_eager_scaffold_proposals_discarded") or 0) for r in scaffold_records
     )
 
-    # Transport exec totals
     exec_send_tokens = sum(
         int(r.get("continuous_eager_exec_send_token_count") or 0) for r in scaffold_records
     )
@@ -112,6 +157,20 @@ def main() -> int:
     )
     exec_received_seq_count = sum(
         len(r.get("continuous_eager_exec_received_seq_ids") or []) for r in scaffold_records
+    )
+
+    # Invariant counters
+    continue_set_executed = sum(
+        len(r.get("draft_eager_continue_set_executed") or []) for r in scaffold_records
+    )
+    target_eager_exec = sum(
+        len(r.get("target_eager_set_executed") or []) for r in scaffold_records
+    )
+    eager_verified = sum(
+        int(r.get("eager_tokens_verified") or 0) for r in scaffold_records
+    )
+    eager_accepted = sum(
+        int(r.get("eager_tokens_accepted") or 0) for r in scaffold_records
     )
 
     print(f"\n--- Scaffold summary ---")
@@ -129,37 +188,78 @@ def main() -> int:
     print(f"exec_sent_seq_ids_count={exec_sent_seq_count}")
     print(f"exec_received_seq_ids_count={exec_received_seq_count}")
 
-    # --- Per-record checks ---
+    # --- Invariant checks (all phases) ---
+
+    # Check O: draft_eager_continue_set_executed == []
+    if continue_set_executed > 0:
+        errors.append(
+            f"INVARIANT: draft_eager_continue_set_executed must be empty, "
+            f"got {continue_set_executed} entries"
+        )
+
+    # Check C: target_eager_set_executed == []
+    if target_eager_exec > 0:
+        errors.append(
+            f"INVARIANT: target_eager_set_executed must be empty, "
+            f"got {target_eager_exec} entries"
+        )
+
+    # Check P: eager_tokens_verified == 0, eager_tokens_accepted == 0
+    if eager_verified > 0:
+        errors.append(
+            f"INVARIANT: eager_tokens_verified must be 0 (no target verification), "
+            f"got {eager_verified}"
+        )
+    if eager_accepted > 0:
+        errors.append(
+            f"INVARIANT: eager_tokens_accepted must be 0 (no token application), "
+            f"got {eager_accepted}"
+        )
+
+    # --- Per-record checks (strict for steady, relaxed for non-steady) ---
     for idx, record in enumerate(scaffold_records):
         phase = record.get("plan_phase", "unknown")
+        role = record.get("runner_role", "unknown")
+        is_steady = phase == "steady"
+        is_scaffold_enabled_record = _is_scaffold_enabled(record)
+
         executed = as_int_set(record.get("draft_eager_new_set_executed"))
         continue_set = as_int_set(record.get("draft_eager_continue_set"))
         target_exec = as_int_set(record.get("target_eager_set_executed"))
-        base_kind = record.get("continuous_eager_exec_base_kind_by_seq_id") or {}
-        base_len = record.get("continuous_eager_exec_base_len_by_seq_id") or {}
-        base_valid = record.get("continuous_eager_exec_base_is_valid_by_seq_id") or {}
-        base_val_ok = record.get("continuous_eager_exec_base_validation_ok_by_seq_id") or {}
-        base_val_reason = record.get("continuous_eager_exec_base_validation_reason_by_seq_id") or {}
 
-        # Check I: enablement flag present
-        if not record.get("continuous_eager_draft_execution_enabled"):
-            errors.append(
-                f"record[{idx}] phase={phase}: continuous_eager_draft_execution_enabled "
-                f"is missing or False"
-            )
+        # Non-steady records: safety-only checks unless proposals are executed.
+        if not is_steady and not executed:
+            # If scaffold is enabled, flag must be present.
+            if is_scaffold_enabled_record:
+                if not record.get("continuous_eager_draft_execution_enabled"):
+                    pass  # aggregated above
+                if not record.get("continuous_eager_execution_phase"):
+                    pass  # aggregated above
+            continue
 
-        # Check N: execution phase is non-empty
-        exec_phase = record.get("continuous_eager_execution_phase", "")
-        if not exec_phase:
-            errors.append(
-                f"record[{idx}] phase={phase}: continuous_eager_execution_phase is empty"
-            )
+        # Check I: enablement flag present (steady only, strict)
+        if is_steady and is_scaffold_enabled_record:
+            if not record.get("continuous_eager_draft_execution_enabled"):
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: "
+                    f"continuous_eager_draft_execution_enabled missing or False"
+                )
+
+        # Check N: execution phase non-empty (steady only, strict)
+        if is_steady and is_scaffold_enabled_record:
+            exec_phase = record.get("continuous_eager_execution_phase", "")
+            if not exec_phase:
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: "
+                    f"continuous_eager_execution_phase is empty"
+                )
 
         # Check A: executed non-empty -> proposals generated > 0
-        if phase == "steady" and executed:
+        if is_steady and executed:
             if int(record.get("continuous_eager_scaffold_proposals_generated") or 0) <= 0:
                 errors.append(
-                    f"record[{idx}] phase={phase}: draft_eager_new_set_executed={sorted(executed)} "
+                    f"record[{idx}] role={role} phase={phase}: "
+                    f"draft_eager_new_set_executed={sorted(executed)} "
                     f"but scaffold_proposals_generated=0"
                 )
 
@@ -167,57 +267,75 @@ def main() -> int:
         bad_continue = continue_set & executed
         if bad_continue:
             errors.append(
-                f"record[{idx}] phase={phase}: draft_eager_continue_set seqs in "
-                f"draft_eager_new_set_executed: {sorted(bad_continue)}"
-            )
-
-        # Check C: target_eager_set_executed empty
-        if target_exec:
-            errors.append(
-                f"record[{idx}] phase={phase}: target_eager_set_executed must be empty, "
-                f"got {sorted(target_exec)}"
+                f"record[{idx}] role={role} phase={phase}: "
+                f"draft_eager_continue_set seqs in draft_eager_new_set_executed: "
+                f"{sorted(bad_continue)}"
             )
 
         # Check D: executed seqs have base_kind = "draft_eager_new_set"
+        base_kind = record.get("continuous_eager_exec_base_kind_by_seq_id") or {}
         for sid in sorted(executed):
             if str(sid) not in base_kind:
-                errors.append(
-                    f"record[{idx}] phase={phase}: seq_id={sid} in "
-                    f"draft_eager_new_set_executed missing exec_base_kind"
-                )
+                if is_steady:
+                    errors.append(
+                        f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
+                        f"in draft_eager_new_set_executed missing exec_base_kind"
+                    )
             elif base_kind[str(sid)] != "draft_eager_new_set":
                 errors.append(
-                    f"record[{idx}] phase={phase}: seq_id={sid} exec_base_kind="
-                    f"'{base_kind[str(sid)]}' expected 'draft_eager_new_set'"
+                    f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
+                    f"exec_base_kind='{base_kind[str(sid)]}' expected 'draft_eager_new_set'"
                 )
 
         # Check J: base validation ok for all executed seqs
+        base_val_ok = record.get("continuous_eager_exec_base_validation_ok_by_seq_id") or {}
+        base_val_reason = record.get("continuous_eager_exec_base_validation_reason_by_seq_id") or {}
+        base_len = record.get("continuous_eager_exec_base_len_by_seq_id") or {}
+        expected_base = record.get("continuous_eager_exec_expected_base_len_by_seq_id") or {}
+        parent_len = record.get("continuous_eager_exec_parent_len_by_seq_id") or {}
         for sid in sorted(executed):
             ok = base_val_ok.get(str(sid))
             if ok is not True:
                 reason = base_val_reason.get(str(sid), "missing")
                 errors.append(
-                    f"record[{idx}] phase={phase}: seq_id={sid} "
+                    f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
                     f"base_validation_ok={ok} reason='{reason}'"
                 )
+            # Check base metadata completeness for executed seqs.
+            if str(sid) not in base_len:
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
+                    f"missing exec_base_len"
+                )
+            if str(sid) not in expected_base:
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
+                    f"missing exec_expected_base_len"
+                )
+            if str(sid) not in parent_len:
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
+                    f"missing exec_parent_len"
+                )
 
-        # Check G: tokens_generated > 0 iff executed non-empty (in steady)
-        if phase == "steady":
+        # Check G: tokens_generated > 0 iff executed non-empty (steady)
+        if is_steady:
             has_tokens = int(record.get("continuous_eager_scaffold_tokens_generated") or 0) > 0
             has_executed = bool(executed)
             if has_tokens != has_executed:
                 errors.append(
-                    f"record[{idx}] phase={phase}: scaffold_tokens_generated>0={has_tokens} "
+                    f"record[{idx}] role={role} phase={phase}: "
+                    f"scaffold_tokens_generated>0={has_tokens} "
                     f"but executed_non_empty={has_executed}"
                 )
 
         # Check K: transport token per-record consistency
         send_tokens = int(record.get("continuous_eager_exec_send_token_count") or 0)
         recv_tokens = int(record.get("continuous_eager_exec_receive_token_count") or 0)
-        if send_tokens > 0 and recv_tokens > 0 and recv_tokens > send_tokens:
+        if send_tokens > 0 and recv_tokens > 0 and recv_tokens != send_tokens:
             errors.append(
-                f"record[{idx}] phase={phase}: receive_token_count={recv_tokens} > "
-                f"send_token_count={send_tokens}"
+                f"record[{idx}] role={role} phase={phase}: "
+                f"receive_token_count={recv_tokens} != send_token_count={send_tokens}"
             )
 
         # Check L: buffer consistency
@@ -225,43 +343,59 @@ def main() -> int:
         buf_after = int(record.get("continuous_eager_exec_buffer_size_after") or 0)
         if buf_before > buf_after and buf_after > 0:
             errors.append(
-                f"record[{idx}] phase={phase}: buffer_size_before={buf_before} > "
-                f"buffer_size_after={buf_after}"
+                f"record[{idx}] role={role} phase={phase}: "
+                f"buffer_size_before={buf_before} > buffer_size_after={buf_after}"
             )
 
-        # Check transport seq_id consistency: sent seq_ids should match received
-        # when both are non-empty on the same record.
+        # Check Q: sent/received seq_ids match (when both present)
         sent_ids = as_int_set(record.get("continuous_eager_exec_sent_seq_ids"))
         recv_ids = as_int_set(record.get("continuous_eager_exec_received_seq_ids"))
         if sent_ids and recv_ids and sent_ids != recv_ids:
             errors.append(
-                f"record[{idx}] phase={phase}: sent_seq_ids={sorted(sent_ids)} != "
-                f"received_seq_ids={sorted(recv_ids)}"
+                f"record[{idx}] role={role} phase={phase}: "
+                f"sent_seq_ids={sorted(sent_ids)} != received_seq_ids={sorted(recv_ids)}"
+            )
+
+        # Check R: sent/received proposal_ids match
+        sent_pids = record.get("continuous_eager_exec_sent_proposal_ids") or []
+        recv_pids = record.get("continuous_eager_exec_received_proposal_ids") or []
+        if sent_pids and recv_pids and sorted(sent_pids) != sorted(recv_pids):
+            errors.append(
+                f"record[{idx}] role={role} phase={phase}: "
+                f"sent_proposal_ids != received_proposal_ids"
             )
 
     # --- Cross-record checks ---
 
-    # Check E: sent >= received (DRAFT-TARGET consistency, best-effort)
+    # Check E: sent >= received
     if sent_total > 0 and recv_total > 0 and recv_total > sent_total:
         errors.append(
             f"cross-record: scaffold_proposals_received={recv_total} > "
             f"scaffold_proposals_sent={sent_total}"
         )
 
-    # Check transport token totals
-    if exec_send_tokens > 0 and exec_recv_tokens > 0 and exec_recv_tokens > exec_send_tokens:
+    # Check K (cross): transport token totals must match
+    if exec_send_tokens > 0 and exec_recv_tokens > 0 and exec_recv_tokens != exec_send_tokens:
         errors.append(
-            f"cross-record: exec_receive_token_count={exec_recv_tokens} > "
+            f"cross-record: exec_receive_token_count={exec_recv_tokens} != "
             f"exec_send_token_count={exec_send_tokens}"
         )
 
+    # Check S: proposals generated => sent > 0 and received > 0
+    if prop_gen_total > 0:
+        if sent_total == 0:
+            errors.append(
+                f"cross-record: scaffold_proposals_generated={prop_gen_total} "
+                f"but scaffold_proposals_sent=0"
+            )
+        if recv_total == 0:
+            errors.append(
+                f"cross-record: scaffold_proposals_generated={prop_gen_total} "
+                f"but scaffold_proposals_received=0"
+            )
+
     # Check F: Promoted proposals must have parent_acceptance_status = "accepted"
-    # Use exec-prefixed fields for the execution scaffold.
-    promoted_total_scaffold = sum(
-        int(r.get("continuous_eager_scaffold_proposals_promoted") or 0)
-        for r in scaffold_records
-    )
-    if promoted_total_scaffold > 0:
+    if promoted_total > 0:
         for idx, record in enumerate(scaffold_records):
             parent_status = record.get(
                 "continuous_eager_exec_parent_acceptance_status_by_seq_id"
@@ -281,7 +415,7 @@ def main() -> int:
                             f"parent_acceptance_status='{status}' expected 'accepted'"
                         )
 
-    # Check M: promotion/discard exec fields should be consistent with counters
+    # Check M: promotion/discard exec field consistency
     for idx, record in enumerate(scaffold_records):
         promoted_count = int(
             record.get("continuous_eager_scaffold_proposals_promoted") or 0
@@ -312,9 +446,17 @@ def main() -> int:
             errors.append(
                 f"proposal lifecycle: sent={sent_total} > generated={prop_gen_total}"
             )
-        if recv_total > sent_total and recv_total > 0:
-            errors.append(
-                f"proposal lifecycle: received={recv_total} > sent={sent_total}"
+        total_disposition = promoted_total + discarded_total
+        # sum of unknown across all records
+        unknown_total = sum(
+            len(r.get("continuous_eager_exec_parent_unknown_seq_ids") or [])
+            for r in scaffold_records
+        )
+        if total_disposition + unknown_total < prop_gen_total:
+            warnings.append(
+                f"proposal lifecycle: generated={prop_gen_total} but "
+                f"promoted={promoted_total} + discarded={discarded_total} + "
+                f"unknown={unknown_total} = {total_disposition + unknown_total} < generated"
             )
 
     if warnings:

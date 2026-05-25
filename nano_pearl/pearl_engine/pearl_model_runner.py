@@ -2143,6 +2143,31 @@ class ModelRunnerBase:
         trace_record["proposal_message_step_id"] = plan.proposal_message_step_id
         trace_record["normal_proposal_buffer_keys_after_receive"] = self.dual_proposal_buffer.pending_seq_ids()
         trace_record["eager_buffer_keys_after_receive"] = self.eager_proposal_buffer.keys()
+        # Phase 1I-A scaffold receive fields.
+        trace_record["continuous_eager_scaffold_proposals_received"] = (
+            plan.continuous_eager_scaffold_proposals_received
+        )
+        trace_record["continuous_eager_exec_received_seq_ids"] = list(
+            plan.continuous_eager_exec_received_seq_ids
+        )
+        trace_record["continuous_eager_exec_received_proposal_ids"] = list(
+            plan.continuous_eager_exec_received_proposal_ids
+        )
+        trace_record["continuous_eager_exec_receive_token_count"] = (
+            plan.continuous_eager_exec_receive_token_count
+        )
+        trace_record["continuous_eager_exec_receive_validation_ok"] = (
+            plan.continuous_eager_exec_receive_validation_ok
+        )
+        trace_record["continuous_eager_exec_receive_validation_reason"] = (
+            plan.continuous_eager_exec_receive_validation_reason
+        )
+        trace_record["continuous_eager_exec_buffer_size_before"] = (
+            plan.continuous_eager_exec_buffer_size_before
+        )
+        trace_record["continuous_eager_exec_buffer_size_after"] = (
+            plan.continuous_eager_exec_buffer_size_after
+        )
 
     def _apply_combined_send_trace_fields(self, trace_record: dict, plan: StepPlan) -> None:
         trace_record["send_expected_normal_seq_ids"] = list(plan.send_expected_normal_seq_ids)
@@ -2161,6 +2186,19 @@ class ModelRunnerBase:
         trace_record["eager_discard_reason_by_seq_id"] = {
             str(k): v for k, v in plan.eager_discard_reason_by_seq_id.items()
         }
+        # Phase 1I-A scaffold send fields.
+        trace_record["continuous_eager_scaffold_proposals_sent"] = (
+            plan.continuous_eager_scaffold_proposals_sent
+        )
+        trace_record["continuous_eager_exec_sent_seq_ids"] = list(
+            plan.continuous_eager_exec_sent_seq_ids
+        )
+        trace_record["continuous_eager_exec_sent_proposal_ids"] = list(
+            plan.continuous_eager_exec_sent_proposal_ids
+        )
+        trace_record["continuous_eager_exec_send_token_count"] = (
+            plan.continuous_eager_exec_send_token_count
+        )
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
@@ -2432,6 +2470,35 @@ class ModelRunnerBase:
             trace_record["continuous_eager_parent_acceptance_status_by_seq_id"] = {
                 str(k): v for k, v in parent_status.items()
             }
+            # Phase 1I-A scaffold exec promotion/discard fields.
+            if self.global_config.enable_continuous_eager_draft_execution:
+                trace_record["continuous_eager_scaffold_proposals_promoted"] = (
+                    plan.continuous_eager_scaffold_proposals_promoted
+                )
+                trace_record["continuous_eager_scaffold_proposals_discarded"] = (
+                    plan.continuous_eager_scaffold_proposals_discarded
+                )
+                trace_record["continuous_eager_exec_promoted_seq_ids"] = list(
+                    plan.continuous_eager_exec_promoted_seq_ids
+                )
+                trace_record["continuous_eager_exec_discarded_seq_ids"] = list(
+                    plan.continuous_eager_exec_discarded_seq_ids
+                )
+                trace_record["continuous_eager_exec_parent_unknown_seq_ids"] = list(
+                    plan.continuous_eager_exec_parent_unknown_seq_ids
+                )
+                trace_record["continuous_eager_exec_promotion_reason_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_promotion_reason_by_seq_id.items()
+                }
+                trace_record["continuous_eager_exec_discard_reason_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_discard_reason_by_seq_id.items()
+                }
+                trace_record["continuous_eager_exec_parent_acceptance_status_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_parent_acceptance_status_by_seq_id.items()
+                }
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on
@@ -3522,6 +3589,11 @@ class DraftModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
+        # Phase 1I-A: set feature flag fields early so they appear in every
+        # trace record via to_trace_dict() in _trace_dual_batch_schedule.
+        if self.global_config.enable_continuous_eager_draft_execution:
+            plan.continuous_eager_draft_execution_enabled = True
+            plan.continuous_eager_execution_phase = "draft_only"
         self._sync_h2_plan_fields(plan)
         self._debug_check_h2_plan_consistency(plan)
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
@@ -3604,9 +3676,35 @@ class DraftModelRunner(ModelRunnerBase):
         ce_scaffold_trace_record = None
         if (self.global_config.enable_continuous_eager_draft_execution
                 and plan.draft_eager_new_set and plan.plan_phase == "steady"):
-            ce_new_seqs = self._resolve_dual_seq_ids(
+            # Base validation: validate each seq before execution.
+            # Skip seqs with missing tokens, missing seqs, or base validation failures.
+            _all_new_seqs = self._resolve_dual_seq_ids(
                 plan.draft_eager_new_set, plan, "ce_scaffold_draft",
             )
+            ce_new_seqs = []
+            _skipped_base_validation: dict[int, str] = {}
+            for _s in _all_new_seqs:
+                _sid = int(_s.seq_id)
+                if not _s.pre_verify:
+                    _skipped_base_validation[_sid] = "unsupported_post_verify_seq"
+                elif len(_s) == 0:
+                    _skipped_base_validation[_sid] = "unsupported_empty_seq"
+                else:
+                    ce_new_seqs.append(_s)
+            if _skipped_base_validation:
+                plan.continuous_eager_exec_base_validation_ok_by_seq_id.update({
+                    int(sid): False for sid in _skipped_base_validation
+                })
+                plan.continuous_eager_exec_base_validation_reason_by_seq_id.update(
+                    _skipped_base_validation
+                )
+                plan.continuous_eager_exec_base_is_valid_by_seq_id.update({
+                    int(sid): False for sid in _skipped_base_validation
+                })
+                plan.continuous_eager_exec_base_kind_by_seq_id.update({
+                    int(sid): "draft_eager_new_set" for sid in _skipped_base_validation
+                })
+
             ce_scaffold_proposals, ce_scaffold_trace_record = \
                 self._draft_continuous_eager_scaffold_proposals(ce_new_seqs, plan)
             self.continuous_eager_draft_buffer.store(ce_scaffold_proposals)
@@ -3615,8 +3713,6 @@ class DraftModelRunner(ModelRunnerBase):
                 p.eager_len for p in ce_scaffold_proposals
             )
             plan.continuous_eager_scaffold_proposals_generated = len(ce_scaffold_proposals)
-            plan.continuous_eager_draft_execution_enabled = True
-            plan.continuous_eager_execution_phase = plan.plan_phase
             _ce_seq_map = {int(s.seq_id): s for s in ce_new_seqs}
             for p in ce_scaffold_proposals:
                 plan.continuous_eager_exec_base_kind_by_seq_id[p.seq_id] = "draft_eager_new_set"
@@ -3632,8 +3728,40 @@ class DraftModelRunner(ModelRunnerBase):
                     int(len(_ce_seq)) if _ce_seq is not None else int(p.eager_base_len)
                 )
 
+            # Write base validation metadata to the scaffold trace record
+            # (set after _trace_dual_batch_schedule already captured plan snapshot).
+            if ce_scaffold_trace_record is not None:
+                ce_scaffold_trace_record["continuous_eager_exec_base_kind_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_base_kind_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_base_len_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_base_len_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_base_is_valid_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_base_is_valid_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_base_validation_ok_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_base_validation_ok_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_base_validation_reason_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_base_validation_reason_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_expected_base_len_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_expected_base_len_by_seq_id.items()
+                }
+                ce_scaffold_trace_record["continuous_eager_exec_parent_len_by_seq_id"] = {
+                    str(k): v
+                    for k, v in plan.continuous_eager_exec_parent_len_by_seq_id.items()
+                }
+
             _gen_ce_seq_ids = sorted(p.seq_id for p in ce_scaffold_proposals)
-            _exp_ce_seq_ids = sorted(plan.draft_eager_new_set)
+            _exp_ce_seq_ids = sorted([int(s.seq_id) for s in ce_new_seqs])
             assert _gen_ce_seq_ids == _exp_ce_seq_ids, self._proposal_assertion_message(
                 plan,
                 f"ce scaffold draft generated seq_ids mismatch: "
@@ -4014,6 +4142,8 @@ class DraftModelRunner(ModelRunnerBase):
                 self._apply_combined_send_trace_fields(eager_trace_record, plan)
             for trace_record in cond_draft_records:
                 self._apply_combined_send_trace_fields(trace_record, plan)
+            if ce_scaffold_trace_record is not None:
+                self._apply_combined_send_trace_fields(ce_scaffold_trace_record, plan)
         else:
             # === Legacy ordering (fallback/priming): send → recv verify ===
             if draft_seqs or expected_eager_seq_ids:
@@ -4492,6 +4622,11 @@ class TargetModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
+        # Phase 1I-A: set feature flag fields early so they appear in every
+        # trace record via to_trace_dict() in _trace_dual_batch_schedule.
+        if self.global_config.enable_continuous_eager_draft_execution:
+            plan.continuous_eager_draft_execution_enabled = True
+            plan.continuous_eager_execution_phase = "draft_only"
         self._sync_h2_plan_fields(plan)
         self._debug_check_h2_plan_consistency(plan)
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")

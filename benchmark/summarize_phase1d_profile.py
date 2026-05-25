@@ -237,6 +237,19 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
     scaffold_buf_max = max(
         [int(r.get("continuous_eager_exec_buffer_size_after") or 0) for r in records] + [0]
     )
+    scaffold_unknown = sum(
+        len(r.get("continuous_eager_exec_parent_unknown_seq_ids") or []) for r in records
+    )
+    scaffold_receive_val_failures = sum(
+        1 for r in records
+        if r.get("continuous_eager_exec_receive_validation_ok") is False
+    )
+    target_eager_set_executed_count = sum(
+        len(r.get("target_eager_set_executed") or []) for r in records
+    )
+    continue_set_executed_count = sum(
+        len(r.get("draft_eager_continue_set_executed") or []) for r in records
+    )
 
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
@@ -315,6 +328,10 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "scaffold_received_seq_count": scaffold_received_seq_count,
         "scaffold_base_val_failures": scaffold_base_val_failures,
         "scaffold_buf_max": scaffold_buf_max,
+        "scaffold_unknown": scaffold_unknown,
+        "scaffold_receive_val_failures": scaffold_receive_val_failures,
+        "target_eager_set_executed_count": target_eager_set_executed_count,
+        "continue_set_executed_count": continue_set_executed_count,
     }
 
 
@@ -382,6 +399,10 @@ def summarize(path: Path) -> dict[str, Any]:
     scaffold_received_seq_count = sum(p["scaffold_received_seq_count"] for p in step_profiles)
     scaffold_base_val_failures = sum(p["scaffold_base_val_failures"] for p in step_profiles)
     scaffold_buf_max = max([p["scaffold_buf_max"] for p in step_profiles] + [0])
+    scaffold_unknown = sum(p["scaffold_unknown"] for p in step_profiles)
+    scaffold_receive_val_failures = sum(p["scaffold_receive_val_failures"] for p in step_profiles)
+    target_eager_set_executed_count = sum(p["target_eager_set_executed_count"] for p in step_profiles)
+    continue_set_executed_count = sum(p["continue_set_executed_count"] for p in step_profiles)
 
     total_ce_selected = sum(p["ce_trace_selected"] for p in step_profiles)
     total_ce_promoted = sum(p["ce_trace_promoted"] for p in step_profiles)
@@ -476,6 +497,10 @@ def summarize(path: Path) -> dict[str, Any]:
         "scaffold_received_seq_count": scaffold_received_seq_count,
         "scaffold_base_val_failures": scaffold_base_val_failures,
         "scaffold_buf_max": scaffold_buf_max,
+        "scaffold_unknown": scaffold_unknown,
+        "scaffold_receive_val_failures": scaffold_receive_val_failures,
+        "target_eager_set_executed_count": target_eager_set_executed_count,
+        "continue_set_executed_count": continue_set_executed_count,
         "steps": step_profiles,
     }
 
@@ -682,6 +707,10 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
             print(f"  scaffold_received_seq_count={row.get('scaffold_received_seq_count', 0)}")
             print(f"  scaffold_base_val_failures={row.get('scaffold_base_val_failures', 0)}")
             print(f"  scaffold_buf_max={row.get('scaffold_buf_max', 0)}")
+            print(f"  scaffold_unknown={row.get('scaffold_unknown', 0)}")
+            print(f"  scaffold_receive_val_failures={row.get('scaffold_receive_val_failures', 0)}")
+            print(f"  target_eager_set_executed_count={row.get('target_eager_set_executed_count', 0)}")
+            print(f"  continue_set_executed_count={row.get('continue_set_executed_count', 0)}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 
