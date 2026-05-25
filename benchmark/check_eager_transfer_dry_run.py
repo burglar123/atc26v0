@@ -46,9 +46,14 @@ DROP_REASONS = {
     "seq_finished_before_base",
     "seq_pre_verify_before_base",
     "seq_returned_pre_verify_before_base",
+    "seq_span_invalidated_before_base",
     "base_overshot",
     "base_overshot_later",
     "base_overshot_or_stale",
+    "invalid_base_pre_verify",
+    "invalid_proposal_len",
+    "invalid_to_verify_len",
+    "invalid_proposal_token_len",
     "base_pre_verify_not_supported",
     "proposal_len_mismatch",
     "to_verify_len_mismatch",
@@ -146,6 +151,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     base_mismatch_count = 0
     base_overshot_count = 0
     bad_sent_received_steps = 0
+    raw_finished_active_in_plan_count = 0
+    span_invalidated_count = 0
+    request_finished_count = 0
+    healthy_lag_current_len_lt_base_len_count = 0
+    healthy_lag_pending_count = 0
+    current_len_lt_base_len_count = 0
+    current_len_lt_base_len_dropped_count = 0
+    current_len_lt_base_len_pending_count = 0
+    seq_finished_before_base_count = 0
+    parent_dependency_invalidated_count = 0
+    seq_span_invalidated_before_base_count = 0
     pending_base_deltas: list[int] = []
     transfer_by_step: dict[tuple[int, int], dict[str, Any]] = {}
 
@@ -304,7 +320,18 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         base_pre_verify = record.get("eager_transfer_base_pre_verify_by_seq_id", {})
         current_len_by_seq = record.get("eager_transfer_current_len_by_seq_id", {})
         base_len_by_seq = record.get("eager_transfer_base_len_by_seq_id", {})
-        base_delta_by_seq = record.get("eager_pending_base_delta_by_seq_id", {})
+        base_delta_by_seq = record.get("eager_transfer_base_delta_by_seq_id") or record.get(
+            "eager_pending_base_delta_by_seq_id",
+            {},
+        )
+        raw_finished_by_seq = record.get("eager_transfer_seq_is_finished_raw_by_seq_id", {})
+        request_finished_by_seq = record.get("eager_transfer_seq_request_finished_by_seq_id", {})
+        span_invalidated_by_seq = record.get("eager_transfer_seq_span_invalidated_by_seq_id", {})
+        in_scheduled_by_seq = record.get("eager_transfer_seq_in_scheduled_by_seq_id", {})
+        in_resolved_by_seq = record.get("eager_transfer_seq_in_resolved_by_seq_id", {})
+        in_target_home_by_seq = record.get("eager_transfer_seq_in_target_home_by_seq_id", {})
+        in_draft_home_by_seq = record.get("eager_transfer_seq_in_draft_home_by_seq_id", {})
+        classification_by_proposal = record.get("eager_transfer_classification_by_proposal_id", {})
         proposal_len_by_id = record.get("eager_transfer_proposal_len_by_proposal_id", {})
         to_verify_len_by_id = record.get("eager_transfer_to_verify_len_by_proposal_id", {})
         drop_reasons = record.get("eager_transfer_drop_reason_by_proposal_id", {})
@@ -323,7 +350,66 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             as_int_set(record.get("scheduled_seq_ids"))
             | as_int_set(record.get("resolved_seq_ids"))
             | as_int_set(record.get("target_home_set"))
+            | {int(seq_id) for seq_id, value in in_scheduled_by_seq.items() if value}
+            | {int(seq_id) for seq_id, value in in_resolved_by_seq.items() if value}
+            | {int(seq_id) for seq_id, value in in_target_home_by_seq.items() if value}
+            | {int(seq_id) for seq_id, value in in_draft_home_by_seq.items() if value}
         )
+        for proposal_id in sorted(received_ids):
+            seq_id = proposal_to_seq.get(proposal_id)
+            if seq_id is None:
+                continue
+            current_len = int_value(dict_get(current_len_by_seq, seq_id), -1)
+            base_len = int_value(dict_get(base_len_by_seq, seq_id), -1)
+            active_in_plan = seq_id in present_seq_ids
+            raw_finished = bool(dict_get(raw_finished_by_seq, seq_id, False))
+            request_finished = bool(dict_get(request_finished_by_seq, seq_id, False))
+            span_invalidated = bool(dict_get(span_invalidated_by_seq, seq_id, False))
+            classification = dict_get(classification_by_proposal, proposal_id)
+            if raw_finished and active_in_plan:
+                raw_finished_active_in_plan_count += 1
+            if request_finished:
+                request_finished_count += 1
+            if span_invalidated:
+                span_invalidated_count += 1
+            if current_len >= 0 and base_len > current_len:
+                current_len_lt_base_len_count += 1
+                if proposal_id in pending_ids:
+                    current_len_lt_base_len_pending_count += 1
+                if proposal_id in dropped_ids:
+                    current_len_lt_base_len_dropped_count += 1
+                is_pre_verify_drop = classification == "seq_returned_pre_verify_before_base"
+                healthy_lag = (
+                    not request_finished
+                    and not span_invalidated
+                    and not is_pre_verify_drop
+                    and dict_get(base_pre_verify, seq_id) is False
+                )
+                if healthy_lag:
+                    healthy_lag_current_len_lt_base_len_count += 1
+                    if proposal_id in pending_ids:
+                        healthy_lag_pending_count += 1
+                    else:
+                        errors.append(
+                            f"record[{idx}] healthy lagging proposal_id={proposal_id} should be pending, "
+                            f"classification={classification!r}"
+                        )
+                if proposal_id in dropped_ids:
+                    reason = dict_get(drop_reasons, proposal_id)
+                    if active_in_plan and reason == "seq_finished_before_base":
+                        errors.append(
+                            f"record[{idx}] active lagging proposal_id={proposal_id} must not drop as "
+                            "seq_finished_before_base"
+                        )
+                    if span_invalidated and reason not in {
+                        "parent_dependency_invalidated",
+                        "seq_span_invalidated_before_base",
+                    }:
+                        errors.append(
+                            f"record[{idx}] span-invalidated lagging proposal_id={proposal_id} has "
+                            f"bad drop reason={reason!r}"
+                        )
+
         for proposal_id in sorted(validated_ids):
             seq_id = proposal_to_seq.get(proposal_id)
             if seq_id is None:
@@ -381,6 +467,12 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] dropped proposal_id={proposal_id} missing drop reason")
             elif reason not in DROP_REASONS:
                 errors.append(f"record[{idx}] dropped proposal_id={proposal_id} has unexpected reason={reason!r}")
+            if reason == "seq_finished_before_base":
+                seq_finished_before_base_count += 1
+            if reason == "parent_dependency_invalidated":
+                parent_dependency_invalidated_count += 1
+            if reason == "seq_span_invalidated_before_base":
+                seq_span_invalidated_before_base_count += 1
             if reason in {"base_overshot", "base_overshot_later", "base_overshot_or_stale"}:
                 base_overshot_count += 1
             seq_id = proposal_to_seq.get(proposal_id)
@@ -393,6 +485,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 base_len = int_value(dict_get(base_len_by_seq, seq_id), -1)
                 if current_len > base_len:
                     base_overshot_count += 1
+                elif current_len < base_len:
+                    pass
                 elif reason not in {"base_overshot", "base_overshot_later", "base_overshot_or_stale"}:
                     base_mismatch_count += 1
 
@@ -403,6 +497,12 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] pending-dropped proposal_id={proposal_id} missing drop reason")
             elif reason not in DROP_REASONS:
                 errors.append(f"record[{idx}] pending-dropped proposal_id={proposal_id} has unexpected reason={reason!r}")
+            if reason == "seq_finished_before_base":
+                seq_finished_before_base_count += 1
+            if reason == "parent_dependency_invalidated":
+                parent_dependency_invalidated_count += 1
+            if reason == "seq_span_invalidated_before_base":
+                seq_span_invalidated_before_base_count += 1
             if reason in {"base_overshot", "base_overshot_later", "base_overshot_or_stale"}:
                 base_overshot_count += 1
 
@@ -427,6 +527,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 f"{step['transferred_tokens']} != {step['promoted_tokens']}"
             )
 
+    if healthy_lag_current_len_lt_base_len_count > 0 and len(pending_proposal_ids) == 0:
+        errors.append("healthy lagging proposals were observed, but no proposal entered pending state")
+
     summary = {
         "total_trace_records": len(records),
         "records_with_transfer_dry_run_enabled": transfer_records,
@@ -443,6 +546,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "base_delta_median": median_int(pending_base_deltas),
         "base_delta_max": max(pending_base_deltas) if pending_base_deltas else None,
         "base_overshot_count": base_overshot_count,
+        "raw_finished_active_in_plan_count": raw_finished_active_in_plan_count,
+        "span_invalidated_count": span_invalidated_count,
+        "request_finished_count": request_finished_count,
+        "healthy_lag_current_len_lt_base_len_count": healthy_lag_current_len_lt_base_len_count,
+        "healthy_lag_pending_count": healthy_lag_pending_count,
+        "current_len_lt_base_len_count": current_len_lt_base_len_count,
+        "current_len_lt_base_len_dropped_count": current_len_lt_base_len_dropped_count,
+        "current_len_lt_base_len_pending_count": current_len_lt_base_len_pending_count,
+        "seq_finished_before_base_count": seq_finished_before_base_count,
+        "parent_dependency_invalidated_count": parent_dependency_invalidated_count,
+        "seq_span_invalidated_before_base_count": seq_span_invalidated_before_base_count,
         "eager_tokens_generated": generated_tokens,
         "eager_tokens_promoted": promoted_tokens,
         "eager_tokens_discarded": discarded_tokens,
@@ -475,6 +589,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "base_delta_median",
         "base_delta_max",
         "base_overshot_count",
+        "raw_finished_active_in_plan_count",
+        "span_invalidated_count",
+        "request_finished_count",
+        "healthy_lag_current_len_lt_base_len_count",
+        "healthy_lag_pending_count",
+        "current_len_lt_base_len_count",
+        "current_len_lt_base_len_dropped_count",
+        "current_len_lt_base_len_pending_count",
+        "seq_finished_before_base_count",
+        "parent_dependency_invalidated_count",
+        "seq_span_invalidated_before_base_count",
         "eager_tokens_generated",
         "eager_tokens_promoted",
         "eager_tokens_discarded",
@@ -598,7 +723,17 @@ def synthetic_transfer_record(num_proposals: int = 1) -> dict[str, Any]:
             "eager_transfer_base_len_by_seq_id": {"1": 12} if num_proposals else {},
             "eager_transfer_base_pre_verify_by_seq_id": {"1": False} if num_proposals else {},
             "eager_transfer_current_len_by_seq_id": {"1": 12} if num_proposals else {},
+            "eager_transfer_base_delta_by_seq_id": {"1": 0} if num_proposals else {},
             "eager_transfer_base_match_by_seq_id": {"1": True} if num_proposals else {},
+            "eager_transfer_seq_raw_status_by_seq_id": {"1": "RUNNING"} if num_proposals else {},
+            "eager_transfer_seq_is_finished_raw_by_seq_id": {"1": False} if num_proposals else {},
+            "eager_transfer_seq_request_finished_by_seq_id": {"1": False} if num_proposals else {},
+            "eager_transfer_seq_span_invalidated_by_seq_id": {"1": False} if num_proposals else {},
+            "eager_transfer_seq_in_scheduled_by_seq_id": {"1": True} if num_proposals else {},
+            "eager_transfer_seq_in_resolved_by_seq_id": {"1": True} if num_proposals else {},
+            "eager_transfer_seq_in_target_home_by_seq_id": {"1": True} if num_proposals else {},
+            "eager_transfer_seq_in_draft_home_by_seq_id": {"1": False} if num_proposals else {},
+            "eager_transfer_classification_by_proposal_id": {"101": "base_reached"} if num_proposals else {},
             "eager_transfer_proposal_len_by_proposal_id": {"101": 4} if num_proposals else {},
             "eager_transfer_to_verify_len_by_proposal_id": {"101": 4} if num_proposals else {},
             "eager_pending_received_proposal_ids": [],
@@ -638,7 +773,9 @@ def synthetic_pending_receive_record() -> dict[str, Any]:
             "eager_transfer_validated_proposal_ids": [],
             "eager_transfer_pending_proposal_ids": [101],
             "eager_transfer_current_len_by_seq_id": {"1": 11},
+            "eager_transfer_base_delta_by_seq_id": {"1": 1},
             "eager_transfer_base_match_by_seq_id": {"1": False},
+            "eager_transfer_classification_by_proposal_id": {"101": "pending_base_not_reached"},
             "eager_pending_received_proposal_ids": [101],
             "eager_pending_received_seq_ids": [1],
             "eager_pending_base_not_reached_proposal_ids": [101],
@@ -668,7 +805,9 @@ def synthetic_pending_ready_record() -> dict[str, Any]:
             "eager_transfer_base_len_by_seq_id": {"1": 12},
             "eager_transfer_base_pre_verify_by_seq_id": {"1": False},
             "eager_transfer_current_len_by_seq_id": {"1": 12},
+            "eager_transfer_base_delta_by_seq_id": {"1": 0},
             "eager_transfer_base_match_by_seq_id": {"1": True},
+            "eager_transfer_classification_by_proposal_id": {"101": "base_reached"},
             "eager_pending_current_len_by_seq_id": {"1": 12},
             "eager_pending_base_len_by_seq_id": {"1": 12},
             "eager_pending_base_delta_by_seq_id": {"1": 0},
@@ -695,7 +834,9 @@ def synthetic_pending_drop_record(reason: str, proposal_id: int, step_id: int, c
             "eager_transfer_base_len_by_seq_id": {"1": 12},
             "eager_transfer_base_pre_verify_by_seq_id": {"1": False},
             "eager_transfer_current_len_by_seq_id": {"1": current_len},
+            "eager_transfer_base_delta_by_seq_id": {"1": 12 - current_len},
             "eager_transfer_base_match_by_seq_id": {"1": current_len == 12},
+            "eager_transfer_classification_by_proposal_id": {str(proposal_id): reason},
             "eager_pending_current_len_by_seq_id": {"1": current_len},
             "eager_pending_base_len_by_seq_id": {"1": 12},
             "eager_pending_base_delta_by_seq_id": {"1": 12 - current_len},
@@ -708,6 +849,52 @@ def synthetic_pending_drop_record(reason: str, proposal_id: int, step_id: int, c
             "eager_tokens_transfer_dropped": 4,
         }
     )
+    return record
+
+
+def synthetic_receive_drop_record(
+    reason: str,
+    proposal_id: int,
+    step_id: int,
+    current_len: int,
+    *,
+    raw_finished: bool = False,
+    request_finished: bool = False,
+    span_invalidated: bool = False,
+    active_in_plan: bool = True,
+) -> dict[str, Any]:
+    record = synthetic_transfer_record(1)
+    record.update(
+        {
+            "eager_transfer_step_id": step_id,
+            "eager_transfer_plan_id": 40 + step_id,
+            "eager_transfer_sent_proposal_ids": [proposal_id],
+            "eager_transfer_received_proposal_ids": [proposal_id],
+            "eager_transfer_validated_proposal_ids": [],
+            "eager_transfer_pending_proposal_ids": [],
+            "eager_transfer_dropped_proposal_ids": [proposal_id],
+            "eager_transfer_drop_reason_by_proposal_id": {str(proposal_id): reason},
+            "eager_transfer_base_len_by_seq_id": {"1": 12},
+            "eager_transfer_current_len_by_seq_id": {"1": current_len},
+            "eager_transfer_base_delta_by_seq_id": {"1": 12 - current_len},
+            "eager_transfer_base_match_by_seq_id": {"1": current_len == 12},
+            "eager_transfer_seq_raw_status_by_seq_id": {"1": "FINISHED" if raw_finished else "RUNNING"},
+            "eager_transfer_seq_is_finished_raw_by_seq_id": {"1": raw_finished},
+            "eager_transfer_seq_request_finished_by_seq_id": {"1": request_finished},
+            "eager_transfer_seq_span_invalidated_by_seq_id": {"1": span_invalidated},
+            "eager_transfer_seq_in_scheduled_by_seq_id": {"1": active_in_plan},
+            "eager_transfer_seq_in_resolved_by_seq_id": {"1": active_in_plan},
+            "eager_transfer_seq_in_target_home_by_seq_id": {"1": active_in_plan},
+            "eager_transfer_seq_in_draft_home_by_seq_id": {"1": False},
+            "eager_transfer_classification_by_proposal_id": {str(proposal_id): reason},
+            "eager_tokens_transfer_validated": 0,
+            "eager_tokens_transfer_dropped": 4,
+        }
+    )
+    if not active_in_plan:
+        record["target_home_set"] = []
+        record["scheduled_seq_ids"] = []
+        record["resolved_seq_ids"] = []
     return record
 
 
@@ -772,6 +959,38 @@ def run_synthetic_tests() -> None:
         synthetic_pending_drop_record("seq_returned_pre_verify_before_base", 201, 9, 11),
         synthetic_pending_drop_record("seq_finished_before_base", 202, 10, 11),
         synthetic_pending_drop_record("base_overshot_later", 203, 11, 13),
+        synthetic_receive_drop_record(
+            "seq_span_invalidated_before_base",
+            301,
+            12,
+            11,
+            raw_finished=True,
+            span_invalidated=True,
+            active_in_plan=True,
+        ),
+        synthetic_receive_drop_record(
+            "seq_returned_pre_verify_before_base",
+            302,
+            13,
+            11,
+            active_in_plan=True,
+        ),
+        synthetic_receive_drop_record(
+            "seq_finished_before_base",
+            303,
+            14,
+            11,
+            raw_finished=True,
+            request_finished=True,
+            active_in_plan=False,
+        ),
+        synthetic_receive_drop_record(
+            "base_overshot_or_stale",
+            304,
+            15,
+            13,
+            active_in_plan=True,
+        ),
         *synthetic_split_transfer_records(),
     ]
     errors, _ = validate_records(valid_records)
@@ -800,6 +1019,23 @@ def run_synthetic_tests() -> None:
     invalid[-1]["eager_tokens_transfer_dropped"] = 4
     errors, _ = validate_records(invalid)
     assert any("seq_not_running" in error for error in errors), "checker missed seq_not_running for present seq"
+
+    invalid = deepcopy(valid_records)
+    invalid.append(
+        synthetic_receive_drop_record(
+            "seq_finished_before_base",
+            401,
+            16,
+            11,
+            raw_finished=True,
+            span_invalidated=True,
+            active_in_plan=True,
+        )
+    )
+    errors, _ = validate_records(invalid)
+    assert any("seq_finished_before_base" in error for error in errors), (
+        "checker missed active lagging seq_finished_before_base"
+    )
 
     print("Synthetic eager transfer dry-run checks passed.")
 

@@ -576,7 +576,17 @@ class ModelRunnerBase:
             "eager_transfer_base_len_by_seq_id": {},
             "eager_transfer_base_pre_verify_by_seq_id": {},
             "eager_transfer_current_len_by_seq_id": {},
+            "eager_transfer_base_delta_by_seq_id": {},
             "eager_transfer_base_match_by_seq_id": {},
+            "eager_transfer_seq_raw_status_by_seq_id": {},
+            "eager_transfer_seq_is_finished_raw_by_seq_id": {},
+            "eager_transfer_seq_request_finished_by_seq_id": {},
+            "eager_transfer_seq_span_invalidated_by_seq_id": {},
+            "eager_transfer_seq_in_scheduled_by_seq_id": {},
+            "eager_transfer_seq_in_resolved_by_seq_id": {},
+            "eager_transfer_seq_in_target_home_by_seq_id": {},
+            "eager_transfer_seq_in_draft_home_by_seq_id": {},
+            "eager_transfer_classification_by_proposal_id": {},
             "eager_transfer_proposal_len_by_proposal_id": {},
             "eager_transfer_to_verify_len_by_proposal_id": {},
             "eager_pending_received_proposal_ids": [],
@@ -1171,21 +1181,70 @@ class ModelRunnerBase:
 
     def _eager_transfer_metadata_drop_reason(self, proposal: EagerProposal) -> str | None:
         if bool(proposal.base_pre_verify):
-            return "base_pre_verify_not_supported"
+            return "invalid_base_pre_verify"
         if int(proposal.proposal_len) != int(self.gamma):
-            return "proposal_len_mismatch"
+            return "invalid_proposal_len"
         if len(proposal.to_be_verified_token_ids) != int(self.gamma):
-            return "to_verify_len_mismatch"
+            return "invalid_to_verify_len"
         if len(proposal.proposal_token_ids) != int(self.gamma):
-            return "proposal_token_len_mismatch"
+            return "invalid_proposal_token_len"
         if proposal.parent_kind != LANE_NORMAL:
             return "parent_dependency_invalidated"
         return None
+
+    def _eager_transfer_plan_context(self, plan: StepPlan, trace_record: dict | None) -> dict[str, set[int]]:
+        trace_record = trace_record or {}
+        scheduled = {int(seq_id) for seq_id in trace_record.get("scheduled_seq_ids", [])}
+        resolved = {int(seq_id) for seq_id in trace_record.get("resolved_seq_ids", [])}
+        target_home = {int(seq_id) for seq_id in plan.target_home_set}
+        draft_home = {int(seq_id) for seq_id in plan.draft_home_set}
+        target_eager = {int(seq_id) for seq_id in plan.target_eager_set}
+        draft_eager = {int(seq_id) for seq_id in plan.draft_eager_set}
+        return {
+            "scheduled_seq_ids": scheduled,
+            "resolved_seq_ids": resolved,
+            "target_home_set": target_home,
+            "draft_home_set": draft_home,
+            "target_eager_set": target_eager,
+            "draft_eager_set": draft_eager,
+            "active_plan_seq_ids": scheduled | resolved | target_home | draft_home | target_eager | draft_eager,
+        }
+
+    def _sequence_status_name(self, seq: Sequence | None) -> str:
+        if seq is None:
+            return "MISSING"
+        status = getattr(seq, "status", None)
+        return status.name if isinstance(status, SequenceStatus) else str(status)
+
+    def _seq_in_plan_context(self, seq_id: int, plan_context: dict[str, set[int]]) -> bool:
+        return int(seq_id) in plan_context.get("active_plan_seq_ids", set())
+
+    def is_request_level_finished(self, seq: Sequence | None, plan_context: dict[str, set[int]]) -> bool:
+        if seq is None or not bool(getattr(seq, "is_finished", False)):
+            return False
+        if self._seq_in_plan_context(int(seq.seq_id), plan_context):
+            return False
+        if getattr(seq, "finish_ts", None) is not None:
+            return True
+        return True
+
+    def is_speculative_span_invalidated(
+        self,
+        seq: Sequence | None,
+        plan_context: dict[str, set[int]],
+    ) -> bool:
+        if seq is None:
+            return False
+        return bool(getattr(seq, "is_finished", False)) and self._seq_in_plan_context(
+            int(seq.seq_id),
+            plan_context,
+        )
 
     def _classify_eager_transfer_proposal(
         self,
         proposal: EagerProposal,
         seq: Sequence | None,
+        plan_context: dict[str, set[int]],
         *,
         pending_update: bool = False,
     ) -> tuple[str, str]:
@@ -1194,8 +1253,10 @@ class ModelRunnerBase:
             return "drop", metadata_reason
         if seq is None:
             return "drop", "seq_not_found_later" if pending_update else "seq_not_found"
-        if seq.is_finished:
+        if self.is_request_level_finished(seq, plan_context):
             return "drop", "seq_finished_before_base"
+        if self.is_speculative_span_invalidated(seq, plan_context):
+            return "drop", "seq_span_invalidated_before_base"
         if getattr(seq, "status", None) != SequenceStatus.RUNNING:
             return "drop", "seq_not_running"
         if bool(seq.pre_verify):
@@ -1206,7 +1267,7 @@ class ModelRunnerBase:
             return "pending", "pending_base_not_reached"
         if current_len == base_len:
             return "ready", "base_reached"
-        return "drop", "base_overshot_later" if pending_update else "base_overshot"
+        return "drop", "base_overshot_or_stale"
 
     def _record_eager_transfer_seq_state(
         self,
@@ -1219,6 +1280,15 @@ class ModelRunnerBase:
         proposal_len_by_proposal_id: dict[int, int],
         to_verify_len_by_proposal_id: dict[int, int],
         base_delta_by_seq_id: dict[int, int],
+        seq_raw_status_by_seq_id: dict[int, str],
+        seq_is_finished_raw_by_seq_id: dict[int, bool],
+        seq_request_finished_by_seq_id: dict[int, bool],
+        seq_span_invalidated_by_seq_id: dict[int, bool],
+        seq_in_scheduled_by_seq_id: dict[int, bool],
+        seq_in_resolved_by_seq_id: dict[int, bool],
+        seq_in_target_home_by_seq_id: dict[int, bool],
+        seq_in_draft_home_by_seq_id: dict[int, bool],
+        plan_context: dict[str, set[int]],
     ) -> None:
         seq_id = int(proposal.seq_id)
         proposal_id = int(proposal.proposal_id)
@@ -1231,6 +1301,14 @@ class ModelRunnerBase:
         base_delta_by_seq_id[seq_id] = base_len - current_len if seq is not None else base_len
         proposal_len_by_proposal_id[proposal_id] = int(proposal.proposal_len)
         to_verify_len_by_proposal_id[proposal_id] = len(proposal.to_be_verified_token_ids)
+        seq_raw_status_by_seq_id[seq_id] = self._sequence_status_name(seq)
+        seq_is_finished_raw_by_seq_id[seq_id] = bool(getattr(seq, "is_finished", False)) if seq is not None else False
+        seq_request_finished_by_seq_id[seq_id] = self.is_request_level_finished(seq, plan_context)
+        seq_span_invalidated_by_seq_id[seq_id] = self.is_speculative_span_invalidated(seq, plan_context)
+        seq_in_scheduled_by_seq_id[seq_id] = seq_id in plan_context.get("scheduled_seq_ids", set())
+        seq_in_resolved_by_seq_id[seq_id] = seq_id in plan_context.get("resolved_seq_ids", set())
+        seq_in_target_home_by_seq_id[seq_id] = seq_id in plan_context.get("target_home_set", set())
+        seq_in_draft_home_by_seq_id[seq_id] = seq_id in plan_context.get("draft_home_set", set())
 
     def _update_target_pending_eager_buffer(
         self,
@@ -1242,6 +1320,15 @@ class ModelRunnerBase:
         proposal_len_by_proposal_id: dict[int, int],
         to_verify_len_by_proposal_id: dict[int, int],
         base_delta_by_seq_id: dict[int, int],
+        seq_raw_status_by_seq_id: dict[int, str],
+        seq_is_finished_raw_by_seq_id: dict[int, bool],
+        seq_request_finished_by_seq_id: dict[int, bool],
+        seq_span_invalidated_by_seq_id: dict[int, bool],
+        seq_in_scheduled_by_seq_id: dict[int, bool],
+        seq_in_resolved_by_seq_id: dict[int, bool],
+        seq_in_target_home_by_seq_id: dict[int, bool],
+        seq_in_draft_home_by_seq_id: dict[int, bool],
+        plan_context: dict[str, set[int]],
     ) -> tuple[list[EagerProposal], list[EagerProposal], list[EagerProposal], dict[int, str]]:
         ready: list[EagerProposal] = []
         still_pending: list[EagerProposal] = []
@@ -1265,10 +1352,20 @@ class ModelRunnerBase:
                 proposal_len_by_proposal_id,
                 to_verify_len_by_proposal_id,
                 base_delta_by_seq_id,
+                seq_raw_status_by_seq_id,
+                seq_is_finished_raw_by_seq_id,
+                seq_request_finished_by_seq_id,
+                seq_span_invalidated_by_seq_id,
+                seq_in_scheduled_by_seq_id,
+                seq_in_resolved_by_seq_id,
+                seq_in_target_home_by_seq_id,
+                seq_in_draft_home_by_seq_id,
+                plan_context,
             )
             action, reason = self._classify_eager_transfer_proposal(
                 proposal,
                 seq,
+                plan_context,
                 pending_update=True,
             )
             state_by_proposal_id[int(proposal.proposal_id)] = reason
@@ -1292,6 +1389,7 @@ class ModelRunnerBase:
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
         seq_by_id = self._local_sequence_by_id()
+        plan_context = self._eager_transfer_plan_context(plan, trace_record)
         buffer_size_before_update = self.eager_proposal_buffer.size()
         base_len_by_seq_id: dict[int, int] = {}
         base_pre_verify_by_seq_id: dict[int, bool] = {}
@@ -1300,6 +1398,14 @@ class ModelRunnerBase:
         proposal_len_by_proposal_id: dict[int, int] = {}
         to_verify_len_by_proposal_id: dict[int, int] = {}
         base_delta_by_seq_id: dict[int, int] = {}
+        seq_raw_status_by_seq_id: dict[int, str] = {}
+        seq_is_finished_raw_by_seq_id: dict[int, bool] = {}
+        seq_request_finished_by_seq_id: dict[int, bool] = {}
+        seq_span_invalidated_by_seq_id: dict[int, bool] = {}
+        seq_in_scheduled_by_seq_id: dict[int, bool] = {}
+        seq_in_resolved_by_seq_id: dict[int, bool] = {}
+        seq_in_target_home_by_seq_id: dict[int, bool] = {}
+        seq_in_draft_home_by_seq_id: dict[int, bool] = {}
 
         pending_ready, still_pending, pending_dropped, pending_state_by_proposal_id = (
             self._update_target_pending_eager_buffer(
@@ -1311,6 +1417,15 @@ class ModelRunnerBase:
                 proposal_len_by_proposal_id,
                 to_verify_len_by_proposal_id,
                 base_delta_by_seq_id,
+                seq_raw_status_by_seq_id,
+                seq_is_finished_raw_by_seq_id,
+                seq_request_finished_by_seq_id,
+                seq_span_invalidated_by_seq_id,
+                seq_in_scheduled_by_seq_id,
+                seq_in_resolved_by_seq_id,
+                seq_in_target_home_by_seq_id,
+                seq_in_draft_home_by_seq_id,
+                plan_context,
             )
         )
         buffer_size_after_update = self.eager_proposal_buffer.size()
@@ -1344,8 +1459,17 @@ class ModelRunnerBase:
                 proposal_len_by_proposal_id,
                 to_verify_len_by_proposal_id,
                 base_delta_by_seq_id,
+                seq_raw_status_by_seq_id,
+                seq_is_finished_raw_by_seq_id,
+                seq_request_finished_by_seq_id,
+                seq_span_invalidated_by_seq_id,
+                seq_in_scheduled_by_seq_id,
+                seq_in_resolved_by_seq_id,
+                seq_in_target_home_by_seq_id,
+                seq_in_draft_home_by_seq_id,
+                plan_context,
             )
-            action, reason = self._classify_eager_transfer_proposal(proposal, seq)
+            action, reason = self._classify_eager_transfer_proposal(proposal, seq, plan_context)
             state_by_proposal_id[int(proposal.proposal_id)] = reason
             if action == "ready":
                 proposal.state = EAGER_STATE_READY_TO_VERIFY_DRY_RUN
@@ -1399,8 +1523,38 @@ class ModelRunnerBase:
         trace_record["eager_transfer_current_len_by_seq_id"] = {
             str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
         }
+        trace_record["eager_transfer_base_delta_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_delta_by_seq_id.items()
+        }
         trace_record["eager_transfer_base_match_by_seq_id"] = {
             str(seq_id): value for seq_id, value in base_match_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_raw_status_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_raw_status_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_is_finished_raw_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_is_finished_raw_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_request_finished_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_request_finished_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_span_invalidated_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_span_invalidated_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_in_scheduled_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_in_scheduled_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_in_resolved_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_in_resolved_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_in_target_home_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_in_target_home_by_seq_id.items()
+        }
+        trace_record["eager_transfer_seq_in_draft_home_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_in_draft_home_by_seq_id.items()
+        }
+        trace_record["eager_transfer_classification_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in state_by_proposal_id.items()
         }
         trace_record["eager_transfer_proposal_len_by_proposal_id"] = {
             str(proposal_id): value for proposal_id, value in proposal_len_by_proposal_id.items()
