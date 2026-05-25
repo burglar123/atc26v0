@@ -93,6 +93,7 @@ class PEARLConfig:
     eager_accept_threshold: float = 0.0
     enable_eager_execution: bool = False
     enable_continuous_eager_trace: bool = False
+    enable_continuous_eager_draft_execution: bool = False
     disable_eager_base_len_fixup: bool = True
 
     def __post_init__(self):
@@ -119,6 +120,19 @@ class PEARLConfig:
                 raise ValueError("--enable-eager-execution requires --max-eager-tokens-per-step > 0")
             if int(self.max_eager_tokens_per_request) <= 0:
                 raise ValueError("--enable-eager-execution requires --max-eager-tokens-per-request > 0")
+        if self.enable_continuous_eager_draft_execution:
+            if not self.enable_continuous_eager_trace:
+                raise ValueError("--enable-continuous-eager-draft-execution requires --enable-continuous-eager-trace")
+            if self.execution_mode != "dual_batch_pearl":
+                raise ValueError("--enable-continuous-eager-draft-execution requires --execution-mode dual_batch_pearl")
+            if self.eager_policy == "none":
+                raise ValueError("--enable-continuous-eager-draft-execution requires --eager-policy tight_only or urgency")
+            if int(self.max_eager_requests_per_step) <= 0:
+                raise ValueError("--enable-continuous-eager-draft-execution requires --max-eager-requests-per-step > 0")
+            if int(self.max_eager_tokens_per_step) <= 0:
+                raise ValueError("--enable-continuous-eager-draft-execution requires --max-eager-tokens-per-step > 0")
+            if int(self.max_eager_tokens_per_request) <= 0:
+                raise ValueError("--enable-continuous-eager-draft-execution requires --max-eager-tokens-per-request > 0")
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))
@@ -138,6 +152,8 @@ class PEARLConfig:
         logger.info(f"Execution_Mode={self.execution_mode}")
         logger.info(f"Enable_Eager_Trace={self.enable_eager_trace}")
         logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
+        logger.info(f"Enable_Continuous_Eager_Trace={self.enable_continuous_eager_trace}")
+        logger.info(f"Enable_Continuous_Eager_Draft_Execution={self.enable_continuous_eager_draft_execution}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")

@@ -207,6 +207,68 @@ class EagerProposalBuffer:
         )
 
 
+class ContinuousEagerDraftExecutionBuffer:
+    """Phase 1I-A scaffold: stores EagerBufferedProposal for draft_eager_new_set only.
+
+    Separate from EagerProposalBuffer (old eager) to avoid cross-contamination.
+    Same lifecycle: store -> mark_ready -> consume, but NO target verification.
+    """
+
+    def __init__(self):
+        self._proposals: Dict[int, EagerBufferedProposal] = {}
+
+    def clear(self) -> None:
+        self._proposals.clear()
+
+    def size(self) -> int:
+        return len(self._proposals)
+
+    def keys(self) -> list[int]:
+        return sorted(self._proposals)
+
+    def store(self, proposals: Iterable[EagerBufferedProposal]) -> None:
+        for proposal in proposals:
+            if proposal.valid:
+                self._proposals[int(proposal.seq_id)] = proposal
+
+    def get(self, seq_id: int) -> Optional[EagerBufferedProposal]:
+        proposal = self._proposals.get(int(seq_id))
+        if proposal is not None and proposal.valid and not proposal.consumed:
+            return proposal
+        return None
+
+    def mark_ready(self, seq_id: int) -> bool:
+        proposal = self.get(int(seq_id))
+        if proposal is None:
+            return False
+        proposal.ready = True
+        return True
+
+    def discard(self, seq_ids: Iterable[int]) -> list[int]:
+        dropped = []
+        for seq_id in seq_ids:
+            seq_id = int(seq_id)
+            if self._proposals.pop(seq_id, None) is not None:
+                dropped.append(seq_id)
+        return dropped
+
+    def discard_inactive(self, active_seq_ids: Iterable[int]) -> list[int]:
+        active = {int(seq_id) for seq_id in active_seq_ids}
+        dropped = []
+        for seq_id in list(self._proposals):
+            if seq_id not in active:
+                self._proposals.pop(seq_id, None)
+                dropped.append(seq_id)
+        return dropped
+
+    def ready_seq_ids(self) -> list[int]:
+        return sorted(
+            seq_id
+            for seq_id, proposal in self._proposals.items()
+            if proposal.valid and proposal.ready and not proposal.consumed
+        )
+
+
 class DualBatchManager:
     """Assign sticky home batches and produce breadth-only A/B StepPlans."""
 

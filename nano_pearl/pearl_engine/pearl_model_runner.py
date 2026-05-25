@@ -24,6 +24,7 @@ from nano_pearl.pearl_engine.continuous_eager_trace_state import ContinuousEager
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from nano_pearl.pearl_engine.dual_batch import (
     BufferedProposal,
+    ContinuousEagerDraftExecutionBuffer,
     DualBatchManager,
     EagerBufferedProposal,
     EagerProposalBuffer,
@@ -128,6 +129,7 @@ class ModelRunnerBase:
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
         self.continuous_eager_trace_state = ContinuousEagerTraceState()
+        self.continuous_eager_draft_buffer = ContinuousEagerDraftExecutionBuffer()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -2373,6 +2375,27 @@ class ModelRunnerBase:
         plan.continuous_eager_trace_promoted_count = len(promoted)
         plan.continuous_eager_trace_discarded_count = len(discarded)
 
+        # Phase 1I-A: buffer-level promotion/discard using real normal verify results.
+        if self.global_config.enable_continuous_eager_draft_execution:
+            plan.continuous_eager_scaffold_proposals_promoted = len(promoted)
+            plan.continuous_eager_scaffold_proposals_discarded = len(discarded)
+            scaffold_promoted_tokens = 0
+            scaffold_discarded_tokens = 0
+            for seq_id in promoted:
+                self.continuous_eager_draft_buffer.mark_ready(seq_id)
+                proposal = self.continuous_eager_draft_buffer.get(seq_id)
+                if proposal is not None:
+                    scaffold_promoted_tokens += int(proposal.eager_len)
+                plan.continuous_eager_parent_acceptance_source_by_seq_id[seq_id] = "normal_verify"
+                plan.continuous_eager_parent_acceptance_is_exact_by_seq_id[seq_id] = True
+            for seq_id in discarded:
+                proposal = self.continuous_eager_draft_buffer.get(seq_id)
+                if proposal is not None:
+                    scaffold_discarded_tokens += int(proposal.eager_len)
+                self.continuous_eager_draft_buffer.discard([seq_id])
+            plan.continuous_eager_scaffold_tokens_promoted = scaffold_promoted_tokens
+            plan.continuous_eager_scaffold_tokens_discarded = scaffold_discarded_tokens
+
         if trace_record is not None:
             trace_record["continuous_eager_promoted_seq_ids"] = promoted
             trace_record["continuous_eager_discarded_seq_ids"] = discarded
@@ -3307,6 +3330,85 @@ class DraftModelRunner(ModelRunnerBase):
         self._finalize_record_profile(trace_record)
         return proposals, trace_record
 
+    def _draft_continuous_eager_scaffold_proposals(
+        self, seqs: list[Sequence], plan: StepPlan
+    ) -> tuple[list[EagerBufferedProposal], dict | None]:
+        """Phase 1I-A: generate eager tokens for draft_eager_new_set only.
+
+        Same token-generation pattern as _draft_eager_proposals but reads budgets
+        from plan.eager_budget_by_seq_id (populated by trace annotation) and uses
+        scaffold-specific trace counters.  Rolls back tokens after generation.
+        """
+        if not seqs:
+            return [], None
+
+        trace_record = self._trace_dual_batch_schedule(seqs, plan, "ce_scaffold_draft")
+        budgets = {seq.seq_id: int(plan.eager_budget_by_seq_id.get(seq.seq_id, 0)) for seq in seqs}
+        base_lens = {seq.seq_id: len(seq) for seq in seqs}
+        generated: dict[int, list[int]] = {seq.seq_id: [] for seq in seqs}
+
+        torch.cuda.synchronize()
+        self._mark_trace_start(trace_record)
+        trace_record["ce_scaffold_draft_start_ts"] = trace_record.get("draft_start_ts")
+        max_budget = max(budgets.values(), default=0)
+        for token_idx in range(max_budget):
+            active = [seq for seq in seqs if token_idx < budgets[seq.seq_id]]
+            if not active:
+                continue
+            self._allocate_decode_slots_for_dual(active, plan, "ce_scaffold_draft")
+            input_ids, positions = self.prepare_pearl_decode(active)
+            logits = self.run_model(input_ids, positions, False)
+            if self.tp_params.local_rank == 0:
+                sample_tokens = logits.argmax(dim=-1)
+            else:
+                sample_tokens = torch.zeros(len(active), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            for seq, token_id in zip(active, token_ids):
+                token_id = int(token_id)
+                seq.append_token(token_id)
+                generated[seq.seq_id].append(token_id)
+
+        proposals = []
+        for seq in seqs:
+            eager_token_ids = generated[seq.seq_id]
+            eager_len = len(eager_token_ids)
+            proposals.append(
+                EagerBufferedProposal(
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    home_batch_id=int(seq.home_batch_id),
+                    eager_token_ids=eager_token_ids,
+                    eager_len=int(eager_len),
+                    eager_base_len=int(base_lens[seq.seq_id]),
+                    source_plan_id=int(plan.plan_id),
+                    source_step_id=-1 if plan.step_id is None else int(plan.step_id),
+                    source_home_batch_id=-1 if plan.target_batch_id is None else int(plan.target_batch_id),
+                    verify_with_batch_id=None if plan.draft_batch_id is None else int(plan.draft_batch_id),
+                    score=float(plan.eager_score_by_seq_id.get(seq.seq_id, 0.0)),
+                    policy=plan.eager_policy,
+                    valid=True,
+                    ready=False,
+                    original_eager_base_len_at_generation=int(base_lens[seq.seq_id]),
+                )
+            )
+
+        for seq in seqs:
+            if generated[seq.seq_id]:
+                self.scheduler.rollback(seq, len(generated[seq.seq_id]))
+
+        torch.cuda.synchronize()
+        self._mark_trace_end(trace_record)
+        trace_record["ce_scaffold_draft_end_ts"] = trace_record.get("draft_end_ts")
+        if trace_record["ce_scaffold_draft_start_ts"] is not None and trace_record["ce_scaffold_draft_end_ts"] is not None:
+            trace_record["ce_scaffold_draft_time_ms"] = (
+                trace_record["ce_scaffold_draft_end_ts"] - trace_record["ce_scaffold_draft_start_ts"]
+            ) * 1000
+        trace_record["ce_scaffold_tokens_generated"] = sum(len(tokens) for tokens in generated.values())
+        self._finalize_record_profile(trace_record)
+        return proposals, trace_record
+
     def _receive_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank, group=group)
@@ -3453,6 +3555,12 @@ class DraftModelRunner(ModelRunnerBase):
             f"draft eager seq_id mismatch before send packaging: expected={expected_eager_seq_ids}, actual={eager_seq_ids}",
         )
 
+        # Phase 1I-A: include scaffold seq ids in expected eager.
+        if self.global_config.enable_continuous_eager_draft_execution:
+            expected_eager_seq_ids = list(expected_eager_seq_ids) + list(
+                plan.draft_eager_new_set_executed
+            )
+
         # H2: detect overlap between target_eager_set and draft_home_set (steady only)
         h2_steady = plan.plan_phase == "steady" and self.global_config.enable_eager_execution
         target_eager_seq_ids = [int(seq.seq_id) for seq in target_eager_seqs]
@@ -3477,6 +3585,35 @@ class DraftModelRunner(ModelRunnerBase):
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
+
+        # === Phase 1.5: Continuous eager scaffold draft (local) ===
+        ce_scaffold_proposals: list[EagerBufferedProposal] = []
+        ce_scaffold_trace_record = None
+        if (self.global_config.enable_continuous_eager_draft_execution
+                and plan.draft_eager_new_set and plan.plan_phase == "steady"):
+            ce_new_seqs = self._resolve_dual_seq_ids(
+                plan.draft_eager_new_set, plan, "ce_scaffold_draft",
+            )
+            ce_scaffold_proposals, ce_scaffold_trace_record = \
+                self._draft_continuous_eager_scaffold_proposals(ce_new_seqs, plan)
+            self.continuous_eager_draft_buffer.store(ce_scaffold_proposals)
+            plan.draft_eager_new_set_executed = sorted(p.seq_id for p in ce_scaffold_proposals)
+            plan.continuous_eager_scaffold_tokens_generated = sum(
+                p.eager_len for p in ce_scaffold_proposals
+            )
+            plan.continuous_eager_scaffold_proposals_generated = len(ce_scaffold_proposals)
+            for p in ce_scaffold_proposals:
+                plan.continuous_eager_exec_base_kind_by_seq_id[p.seq_id] = "draft_eager_new_set"
+                plan.continuous_eager_exec_base_len_by_seq_id[p.seq_id] = int(p.eager_base_len)
+                plan.continuous_eager_exec_base_is_valid_by_seq_id[p.seq_id] = True
+
+            _gen_ce_seq_ids = sorted(p.seq_id for p in ce_scaffold_proposals)
+            _exp_ce_seq_ids = sorted(plan.draft_eager_new_set)
+            assert _gen_ce_seq_ids == _exp_ce_seq_ids, self._proposal_assertion_message(
+                plan,
+                f"ce scaffold draft generated seq_ids mismatch: "
+                f"expected={_exp_ce_seq_ids}, generated={_gen_ce_seq_ids}",
+            )
 
         # === Phase 2: Eager draft (local) ===
         eager_proposals = []
@@ -3761,6 +3898,19 @@ class DraftModelRunner(ModelRunnerBase):
             eager_ready_for_send = self.eager_proposal_buffer.get_many(
                 plan.draft_eager_set, ready_only=True,
             ) if plan.draft_eager_set else []
+
+            # Phase 1I-A: append scaffold proposals to the combined payload.
+            ce_scaffold_for_send: list[EagerBufferedProposal] = []
+            if (self.global_config.enable_continuous_eager_draft_execution
+                    and plan.draft_eager_new_set_executed):
+                ce_scaffold_for_send = [
+                    self.continuous_eager_draft_buffer.get(seq_id)
+                    for seq_id in plan.draft_eager_new_set_executed
+                ]
+                ce_scaffold_for_send = [p for p in ce_scaffold_for_send if p is not None]
+                plan.continuous_eager_scaffold_proposals_sent = len(ce_scaffold_for_send)
+            eager_ready_for_send = list(eager_ready_for_send) + ce_scaffold_for_send
+
             _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
             plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
             # --- instrumentation: before send ---
@@ -4348,6 +4498,12 @@ class TargetModelRunner(ModelRunnerBase):
 
         expected_eager_seq_ids = list(plan.draft_eager_set) if self.global_config.enable_eager_execution else []
 
+        # Phase 1I-A: include scaffold seq ids in expected eager on target.
+        if self.global_config.enable_continuous_eager_draft_execution:
+            expected_eager_seq_ids = list(expected_eager_seq_ids) + list(
+                plan.draft_eager_new_set_executed
+            )
+
         if h2_steady:
             # === H2 steady ordering: verify → broadcast → eager verify → broadcast → recv ===
             # ALL collectives in this block are UNCONDITIONAL — every H2 steady step
@@ -4412,14 +4568,19 @@ class TargetModelRunner(ModelRunnerBase):
             if received_conditional:
                 self.dual_proposal_buffer.store(received_conditional)
             if received_eager:
-                self.eager_proposal_buffer.store(received_eager)
-                # Mark received eager proposals as ready: the DRAFT rank
-                # already filtered for ready_only before sending, so every
-                # received eager proposal is implicitly ready for the next
-                # step's _populate_eager_fields.  Without this the TARGET
-                # eager_proposal_buffer diverges from the DRAFT side.
-                for ep in received_eager:
-                    self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
+                # Phase 1I-A: split scaffold proposals from old eager.
+                _ce_scaffold_seq_ids = set(plan.draft_eager_new_set_executed)
+                _ce_scaffold_received = [ep for ep in received_eager if int(ep.seq_id) in _ce_scaffold_seq_ids]
+                _old_eager_received = [ep for ep in received_eager if int(ep.seq_id) not in _ce_scaffold_seq_ids]
+
+                if _old_eager_received:
+                    self.eager_proposal_buffer.store(_old_eager_received)
+                    for ep in _old_eager_received:
+                        self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
+
+                if _ce_scaffold_received:
+                    self.continuous_eager_draft_buffer.store(_ce_scaffold_received)
+                    plan.continuous_eager_scaffold_proposals_received = len(_ce_scaffold_received)
                 # Instrumentation + fail-fast: record full lifecycle state at receive.
                 _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
                 _target_receive_eager_info = []
@@ -4513,7 +4674,16 @@ class TargetModelRunner(ModelRunnerBase):
                     if received_conditional:
                         self.dual_proposal_buffer.store(received_conditional)
                 if received_eager:
-                    self.eager_proposal_buffer.store(received_eager)
+                    # Phase 1I-A: split scaffold proposals from old eager (legacy).
+                    _ce_legacy_ids = set(plan.draft_eager_new_set_executed)
+                    _ce_legacy_received = [ep for ep in received_eager if int(ep.seq_id) in _ce_legacy_ids]
+                    _old_legacy_received = [ep for ep in received_eager if int(ep.seq_id) not in _ce_legacy_ids]
+
+                    if _old_legacy_received:
+                        self.eager_proposal_buffer.store(_old_legacy_received)
+                    if _ce_legacy_received:
+                        self.continuous_eager_draft_buffer.store(_ce_legacy_received)
+                        plan.continuous_eager_scaffold_proposals_received = len(_ce_legacy_received)
                     # Instrumentation + fail-fast at receive (legacy).
                     _running_ids_l = {int(s.seq_id): s for s in self.scheduler.running}
                     _legacy_receive_info = []

@@ -215,6 +215,17 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
             else:
                 cont_without_parent += 1
 
+    # Phase 1I-A scaffold metrics.
+    scaffold_gen = isum([r.get("continuous_eager_scaffold_tokens_generated") for r in records])
+    scaffold_prop_gen = isum([r.get("continuous_eager_scaffold_proposals_generated") for r in records])
+    scaffold_sent = isum([r.get("continuous_eager_scaffold_proposals_sent") for r in records])
+    scaffold_recv = isum([r.get("continuous_eager_scaffold_proposals_received") for r in records])
+    scaffold_promoted = isum([r.get("continuous_eager_scaffold_proposals_promoted") for r in records])
+    scaffold_discarded = isum([r.get("continuous_eager_scaffold_proposals_discarded") for r in records])
+    scaffold_tokens_promoted = isum([r.get("continuous_eager_scaffold_tokens_promoted") for r in records])
+    scaffold_tokens_discarded = isum([r.get("continuous_eager_scaffold_tokens_discarded") for r in records])
+    scaffold_executed = sum(len(r.get("draft_eager_new_set_executed") or []) for r in records)
+
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
         "phase": phase,
@@ -274,6 +285,18 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "target_eager_without_ready": target_eager_without_ready,
         "cont_with_parent": cont_with_parent,
         "cont_without_parent": cont_without_parent,
+        # Phase 1I-A scaffold metrics.
+        "scaffold_tokens_generated": scaffold_gen,
+        "scaffold_proposals_generated": scaffold_prop_gen,
+        "scaffold_proposals_sent": scaffold_sent,
+        "scaffold_proposals_received": scaffold_recv,
+        "scaffold_proposals_promoted": scaffold_promoted,
+        "scaffold_proposals_discarded": scaffold_discarded,
+        "scaffold_tokens_promoted": scaffold_tokens_promoted,
+        "scaffold_tokens_discarded": scaffold_tokens_discarded,
+        "scaffold_executed": scaffold_executed,
+        "scaffold_promotion_rate": scaffold_promoted / max(1, scaffold_executed),
+        "scaffold_generation_success_rate": scaffold_prop_gen / max(1, scaffold_executed),
     }
 
 
@@ -326,6 +349,15 @@ def summarize(path: Path) -> dict[str, Any]:
     total_eager_accepted = sum(p["eager_tokens_accepted"] for p in step_profiles)
     total_eager_rejected = sum(p["eager_tokens_rejected"] for p in step_profiles)
     records_with_target_eager_set = sum(p["records_with_target_eager_set"] for p in step_profiles)
+
+    # Phase 1I-A scaffold aggregation.
+    scaffold_gen = sum(p["scaffold_tokens_generated"] for p in step_profiles)
+    scaffold_prop_gen = sum(p["scaffold_proposals_generated"] for p in step_profiles)
+    scaffold_sent = sum(p["scaffold_proposals_sent"] for p in step_profiles)
+    scaffold_recv = sum(p["scaffold_proposals_received"] for p in step_profiles)
+    scaffold_promoted = sum(p["scaffold_proposals_promoted"] for p in step_profiles)
+    scaffold_discarded = sum(p["scaffold_proposals_discarded"] for p in step_profiles)
+    scaffold_executed = sum(p["scaffold_executed"] for p in step_profiles)
 
     total_ce_selected = sum(p["ce_trace_selected"] for p in step_profiles)
     total_ce_promoted = sum(p["ce_trace_promoted"] for p in step_profiles)
@@ -405,6 +437,15 @@ def summarize(path: Path) -> dict[str, Any]:
         "total_target_eager_without_ready": total_target_without_ready,
         "total_cont_with_parent": total_cont_with_parent,
         "total_cont_without_parent": total_cont_without_parent,
+        # Phase 1I-A scaffold.
+        "scaffold_tokens_generated": scaffold_gen,
+        "scaffold_proposals_generated": scaffold_prop_gen,
+        "scaffold_proposals_sent": scaffold_sent,
+        "scaffold_proposals_received": scaffold_recv,
+        "scaffold_proposals_promoted": scaffold_promoted,
+        "scaffold_proposals_discarded": scaffold_discarded,
+        "scaffold_executed": scaffold_executed,
+        "scaffold_promotion_rate": scaffold_promoted / max(1, scaffold_executed),
         "steps": step_profiles,
     }
 
@@ -594,6 +635,17 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
         print(f"  total_target_eager_without_ready={row['total_target_eager_without_ready']}")
         print(f"  total_cont_with_parent={row['total_cont_with_parent']}")
         print(f"  total_cont_without_parent={row['total_cont_without_parent']}")
+        # Phase 1I-A scaffold metrics.
+        scaffold_executed = row.get("scaffold_executed", 0)
+        if scaffold_executed > 0:
+            print(f"  scaffold_executed={scaffold_executed}")
+            print(f"  scaffold_tokens_generated={row.get('scaffold_tokens_generated', 0)}")
+            print(f"  scaffold_proposals_generated={row.get('scaffold_proposals_generated', 0)}")
+            print(f"  scaffold_proposals_sent={row.get('scaffold_proposals_sent', 0)}")
+            print(f"  scaffold_proposals_received={row.get('scaffold_proposals_received', 0)}")
+            print(f"  scaffold_proposals_promoted={row.get('scaffold_proposals_promoted', 0)}")
+            print(f"  scaffold_proposals_discarded={row.get('scaffold_proposals_discarded', 0)}")
+            print(f"  scaffold_promotion_rate={row.get('scaffold_promotion_rate', 0.0):.3f}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

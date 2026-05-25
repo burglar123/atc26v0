@@ -45,6 +45,9 @@ class StepPlan:
     draft_eager_set_executed: List[int] = field(default_factory=list)
     target_eager_set_executed: List[int] = field(default_factory=list)
 
+    # Phase 1I-A: continuous eager draft-execution scaffold executed set.
+    draft_eager_new_set_executed: List[int] = field(default_factory=list)
+
     budgets: Dict[int, RequestBudget] = field(default_factory=dict)
 
     target_batch_id: Optional[str | int] = None
@@ -120,6 +123,17 @@ class StepPlan:
     eager_waste_rate: Optional[float] = None
     eager_buffer_size_before: int = 0
     eager_buffer_size_after: int = 0
+
+    # Phase 1I-A scaffold counters (separate from old eager counters).
+    continuous_eager_scaffold_tokens_generated: int = 0
+    continuous_eager_scaffold_proposals_generated: int = 0
+    continuous_eager_scaffold_proposals_sent: int = 0
+    continuous_eager_scaffold_proposals_received: int = 0
+    continuous_eager_scaffold_proposals_promoted: int = 0
+    continuous_eager_scaffold_proposals_discarded: int = 0
+    continuous_eager_scaffold_tokens_promoted: int = 0
+    continuous_eager_scaffold_tokens_discarded: int = 0
+
     eager_ready_seq_ids: List[int] = field(default_factory=list)
     eager_promoted_seq_ids: List[int] = field(default_factory=list)
     eager_discarded_seq_ids: List[int] = field(default_factory=list)
@@ -180,6 +194,16 @@ class StepPlan:
     continuous_eager_promotion_simulated_seq_ids: List[int] = field(default_factory=list)
     continuous_eager_promotion_simulation_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_trace_simulated_promoted_total: int = 0
+
+    # Phase 1I-A: full-accept signal audit.
+    continuous_eager_parent_acceptance_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_parent_acceptance_is_exact_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+
+    # Phase 1I-A: eager base construction audit.
+    continuous_eager_exec_base_kind_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_exec_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    continuous_eager_exec_base_is_valid_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
     eager_rejected_seq_ids: List[int] = field(default_factory=list)
@@ -437,6 +461,8 @@ class StepPlan:
             "draft_home_set_executed": [int(seq_id) for seq_id in self.draft_home_set_executed],
             "draft_eager_set_executed": [int(seq_id) for seq_id in self.draft_eager_set_executed],
             "target_eager_set_executed": [int(seq_id) for seq_id in self.target_eager_set_executed],
+            # Phase 1I-A scaffold executed set.
+            "draft_eager_new_set_executed": [int(seq_id) for seq_id in self.draft_eager_new_set_executed],
             "budgets": {
                 str(seq_id): budget.to_trace_dict()
                 for seq_id, budget in self.budgets.items()
@@ -705,6 +731,53 @@ class StepPlan:
             "continuous_eager_trace_simulated_promoted_total": int(
                 self.continuous_eager_trace_simulated_promoted_total
             ),
+            # Phase 1I-A scaffold counters.
+            "continuous_eager_scaffold_tokens_generated": int(
+                self.continuous_eager_scaffold_tokens_generated
+            ),
+            "continuous_eager_scaffold_proposals_generated": int(
+                self.continuous_eager_scaffold_proposals_generated
+            ),
+            "continuous_eager_scaffold_proposals_sent": int(
+                self.continuous_eager_scaffold_proposals_sent
+            ),
+            "continuous_eager_scaffold_proposals_received": int(
+                self.continuous_eager_scaffold_proposals_received
+            ),
+            "continuous_eager_scaffold_proposals_promoted": int(
+                self.continuous_eager_scaffold_proposals_promoted
+            ),
+            "continuous_eager_scaffold_proposals_discarded": int(
+                self.continuous_eager_scaffold_proposals_discarded
+            ),
+            "continuous_eager_scaffold_tokens_promoted": int(
+                self.continuous_eager_scaffold_tokens_promoted
+            ),
+            "continuous_eager_scaffold_tokens_discarded": int(
+                self.continuous_eager_scaffold_tokens_discarded
+            ),
+            # Phase 1I-A full-accept signal audit.
+            "continuous_eager_parent_acceptance_source_by_seq_id": {
+                str(seq_id): str(source)
+                for seq_id, source in self.continuous_eager_parent_acceptance_source_by_seq_id.items()
+            },
+            "continuous_eager_parent_acceptance_is_exact_by_seq_id": {
+                str(seq_id): bool(is_exact)
+                for seq_id, is_exact in self.continuous_eager_parent_acceptance_is_exact_by_seq_id.items()
+            },
+            # Phase 1I-A base construction audit.
+            "continuous_eager_exec_base_kind_by_seq_id": {
+                str(seq_id): str(kind)
+                for seq_id, kind in self.continuous_eager_exec_base_kind_by_seq_id.items()
+            },
+            "continuous_eager_exec_base_len_by_seq_id": {
+                str(seq_id): int(base_len)
+                for seq_id, base_len in self.continuous_eager_exec_base_len_by_seq_id.items()
+            },
+            "continuous_eager_exec_base_is_valid_by_seq_id": {
+                str(seq_id): bool(is_valid)
+                for seq_id, is_valid in self.continuous_eager_exec_base_is_valid_by_seq_id.items()
+            },
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],
             "eager_rejected_seq_ids": [int(seq_id) for seq_id in self.eager_rejected_seq_ids],

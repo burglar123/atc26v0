@@ -40,11 +40,11 @@ def _load_dual_batch():
     mod.__dict__["__name__"] = "nano_pearl.pearl_engine.dual_batch"
     sys.modules["nano_pearl.pearl_engine.dual_batch"] = mod
     exec(src, mod.__dict__)
-    return mod.EagerBufferedProposal, mod.BufferedProposal, mod.ProposalBuffer, mod.EagerProposalBuffer
+    return mod.EagerBufferedProposal, mod.BufferedProposal, mod.ProposalBuffer, mod.EagerProposalBuffer, mod.ContinuousEagerDraftExecutionBuffer
 
 
 StepPlan, RequestBudget = _load_step_plan()
-EagerBufferedProposal, BufferedProposal, ProposalBuffer, EagerProposalBuffer = _load_dual_batch()
+EagerBufferedProposal, BufferedProposal, ProposalBuffer, EagerProposalBuffer, ContinuousEagerDraftExecutionBuffer = _load_dual_batch()
 
 
 # --- Standalone validation function that mirrors _validate_received_eager_seq_ids ---
@@ -1866,6 +1866,180 @@ def test_continuous_promotion_to_trace_dict_includes_promotion_fields():
     assert d.get("continuous_eager_chain_depth_by_seq_id") == {"1": 1}
 
 
+# --- Phase 1I-A scaffold tests ---
+
+
+def test_scaffold_buffer_store_and_get():
+    """Scaffold buffer stores proposals and retrieves them by seq_id."""
+    buf = ContinuousEagerDraftExecutionBuffer()
+    p = EagerBufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        eager_token_ids=[10, 20], eager_len=2, eager_base_len=100,
+        source_plan_id=1, source_step_id=0, source_home_batch_id=0,
+        verify_with_batch_id=None, score=0.5, policy="tight_only",
+        valid=True, ready=False, original_eager_base_len_at_generation=100,
+    )
+    buf.store([p])
+    assert buf.size() == 1
+    assert buf.get(1) is not None
+    assert buf.get(1).eager_len == 2
+    assert buf.get(999) is None
+
+
+def test_scaffold_buffer_mark_ready():
+    """Scaffold buffer mark_ready transitions proposal to ready."""
+    buf = ContinuousEagerDraftExecutionBuffer()
+    p = EagerBufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        eager_token_ids=[10], eager_len=1, eager_base_len=100,
+        source_plan_id=1, source_step_id=0, source_home_batch_id=0,
+        verify_with_batch_id=None, score=0.5, policy="tight_only",
+        valid=True, ready=False, original_eager_base_len_at_generation=100,
+    )
+    buf.store([p])
+    assert buf.mark_ready(1)
+    assert buf.get(1).ready
+    assert buf.ready_seq_ids() == [1]
+    assert not buf.mark_ready(999)
+
+
+def test_scaffold_buffer_discard():
+    """Scaffold buffer discard removes proposals."""
+    buf = ContinuousEagerDraftExecutionBuffer()
+    p = EagerBufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        eager_token_ids=[10], eager_len=1, eager_base_len=100,
+        source_plan_id=1, source_step_id=0, source_home_batch_id=0,
+        verify_with_batch_id=None, score=0.5, policy="tight_only",
+        valid=True, ready=False, original_eager_base_len_at_generation=100,
+    )
+    buf.store([p])
+    dropped = buf.discard([1])
+    assert dropped == [1]
+    assert buf.size() == 0
+    assert buf.get(1) is None
+
+
+def test_scaffold_buffer_discard_inactive():
+    """Scaffold buffer discard_inactive removes finished seqs."""
+    buf = ContinuousEagerDraftExecutionBuffer()
+    p1 = EagerBufferedProposal(
+        seq_id=1, request_id="r1", home_batch_id=0,
+        eager_token_ids=[10], eager_len=1, eager_base_len=100,
+        source_plan_id=1, source_step_id=0, source_home_batch_id=0,
+        verify_with_batch_id=None, score=0.5, policy="tight_only",
+        valid=True, ready=False, original_eager_base_len_at_generation=100,
+    )
+    p2 = EagerBufferedProposal(
+        seq_id=2, request_id="r2", home_batch_id=0,
+        eager_token_ids=[20], eager_len=1, eager_base_len=200,
+        source_plan_id=1, source_step_id=0, source_home_batch_id=0,
+        verify_with_batch_id=None, score=0.5, policy="tight_only",
+        valid=True, ready=False, original_eager_base_len_at_generation=200,
+    )
+    buf.store([p1, p2])
+    dropped = buf.discard_inactive([1])
+    assert sorted(dropped) == [2]
+    assert buf.size() == 1
+    assert buf.get(1) is not None
+
+
+def test_scaffold_draft_eager_new_set_executed_field():
+    """StepPlan has draft_eager_new_set_executed field."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.draft_eager_new_set_executed = [1, 2]
+    d = plan.to_trace_dict()
+    assert d.get("draft_eager_new_set_executed") == [1, 2]
+
+
+def test_scaffold_counters_serialized():
+    """Scaffold counters include tokens_generated, proposals_sent, etc."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_scaffold_tokens_generated = 42
+    plan.continuous_eager_scaffold_proposals_generated = 3
+    plan.continuous_eager_scaffold_proposals_sent = 3
+    plan.continuous_eager_scaffold_proposals_received = 3
+    plan.continuous_eager_scaffold_proposals_promoted = 2
+    plan.continuous_eager_scaffold_proposals_discarded = 1
+    d = plan.to_trace_dict()
+    assert d["continuous_eager_scaffold_tokens_generated"] == 42
+    assert d["continuous_eager_scaffold_proposals_generated"] == 3
+    assert d["continuous_eager_scaffold_proposals_sent"] == 3
+    assert d["continuous_eager_scaffold_proposals_received"] == 3
+    assert d["continuous_eager_scaffold_proposals_promoted"] == 2
+    assert d["continuous_eager_scaffold_proposals_discarded"] == 1
+
+
+def test_scaffold_audit_fields_serialized():
+    """Full-accept audit and base construction audit fields are serialized."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_parent_acceptance_source_by_seq_id = {1: "normal_verify"}
+    plan.continuous_eager_parent_acceptance_is_exact_by_seq_id = {1: True}
+    plan.continuous_eager_exec_base_kind_by_seq_id = {1: "draft_eager_new_set"}
+    plan.continuous_eager_exec_base_len_by_seq_id = {1: 100}
+    plan.continuous_eager_exec_base_is_valid_by_seq_id = {1: True}
+    d = plan.to_trace_dict()
+    assert d["continuous_eager_parent_acceptance_source_by_seq_id"] == {"1": "normal_verify"}
+    assert d["continuous_eager_parent_acceptance_is_exact_by_seq_id"] == {"1": True}
+    assert d["continuous_eager_exec_base_kind_by_seq_id"] == {"1": "draft_eager_new_set"}
+    assert d["continuous_eager_exec_base_len_by_seq_id"] == {"1": 100}
+    assert d["continuous_eager_exec_base_is_valid_by_seq_id"] == {"1": True}
+
+
+def test_scaffold_target_eager_set_executed_empty():
+    """target_eager_set_executed stays empty (no target verification in scaffold)."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.draft_eager_new_set_executed = [1, 2]
+    # target_eager_set_executed is never populated in scaffold phase.
+    assert plan.target_eager_set_executed == []
+    d = plan.to_trace_dict()
+    assert d["target_eager_set_executed"] == []
+
+
+def test_scaffold_continue_set_not_in_executed():
+    """draft_eager_continue_set seqs are NOT in draft_eager_new_set_executed."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1, 2], draft_home_set=[3, 4],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.draft_eager_new_set = [1]
+    plan.draft_eager_continue_set = [2]
+    plan.draft_eager_new_set_executed = [1]
+    # Verify: continue_set[2] NOT in executed[1]
+    assert 2 not in set(plan.draft_eager_new_set_executed)
+
+
+def test_scaffold_counters_consistency():
+    """Scaffold counters read correctly from to_trace_dict."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1, 2], draft_home_set=[3, 4],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_scaffold_tokens_generated = 10
+    plan.continuous_eager_scaffold_proposals_generated = 5
+    d = plan.to_trace_dict()
+    assert d["continuous_eager_scaffold_tokens_generated"] == 10
+    assert d["continuous_eager_scaffold_proposals_generated"] == 5
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -1956,6 +2130,17 @@ if __name__ == "__main__":
         test_continuous_promotion_no_verified_or_applied_state,
         test_continuous_promotion_parent_kind_eager_has_parent_id,
         test_continuous_promotion_to_trace_dict_includes_promotion_fields,
+        # Phase 1I-A scaffold tests
+        test_scaffold_buffer_store_and_get,
+        test_scaffold_buffer_mark_ready,
+        test_scaffold_buffer_discard,
+        test_scaffold_buffer_discard_inactive,
+        test_scaffold_draft_eager_new_set_executed_field,
+        test_scaffold_counters_serialized,
+        test_scaffold_audit_fields_serialized,
+        test_scaffold_target_eager_set_executed_empty,
+        test_scaffold_continue_set_not_in_executed,
+        test_scaffold_counters_consistency,
     ]
     passed = 0
     for test in tests:
