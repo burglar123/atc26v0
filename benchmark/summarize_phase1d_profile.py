@@ -225,6 +225,18 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
     scaffold_tokens_promoted = isum([r.get("continuous_eager_scaffold_tokens_promoted") for r in records])
     scaffold_tokens_discarded = isum([r.get("continuous_eager_scaffold_tokens_discarded") for r in records])
     scaffold_executed = sum(len(r.get("draft_eager_new_set_executed") or []) for r in records)
+    scaffold_send_tokens = isum([r.get("continuous_eager_exec_send_token_count") for r in records])
+    scaffold_recv_tokens = isum([r.get("continuous_eager_exec_receive_token_count") for r in records])
+    scaffold_sent_seq_count = sum(len(r.get("continuous_eager_exec_sent_seq_ids") or []) for r in records)
+    scaffold_received_seq_count = sum(len(r.get("continuous_eager_exec_received_seq_ids") or []) for r in records)
+    scaffold_base_val_failures = sum(
+        1 for r in records
+        for ok in (r.get("continuous_eager_exec_base_validation_ok_by_seq_id") or {}).values()
+        if not ok
+    )
+    scaffold_buf_max = max(
+        [int(r.get("continuous_eager_exec_buffer_size_after") or 0) for r in records] + [0]
+    )
 
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
@@ -297,6 +309,12 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "scaffold_executed": scaffold_executed,
         "scaffold_promotion_rate": scaffold_promoted / max(1, scaffold_executed),
         "scaffold_generation_success_rate": scaffold_prop_gen / max(1, scaffold_executed),
+        "scaffold_send_tokens": scaffold_send_tokens,
+        "scaffold_recv_tokens": scaffold_recv_tokens,
+        "scaffold_sent_seq_count": scaffold_sent_seq_count,
+        "scaffold_received_seq_count": scaffold_received_seq_count,
+        "scaffold_base_val_failures": scaffold_base_val_failures,
+        "scaffold_buf_max": scaffold_buf_max,
     }
 
 
@@ -358,6 +376,12 @@ def summarize(path: Path) -> dict[str, Any]:
     scaffold_promoted = sum(p["scaffold_proposals_promoted"] for p in step_profiles)
     scaffold_discarded = sum(p["scaffold_proposals_discarded"] for p in step_profiles)
     scaffold_executed = sum(p["scaffold_executed"] for p in step_profiles)
+    scaffold_send_tokens = sum(p["scaffold_send_tokens"] for p in step_profiles)
+    scaffold_recv_tokens = sum(p["scaffold_recv_tokens"] for p in step_profiles)
+    scaffold_sent_seq_count = sum(p["scaffold_sent_seq_count"] for p in step_profiles)
+    scaffold_received_seq_count = sum(p["scaffold_received_seq_count"] for p in step_profiles)
+    scaffold_base_val_failures = sum(p["scaffold_base_val_failures"] for p in step_profiles)
+    scaffold_buf_max = max([p["scaffold_buf_max"] for p in step_profiles] + [0])
 
     total_ce_selected = sum(p["ce_trace_selected"] for p in step_profiles)
     total_ce_promoted = sum(p["ce_trace_promoted"] for p in step_profiles)
@@ -446,6 +470,12 @@ def summarize(path: Path) -> dict[str, Any]:
         "scaffold_proposals_discarded": scaffold_discarded,
         "scaffold_executed": scaffold_executed,
         "scaffold_promotion_rate": scaffold_promoted / max(1, scaffold_executed),
+        "scaffold_send_tokens": scaffold_send_tokens,
+        "scaffold_recv_tokens": scaffold_recv_tokens,
+        "scaffold_sent_seq_count": scaffold_sent_seq_count,
+        "scaffold_received_seq_count": scaffold_received_seq_count,
+        "scaffold_base_val_failures": scaffold_base_val_failures,
+        "scaffold_buf_max": scaffold_buf_max,
         "steps": step_profiles,
     }
 
@@ -646,6 +676,12 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
             print(f"  scaffold_proposals_promoted={row.get('scaffold_proposals_promoted', 0)}")
             print(f"  scaffold_proposals_discarded={row.get('scaffold_proposals_discarded', 0)}")
             print(f"  scaffold_promotion_rate={row.get('scaffold_promotion_rate', 0.0):.3f}")
+            print(f"  scaffold_send_tokens={row.get('scaffold_send_tokens', 0)}")
+            print(f"  scaffold_recv_tokens={row.get('scaffold_recv_tokens', 0)}")
+            print(f"  scaffold_sent_seq_count={row.get('scaffold_sent_seq_count', 0)}")
+            print(f"  scaffold_received_seq_count={row.get('scaffold_received_seq_count', 0)}")
+            print(f"  scaffold_base_val_failures={row.get('scaffold_base_val_failures', 0)}")
+            print(f"  scaffold_buf_max={row.get('scaffold_buf_max', 0)}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

@@ -195,6 +195,10 @@ class StepPlan:
     continuous_eager_promotion_simulation_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_trace_simulated_promoted_total: int = 0
 
+    # Phase 1I-A: enablement flags.
+    continuous_eager_draft_execution_enabled: bool = False
+    continuous_eager_execution_phase: str = ""
+
     # Phase 1I-A: full-accept signal audit.
     continuous_eager_parent_acceptance_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_parent_acceptance_is_exact_by_seq_id: Dict[int, bool] = field(default_factory=dict)
@@ -203,6 +207,32 @@ class StepPlan:
     continuous_eager_exec_base_kind_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_exec_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
     continuous_eager_exec_base_is_valid_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    continuous_eager_exec_base_validation_ok_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    continuous_eager_exec_base_validation_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_exec_expected_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    continuous_eager_exec_parent_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+
+    # Phase 1I-A: transport trace fields.
+    continuous_eager_exec_sent_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_exec_received_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_exec_sent_proposal_ids: List[str] = field(default_factory=list)
+    continuous_eager_exec_received_proposal_ids: List[str] = field(default_factory=list)
+    continuous_eager_exec_send_token_count: int = 0
+    continuous_eager_exec_receive_token_count: int = 0
+    continuous_eager_exec_receive_validation_ok: Optional[bool] = None
+    continuous_eager_exec_receive_validation_reason: str = ""
+
+    # Phase 1I-A: target-side buffer trace.
+    continuous_eager_exec_buffer_size_before: int = 0
+    continuous_eager_exec_buffer_size_after: int = 0
+
+    # Phase 1I-A: promotion/discard bookkeeping.
+    continuous_eager_exec_promoted_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_exec_discarded_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_exec_parent_unknown_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_exec_promotion_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_exec_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_exec_parent_acceptance_status_by_seq_id: Dict[int, str] = field(default_factory=dict)
 
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
@@ -731,6 +761,11 @@ class StepPlan:
             "continuous_eager_trace_simulated_promoted_total": int(
                 self.continuous_eager_trace_simulated_promoted_total
             ),
+            # Phase 1I-A enablement flags.
+            "continuous_eager_draft_execution_enabled": bool(
+                self.continuous_eager_draft_execution_enabled
+            ),
+            "continuous_eager_execution_phase": self.continuous_eager_execution_phase,
             # Phase 1I-A scaffold counters.
             "continuous_eager_scaffold_tokens_generated": int(
                 self.continuous_eager_scaffold_tokens_generated
@@ -756,15 +791,6 @@ class StepPlan:
             "continuous_eager_scaffold_tokens_discarded": int(
                 self.continuous_eager_scaffold_tokens_discarded
             ),
-            # Phase 1I-A full-accept signal audit.
-            "continuous_eager_parent_acceptance_source_by_seq_id": {
-                str(seq_id): str(source)
-                for seq_id, source in self.continuous_eager_parent_acceptance_source_by_seq_id.items()
-            },
-            "continuous_eager_parent_acceptance_is_exact_by_seq_id": {
-                str(seq_id): bool(is_exact)
-                for seq_id, is_exact in self.continuous_eager_parent_acceptance_is_exact_by_seq_id.items()
-            },
             # Phase 1I-A base construction audit.
             "continuous_eager_exec_base_kind_by_seq_id": {
                 str(seq_id): str(kind)
@@ -777,6 +803,86 @@ class StepPlan:
             "continuous_eager_exec_base_is_valid_by_seq_id": {
                 str(seq_id): bool(is_valid)
                 for seq_id, is_valid in self.continuous_eager_exec_base_is_valid_by_seq_id.items()
+            },
+            "continuous_eager_exec_base_validation_ok_by_seq_id": {
+                str(seq_id): bool(ok)
+                for seq_id, ok in self.continuous_eager_exec_base_validation_ok_by_seq_id.items()
+            },
+            "continuous_eager_exec_base_validation_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_exec_base_validation_reason_by_seq_id.items()
+            },
+            "continuous_eager_exec_expected_base_len_by_seq_id": {
+                str(seq_id): int(base_len)
+                for seq_id, base_len in self.continuous_eager_exec_expected_base_len_by_seq_id.items()
+            },
+            "continuous_eager_exec_parent_len_by_seq_id": {
+                str(seq_id): int(parent_len)
+                for seq_id, parent_len in self.continuous_eager_exec_parent_len_by_seq_id.items()
+            },
+            # Phase 1I-A full-accept signal audit.
+            "continuous_eager_parent_acceptance_source_by_seq_id": {
+                str(seq_id): str(source)
+                for seq_id, source in self.continuous_eager_parent_acceptance_source_by_seq_id.items()
+            },
+            "continuous_eager_parent_acceptance_is_exact_by_seq_id": {
+                str(seq_id): bool(is_exact)
+                for seq_id, is_exact in self.continuous_eager_parent_acceptance_is_exact_by_seq_id.items()
+            },
+            # Phase 1I-A transport trace.
+            "continuous_eager_exec_sent_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_exec_sent_seq_ids
+            ],
+            "continuous_eager_exec_received_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_exec_received_seq_ids
+            ],
+            "continuous_eager_exec_sent_proposal_ids": list(
+                self.continuous_eager_exec_sent_proposal_ids
+            ),
+            "continuous_eager_exec_received_proposal_ids": list(
+                self.continuous_eager_exec_received_proposal_ids
+            ),
+            "continuous_eager_exec_send_token_count": int(
+                self.continuous_eager_exec_send_token_count
+            ),
+            "continuous_eager_exec_receive_token_count": int(
+                self.continuous_eager_exec_receive_token_count
+            ),
+            "continuous_eager_exec_receive_validation_ok": (
+                None if self.continuous_eager_exec_receive_validation_ok is None
+                else bool(self.continuous_eager_exec_receive_validation_ok)
+            ),
+            "continuous_eager_exec_receive_validation_reason": (
+                self.continuous_eager_exec_receive_validation_reason
+            ),
+            # Phase 1I-A target-side buffer trace.
+            "continuous_eager_exec_buffer_size_before": int(
+                self.continuous_eager_exec_buffer_size_before
+            ),
+            "continuous_eager_exec_buffer_size_after": int(
+                self.continuous_eager_exec_buffer_size_after
+            ),
+            # Phase 1I-A promotion/discard bookkeeping.
+            "continuous_eager_exec_promoted_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_exec_promoted_seq_ids
+            ],
+            "continuous_eager_exec_discarded_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_exec_discarded_seq_ids
+            ],
+            "continuous_eager_exec_parent_unknown_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_exec_parent_unknown_seq_ids
+            ],
+            "continuous_eager_exec_promotion_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_exec_promotion_reason_by_seq_id.items()
+            },
+            "continuous_eager_exec_discard_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_exec_discard_reason_by_seq_id.items()
+            },
+            "continuous_eager_exec_parent_acceptance_status_by_seq_id": {
+                str(seq_id): str(status)
+                for seq_id, status in self.continuous_eager_exec_parent_acceptance_status_by_seq_id.items()
             },
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],

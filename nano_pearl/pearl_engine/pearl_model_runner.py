@@ -1337,19 +1337,23 @@ class ModelRunnerBase:
         expected_normal_proposal_seq_ids, excluded_normal_proposal_seq_ids.
         TARGET must not derive these independently from local buffer state.
         """
-        if plan.plan_phase != "steady" or not self.global_config.enable_eager_execution:
+        if plan.plan_phase != "steady" or not (
+            self.global_config.enable_eager_execution
+            or self.global_config.enable_continuous_eager_draft_execution
+        ):
             return
 
         src_rank = self.global_config.draft_config.master_rank
         is_source = self.is_draft and self.tp_params.local_rank == 0
 
-        # Serialize four lists: [num_fields, len0, data0..., len1, data1..., ...]
+        # Serialize lists: [num_fields, len0, data0..., len1, data1..., ...]
         if is_source:
             fields = [
                 [int(s) for s in plan.draft_eager_set],
                 [int(s) for s in plan.expected_eager_proposal_seq_ids],
                 [int(s) for s in plan.expected_normal_proposal_seq_ids],
                 [int(s) for s in plan.excluded_normal_proposal_seq_ids],
+                [int(s) for s in plan.draft_eager_new_set_executed],
             ]
             packed = [len(fields)]
             for f in fields:
@@ -1395,6 +1399,9 @@ class ModelRunnerBase:
                 plan.excluded_normal_proposal_reason = (
                     "covered_by_target_eager_result" if arr[idx - n:idx] else ""
                 )
+            if num_fields >= 5:
+                n = arr[idx]; idx += 1
+                plan.draft_eager_new_set_executed = arr[idx:idx + n]; idx += n
 
     def _debug_check_h2_plan_consistency(self, plan: StepPlan) -> None:
         """Fail-fast debug check: all_gather key plan fields and assert equality.
@@ -2067,7 +2074,7 @@ class ModelRunnerBase:
         plan.eager_receive_policy = "producer_authoritative"
 
         if received_eager_seq_ids:
-            if not self.global_config.enable_eager_execution:
+            if not self.global_config.enable_eager_execution and not self.global_config.enable_continuous_eager_draft_execution:
                 plan.eager_receive_validation_passed = False
                 plan.eager_receive_validation_error = (
                     "received eager proposals but eager execution is disabled"
@@ -2395,6 +2402,12 @@ class ModelRunnerBase:
                 self.continuous_eager_draft_buffer.discard([seq_id])
             plan.continuous_eager_scaffold_tokens_promoted = scaffold_promoted_tokens
             plan.continuous_eager_scaffold_tokens_discarded = scaffold_discarded_tokens
+            plan.continuous_eager_exec_promoted_seq_ids = promoted
+            plan.continuous_eager_exec_discarded_seq_ids = discarded
+            plan.continuous_eager_exec_parent_unknown_seq_ids = unknown
+            plan.continuous_eager_exec_promotion_reason_by_seq_id = promote_reasons
+            plan.continuous_eager_exec_discard_reason_by_seq_id = discard_reasons
+            plan.continuous_eager_exec_parent_acceptance_status_by_seq_id = parent_status
 
         if trace_record is not None:
             trace_record["continuous_eager_promoted_seq_ids"] = promoted
@@ -3602,10 +3615,22 @@ class DraftModelRunner(ModelRunnerBase):
                 p.eager_len for p in ce_scaffold_proposals
             )
             plan.continuous_eager_scaffold_proposals_generated = len(ce_scaffold_proposals)
+            plan.continuous_eager_draft_execution_enabled = True
+            plan.continuous_eager_execution_phase = plan.plan_phase
+            _ce_seq_map = {int(s.seq_id): s for s in ce_new_seqs}
             for p in ce_scaffold_proposals:
                 plan.continuous_eager_exec_base_kind_by_seq_id[p.seq_id] = "draft_eager_new_set"
                 plan.continuous_eager_exec_base_len_by_seq_id[p.seq_id] = int(p.eager_base_len)
                 plan.continuous_eager_exec_base_is_valid_by_seq_id[p.seq_id] = True
+                plan.continuous_eager_exec_base_validation_ok_by_seq_id[p.seq_id] = True
+                plan.continuous_eager_exec_base_validation_reason_by_seq_id[p.seq_id] = (
+                    "seq_len_matches_eager_base_len"
+                )
+                plan.continuous_eager_exec_expected_base_len_by_seq_id[p.seq_id] = int(p.eager_base_len)
+                _ce_seq = _ce_seq_map.get(int(p.seq_id))
+                plan.continuous_eager_exec_parent_len_by_seq_id[p.seq_id] = (
+                    int(len(_ce_seq)) if _ce_seq is not None else int(p.eager_base_len)
+                )
 
             _gen_ce_seq_ids = sorted(p.seq_id for p in ce_scaffold_proposals)
             _exp_ce_seq_ids = sorted(plan.draft_eager_new_set)
@@ -3909,6 +3934,13 @@ class DraftModelRunner(ModelRunnerBase):
                 ]
                 ce_scaffold_for_send = [p for p in ce_scaffold_for_send if p is not None]
                 plan.continuous_eager_scaffold_proposals_sent = len(ce_scaffold_for_send)
+                plan.continuous_eager_exec_sent_seq_ids = [int(p.seq_id) for p in ce_scaffold_for_send]
+                plan.continuous_eager_exec_sent_proposal_ids = [
+                    str(p.seq_id) for p in ce_scaffold_for_send
+                ]
+                plan.continuous_eager_exec_send_token_count = sum(
+                    int(p.eager_len) for p in ce_scaffold_for_send
+                )
             eager_ready_for_send = list(eager_ready_for_send) + ce_scaffold_for_send
 
             _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
@@ -3935,6 +3967,7 @@ class DraftModelRunner(ModelRunnerBase):
             # normal verify runs BEFORE send packaging, so the live seq may
             # already be post-verify.  The proposal is valid if its
             # eager_base_len matches the current seq length.
+            _ce_scaffold_send_ids = set(plan.draft_eager_new_set_executed)
             send_validation_ok = True
             send_validation_reasons = []
             for p in eager_ready_for_send:
@@ -3945,6 +3978,10 @@ class DraftModelRunner(ModelRunnerBase):
                     send_validation_reasons.append(
                         f"seq_id={_sid} not found in running set at send time"
                     )
+                    continue
+                # Phase 1I-A: skip base_len==seq_len check for scaffold proposals
+                # because normal verify runs before send and changes seq length.
+                if _sid in _ce_scaffold_send_ids:
                     continue
                 _base_len = int(p.eager_base_len)
                 _seq_len = int(len(_seq))
@@ -4579,8 +4616,27 @@ class TargetModelRunner(ModelRunnerBase):
                         self.eager_proposal_buffer.mark_ready(int(ep.seq_id))
 
                 if _ce_scaffold_received:
+                    plan.continuous_eager_exec_buffer_size_before = (
+                        self.continuous_eager_draft_buffer.size()
+                    )
                     self.continuous_eager_draft_buffer.store(_ce_scaffold_received)
+                    plan.continuous_eager_exec_buffer_size_after = (
+                        self.continuous_eager_draft_buffer.size()
+                    )
                     plan.continuous_eager_scaffold_proposals_received = len(_ce_scaffold_received)
+                    plan.continuous_eager_exec_received_seq_ids = [
+                        int(p.seq_id) for p in _ce_scaffold_received
+                    ]
+                    plan.continuous_eager_exec_received_proposal_ids = [
+                        str(p.seq_id) for p in _ce_scaffold_received
+                    ]
+                    plan.continuous_eager_exec_receive_token_count = sum(
+                        int(p.eager_len) for p in _ce_scaffold_received
+                    )
+                    plan.continuous_eager_exec_receive_validation_ok = True
+                    plan.continuous_eager_exec_receive_validation_reason = (
+                        "scaffold_no_target_verify"
+                    )
                 # Instrumentation + fail-fast: record full lifecycle state at receive.
                 _running_ids = {int(s.seq_id): s for s in self.scheduler.running}
                 _target_receive_eager_info = []
@@ -4611,6 +4667,7 @@ class TargetModelRunner(ModelRunnerBase):
                 # compatibility check is base_len match, not pre_verify.
                 receive_ok = True
                 receive_reasons = []
+                _ce_scaffold_receive_ids = set(plan.draft_eager_new_set_executed)
                 for ep in received_eager:
                     _sid = int(ep.seq_id)
                     _seq = _running_ids.get(_sid)
@@ -4624,6 +4681,14 @@ class TargetModelRunner(ModelRunnerBase):
                     _ep_base = int(ep.eager_base_len)
                     _seq_len = int(len(_seq))
                     _orig_base = int(ep.original_eager_base_len_at_generation)
+                    # Phase 1I-A: skip base_len==seq_len check for scaffold proposals
+                    # because normal verify on TARGET may have changed seq length.
+                    if _sid in _ce_scaffold_receive_ids:
+                        receive_reasons.append(
+                            f"seq_id={_sid} scaffold proposal (skip base_len check, "
+                            f"base={_ep_base}, seq={_seq_len})"
+                        )
+                        continue
                     if _ep_base != _seq_len:
                         assert False, self._proposal_assertion_message(
                             plan,
@@ -4682,8 +4747,27 @@ class TargetModelRunner(ModelRunnerBase):
                     if _old_legacy_received:
                         self.eager_proposal_buffer.store(_old_legacy_received)
                     if _ce_legacy_received:
+                        plan.continuous_eager_exec_buffer_size_before = (
+                            self.continuous_eager_draft_buffer.size()
+                        )
                         self.continuous_eager_draft_buffer.store(_ce_legacy_received)
+                        plan.continuous_eager_exec_buffer_size_after = (
+                            self.continuous_eager_draft_buffer.size()
+                        )
                         plan.continuous_eager_scaffold_proposals_received = len(_ce_legacy_received)
+                        plan.continuous_eager_exec_received_seq_ids = [
+                            int(p.seq_id) for p in _ce_legacy_received
+                        ]
+                        plan.continuous_eager_exec_received_proposal_ids = [
+                            str(p.seq_id) for p in _ce_legacy_received
+                        ]
+                        plan.continuous_eager_exec_receive_token_count = sum(
+                            int(p.eager_len) for p in _ce_legacy_received
+                        )
+                        plan.continuous_eager_exec_receive_validation_ok = True
+                        plan.continuous_eager_exec_receive_validation_reason = (
+                            "scaffold_no_target_verify"
+                        )
                     # Instrumentation + fail-fast at receive (legacy).
                     _running_ids_l = {int(s.seq_id): s for s in self.scheduler.running}
                     _legacy_receive_info = []
@@ -4714,6 +4798,9 @@ class TargetModelRunner(ModelRunnerBase):
                             _ep_base = int(ep.eager_base_len)
                             _seq_len = int(len(_seq))
                             _orig_base = int(ep.original_eager_base_len_at_generation)
+                            # Phase 1I-A: skip base_len check for scaffold proposals.
+                            if _sid in _ce_legacy_ids:
+                                continue
                             assert _ep_base == _seq_len, self._proposal_assertion_message(
                                 plan,
                                 f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
