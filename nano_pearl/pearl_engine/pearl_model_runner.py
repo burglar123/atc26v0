@@ -2420,14 +2420,15 @@ class ModelRunnerBase:
         plan.continuous_eager_trace_promoted_count = len(promoted)
         plan.continuous_eager_trace_discarded_count = len(discarded)
 
-        # Phase 1I-A: buffer-level promotion/discard using real normal verify results.
+        # Phase 1I-A: scaffold trace bookkeeping using normal verify results.
+        # Buffer mutations (mark_ready / discard) are deferred to the TARGET
+        # side after receive, so that ALL generated proposals are sent.
         if self.global_config.enable_continuous_eager_draft_execution:
             plan.continuous_eager_scaffold_proposals_promoted = len(promoted)
             plan.continuous_eager_scaffold_proposals_discarded = len(discarded)
             scaffold_promoted_tokens = 0
             scaffold_discarded_tokens = 0
             for seq_id in promoted:
-                self.continuous_eager_draft_buffer.mark_ready(seq_id)
                 proposal = self.continuous_eager_draft_buffer.get(seq_id)
                 if proposal is not None:
                     scaffold_promoted_tokens += int(proposal.eager_len)
@@ -2437,7 +2438,6 @@ class ModelRunnerBase:
                 proposal = self.continuous_eager_draft_buffer.get(seq_id)
                 if proposal is not None:
                     scaffold_discarded_tokens += int(proposal.eager_len)
-                self.continuous_eager_draft_buffer.discard([seq_id])
             plan.continuous_eager_scaffold_tokens_promoted = scaffold_promoted_tokens
             plan.continuous_eager_scaffold_tokens_discarded = scaffold_discarded_tokens
             plan.continuous_eager_exec_promoted_seq_ids = promoted
@@ -4729,6 +4729,8 @@ class TargetModelRunner(ModelRunnerBase):
             # executes the same three collective pairs regardless of empty sets.
 
             # Phase A: Normal verify broadcast (UNCONDITIONAL)
+            accepted_lens: dict[int, int] = {}
+            invalidated_lens: dict[int, int] = {}
             if target_seqs:
                 self._validate_proposals_for_target(target_proposals, target_seqs, plan)
                 consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
@@ -4901,6 +4903,94 @@ class TargetModelRunner(ModelRunnerBase):
                     )
             plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
             plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
+
+            # Phase 1I-A: target-side scaffold promotion/discard using normal
+            # verify results from Phase A.  Buffer mutations happen HERE
+            # (after receive), not on the DRAFT side before send.
+            if (self.global_config.enable_continuous_eager_draft_execution
+                    and self.continuous_eager_draft_buffer.size() > 0):
+                _tgt_running = {int(s.seq_id) for s in self.scheduler.running}
+                _tgt_promoted: list[int] = []
+                _tgt_discarded: list[int] = []
+                _tgt_unknown: list[int] = []
+                _tgt_promote_reasons: dict[int, str] = {}
+                _tgt_discard_reasons: dict[int, str] = {}
+                _tgt_parent_status: dict[int, str] = {}
+                _tgt_promoted_tokens = 0
+                _tgt_discarded_tokens = 0
+
+                for _sid in sorted(self.continuous_eager_draft_buffer.keys()):
+                    _in_verify = _sid in accepted_lens or _sid in invalidated_lens
+                    if not _in_verify:
+                        _tgt_unknown.append(int(_sid))
+                        _tgt_parent_status[int(_sid)] = "unknown"
+                        continue
+
+                    _full_accept = (
+                        _sid in _tgt_running
+                        and invalidated_lens.get(_sid, 0) == 0
+                        and accepted_lens.get(_sid, 0) > 0
+                    )
+
+                    _proposal = self.continuous_eager_draft_buffer.get(_sid)
+                    _eager_len = int(_proposal.eager_len) if _proposal is not None else 0
+
+                    if _full_accept:
+                        self.continuous_eager_draft_buffer.mark_ready(_sid)
+                        _tgt_promoted.append(int(_sid))
+                        _tgt_promote_reasons[int(_sid)] = "normal_full_accept"
+                        _tgt_parent_status[int(_sid)] = "accepted"
+                        _tgt_promoted_tokens += _eager_len
+                    else:
+                        _inv = invalidated_lens.get(_sid, 0)
+                        _acc = accepted_lens.get(_sid, 0)
+                        if _inv > 0:
+                            _reason = f"normal_verify_invalidated_tokens={_inv}"
+                        elif _acc == 0:
+                            _reason = "normal_verify_zero_accept"
+                        else:
+                            _reason = "normal_verify_partial_or_finished"
+                        self.continuous_eager_draft_buffer.discard([_sid])
+                        _tgt_discarded.append(int(_sid))
+                        _tgt_discard_reasons[int(_sid)] = _reason
+                        _tgt_parent_status[int(_sid)] = "rejected"
+                        _tgt_discarded_tokens += _eager_len
+
+                # Update plan fields with target-side results.
+                plan.continuous_eager_scaffold_proposals_promoted = len(_tgt_promoted)
+                plan.continuous_eager_scaffold_proposals_discarded = len(_tgt_discarded)
+                plan.continuous_eager_scaffold_tokens_promoted = _tgt_promoted_tokens
+                plan.continuous_eager_scaffold_tokens_discarded = _tgt_discarded_tokens
+                plan.continuous_eager_exec_promoted_seq_ids = _tgt_promoted
+                plan.continuous_eager_exec_discarded_seq_ids = _tgt_discarded
+                plan.continuous_eager_exec_parent_unknown_seq_ids = _tgt_unknown
+                plan.continuous_eager_exec_promotion_reason_by_seq_id = _tgt_promote_reasons
+                plan.continuous_eager_exec_discard_reason_by_seq_id = _tgt_discard_reasons
+                plan.continuous_eager_exec_parent_acceptance_status_by_seq_id = _tgt_parent_status
+
+                # Write scaffold promotion/discard fields into the trace record.
+                if trace_record is not None:
+                    trace_record["continuous_eager_scaffold_proposals_promoted"] = len(_tgt_promoted)
+                    trace_record["continuous_eager_scaffold_proposals_discarded"] = len(_tgt_discarded)
+                    trace_record["continuous_eager_scaffold_tokens_promoted"] = _tgt_promoted_tokens
+                    trace_record["continuous_eager_scaffold_tokens_discarded"] = _tgt_discarded_tokens
+                    trace_record["continuous_eager_exec_promoted_seq_ids"] = _tgt_promoted
+                    trace_record["continuous_eager_exec_discarded_seq_ids"] = _tgt_discarded
+                    trace_record["continuous_eager_exec_parent_unknown_seq_ids"] = _tgt_unknown
+                    trace_record["continuous_eager_exec_promotion_reason_by_seq_id"] = {
+                        str(k): v for k, v in _tgt_promote_reasons.items()
+                    }
+                    trace_record["continuous_eager_exec_discard_reason_by_seq_id"] = {
+                        str(k): v for k, v in _tgt_discard_reasons.items()
+                    }
+                    trace_record["continuous_eager_exec_parent_acceptance_status_by_seq_id"] = {
+                        str(k): v for k, v in _tgt_parent_status.items()
+                    }
+
+            # Apply combined proposal trace fields to the verify trace record
+            # (H2 steady path — the legacy path does this separately).
+            if trace_record is not None:
+                self._apply_combined_proposal_trace_fields(trace_record, plan)
         else:
             # === Legacy ordering (fallback/priming): recv → verify → broadcast ===
             received_normal = []

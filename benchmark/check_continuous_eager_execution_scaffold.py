@@ -27,6 +27,10 @@ Validates:
   S. Proposals generated => sent > 0, received > 0.
   T. unsupported_post_verify_seq must never appear as a skip reason.
   U. Non-empty draft_eager_new_set with zero executed must have valid skip reasons.
+  V. executed_total > 0 requires transport records (sent/received > 0).
+  W. generated > 0 => sent_seq_ids and received_seq_ids must be non-empty.
+  X. send_token_count == receive_token_count (cross-record).
+  Y. receive_validation_ok must be True when proposals received.
 """
 
 from __future__ import annotations
@@ -428,6 +432,57 @@ def main() -> int:
                 f"cross-record: scaffold_proposals_generated={prop_gen_total} "
                 f"but scaffold_proposals_received=0"
             )
+
+    # Check V: executed_total > 0 requires transport records.
+    if total_executed > 0:
+        if sent_total == 0:
+            errors.append(
+                f"TRANSPORT: draft_eager_new_set_executed_total={total_executed} "
+                f"but scaffold_proposals_sent=0 (no transport records on DRAFT side)"
+            )
+        if recv_total == 0:
+            errors.append(
+                f"TRANSPORT: draft_eager_new_set_executed_total={total_executed} "
+                f"but scaffold_proposals_received=0 (no transport records on TARGET side)"
+            )
+
+    # Check W: generated > 0 => sent_seq_ids and received_seq_ids must be non-empty.
+    if prop_gen_total > 0:
+        if exec_sent_seq_count == 0:
+            errors.append(
+                f"TRANSPORT: scaffold_proposals_generated={prop_gen_total} "
+                f"but sent_seq_ids is empty across all records"
+            )
+        if exec_received_seq_count == 0:
+            errors.append(
+                f"TRANSPORT: scaffold_proposals_generated={prop_gen_total} "
+                f"but received_seq_ids is empty across all records"
+            )
+
+    # Check X: sent/received token counts must match (cross-record).
+    if exec_send_tokens > 0 and exec_recv_tokens > 0:
+        if exec_recv_tokens != exec_send_tokens:
+            errors.append(
+                f"TRANSPORT: send_token_count_total={exec_send_tokens} != "
+                f"receive_token_count_total={exec_recv_tokens}"
+            )
+
+    # Check Y: receive_validation_ok must be True when proposals received.
+    _recv_val_failures = 0
+    for idx, record in enumerate(scaffold_records):
+        recv_ok = record.get("continuous_eager_exec_receive_validation_ok")
+        recv_count = int(record.get("continuous_eager_exec_receive_token_count") or 0)
+        if recv_count > 0 and recv_ok is not True:
+            _recv_val_failures += 1
+            errors.append(
+                f"record[{idx}]: receive_token_count={recv_count} but "
+                f"receive_validation_ok={recv_ok}"
+            )
+    if exec_recv_tokens > 0 and _recv_val_failures > 0:
+        errors.append(
+            f"TRANSPORT: {_recv_val_failures} records with non-empty receive "
+            f"but receive_validation_ok != True"
+        )
 
     # Check F: Promoted proposals must have parent_acceptance_status = "accepted"
     if promoted_total > 0:
