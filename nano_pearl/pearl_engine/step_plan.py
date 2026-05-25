@@ -223,6 +223,12 @@ class StepPlan:
     continuous_eager_exec_receive_token_count: int = 0
     continuous_eager_exec_receive_validation_ok: Optional[bool] = None
     continuous_eager_exec_receive_validation_reason: str = ""
+    continuous_eager_exec_send_validation_ok: Optional[bool] = None
+    continuous_eager_exec_send_validation_reason: str = ""
+    # Phase 1I-A: per-seq skip reasons for candidates not executed.
+    continuous_eager_exec_skip_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    # Phase 1I-A: debug sentinel — True if Phase 6 send code was reached.
+    continuous_eager_exec_send_code_reached: bool = False
 
     # Phase 1I-A: target-side buffer trace.
     continuous_eager_exec_buffer_size_before: int = 0
@@ -859,6 +865,20 @@ class StepPlan:
             ),
             "continuous_eager_exec_receive_validation_reason": (
                 self.continuous_eager_exec_receive_validation_reason
+            ),
+            "continuous_eager_exec_send_validation_ok": (
+                None if self.continuous_eager_exec_send_validation_ok is None
+                else bool(self.continuous_eager_exec_send_validation_ok)
+            ),
+            "continuous_eager_exec_send_validation_reason": (
+                self.continuous_eager_exec_send_validation_reason
+            ),
+            "continuous_eager_exec_skip_reason_by_seq_id": {
+                str(k): v
+                for k, v in self.continuous_eager_exec_skip_reason_by_seq_id.items()
+            },
+            "continuous_eager_exec_send_code_reached": bool(
+                self.continuous_eager_exec_send_code_reached
             ),
             # Phase 1I-A target-side buffer trace.
             "continuous_eager_exec_buffer_size_before": int(

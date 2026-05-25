@@ -2313,6 +2313,15 @@ class ModelRunnerBase:
         trace_record["continuous_eager_exec_send_token_count"] = (
             plan.continuous_eager_exec_send_token_count
         )
+        trace_record["continuous_eager_exec_send_validation_ok"] = (
+            plan.continuous_eager_exec_send_validation_ok
+        )
+        trace_record["continuous_eager_exec_send_validation_reason"] = (
+            plan.continuous_eager_exec_send_validation_reason
+        )
+        trace_record["continuous_eager_exec_send_code_reached"] = bool(
+            plan.continuous_eager_exec_send_code_reached
+        )
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
@@ -3755,7 +3764,10 @@ class DraftModelRunner(ModelRunnerBase):
         )
 
         # H2: detect overlap between target_eager_set and draft_home_set (steady only)
-        h2_steady = plan.plan_phase == "steady" and self.global_config.enable_eager_execution
+        h2_steady = plan.plan_phase == "steady" and (
+            self.global_config.enable_eager_execution
+            or self.global_config.enable_continuous_eager_draft_execution
+        )
         target_eager_seq_ids = [int(seq.seq_id) for seq in target_eager_seqs]
         draft_seq_ids = [int(seq.seq_id) for seq in draft_seqs]
         overlap_seq_ids = sorted(set(target_eager_seq_ids) & set(draft_seq_ids))
@@ -3848,6 +3860,10 @@ class DraftModelRunner(ModelRunnerBase):
                 plan.continuous_eager_exec_base_kind_by_seq_id.update({
                     int(sid): "draft_eager_new_set" for sid in _skipped_base_validation
                 })
+                # Phase 1I-A: record skip reasons for candidates not executed.
+                plan.continuous_eager_exec_skip_reason_by_seq_id.update(
+                    _skipped_base_validation
+                )
 
             ce_scaffold_proposals, ce_scaffold_trace_record = \
                 self._draft_continuous_eager_scaffold_proposals(ce_new_seqs, plan)
@@ -4224,6 +4240,27 @@ class DraftModelRunner(ModelRunnerBase):
                 plan.continuous_eager_exec_send_token_count = sum(
                     int(p.eager_len) for p in ce_scaffold_for_send
                 )
+
+            # Phase 1I-A: send validation (unconditional — set even when empty).
+            if self.global_config.enable_continuous_eager_draft_execution:
+                plan.continuous_eager_exec_send_code_reached = True
+                n_ce = len(ce_scaffold_for_send)
+                if n_ce > 0:
+                    plan.continuous_eager_exec_send_validation_ok = True
+                    plan.continuous_eager_exec_send_validation_reason = (
+                        f"scaffold_proposals_packaged:n={n_ce}"
+                    )
+                elif plan.draft_eager_new_set_executed:
+                    plan.continuous_eager_exec_send_validation_ok = False
+                    plan.continuous_eager_exec_send_validation_reason = (
+                        f"draft_eager_new_set_executed_nonempty_but_buffer_get_returned_none:"
+                        f"expected={len(plan.draft_eager_new_set_executed)},got=0"
+                    )
+                else:
+                    plan.continuous_eager_exec_send_validation_ok = True
+                    plan.continuous_eager_exec_send_validation_reason = (
+                        "no_scaffold_proposals_to_send"
+                    )
 
             _eager_ready_seq_ids = sorted(p.seq_id for p in eager_ready_for_send)
             plan.eager_ready_seq_ids_before_send = _eager_ready_seq_ids
@@ -4798,7 +4835,10 @@ class TargetModelRunner(ModelRunnerBase):
             f"target_eager_set overlaps target_home_set: {target_eager_seq_ids}",
         )
         # H2: detect overlap between target_eager_set and draft_home_set
-        h2_steady = plan.plan_phase == "steady" and self.global_config.enable_eager_execution
+        h2_steady = plan.plan_phase == "steady" and (
+            self.global_config.enable_eager_execution
+            or self.global_config.enable_continuous_eager_draft_execution
+        )
         overlap_eager_draft = sorted(set(target_eager_seq_ids) & set(draft_seq_ids))
         if overlap_eager_draft:
             plan.target_eager_draft_home_overlap_seq_ids = overlap_eager_draft
