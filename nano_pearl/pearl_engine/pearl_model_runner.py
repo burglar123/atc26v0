@@ -2319,6 +2319,7 @@ class ModelRunnerBase:
         unknown_pids: list[str] = []
         discard_reasons: dict[int, str] = {}
         promote_reasons: dict[int, str] = {}
+        parent_status: dict[int, str] = {}
 
         for seq_id in sorted(_trace_state.get_pending_seq_ids()):
             plan.continuous_eager_promotion_checked_seq_ids.append(int(seq_id))
@@ -2329,6 +2330,7 @@ class ModelRunnerBase:
             if not in_normal_verify:
                 _trace_state.mark_pending_unknown(seq_id, _pid, "not_in_normal_verify_batch")
                 unknown.append(int(seq_id))
+                parent_status[int(seq_id)] = "unknown"
                 if _pid:
                     unknown_pids.append(str(_pid))
                 continue
@@ -2343,6 +2345,7 @@ class ModelRunnerBase:
                 _trace_state.promote_pending(seq_id, _pid, "normal_full_accept")
                 promoted.append(int(seq_id))
                 promote_reasons[int(seq_id)] = "normal_full_accept"
+                parent_status[int(seq_id)] = "accepted"
                 if _pid:
                     promoted_pids.append(str(_pid))
             else:
@@ -2357,6 +2360,7 @@ class ModelRunnerBase:
                 _trace_state.discard_pending(seq_id, _pid, reason)
                 discarded.append(int(seq_id))
                 discard_reasons[int(seq_id)] = reason
+                parent_status[int(seq_id)] = "rejected"
                 if _pid:
                     discarded_pids.append(str(_pid))
 
@@ -2365,6 +2369,7 @@ class ModelRunnerBase:
         plan.continuous_eager_parent_acceptance_unknown_seq_ids = unknown
         plan.continuous_eager_discard_reason_by_seq_id = discard_reasons
         plan.continuous_eager_promotion_reason_by_seq_id = promote_reasons
+        plan.continuous_eager_parent_acceptance_status_by_seq_id = parent_status
         plan.continuous_eager_trace_promoted_count = len(promoted)
         plan.continuous_eager_trace_discarded_count = len(discarded)
 
@@ -2386,6 +2391,11 @@ class ModelRunnerBase:
             trace_record["continuous_eager_promoted_proposal_ids"] = promoted_pids
             trace_record["continuous_eager_discarded_proposal_ids"] = discarded_pids
             trace_record["continuous_eager_unknown_proposal_ids"] = unknown_pids
+            # Parent acceptance status per seq — separates parent outcome
+            # from child proposal state.  Values: accepted/rejected/unknown.
+            trace_record["continuous_eager_parent_acceptance_status_by_seq_id"] = {
+                str(k): v for k, v in parent_status.items()
+            }
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on

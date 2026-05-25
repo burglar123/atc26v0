@@ -411,6 +411,28 @@ def _steady_checks(
                 f"!= target_eager_proposal_id={t_pid}"
             )
 
+    # B7. Parent acceptance status — must use separate field, not overwrite
+    #     proposal state.  Values: accepted/rejected/unknown only.
+    parent_status_by_seq = record.get("continuous_eager_parent_acceptance_status_by_seq_id") or {}
+    ALLOWED_PARENT_STATUSES = {"accepted", "rejected", "unknown"}
+    for key, status in parent_status_by_seq.items():
+        if str(status) not in ALLOWED_PARENT_STATUSES:
+            errors.append(
+                f"record[{idx}] continuous_eager_parent_acceptance_status_by_seq_id[{key}] = {status!r}, "
+                f"expected one of {ALLOWED_PARENT_STATUSES}"
+            )
+
+    # B7 continued: proposal state must NOT encode parent acceptance.
+    # "pending_parent_unknown" is a conflation of proposal state with parent
+    # status — it must not appear.
+    for key, state in cont_state_by_seq.items():
+        if str(state) == "pending_parent_unknown":
+            errors.append(
+                f"record[{idx}] continuous_eager_proposal_state_by_seq_id[{key}] = "
+                f"'pending_parent_unknown' — parent status must use "
+                f"continuous_eager_parent_acceptance_status_by_seq_id, not proposal state"
+            )
+
     return errors
 
 
@@ -491,6 +513,16 @@ def main() -> int:
         from collections import Counter as _Counter
         _depth_dist = _Counter(chain_depths)
         print(f"chain_depth_distribution={dict(sorted(_depth_dist.items()))}")
+
+    # Parent acceptance status summary (separate from proposal state).
+    parent_status_counts: dict[str, int] = {}
+    for r in continuous_records:
+        for status in (r.get("continuous_eager_parent_acceptance_status_by_seq_id") or {}).values():
+            parent_status_counts[str(status)] = parent_status_counts.get(str(status), 0) + 1
+    if parent_status_counts:
+        print(f"\n--- Parent acceptance status ---")
+        for status, count in sorted(parent_status_counts.items()):
+            print(f"  parent_status_{status}={count}")
 
     # --- Missing metadata by phase/role ---
     missing_by_key: dict[tuple[str, str], int] = Counter()

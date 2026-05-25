@@ -141,6 +141,9 @@ class StepPlan:
     continuous_eager_parent_acceptance_unknown_seq_ids: List[int] = field(default_factory=list)
     continuous_eager_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_promotion_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    # Parent acceptance status per seq — separates "what we know about the parent"
+    # from "what state the child proposal is in".  Values: accepted/rejected/unknown.
+    continuous_eager_parent_acceptance_status_by_seq_id: Dict[int, str] = field(default_factory=dict)
     continuous_eager_chain_depth_by_seq_id: Dict[int, int] = field(default_factory=dict)
     # Phase 1H-continuous-promotion-trace: proposal version metadata.
     continuous_eager_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
@@ -600,6 +603,10 @@ class StepPlan:
             "continuous_eager_promotion_reason_by_seq_id": {
                 str(seq_id): str(reason)
                 for seq_id, reason in self.continuous_eager_promotion_reason_by_seq_id.items()
+            },
+            "continuous_eager_parent_acceptance_status_by_seq_id": {
+                str(seq_id): str(status)
+                for seq_id, status in self.continuous_eager_parent_acceptance_status_by_seq_id.items()
             },
             "continuous_eager_chain_depth_by_seq_id": {
                 str(seq_id): int(depth)
