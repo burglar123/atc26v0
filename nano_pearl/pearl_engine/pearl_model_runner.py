@@ -33,11 +33,14 @@ from nano_pearl.pearl_engine.dual_batch import (
     EAGER_STATE_DISCARDED,
     EAGER_STATE_DRAFTED_DRY_RUN,
     EAGER_STATE_READY_TO_VERIFY,
+    EAGER_STATE_TRANSFERRED_DRY_RUN,
     EagerProposal,
     EagerProposalBuffer,
     LANE_EAGER,
     LANE_NORMAL,
     ProposalBuffer,
+    deserialize_eager_transfer_payload,
+    serialize_eager_transfer_payload,
 )
 from transformers import AutoTokenizer
 from tqdm import trange
@@ -552,6 +555,32 @@ class ModelRunnerBase:
                 getattr(self.global_config, "enable_eager_promotion_dry_run", False)
             ),
             "eager_promotion_dry_run_enabled": False,
+            "enable_eager_transfer_dry_run": bool(
+                getattr(self.global_config, "enable_eager_transfer_dry_run", False)
+            ),
+            "eager_transfer_dry_run_enabled": False,
+            "eager_transfer_step_id": None,
+            "eager_transfer_plan_id": None,
+            "eager_transfer_num_proposals": 0,
+            "eager_transfer_payload_len": 0,
+            "eager_transfer_sent_proposal_ids": [],
+            "eager_transfer_sent_seq_ids": [],
+            "eager_transfer_received_proposal_ids": [],
+            "eager_transfer_received_seq_ids": [],
+            "eager_transfer_validated_proposal_ids": [],
+            "eager_transfer_dropped_proposal_ids": [],
+            "eager_transfer_drop_reason_by_proposal_id": {},
+            "eager_transfer_base_len_by_seq_id": {},
+            "eager_transfer_base_pre_verify_by_seq_id": {},
+            "eager_transfer_current_len_by_seq_id": {},
+            "eager_transfer_base_match_by_seq_id": {},
+            "eager_transfer_proposal_len_by_proposal_id": {},
+            "eager_transfer_to_verify_len_by_proposal_id": {},
+            "draft_eager_buffer_size_before_transfer": self.eager_proposal_buffer.size(),
+            "draft_eager_buffer_size_after_transfer": self.eager_proposal_buffer.size(),
+            "target_eager_buffer_size_before_receive": self.eager_proposal_buffer.size(),
+            "target_eager_buffer_size_after_receive": self.eager_proposal_buffer.size(),
+            "target_eager_buffer_size_after_clear": self.eager_proposal_buffer.size(),
             "eager_buffer_size_before": self.eager_proposal_buffer.size(),
             "eager_buffer_size_after": self.eager_proposal_buffer.size(),
             "eager_parent_seq_ids": [],
@@ -574,6 +603,9 @@ class ModelRunnerBase:
             "eager_tokens_generated": 0,
             "eager_tokens_promoted": 0,
             "eager_tokens_discarded": 0,
+            "eager_tokens_transferred": 0,
+            "eager_tokens_transfer_validated": 0,
+            "eager_tokens_transfer_dropped": 0,
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -676,6 +708,9 @@ class ModelRunnerBase:
     def _eager_promotion_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_promotion_dry_run", False))
 
+    def _eager_transfer_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_transfer_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -686,7 +721,8 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled()
+        transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled()
+        promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled() or transfer_dry_run_enabled
         draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
         dry_run_enabled = self._eager_plan_dry_run_enabled() or draft_dry_run_enabled
         policy = str(getattr(self.global_config, "eager_policy", "none"))
@@ -694,6 +730,7 @@ class ModelRunnerBase:
         plan.enable_eager_plan_dry_run = dry_run_enabled
         plan.enable_eager_draft_dry_run = draft_dry_run_enabled
         plan.enable_eager_promotion_dry_run = promotion_dry_run_enabled
+        plan.enable_eager_transfer_dry_run = transfer_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -727,6 +764,7 @@ class ModelRunnerBase:
                 enable_eager_plan_dry_run=True,
                 enable_eager_draft_dry_run=draft_dry_run_enabled,
                 enable_eager_promotion_dry_run=promotion_dry_run_enabled,
+                enable_eager_transfer_dry_run=transfer_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -811,6 +849,7 @@ class ModelRunnerBase:
             enable_eager_plan_dry_run=True,
             enable_eager_draft_dry_run=draft_dry_run_enabled,
             enable_eager_promotion_dry_run=promotion_dry_run_enabled,
+            enable_eager_transfer_dry_run=transfer_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1045,6 +1084,174 @@ class ModelRunnerBase:
             plan,
             f"proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, batch_id={batch_id}",
         )
+        return proposals
+
+    def _trace_eager_transfer_send(
+        self,
+        trace_record: dict,
+        plan: StepPlan,
+        proposals: list[EagerProposal],
+        meta_values: list[int],
+        buffer_size_before: int,
+    ) -> None:
+        trace_record["enable_eager_transfer_dry_run"] = True
+        trace_record["eager_transfer_dry_run_enabled"] = True
+        trace_record["eager_transfer_step_id"] = None if plan.step_id is None else int(plan.step_id)
+        trace_record["eager_transfer_plan_id"] = int(plan.plan_id)
+        trace_record["eager_transfer_num_proposals"] = int(meta_values[0])
+        trace_record["eager_transfer_payload_len"] = int(meta_values[1])
+        trace_record["eager_transfer_sent_proposal_ids"] = [int(proposal.proposal_id) for proposal in proposals]
+        trace_record["eager_transfer_sent_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+        trace_record["draft_eager_buffer_size_before_transfer"] = int(buffer_size_before)
+        trace_record["draft_eager_buffer_size_after_transfer"] = self.eager_proposal_buffer.size()
+        trace_record["eager_tokens_transferred"] = sum(int(proposal.proposal_len) for proposal in proposals)
+        trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+
+    def _send_eager_transfer_dry_run(
+        self,
+        proposals: list[EagerProposal],
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> None:
+        buffer_size_before = self.eager_proposal_buffer.size()
+        ready_proposals = [
+            proposal for proposal in proposals
+            if proposal.valid and proposal.state == EAGER_STATE_READY_TO_VERIFY
+        ]
+        meta_values, payload_values = serialize_eager_transfer_payload(
+            ready_proposals,
+            gamma=int(self.gamma),
+            plan_id=int(plan.plan_id),
+            step_id=plan.step_id,
+        )
+        for proposal in ready_proposals:
+            proposal.state = EAGER_STATE_TRANSFERRED_DRY_RUN
+            proposal.valid = False
+        self.eager_proposal_buffer.clear()
+        self._trace_eager_transfer_send(
+            trace_record,
+            plan,
+            ready_proposals,
+            meta_values,
+            buffer_size_before,
+        )
+        if self.tp_params.local_rank != 0:
+            return
+        meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        if int(meta_values[1]) > 0:
+            payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _local_sequence_by_id(self) -> dict[int, Sequence]:
+        seq_by_id = {}
+        for seq in list(self.scheduler.running) + list(self.scheduler.waiting) + list(self.scheduler.pending_cached) + list(self.scheduler.finished):
+            seq_by_id[int(seq.seq_id)] = seq
+        return seq_by_id
+
+    def _eager_transfer_drop_reason(self, proposal: EagerProposal, seq: Sequence | None) -> str | None:
+        if seq is None:
+            return "seq_not_found"
+        if getattr(seq, "status", None) != SequenceStatus.RUNNING or seq.is_finished:
+            return "seq_not_running"
+        if bool(proposal.base_pre_verify):
+            return "base_pre_verify_not_post_verify"
+        if bool(seq.pre_verify) != bool(proposal.base_pre_verify):
+            return "base_pre_verify_mismatch"
+        if len(seq) != int(proposal.base_len):
+            return "base_len_mismatch"
+        if int(proposal.proposal_len) != int(self.gamma):
+            return "proposal_len_mismatch"
+        if len(proposal.to_be_verified_token_ids) != int(self.gamma):
+            return "to_verify_len_mismatch"
+        if len(proposal.proposal_token_ids) != int(self.gamma):
+            return "proposal_token_len_mismatch"
+        return None
+
+    def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
+        buffer_size_before = self.eager_proposal_buffer.size()
+        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        num_proposals, payload_len, gamma, transfer_plan_id, transfer_step_id = meta_values
+        if int(gamma) != int(self.gamma):
+            raise ValueError(f"eager transfer gamma mismatch: expected={self.gamma}, got={gamma}")
+        payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+        if payload_len > 0:
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        proposals = deserialize_eager_transfer_payload(meta_values, payload.tolist())
+
+        seq_by_id = self._local_sequence_by_id()
+        validated: list[EagerProposal] = []
+        dropped: list[EagerProposal] = []
+        drop_reason_by_proposal_id: dict[int, str] = {}
+        base_len_by_seq_id: dict[int, int] = {}
+        base_pre_verify_by_seq_id: dict[int, bool] = {}
+        current_len_by_seq_id: dict[int, int] = {}
+        base_match_by_seq_id: dict[int, bool] = {}
+        proposal_len_by_proposal_id: dict[int, int] = {}
+        to_verify_len_by_proposal_id: dict[int, int] = {}
+
+        for proposal in proposals:
+            seq = seq_by_id.get(int(proposal.seq_id))
+            base_len_by_seq_id[int(proposal.seq_id)] = int(proposal.base_len)
+            base_pre_verify_by_seq_id[int(proposal.seq_id)] = bool(proposal.base_pre_verify)
+            current_len_by_seq_id[int(proposal.seq_id)] = -1 if seq is None else int(len(seq))
+            base_match_by_seq_id[int(proposal.seq_id)] = seq is not None and int(len(seq)) == int(proposal.base_len)
+            proposal_len_by_proposal_id[int(proposal.proposal_id)] = int(proposal.proposal_len)
+            to_verify_len_by_proposal_id[int(proposal.proposal_id)] = len(proposal.to_be_verified_token_ids)
+            reason = self._eager_transfer_drop_reason(proposal, seq)
+            if reason is None:
+                proposal.state = EAGER_STATE_READY_TO_VERIFY
+                proposal.valid = True
+                self.eager_proposal_buffer.store(proposal)
+                validated.append(proposal)
+            else:
+                proposal.state = EAGER_STATE_DISCARDED
+                proposal.valid = False
+                dropped.append(proposal)
+                drop_reason_by_proposal_id[int(proposal.proposal_id)] = reason
+
+        buffer_size_after_receive = self.eager_proposal_buffer.size()
+        self.eager_proposal_buffer.clear()
+
+        trace_record["enable_eager_transfer_dry_run"] = True
+        trace_record["eager_transfer_dry_run_enabled"] = True
+        trace_record["eager_transfer_step_id"] = None if transfer_step_id < 0 else int(transfer_step_id)
+        trace_record["eager_transfer_plan_id"] = int(transfer_plan_id)
+        trace_record["eager_transfer_num_proposals"] = int(num_proposals)
+        trace_record["eager_transfer_payload_len"] = int(payload_len)
+        trace_record["eager_transfer_received_proposal_ids"] = [int(proposal.proposal_id) for proposal in proposals]
+        trace_record["eager_transfer_received_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+        trace_record["eager_transfer_validated_proposal_ids"] = [int(proposal.proposal_id) for proposal in validated]
+        trace_record["eager_transfer_dropped_proposal_ids"] = [int(proposal.proposal_id) for proposal in dropped]
+        trace_record["eager_transfer_drop_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in drop_reason_by_proposal_id.items()
+        }
+        trace_record["eager_transfer_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_transfer_base_pre_verify_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_pre_verify_by_seq_id.items()
+        }
+        trace_record["eager_transfer_current_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
+        }
+        trace_record["eager_transfer_base_match_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_match_by_seq_id.items()
+        }
+        trace_record["eager_transfer_proposal_len_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in proposal_len_by_proposal_id.items()
+        }
+        trace_record["eager_transfer_to_verify_len_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in to_verify_len_by_proposal_id.items()
+        }
+        trace_record["target_eager_buffer_size_before_receive"] = int(buffer_size_before)
+        trace_record["target_eager_buffer_size_after_receive"] = int(buffer_size_after_receive)
+        trace_record["target_eager_buffer_size_after_clear"] = self.eager_proposal_buffer.size()
+        trace_record["eager_tokens_transfer_validated"] = sum(int(proposal.proposal_len) for proposal in validated)
+        trace_record["eager_tokens_transfer_dropped"] = sum(int(proposal.proposal_len) for proposal in dropped)
+        trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
         return proposals
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
@@ -1954,10 +2161,13 @@ class DraftModelRunner(ModelRunnerBase):
 
             if parent_full_accept:
                 proposal.state = EAGER_STATE_READY_TO_VERIFY
+                proposal.valid = True
                 promoted_seq_ids.append(seq_id)
                 promoted_proposal_ids.append(int(proposal.proposal_id))
                 promoted_tokens += int(proposal.proposal_len)
                 promotion_reason_by_seq_id[seq_id] = "parent_normal_full_accept"
+                if self._eager_transfer_dry_run_enabled():
+                    self.eager_proposal_buffer.store(proposal)
             else:
                 proposal.state = EAGER_STATE_DISCARDED
                 proposal.valid = False
@@ -2063,6 +2273,7 @@ class DraftModelRunner(ModelRunnerBase):
         draft_records = []
         eager_proposals = []
         eager_trace_record = None
+        target_trace_record = None
         if draft_seqs:
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             if plan.plan_phase in {"priming", "steady"}:
@@ -2082,6 +2293,7 @@ class DraftModelRunner(ModelRunnerBase):
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+            target_trace_record = trace_record
             trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
             trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
             torch.cuda.synchronize()
@@ -2103,6 +2315,19 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+        if self._eager_transfer_dry_run_enabled():
+            transfer_trace_record = eager_trace_record or target_trace_record
+            if transfer_trace_record is None and draft_records:
+                transfer_trace_record = draft_records[-1]
+            if transfer_trace_record is None:
+                transfer_trace_record = self._trace_dual_batch_schedule([], plan, "eager_transfer_dry_run")
+            self._send_eager_transfer_dry_run(
+                eager_proposals,
+                plan,
+                transfer_trace_record,
+            )
+            self._finalize_record_profile(transfer_trace_record)
     
     def pearl_step(self):
         trace_record = None
@@ -2257,6 +2482,7 @@ class TargetModelRunner(ModelRunnerBase):
             target_proposals = self.dual_proposal_buffer.get_many(target_seq_ids)
 
         trace_record = None
+        priming_record = None
         logits = None
         temperatures = None
         if target_seqs:
@@ -2302,6 +2528,13 @@ class TargetModelRunner(ModelRunnerBase):
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             self._finalize_record_profile(priming_record)
+
+        if self._eager_transfer_dry_run_enabled():
+            transfer_trace_record = trace_record or priming_record
+            if transfer_trace_record is None:
+                transfer_trace_record = self._trace_dual_batch_schedule([], plan, "eager_transfer_dry_run")
+            self._receive_eager_transfer_dry_run(plan, transfer_trace_record)
+            self._finalize_record_profile(transfer_trace_record)
 
     def serialized_pearl_step(self):
         """Serialized-PEARL target verification phase.

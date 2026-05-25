@@ -14,6 +14,7 @@ PROPOSAL_LANES = {LANE_NORMAL, LANE_EAGER}
 EAGER_STATE_DRAFTED_PENDING_PARENT = "DRAFTED_PENDING_PARENT"
 EAGER_STATE_DRAFTED_DRY_RUN = "DRAFTED_DRY_RUN"
 EAGER_STATE_READY_TO_VERIFY = "READY_TO_VERIFY"
+EAGER_STATE_TRANSFERRED_DRY_RUN = "TRANSFERRED_DRY_RUN"
 EAGER_STATE_VERIFYING = "VERIFYING"
 EAGER_STATE_CONSUMED = "CONSUMED"
 EAGER_STATE_DISCARDED = "DISCARDED"
@@ -21,10 +22,15 @@ EAGER_PROPOSAL_STATES = {
     EAGER_STATE_DRAFTED_PENDING_PARENT,
     EAGER_STATE_DRAFTED_DRY_RUN,
     EAGER_STATE_READY_TO_VERIFY,
+    EAGER_STATE_TRANSFERRED_DRY_RUN,
     EAGER_STATE_VERIFYING,
     EAGER_STATE_CONSUMED,
     EAGER_STATE_DISCARDED,
 }
+EAGER_TRANSFER_META_LEN = 5
+EAGER_TRANSFER_HEADER_LEN = 12
+EAGER_PARENT_KIND_TO_INT = {LANE_NORMAL: 0, LANE_EAGER: 1}
+EAGER_PARENT_KIND_FROM_INT = {value: key for key, value in EAGER_PARENT_KIND_TO_INT.items()}
 
 
 @dataclass
@@ -435,6 +441,130 @@ def deserialize_eager_proposal_meta(meta: dict[str, Any], payload: Iterable[int]
         )
     if offset != len(payload):
         raise ValueError(f"eager payload has trailing tokens: decoded={offset}, payload={len(payload)}")
+    return proposals
+
+
+def _encode_eager_parent_kind(kind: str) -> int:
+    if kind not in EAGER_PARENT_KIND_TO_INT:
+        raise ValueError(f"unknown eager parent kind={kind!r}")
+    return EAGER_PARENT_KIND_TO_INT[kind]
+
+
+def _decode_eager_parent_kind(value: int) -> str:
+    value = int(value)
+    if value not in EAGER_PARENT_KIND_FROM_INT:
+        raise ValueError(f"unknown encoded eager parent kind={value}")
+    return EAGER_PARENT_KIND_FROM_INT[value]
+
+
+def serialize_eager_transfer_payload(
+    proposals: Iterable[EagerProposal],
+    gamma: int,
+    plan_id: int,
+    step_id: int | None,
+) -> tuple[list[int], list[int]]:
+    proposals = list(proposals)
+    payload: list[int] = []
+    for proposal in proposals:
+        to_verify_len = len(proposal.to_be_verified_token_ids)
+        proposal_len = int(proposal.proposal_len)
+        payload.extend(
+            [
+                int(proposal.proposal_id),
+                int(proposal.seq_id),
+                int(proposal.home_batch_id),
+                int(proposal.base_len),
+                int(bool(proposal.base_pre_verify)),
+                int(proposal.base_num_completion_tokens),
+                proposal_len,
+                to_verify_len,
+                _encode_eager_parent_kind(proposal.parent_kind),
+                -1 if proposal.parent_proposal_id is None else int(proposal.parent_proposal_id),
+                int(proposal.source_plan_id),
+                int(proposal.source_step_id),
+            ]
+        )
+        payload.extend(int(token_id) for token_id in proposal.to_be_verified_token_ids)
+        payload.extend(int(token_id) for token_id in proposal.proposal_token_ids)
+    meta = [
+        len(proposals),
+        len(payload),
+        int(gamma),
+        int(plan_id),
+        -1 if step_id is None else int(step_id),
+    ]
+    return meta, payload
+
+
+def deserialize_eager_transfer_payload(
+    meta: Iterable[int],
+    payload: Iterable[int],
+) -> list[EagerProposal]:
+    meta_values = [int(value) for value in meta]
+    if len(meta_values) != EAGER_TRANSFER_META_LEN:
+        raise ValueError(
+            f"eager transfer meta must have {EAGER_TRANSFER_META_LEN} values, got {len(meta_values)}"
+        )
+    num_proposals, payload_len, gamma, plan_id, step_id = meta_values
+    payload_values = [int(value) for value in payload]
+    if int(payload_len) != len(payload_values):
+        raise ValueError(
+            f"eager transfer payload length mismatch: meta={payload_len}, payload={len(payload_values)}"
+        )
+
+    proposals = []
+    offset = 0
+    for idx in range(num_proposals):
+        header = payload_values[offset:offset + EAGER_TRANSFER_HEADER_LEN]
+        if len(header) != EAGER_TRANSFER_HEADER_LEN:
+            raise ValueError(f"eager transfer payload ended while reading header index={idx}")
+        offset += EAGER_TRANSFER_HEADER_LEN
+        (
+            proposal_id,
+            seq_id,
+            home_batch_id,
+            base_len,
+            base_pre_verify,
+            base_num_completion_tokens,
+            proposal_len,
+            to_verify_len,
+            parent_kind_value,
+            parent_proposal_id,
+            source_plan_id,
+            source_step_id,
+        ) = header
+        to_verify = payload_values[offset:offset + to_verify_len]
+        offset += to_verify_len
+        proposal_tokens = payload_values[offset:offset + proposal_len]
+        offset += proposal_len
+        if len(to_verify) != to_verify_len or len(proposal_tokens) != proposal_len:
+            raise ValueError(f"eager transfer payload ended while reading tokens index={idx}")
+        proposals.append(
+            EagerProposal(
+                proposal_id=proposal_id,
+                seq_id=seq_id,
+                request_id=seq_id,
+                lane=LANE_EAGER,
+                parent_proposal_id=None if parent_proposal_id < 0 else parent_proposal_id,
+                parent_kind=_decode_eager_parent_kind(parent_kind_value),
+                parent_step_id=None,
+                source_step_id=source_step_id if source_step_id >= 0 else step_id,
+                source_plan_id=source_plan_id if source_plan_id >= 0 else plan_id,
+                home_batch_id=home_batch_id,
+                base_len=base_len,
+                base_pre_verify=bool(base_pre_verify),
+                base_num_completion_tokens=base_num_completion_tokens,
+                proposal_token_ids=proposal_tokens,
+                to_be_verified_token_ids=to_verify,
+                proposal_len=proposal_len if proposal_len else gamma,
+                state=EAGER_STATE_READY_TO_VERIFY,
+                valid=True,
+            )
+        )
+    if offset != len(payload_values):
+        raise ValueError(
+            f"eager transfer payload has trailing values: consumed={offset}, payload={len(payload_values)}"
+        )
     return proposals
 
 

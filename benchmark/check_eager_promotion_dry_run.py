@@ -110,6 +110,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         plan_enabled = bool(record.get("enable_eager_plan_dry_run", False))
         draft_enabled = bool(record.get("enable_eager_draft_dry_run", False))
         promotion_enabled = bool(record.get("enable_eager_promotion_dry_run", False))
+        transfer_enabled = bool(record.get("enable_eager_transfer_dry_run", False))
         promotion_active = bool(record.get("eager_promotion_dry_run_enabled", False))
         phase = record.get("plan_phase")
         target_home = as_int_set(record.get("target_home_set"))
@@ -137,6 +138,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         generated = int_value(record.get("eager_tokens_generated"), 0)
         promoted = int_value(record.get("eager_tokens_promoted"), 0)
         discarded = int_value(record.get("eager_tokens_discarded"), 0)
+        transferred = int_value(record.get("eager_tokens_transferred"), 0)
+        transfer_validated = int_value(record.get("eager_tokens_transfer_validated"), 0)
+        transfer_dropped = int_value(record.get("eager_tokens_transfer_dropped"), 0)
         generated_tokens += generated
         promoted_tokens += promoted
         discarded_tokens += discarded
@@ -144,18 +148,20 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if not plan_enabled and not draft_enabled and not promotion_enabled:
             if draft_eager or target_eager:
                 errors.append(f"record[{idx}] default run has non-empty eager sets")
-            if generated or promoted or discarded:
+            if generated or promoted or discarded or transferred or transfer_validated or transfer_dropped:
                 errors.append(f"record[{idx}] default run has nonzero eager counters")
             continue
 
         if plan_enabled and not draft_enabled and not promotion_enabled:
-            if generated or promoted or discarded:
+            if generated or promoted or discarded or transferred or transfer_validated or transfer_dropped:
                 errors.append(f"record[{idx}] plan dry-run must not generate/promote/discard eager tokens")
             continue
 
         if draft_enabled and not promotion_enabled:
             if promoted or discarded:
                 errors.append(f"record[{idx}] draft dry-run must not promote/discard eager tokens")
+            if transferred or transfer_validated or transfer_dropped:
+                errors.append(f"record[{idx}] draft dry-run must not transfer eager tokens")
             if draft_seq_ids and generated <= 0:
                 errors.append(f"record[{idx}] draft dry-run selected eager but generated no eager tokens")
             continue
@@ -165,6 +171,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] promotion dry-run must imply plan and draft dry-run")
             if promotion_active:
                 promotion_records += 1
+            if (transferred or transfer_validated or transfer_dropped) and not transfer_enabled:
+                errors.append(f"record[{idx}] transfer counters require transfer dry-run")
 
         if draft_eager:
             selected_by_phase[str(phase)] += len(draft_eager)

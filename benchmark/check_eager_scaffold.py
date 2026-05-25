@@ -28,13 +28,16 @@ try:
         EAGER_STATE_DRAFTED_DRY_RUN,
         EAGER_STATE_DRAFTED_PENDING_PARENT,
         EAGER_STATE_READY_TO_VERIFY,
+        EAGER_STATE_TRANSFERRED_DRY_RUN,
         EagerProposal,
         EagerProposalBuffer,
         LANE_EAGER,
         LANE_NORMAL,
         deserialize_eager_proposal_meta,
+        deserialize_eager_transfer_payload,
         eager_proposal_to_trace_dict,
         serialize_eager_proposal_meta,
+        serialize_eager_transfer_payload,
     )
     from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan  # type: ignore  # noqa: E402
 except ModuleNotFoundError:
@@ -125,13 +128,16 @@ except ModuleNotFoundError:
     EAGER_STATE_DRAFTED_DRY_RUN = dual_batch_module.EAGER_STATE_DRAFTED_DRY_RUN
     EAGER_STATE_DRAFTED_PENDING_PARENT = dual_batch_module.EAGER_STATE_DRAFTED_PENDING_PARENT
     EAGER_STATE_READY_TO_VERIFY = dual_batch_module.EAGER_STATE_READY_TO_VERIFY
+    EAGER_STATE_TRANSFERRED_DRY_RUN = dual_batch_module.EAGER_STATE_TRANSFERRED_DRY_RUN
     EagerProposal = dual_batch_module.EagerProposal
     EagerProposalBuffer = dual_batch_module.EagerProposalBuffer
     LANE_EAGER = dual_batch_module.LANE_EAGER
     LANE_NORMAL = dual_batch_module.LANE_NORMAL
     deserialize_eager_proposal_meta = dual_batch_module.deserialize_eager_proposal_meta
+    deserialize_eager_transfer_payload = dual_batch_module.deserialize_eager_transfer_payload
     eager_proposal_to_trace_dict = dual_batch_module.eager_proposal_to_trace_dict
     serialize_eager_proposal_meta = dual_batch_module.serialize_eager_proposal_meta
+    serialize_eager_transfer_payload = dual_batch_module.serialize_eager_transfer_payload
     RequestBudget = step_plan_module.RequestBudget
     StepPlan = step_plan_module.StepPlan
 
@@ -145,6 +151,9 @@ EAGER_ZERO_COUNTER_FIELDS = [
     "eager_tokens_rejected",
     "eager_tokens_invalidated",
     "eager_dry_run_tokens_generated",
+    "eager_tokens_transferred",
+    "eager_tokens_transfer_validated",
+    "eager_tokens_transfer_dropped",
 ]
 
 EAGER_EMPTY_LIST_FIELDS = [
@@ -161,6 +170,12 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_parent_seq_ids",
     "eager_promoted_proposal_ids",
     "eager_discarded_proposal_ids",
+    "eager_transfer_sent_proposal_ids",
+    "eager_transfer_sent_seq_ids",
+    "eager_transfer_received_proposal_ids",
+    "eager_transfer_received_seq_ids",
+    "eager_transfer_validated_proposal_ids",
+    "eager_transfer_dropped_proposal_ids",
 ]
 
 REQUIRED_EAGER_META_KEYS = [
@@ -459,6 +474,7 @@ def check_step_plan_validation() -> None:
         enable_eager_plan_dry_run=True,
         enable_eager_draft_dry_run=True,
         enable_eager_promotion_dry_run=True,
+        enable_eager_transfer_dry_run=True,
         global_gamma=4,
     )
     expect_raises(
@@ -481,6 +497,18 @@ def check_step_plan_validation() -> None:
         ),
         AssertionError,
         "promotion dry-run requires draft dry-run",
+    )
+    expect_raises(
+        lambda: dry_run_allowed.validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=True,
+            enable_eager_draft_dry_run=True,
+            enable_eager_promotion_dry_run=False,
+            enable_eager_transfer_dry_run=True,
+            global_gamma=4,
+        ),
+        AssertionError,
+        "transfer dry-run requires promotion dry-run",
     )
     expect_raises(
         lambda: make_step_plan(
@@ -631,6 +659,21 @@ def check_eager_gamma_validation() -> None:
         ValueError,
         "promotion dry-run rejects eager_policy none",
     )
+    expect_raises(
+        lambda: PEARLConfig(
+            draft_model_path="/synthetic/draft",
+            target_model_path="/synthetic/target",
+            execution_mode="dual_batch_pearl",
+            enable_eager_transfer_dry_run=True,
+            eager_policy="none",
+            gamma=4,
+            max_eager_requests_per_step=1,
+            max_eager_tokens_per_step=4,
+            max_eager_tokens_per_request=4,
+        ),
+        ValueError,
+        "transfer dry-run rejects eager_policy none",
+    )
 
 
 def run_synthetic_checks() -> None:
@@ -658,12 +701,16 @@ def check_trace(path: Path) -> None:
             errors.append(f"dual_record[{idx}] enable_eager_draft_dry_run must be false")
         if record.get("enable_eager_promotion_dry_run") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] enable_eager_promotion_dry_run must be false")
+        if record.get("enable_eager_transfer_dry_run") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] enable_eager_transfer_dry_run must be false")
         if record.get("eager_execution_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_execution_enabled must be false")
         if record.get("eager_draft_dry_run_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_draft_dry_run_enabled must be false")
         if record.get("eager_promotion_dry_run_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_promotion_dry_run_enabled must be false")
+        if record.get("eager_transfer_dry_run_enabled") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] eager_transfer_dry_run_enabled must be false")
         if not eager_trace_enabled and record.get("target_eager_set"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
         if not eager_trace_enabled and record.get("draft_eager_set"):
