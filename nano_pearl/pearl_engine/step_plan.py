@@ -25,6 +25,26 @@ class StepPlan:
     draft_home_set: List[int] = field(default_factory=list)
     draft_eager_set: List[int] = field(default_factory=list)
 
+    # Phase 1H-continuous trace: original home set snapshots (before any modification).
+    original_target_home_set: List[int] = field(default_factory=list)
+    original_draft_home_set: List[int] = field(default_factory=list)
+
+    # Phase 1H-continuous trace: exclusion views (trace-only, with lane rules applied).
+    target_home_set_after_eager_exclusion_trace: List[int] = field(default_factory=list)
+    draft_home_set_after_eager_exclusion_trace: List[int] = field(default_factory=list)
+
+    # Phase 1H-continuous trace: trace-only eager sets.
+    target_eager_set_trace: List[int] = field(default_factory=list)
+    draft_eager_new_set: List[int] = field(default_factory=list)
+    draft_eager_continue_set: List[int] = field(default_factory=list)
+    draft_eager_set_trace: List[int] = field(default_factory=list)
+
+    # Phase 1H-continuous trace: executed eager sets (always empty in trace-only).
+    target_home_set_executed: List[int] = field(default_factory=list)
+    draft_home_set_executed: List[int] = field(default_factory=list)
+    draft_eager_set_executed: List[int] = field(default_factory=list)
+    target_eager_set_executed: List[int] = field(default_factory=list)
+
     budgets: Dict[int, RequestBudget] = field(default_factory=dict)
 
     target_batch_id: Optional[str | int] = None
@@ -82,9 +102,11 @@ class StepPlan:
     missing_eager_metadata_seq_ids: List[int] = field(default_factory=list)
     eager_metadata_lookup_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
     effective_enable_eager_trace: bool = False
+    # Phase 1H-continuous trace: pre-verify snapshot and skip tracking.
+    target_home_pre_verify_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    continuous_eager_skip_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_skip_reason_counts: Dict[str, int] = field(default_factory=dict)
     eager_trace_only: bool = False
-    draft_eager_set_trace: List[int] = field(default_factory=list)
-    draft_eager_set_executed: List[int] = field(default_factory=list)
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
@@ -103,6 +125,13 @@ class StepPlan:
     eager_discarded_seq_ids: List[int] = field(default_factory=list)
     eager_promotion_checked_seq_ids: List[int] = field(default_factory=list)
     eager_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    # Phase 1H-continuous trace: proposal version metadata (trace-only, string IDs).
+    eager_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    eager_parent_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    eager_parent_kind_by_seq_id: Dict[int, str] = field(default_factory=dict)  # "normal" | ""
+    eager_proposal_state_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    #   states: "selected" | "pending_parent"  (no "ready"/"verified" in trace-only)
+    eager_promotion_condition_pending_by_seq_id: Dict[int, bool] = field(default_factory=dict)
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
     eager_rejected_seq_ids: List[int] = field(default_factory=list)
@@ -344,6 +373,22 @@ class StepPlan:
             "target_eager_set": [int(seq_id) for seq_id in self.target_eager_set],
             "draft_home_set": [int(seq_id) for seq_id in self.draft_home_set],
             "draft_eager_set": [int(seq_id) for seq_id in self.draft_eager_set],
+            # Phase 1H-continuous trace: original home set snapshots.
+            "original_target_home_set": [int(seq_id) for seq_id in self.original_target_home_set],
+            "original_draft_home_set": [int(seq_id) for seq_id in self.original_draft_home_set],
+            # Phase 1H-continuous trace: exclusion views.
+            "target_home_set_after_eager_exclusion_trace": [int(seq_id) for seq_id in self.target_home_set_after_eager_exclusion_trace],
+            "draft_home_set_after_eager_exclusion_trace": [int(seq_id) for seq_id in self.draft_home_set_after_eager_exclusion_trace],
+            # Phase 1H-continuous trace: trace-only eager sets.
+            "target_eager_set_trace": [int(seq_id) for seq_id in self.target_eager_set_trace],
+            "draft_eager_new_set": [int(seq_id) for seq_id in self.draft_eager_new_set],
+            "draft_eager_continue_set": [int(seq_id) for seq_id in self.draft_eager_continue_set],
+            "draft_eager_set_trace": [int(seq_id) for seq_id in self.draft_eager_set_trace],
+            # Phase 1H-continuous trace: executed sets (always empty in trace-only).
+            "target_home_set_executed": [int(seq_id) for seq_id in self.target_home_set_executed],
+            "draft_home_set_executed": [int(seq_id) for seq_id in self.draft_home_set_executed],
+            "draft_eager_set_executed": [int(seq_id) for seq_id in self.draft_eager_set_executed],
+            "target_eager_set_executed": [int(seq_id) for seq_id in self.target_eager_set_executed],
             "budgets": {
                 str(seq_id): budget.to_trace_dict()
                 for seq_id, budget in self.budgets.items()
@@ -428,10 +473,20 @@ class StepPlan:
                 str(seq_id): str(source)
                 for seq_id, source in self.eager_metadata_lookup_source_by_seq_id.items()
             },
+            "target_home_pre_verify_by_seq_id": {
+                str(seq_id): bool(pre_verify)
+                for seq_id, pre_verify in self.target_home_pre_verify_by_seq_id.items()
+            },
+            "continuous_eager_skip_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_skip_reason_by_seq_id.items()
+            },
+            "continuous_eager_skip_reason_counts": {
+                str(reason): int(count)
+                for reason, count in self.continuous_eager_skip_reason_counts.items()
+            },
             "effective_enable_eager_trace": bool(self.effective_enable_eager_trace),
             "eager_trace_only": bool(self.eager_trace_only),
-            "draft_eager_set_trace": [int(seq_id) for seq_id in self.draft_eager_set_trace],
-            "draft_eager_set_executed": [int(seq_id) for seq_id in self.draft_eager_set_executed],
             "max_eager_requests_per_step": int(self.max_eager_requests_per_step),
             "max_eager_tokens_per_step": int(self.max_eager_tokens_per_step),
             "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
@@ -452,6 +507,27 @@ class StepPlan:
             "eager_discard_reason_by_seq_id": {
                 str(seq_id): str(reason)
                 for seq_id, reason in self.eager_discard_reason_by_seq_id.items()
+            },
+            # Phase 1H-continuous trace: proposal version metadata.
+            "eager_proposal_id_by_seq_id": {
+                str(seq_id): str(proposal_id)
+                for seq_id, proposal_id in self.eager_proposal_id_by_seq_id.items()
+            },
+            "eager_parent_proposal_id_by_seq_id": {
+                str(seq_id): str(parent_id)
+                for seq_id, parent_id in self.eager_parent_proposal_id_by_seq_id.items()
+            },
+            "eager_parent_kind_by_seq_id": {
+                str(seq_id): str(kind)
+                for seq_id, kind in self.eager_parent_kind_by_seq_id.items()
+            },
+            "eager_proposal_state_by_seq_id": {
+                str(seq_id): str(state)
+                for seq_id, state in self.eager_proposal_state_by_seq_id.items()
+            },
+            "eager_promotion_condition_pending_by_seq_id": {
+                str(seq_id): bool(pending)
+                for seq_id, pending in self.eager_promotion_condition_pending_by_seq_id.items()
             },
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],

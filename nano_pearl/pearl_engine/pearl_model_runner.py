@@ -686,7 +686,148 @@ class ModelRunnerBase:
         plan.fallback_buffer_hit_count = len(inspect["hit_seq_ids"])
         plan.fallback_buffer_miss_count = len(missing)
 
+    def _annotate_eager_trace_plan_continuous(self, plan: StepPlan) -> None:
+        """Phase 1H-continuous-trace: corrected candidate selection.
+
+        Trace/control-plane only — never mutates runtime execution sets or tokens.
+        Selects post-verify (pre_verify=False) stable candidates from
+        original_target_home_set.  Skips pre-verify seqs with explicit reason.
+        Does NOT set plan.draft_eager_set — the runtime set stays empty.
+        """
+        # 1. Snapshot original home sets before any mutation.
+        plan.original_target_home_set = list(plan.target_home_set)
+        plan.original_draft_home_set = list(plan.draft_home_set)
+
+        # 2. Set trace metadata flags only — no execution flags.
+        plan.eager_trace_enabled = True
+        plan.effective_enable_eager_trace = True
+        plan.eager_trace_only = True
+        plan.eager_policy = self.global_config.eager_policy
+        plan.max_eager_requests_per_step = max(0, int(self.global_config.max_eager_requests_per_step))
+        plan.max_eager_tokens_per_step = max(0, int(self.global_config.max_eager_tokens_per_step))
+        plan.max_eager_tokens_per_request = max(0, int(self.global_config.max_eager_tokens_per_request))
+
+        # 3. Early exit: policy disabled or not in steady phase.
+        if plan.eager_policy == "none" or plan.plan_phase != "steady":
+            return
+
+        # 4. Populate rank-safe per-seq metadata snapshots for every seq in
+        #    original_target_home_set BEFORE scoring.  Records pre_verify state.
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+        original_target_home = set(plan.original_target_home_set)
+        for seq_id in sorted(original_target_home):
+            seqs_found = self.scheduler.find_by_seq_ids([seq_id])
+            if seqs_found:
+                seq = seqs_found[0]
+                plan.target_home_request_id_by_seq_id[seq_id] = str(getattr(seq, "request_id", None))
+                plan.target_home_slo_class_by_seq_id[seq_id] = str(getattr(seq, "slo_class", None))
+                plan.target_home_slo_tpot_ms_by_seq_id[seq_id] = float(getattr(seq, "slo_tpot_ms", None) or 0.0)
+                plan.eager_metadata_lookup_source_by_seq_id[seq_id] = "scheduler"
+                plan.target_home_pre_verify_by_seq_id[seq_id] = bool(seq.pre_verify)
+            else:
+                plan.missing_eager_metadata_seq_ids.append(int(seq_id))
+                plan.eager_metadata_lookup_source_by_seq_id[seq_id] = "missing"
+
+        # 5. Candidate iteration — select post-verify (pre_verify=False) only.
+        now = time.time()
+        scored = []
+        threshold = float(self.global_config.eager_accept_threshold)
+        for seq in self.scheduler.find_by_seq_ids(plan.original_target_home_set):
+            _sid = int(seq.seq_id)
+
+            # Skip non-running, finished, or pending-eager seqs.
+            if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
+                continue
+
+            # Continuous eager: select post-verify (pre_verify=False) as stable.
+            # Skip pre-verify (pre_verify=True) with explicit reason.
+            if seq.pre_verify:
+                plan.eager_draft_skipped_seq_ids.append(_sid)
+                plan.eager_draft_skipped_reason_by_seq_id[_sid] = "skip_pre_verify_seq"
+                plan.continuous_eager_skip_reason_by_seq_id[_sid] = "skip_pre_verify_seq"
+                continue
+
+            # post-verify (pre_verify=False): stable candidate, proceed to score.
+            score, reason = self._eager_candidate_score(seq, now)
+            if score <= 0.0 or score <= threshold:
+                plan.continuous_eager_skip_reason_by_seq_id[_sid] = "score_below_threshold"
+                continue
+            seq_id = int(seq.seq_id)
+            plan.eager_candidate_seq_ids.append(seq_id)
+            plan.eager_score_by_seq_id[seq_id] = float(score)
+            plan.eager_selection_reason_by_seq_id[seq_id] = reason
+            plan.eager_slo_class_by_seq_id[seq_id] = str(getattr(seq, "slo_class", None))
+            scored.append((float(score), seq_id))
+
+        # Build skip reason counts for diagnostics.
+        _skip_counts: dict[str, int] = {}
+        for _reason in plan.continuous_eager_skip_reason_by_seq_id.values():
+            _skip_counts[_reason] = _skip_counts.get(_reason, 0) + 1
+        plan.continuous_eager_skip_reason_counts = _skip_counts
+
+        # 6. Budget allocation — same as old: sort by score desc, allocate within caps.
+        if (
+            plan.max_eager_requests_per_step <= 0
+            or plan.max_eager_tokens_per_step <= 0
+            or plan.max_eager_tokens_per_request <= 0
+        ):
+            return
+
+        remaining_tokens = plan.max_eager_tokens_per_step
+        for _, seq_id in sorted(scored, key=lambda item: (-item[0], item[1])):
+            if len(plan.eager_selected_seq_ids) >= plan.max_eager_requests_per_step:
+                break
+            if remaining_tokens <= 0:
+                break
+            budget = min(plan.max_eager_tokens_per_request, remaining_tokens)
+            if budget <= 0:
+                break
+            plan.eager_selected_seq_ids.append(seq_id)
+            plan.eager_budget_by_seq_id[seq_id] = int(budget)
+            plan.eager_total_budget += int(budget)
+            plan.budgets.setdefault(seq_id, RequestBudget(normal_gamma=self.gamma, eager_gamma=0))
+            plan.budgets[seq_id].eager_gamma = int(budget)
+            remaining_tokens -= int(budget)
+
+        # 7. Populate trace-only eager sets.
+        #    Do NOT set plan.draft_eager_set — runtime set stays empty.
+        plan.draft_eager_new_set = list(plan.eager_selected_seq_ids)
+        plan.draft_eager_continue_set = []   # empty — no target_eager_set_trace in first version
+        plan.target_eager_set_trace = []     # empty — no simulated ready proposals
+        plan.draft_eager_set_trace = sorted(
+            set(plan.draft_eager_new_set) | set(plan.draft_eager_continue_set)
+        )
+        # Executed sets stay empty (trace-only):
+        # draft_eager_set_executed = [] (default)
+        # target_eager_set_executed = [] (default)
+
+        # 8. Trace exclusion views — apply continuous lane rules as trace-only computation.
+        _target_eager_trace = set(plan.target_eager_set_trace)      # empty in first version
+        _draft_continue = set(plan.draft_eager_continue_set)         # empty in first version
+        plan.target_home_set_after_eager_exclusion_trace = list(plan.original_target_home_set)
+        plan.draft_home_set_after_eager_exclusion_trace = [
+            s for s in plan.original_draft_home_set
+            if s not in _target_eager_trace and s not in _draft_continue
+        ]
+
+        # 9. Proposal metadata — string IDs, stable, only "selected" state.
+        for seq_id in plan.draft_eager_new_set:
+            plan.eager_proposal_id_by_seq_id[seq_id] = (
+                f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}"
+            )
+            plan.eager_parent_proposal_id_by_seq_id[seq_id] = (
+                f"normal:{plan.step_id}:{plan.plan_id}:{seq_id}"
+            )
+            plan.eager_parent_kind_by_seq_id[seq_id] = "normal"
+            plan.eager_proposal_state_by_seq_id[seq_id] = "selected"
+            plan.eager_promotion_condition_pending_by_seq_id[seq_id] = True
+
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
+        # Phase 1H-continuous-trace: delegate to corrected selection logic.
+        if self.global_config.enable_continuous_eager_trace:
+            self._annotate_eager_trace_plan_continuous(plan)
+            return
+
         plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
         plan.effective_enable_eager_trace = plan.eager_trace_enabled
         plan.eager_trace_only = bool(plan.eager_trace_enabled and not self.global_config.enable_eager_execution)

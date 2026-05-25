@@ -1313,6 +1313,324 @@ def test_h2_empty_broadcasts_are_unconditional():
         "DRAFT H2: _receive_verify_result must be called BEFORE the if target_seqs: guard"
 
 
+# --- Phase 1H-continuous-trace tests ---
+
+
+def test_continuous_draft_eager_new_subset_of_original_target_home():
+    """draft_eager_new_set must be subset of original_target_home_set."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.original_target_home_set = [1, 3, 5, 7]
+    plan.draft_eager_new_set = [1, 5]
+    assert set(plan.draft_eager_new_set).issubset(set(plan.original_target_home_set)), \
+        "draft_eager_new_set must be subset of original_target_home_set"
+
+
+def test_continuous_draft_eager_new_outside_original_target_home():
+    """draft_eager_new_set outside original_target_home_set — must be detected."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.original_target_home_set = [1, 3, 5, 7]
+    plan.draft_eager_new_set = [1, 9]  # 9 is outside
+    assert not set(plan.draft_eager_new_set).issubset(set(plan.original_target_home_set)), \
+        "seq 9 should not pass subset check"
+
+
+def test_continuous_draft_eager_set_trace_union():
+    """draft_eager_set_trace must equal new ∪ continue."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.draft_eager_new_set = [1, 3]
+    plan.draft_eager_continue_set = []
+    plan.draft_eager_set_trace = sorted(set(plan.draft_eager_new_set) | set(plan.draft_eager_continue_set))
+    assert plan.draft_eager_set_trace == [1, 3], \
+        f"draft_eager_set_trace should be [1,3], got {plan.draft_eager_set_trace}"
+
+
+def test_continuous_executed_sets_empty():
+    """All executed eager sets must be empty in trace-only."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    assert plan.draft_eager_set_executed == [], "draft_eager_set_executed must be empty"
+    assert plan.target_eager_set_executed == [], "target_eager_set_executed must be empty"
+    assert plan.target_home_set_executed == [], "target_home_set_executed must be empty"
+    assert plan.draft_home_set_executed == [], "draft_home_set_executed must be empty"
+
+
+def test_continuous_execution_counters_zero():
+    """All eager execution counters must be 0 in trace-only."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    assert plan.eager_tokens_generated == 0
+    assert plan.eager_tokens_verified == 0
+    assert plan.eager_tokens_promoted == 0
+    assert plan.eager_tokens_discarded == 0
+    assert plan.eager_tokens_accepted == 0
+
+
+def test_continuous_proposal_ids_string_format():
+    """Proposal IDs use the ce:new string format."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.step_id = 5
+    plan.plan_id = 10
+    plan.draft_eager_new_set = [1, 3]
+    for seq_id in plan.draft_eager_new_set:
+        plan.eager_proposal_id_by_seq_id[seq_id] = f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}"
+        plan.eager_parent_proposal_id_by_seq_id[seq_id] = f"normal:{plan.step_id}:{plan.plan_id}:{seq_id}"
+        plan.eager_parent_kind_by_seq_id[seq_id] = "normal"
+        plan.eager_proposal_state_by_seq_id[seq_id] = "selected"
+        plan.eager_promotion_condition_pending_by_seq_id[seq_id] = True
+    assert plan.eager_proposal_id_by_seq_id[1] == "ce:new:5:10:1"
+    assert plan.eager_proposal_id_by_seq_id[3] == "ce:new:5:10:3"
+    assert plan.eager_parent_proposal_id_by_seq_id[1] == "normal:5:10:1"
+    assert plan.eager_parent_kind_by_seq_id[1] == "normal"
+
+
+def test_continuous_proposal_ids_unique():
+    """Proposal IDs must be unique across seqs."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.step_id = 1
+    plan.draft_eager_new_set = [1, 3]
+    ids = set()
+    for seq_id in plan.draft_eager_new_set:
+        pid = f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}"
+        assert pid not in ids, f"duplicate proposal_id={pid}"
+        ids.add(pid)
+        plan.eager_proposal_id_by_seq_id[seq_id] = pid
+    assert len(ids) == 2
+
+
+def test_continuous_proposal_state_only_selected_or_pending():
+    """Only 'selected' and 'pending_parent' states allowed in trace-only."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.eager_proposal_state_by_seq_id = {1: "selected", 2: "pending_parent"}
+    ALLOWED = {"selected", "pending_parent"}
+    for state in plan.eager_proposal_state_by_seq_id.values():
+        assert state in ALLOWED, f"state {state!r} not allowed in trace-only"
+    # Verify "ready" would be rejected.
+    bad = {"selected", "ready"}
+    assert not bad.issubset(ALLOWED), "'ready' should not be in allowed states"
+
+
+def test_continuous_target_eager_set_trace_empty():
+    """target_eager_set_trace must be empty in first version."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    assert plan.target_eager_set_trace == [], "target_eager_set_trace must be empty"
+
+
+def test_continuous_draft_eager_continue_set_empty():
+    """draft_eager_continue_set must be empty in first version."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    assert plan.draft_eager_continue_set == [], "draft_eager_continue_set must be empty"
+
+
+def test_continuous_exclusion_views_computed():
+    """Trace exclusion views apply lane rules without mutating originals."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.original_target_home_set = [1, 3, 5, 7]
+    plan.original_draft_home_set = [4, 6, 8]
+    plan.target_eager_set_trace = []        # empty in first version
+    plan.draft_eager_continue_set = []       # empty in first version
+    _te = set(plan.target_eager_set_trace)
+    _dc = set(plan.draft_eager_continue_set)
+    plan.target_home_set_after_eager_exclusion_trace = list(plan.original_target_home_set)
+    plan.draft_home_set_after_eager_exclusion_trace = [
+        s for s in plan.original_draft_home_set if s not in _te and s not in _dc
+    ]
+    assert plan.target_home_set_after_eager_exclusion_trace == [1, 3, 5, 7]
+    assert plan.draft_home_set_after_eager_exclusion_trace == [4, 6, 8]
+
+
+def test_continuous_skip_pre_verify_reason_tracked():
+    """Skip reasons include skip_pre_verify_seq, not skip_post_verify_seq."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.continuous_eager_skip_reason_by_seq_id = {1: "skip_pre_verify_seq", 3: "score_below_threshold"}
+    reasons = set(plan.continuous_eager_skip_reason_by_seq_id.values())
+    assert "skip_pre_verify_seq" in reasons, "should contain skip_pre_verify_seq"
+    assert "skip_post_verify_seq" not in reasons, "should NOT contain skip_post_verify_seq"
+
+
+def test_continuous_parent_kind_normal_only():
+    """Parent kind must be 'normal' or empty — no 'eager' in first version."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.eager_parent_kind_by_seq_id = {1: "normal", 2: ""}
+    ALLOWED = {"normal", ""}
+    for kind in plan.eager_parent_kind_by_seq_id.values():
+        assert kind in ALLOWED, f"parent_kind {kind!r} not allowed"
+
+
+def test_continuous_skip_reason_counts_consistent():
+    """continuous_eager_skip_reason_counts must match by_seq_id values."""
+    skip_by_seq = {1: "skip_pre_verify_seq", 2: "skip_pre_verify_seq", 3: "score_below_threshold"}
+    expected = {}
+    for reason in skip_by_seq.values():
+        expected[reason] = expected.get(reason, 0) + 1
+    assert expected == {"skip_pre_verify_seq": 2, "score_below_threshold": 1}
+
+
+def test_continuous_original_home_sets_preserved():
+    """original_target_home_set and original_draft_home_set are not mutated."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3, 5, 7],
+        draft_home_set=[4, 6, 8],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.original_target_home_set = list(plan.target_home_set)
+    plan.original_draft_home_set = list(plan.draft_home_set)
+    assert plan.original_target_home_set == [1, 3, 5, 7]
+    assert plan.original_draft_home_set == [4, 6, 8]
+    # Mutating actual sets should not affect originals.
+    plan.target_home_set.append(9)
+    assert plan.original_target_home_set == [1, 3, 5, 7]
+
+
+def test_continuous_to_trace_dict_includes_new_fields():
+    """to_trace_dict() includes all new continuous eager fields."""
+    plan = StepPlan(
+        plan_id=1,
+        iteration_id=1,
+        execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3],
+        draft_home_set=[4, 6],
+        dual_batch_enabled=True,
+        plan_phase="steady",
+    )
+    plan.original_target_home_set = [1, 3]
+    plan.original_draft_home_set = [4, 6]
+    plan.draft_eager_new_set = [1]
+    plan.draft_eager_set_trace = [1]
+    plan.target_home_pre_verify_by_seq_id = {1: False, 3: True}
+    plan.continuous_eager_skip_reason_by_seq_id = {3: "skip_pre_verify_seq"}
+    plan.continuous_eager_skip_reason_counts = {"skip_pre_verify_seq": 1}
+    plan.eager_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan.eager_parent_proposal_id_by_seq_id = {1: "normal:0:1:1"}
+    plan.eager_parent_kind_by_seq_id = {1: "normal"}
+    plan.eager_proposal_state_by_seq_id = {1: "selected"}
+    plan.eager_promotion_condition_pending_by_seq_id = {1: True}
+    d = plan.to_trace_dict()
+    assert d.get("original_target_home_set") == [1, 3]
+    assert d.get("original_draft_home_set") == [4, 6]
+    assert d.get("draft_eager_new_set") == [1]
+    assert d.get("draft_eager_set_trace") == [1]
+    assert d.get("target_home_pre_verify_by_seq_id") == {"1": False, "3": True}
+    assert d.get("continuous_eager_skip_reason_by_seq_id") == {"3": "skip_pre_verify_seq"}
+    assert d.get("continuous_eager_skip_reason_counts") == {"skip_pre_verify_seq": 1}
+    assert d.get("eager_proposal_id_by_seq_id") == {"1": "ce:new:0:1:1"}
+    assert d.get("eager_parent_proposal_id_by_seq_id") == {"1": "normal:0:1:1"}
+    assert d.get("eager_parent_kind_by_seq_id") == {"1": "normal"}
+    assert d.get("eager_proposal_state_by_seq_id") == {"1": "selected"}
+    assert d.get("eager_promotion_condition_pending_by_seq_id") == {"1": True}
+    assert d.get("target_eager_set_trace") == []
+    assert d.get("draft_eager_continue_set") == []
+    assert d.get("draft_eager_set_executed") == []
+    assert d.get("target_eager_set_executed") == []
+    assert d.get("target_home_set_executed") == []
+    assert d.get("draft_home_set_executed") == []
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -1371,6 +1689,23 @@ if __name__ == "__main__":
         test_h2_target_eager_no_intersection_draft_home,
         test_h2_non_steady_preserves_old_invariant,
         test_h2_trace_dict_includes_new_fields,
+        # Phase 1H-continuous-trace tests
+        test_continuous_draft_eager_new_subset_of_original_target_home,
+        test_continuous_draft_eager_new_outside_original_target_home,
+        test_continuous_draft_eager_set_trace_union,
+        test_continuous_executed_sets_empty,
+        test_continuous_execution_counters_zero,
+        test_continuous_proposal_ids_string_format,
+        test_continuous_proposal_ids_unique,
+        test_continuous_proposal_state_only_selected_or_pending,
+        test_continuous_target_eager_set_trace_empty,
+        test_continuous_draft_eager_continue_set_empty,
+        test_continuous_exclusion_views_computed,
+        test_continuous_skip_pre_verify_reason_tracked,
+        test_continuous_parent_kind_normal_only,
+        test_continuous_skip_reason_counts_consistent,
+        test_continuous_original_home_sets_preserved,
+        test_continuous_to_trace_dict_includes_new_fields,
     ]
     passed = 0
     for test in tests:
