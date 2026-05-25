@@ -143,6 +143,7 @@ class ModelRunnerBase:
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
         self._eager_proposal_id = 0
+        self._draft_sent_eager_proposals_by_id = {}
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -620,6 +621,47 @@ class ModelRunnerBase:
             "eager_apply_rollback_ok_by_seq_id": {},
             "eager_apply_mutation_remaining_by_seq_id": {},
             "eager_apply_dry_run_appended_token_count_by_seq_id": {},
+            "enable_eager_result_transfer_dry_run": bool(
+                getattr(self.global_config, "enable_eager_result_transfer_dry_run", False)
+            ),
+            "eager_result_transfer_dry_run_enabled": False,
+            "eager_result_transfer_step_id": None,
+            "eager_result_transfer_plan_id": None,
+            "eager_result_transfer_num_results": 0,
+            "eager_result_transfer_payload_len": 0,
+            "eager_result_sent_proposal_ids": [],
+            "eager_result_sent_seq_ids": [],
+            "eager_result_sent_accepted_len_by_seq_id": {},
+            "eager_result_sent_full_accept_by_seq_id": {},
+            "eager_result_sent_reject_position_by_seq_id": {},
+            "eager_result_sent_invalidated_len_by_seq_id": {},
+            "eager_result_sent_revised_token_by_seq_id": {},
+            "eager_result_sent_apply_action_by_seq_id": {},
+            "eager_result_sent_proposal_len_by_proposal_id": {},
+            "eager_result_sent_to_verify_len_by_proposal_id": {},
+            "eager_result_received_num_results": 0,
+            "eager_result_received_payload_len": 0,
+            "eager_result_received_proposal_ids": [],
+            "eager_result_received_seq_ids": [],
+            "eager_result_validated_proposal_ids": [],
+            "eager_result_invalid_proposal_ids": [],
+            "eager_result_validation_reason_by_proposal_id": {},
+            "eager_result_received_accepted_len_by_seq_id": {},
+            "eager_result_received_full_accept_by_seq_id": {},
+            "eager_result_received_reject_position_by_seq_id": {},
+            "eager_result_received_invalidated_len_by_seq_id": {},
+            "eager_result_received_revised_token_by_seq_id": {},
+            "eager_result_received_proposal_len_by_proposal_id": {},
+            "eager_result_received_to_verify_len_by_proposal_id": {},
+            "eager_result_draft_current_len_by_seq_id": {},
+            "eager_result_base_len_by_seq_id": {},
+            "eager_result_draft_len_matches_base_by_seq_id": {},
+            "eager_result_draft_seq_pre_verify_by_seq_id": {},
+            "eager_result_draft_status_before_by_seq_id": {},
+            "eager_result_draft_status_after_by_seq_id": {},
+            "eager_result_draft_checkpoint_ok_by_seq_id": {},
+            "eager_result_draft_mutation_detected_by_seq_id": {},
+            "eager_result_zero_result_step": False,
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
             "target_eager_set_dry_run": [],
@@ -746,6 +788,10 @@ class ModelRunnerBase:
             "eager_tokens_apply_dry_run_discarded": 0,
             "eager_apply_dry_run_append_tokens": 0,
             "eager_apply_dry_run_rollback_failure_count": 0,
+            "eager_tokens_result_transfer_sent": 0,
+            "eager_tokens_result_transfer_received": 0,
+            "eager_tokens_result_transfer_validated": 0,
+            "eager_tokens_result_transfer_invalid": 0,
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -860,6 +906,9 @@ class ModelRunnerBase:
     def _eager_apply_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_apply_dry_run", False))
 
+    def _eager_result_transfer_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_result_transfer_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -870,7 +919,8 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        apply_dry_run_enabled = self._eager_apply_dry_run_enabled()
+        result_transfer_dry_run_enabled = self._eager_result_transfer_dry_run_enabled()
+        apply_dry_run_enabled = self._eager_apply_dry_run_enabled() or result_transfer_dry_run_enabled
         verify_dry_run_enabled = self._eager_verify_dry_run_enabled() or apply_dry_run_enabled
         schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled
         transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled() or schedule_dry_run_enabled
@@ -886,6 +936,7 @@ class ModelRunnerBase:
         plan.enable_eager_schedule_dry_run = schedule_dry_run_enabled
         plan.enable_eager_verify_dry_run = verify_dry_run_enabled
         plan.enable_eager_apply_dry_run = apply_dry_run_enabled
+        plan.enable_eager_result_transfer_dry_run = result_transfer_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -923,6 +974,7 @@ class ModelRunnerBase:
                 enable_eager_schedule_dry_run=schedule_dry_run_enabled,
                 enable_eager_verify_dry_run=verify_dry_run_enabled,
                 enable_eager_apply_dry_run=apply_dry_run_enabled,
+                enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -1011,6 +1063,7 @@ class ModelRunnerBase:
             enable_eager_schedule_dry_run=schedule_dry_run_enabled,
             enable_eager_verify_dry_run=verify_dry_run_enabled,
             enable_eager_apply_dry_run=apply_dry_run_enabled,
+            enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1281,6 +1334,8 @@ class ModelRunnerBase:
             proposal for proposal in proposals
             if proposal.valid and proposal.state == EAGER_STATE_READY_TO_VERIFY
         ]
+        for proposal in ready_proposals:
+            self._draft_sent_eager_proposals_by_id[int(proposal.proposal_id)] = proposal
         meta_values, payload_values = serialize_eager_transfer_payload(
             ready_proposals,
             gamma=int(self.gamma),
@@ -1305,6 +1360,423 @@ class ModelRunnerBase:
         if int(meta_values[1]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _result_action_code(self, action: str) -> int:
+        return {
+            "append_full_accept_then_rollback": 1,
+            "discard_partial_no_mutation": 2,
+            "discard_reject_no_mutation": 3,
+        }.get(str(action), 0)
+
+    def _result_action_from_code(self, action_code: int) -> str:
+        return {
+            1: "append_full_accept_then_rollback",
+            2: "discard_partial_no_mutation",
+            3: "discard_reject_no_mutation",
+        }.get(int(action_code), "unknown")
+
+    def _numeric_request_id(self, request_id) -> int:
+        try:
+            return int(request_id)
+        except Exception:
+            return -1
+
+    def _build_eager_result_transfer_results(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        scheduled_proposals: list[EagerProposal],
+    ) -> list[dict]:
+        verify_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_verify_executed_proposal_ids", [])
+        }
+        accepted_by_seq = trace_record.get("eager_verify_accepted_len_by_seq_id", {})
+        full_accept_by_seq = trace_record.get("eager_verify_full_accept_by_seq_id", {})
+        reject_position_by_seq = trace_record.get("eager_verify_reject_position_by_seq_id", {})
+        invalidated_by_seq = trace_record.get("eager_verify_invalidated_len_by_seq_id", {})
+        revised_by_seq = trace_record.get("eager_verify_revised_token_by_seq_id", {})
+        target_len_by_seq = trace_record.get("eager_verify_current_len_by_seq_id", {})
+        target_pre_verify_by_seq = trace_record.get("eager_verify_seq_pre_verify_by_seq_id", {})
+        apply_action_by_seq = trace_record.get("eager_apply_action_by_seq_id", {})
+        results = []
+        for proposal in scheduled_proposals:
+            proposal_id = int(proposal.proposal_id)
+            if proposal_id not in verify_ids:
+                continue
+            seq_id = int(proposal.seq_id)
+            accepted_len = int(accepted_by_seq.get(str(seq_id), accepted_by_seq.get(seq_id, -1)))
+            full_accept = bool(full_accept_by_seq.get(str(seq_id), full_accept_by_seq.get(seq_id, False)))
+            reject_position = int(reject_position_by_seq.get(str(seq_id), reject_position_by_seq.get(seq_id, -1)))
+            invalidated_len = int(invalidated_by_seq.get(str(seq_id), invalidated_by_seq.get(seq_id, -1)))
+            revised_token = int(revised_by_seq.get(str(seq_id), revised_by_seq.get(seq_id, -1)))
+            target_len = int(target_len_by_seq.get(str(seq_id), target_len_by_seq.get(seq_id, -1)))
+            target_pre_verify = bool(
+                target_pre_verify_by_seq.get(str(seq_id), target_pre_verify_by_seq.get(seq_id, True))
+            )
+            apply_action = str(apply_action_by_seq.get(str(seq_id), apply_action_by_seq.get(seq_id, "unknown")))
+            results.append(
+                {
+                    "proposal_id": proposal_id,
+                    "seq_id": seq_id,
+                    "request_id": self._numeric_request_id(proposal.request_id),
+                    "source_plan_id": int(proposal.source_plan_id),
+                    "source_step_id": int(proposal.source_step_id),
+                    "schedule_plan_id": int(plan.plan_id),
+                    "schedule_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "verify_plan_id": int(trace_record.get("eager_verify_dry_run_plan_id") or plan.plan_id),
+                    "verify_step_id": -1
+                    if trace_record.get("eager_verify_dry_run_step_id") is None
+                    else int(trace_record.get("eager_verify_dry_run_step_id")),
+                    "accepted_len": accepted_len,
+                    "full_accept": full_accept,
+                    "reject_position": reject_position,
+                    "invalidated_len": invalidated_len,
+                    "revised_token": revised_token,
+                    "proposal_len": int(proposal.proposal_len),
+                    "to_verify_len": len(proposal.to_be_verified_token_ids),
+                    "gamma": int(self.gamma),
+                    "base_len": int(proposal.base_len),
+                    "base_pre_verify": bool(proposal.base_pre_verify),
+                    "target_seq_len_at_verify": target_len,
+                    "target_seq_pre_verify_at_verify": target_pre_verify,
+                    "apply_action": apply_action,
+                }
+            )
+        return results
+
+    def _serialize_eager_result_transfer_payload(
+        self,
+        results: list[dict],
+        plan: StepPlan,
+    ) -> tuple[list[int], list[int]]:
+        payload_values = []
+        for result in results:
+            payload_values.extend(
+                [
+                    int(result["proposal_id"]),
+                    int(result["seq_id"]),
+                    int(result["request_id"]),
+                    int(result["source_plan_id"]),
+                    int(result["source_step_id"]),
+                    int(result["schedule_plan_id"]),
+                    int(result["schedule_step_id"]),
+                    int(result["verify_plan_id"]),
+                    int(result["verify_step_id"]),
+                    int(result["accepted_len"]),
+                    int(bool(result["full_accept"])),
+                    int(result["reject_position"]),
+                    int(result["invalidated_len"]),
+                    int(result["revised_token"]),
+                    int(result["proposal_len"]),
+                    int(result["to_verify_len"]),
+                    int(result["gamma"]),
+                    int(result["base_len"]),
+                    int(bool(result["base_pre_verify"])),
+                    int(result["target_seq_len_at_verify"]),
+                    int(bool(result["target_seq_pre_verify_at_verify"])),
+                    int(self._result_action_code(result["apply_action"])),
+                ]
+            )
+        meta_values = [
+            len(results),
+            len(payload_values),
+            int(self.gamma),
+            int(plan.plan_id),
+            -1 if plan.step_id is None else int(plan.step_id),
+        ]
+        return meta_values, payload_values
+
+    def _deserialize_eager_result_transfer_payload(self, meta_values: list[int], payload_values: list[int]) -> list[dict]:
+        num_results, payload_len, _gamma, _plan_id, _step_id = [int(value) for value in meta_values]
+        if int(payload_len) != len(payload_values):
+            raise ValueError(
+                f"eager result transfer payload length mismatch: meta={payload_len}, actual={len(payload_values)}"
+            )
+        header_width = 22
+        if payload_len != num_results * header_width:
+            raise ValueError(
+                f"malformed eager result payload: num_results={num_results}, payload_len={payload_len}"
+            )
+        results = []
+        for idx in range(num_results):
+            base = idx * header_width
+            (
+                proposal_id,
+                seq_id,
+                request_id,
+                source_plan_id,
+                source_step_id,
+                schedule_plan_id,
+                schedule_step_id,
+                verify_plan_id,
+                verify_step_id,
+                accepted_len,
+                full_accept,
+                reject_position,
+                invalidated_len,
+                revised_token,
+                proposal_len,
+                to_verify_len,
+                gamma,
+                base_len,
+                base_pre_verify,
+                target_seq_len_at_verify,
+                target_seq_pre_verify_at_verify,
+                apply_action_code,
+            ) = payload_values[base:base + header_width]
+            results.append(
+                {
+                    "proposal_id": int(proposal_id),
+                    "seq_id": int(seq_id),
+                    "request_id": int(request_id),
+                    "source_plan_id": int(source_plan_id),
+                    "source_step_id": int(source_step_id),
+                    "schedule_plan_id": int(schedule_plan_id),
+                    "schedule_step_id": int(schedule_step_id),
+                    "verify_plan_id": int(verify_plan_id),
+                    "verify_step_id": int(verify_step_id),
+                    "accepted_len": int(accepted_len),
+                    "full_accept": bool(full_accept),
+                    "reject_position": int(reject_position),
+                    "invalidated_len": int(invalidated_len),
+                    "revised_token": int(revised_token),
+                    "proposal_len": int(proposal_len),
+                    "to_verify_len": int(to_verify_len),
+                    "gamma": int(gamma),
+                    "base_len": int(base_len),
+                    "base_pre_verify": bool(base_pre_verify),
+                    "target_seq_len_at_verify": int(target_seq_len_at_verify),
+                    "target_seq_pre_verify_at_verify": bool(target_seq_pre_verify_at_verify),
+                    "apply_action": self._result_action_from_code(int(apply_action_code)),
+                }
+            )
+        return results
+
+    def _send_eager_result_transfer_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        scheduled_proposals: list[EagerProposal],
+    ) -> None:
+        results = self._build_eager_result_transfer_results(plan, trace_record, scheduled_proposals)
+        meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
+        trace_record["enable_eager_result_transfer_dry_run"] = True
+        trace_record["eager_result_transfer_dry_run_enabled"] = True
+        trace_record["eager_result_transfer_step_id"] = None if plan.step_id is None else int(plan.step_id)
+        trace_record["eager_result_transfer_plan_id"] = int(plan.plan_id)
+        trace_record["eager_result_transfer_num_results"] = int(meta_values[0])
+        trace_record["eager_result_transfer_payload_len"] = int(meta_values[1])
+        trace_record["eager_result_sent_proposal_ids"] = [int(result["proposal_id"]) for result in results]
+        trace_record["eager_result_sent_seq_ids"] = [int(result["seq_id"]) for result in results]
+        trace_record["eager_result_sent_accepted_len_by_seq_id"] = {
+            str(result["seq_id"]): int(result["accepted_len"]) for result in results
+        }
+        trace_record["eager_result_sent_full_accept_by_seq_id"] = {
+            str(result["seq_id"]): bool(result["full_accept"]) for result in results
+        }
+        trace_record["eager_result_sent_reject_position_by_seq_id"] = {
+            str(result["seq_id"]): int(result["reject_position"]) for result in results
+        }
+        trace_record["eager_result_sent_invalidated_len_by_seq_id"] = {
+            str(result["seq_id"]): int(result["invalidated_len"]) for result in results
+        }
+        trace_record["eager_result_sent_revised_token_by_seq_id"] = {
+            str(result["seq_id"]): int(result["revised_token"]) for result in results
+        }
+        trace_record["eager_result_sent_apply_action_by_seq_id"] = {
+            str(result["seq_id"]): str(result["apply_action"]) for result in results
+        }
+        trace_record["eager_result_sent_proposal_len_by_proposal_id"] = {
+            str(result["proposal_id"]): int(result["proposal_len"]) for result in results
+        }
+        trace_record["eager_result_sent_to_verify_len_by_proposal_id"] = {
+            str(result["proposal_id"]): int(result["to_verify_len"]) for result in results
+        }
+        trace_record["eager_tokens_result_transfer_sent"] = sum(
+            int(result["proposal_len"]) for result in results
+        )
+        trace_record["eager_result_zero_result_step"] = len(results) == 0
+        if self.tp_params.local_rank != 0:
+            return
+        meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        if int(meta_values[1]) > 0:
+            payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+
+    def _validate_eager_result_on_draft(
+        self,
+        result: dict,
+        known_proposals: dict[int, EagerProposal],
+        seq: Sequence | None,
+        meta_gamma: int,
+    ) -> str:
+        proposal_id = int(result["proposal_id"])
+        gamma = int(self.gamma)
+        if proposal_id not in known_proposals:
+            return "unknown_proposal_id"
+        if seq is None:
+            return "seq_not_found"
+        if int(meta_gamma) != gamma or int(result["gamma"]) != gamma:
+            return "gamma_mismatch"
+        if int(result["proposal_len"]) != gamma:
+            return "invalid_proposal_len"
+        if int(result["to_verify_len"]) != gamma:
+            return "invalid_to_verify_len"
+        accepted_len = int(result["accepted_len"])
+        if not (0 <= accepted_len <= gamma):
+            return "invalid_accepted_len"
+        if bool(result["full_accept"]) != (accepted_len == gamma):
+            return "full_accept_mismatch"
+        if int(result["invalidated_len"]) != gamma - accepted_len:
+            return "invalidated_len_mismatch"
+        if bool(result["base_pre_verify"]):
+            return "invalid_base_pre_verify"
+        for field_name in (
+            "source_plan_id",
+            "source_step_id",
+            "schedule_plan_id",
+            "schedule_step_id",
+            "verify_plan_id",
+            "verify_step_id",
+        ):
+            if int(result[field_name]) < 0:
+                return "missing_plan_or_step_id"
+        return "ok"
+
+    def _receive_eager_result_transfer_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        known_proposals: list[EagerProposal],
+    ) -> None:
+        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
+        known_by_id.update({int(proposal.proposal_id): proposal for proposal in known_proposals})
+        if self.tp_params.local_rank != 0:
+            return
+        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        num_results, payload_len, gamma, result_plan_id, result_step_id = meta_values
+        payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+        if payload_len > 0:
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        results = self._deserialize_eager_result_transfer_payload(meta_values, payload.tolist())
+        seq_by_id = self._local_sequence_by_id()
+        validated: list[dict] = []
+        invalid: list[dict] = []
+        validation_reason_by_proposal_id: dict[int, str] = {}
+        current_len_by_seq_id: dict[int, int] = {}
+        base_len_by_seq_id: dict[int, int] = {}
+        len_match_by_seq_id: dict[int, bool] = {}
+        pre_verify_by_seq_id: dict[int, bool] = {}
+        status_before_by_seq_id: dict[int, str] = {}
+        status_after_by_seq_id: dict[int, str] = {}
+        checkpoint_ok_by_seq_id: dict[int, bool] = {}
+        mutation_detected_by_seq_id: dict[int, bool] = {}
+        checkpoints: dict[int, dict] = {}
+
+        for result in results:
+            seq_id = int(result["seq_id"])
+            proposal_id = int(result["proposal_id"])
+            seq = seq_by_id.get(seq_id)
+            if seq is not None:
+                checkpoints[seq_id] = make_sequence_checkpoint(seq)
+            reason = self._validate_eager_result_on_draft(result, known_by_id, seq, gamma)
+            validation_reason_by_proposal_id[proposal_id] = reason
+            if reason == "ok":
+                validated.append(result)
+            else:
+                invalid.append(result)
+            current_len_by_seq_id[seq_id] = -1 if seq is None else int(len(seq))
+            base_len_by_seq_id[seq_id] = int(result["base_len"])
+            len_match_by_seq_id[seq_id] = seq is not None and int(len(seq)) == int(result["base_len"])
+            pre_verify_by_seq_id[seq_id] = bool(getattr(seq, "pre_verify", True)) if seq is not None else True
+            status_before_by_seq_id[seq_id] = self._sequence_status_name(seq)
+
+        for result in results:
+            seq_id = int(result["seq_id"])
+            seq = seq_by_id.get(seq_id)
+            status_after_by_seq_id[seq_id] = self._sequence_status_name(seq)
+            if seq is None or seq_id not in checkpoints:
+                continue
+            try:
+                assert_sequence_matches_checkpoint(seq, checkpoints[seq_id])
+                checkpoint_ok_by_seq_id[seq_id] = True
+                mutation_detected_by_seq_id[seq_id] = False
+            except AssertionError:
+                checkpoint_ok_by_seq_id[seq_id] = False
+                mutation_detected_by_seq_id[seq_id] = True
+
+        trace_record["enable_eager_result_transfer_dry_run"] = True
+        trace_record["eager_result_transfer_dry_run_enabled"] = True
+        trace_record["eager_result_transfer_step_id"] = None if result_step_id < 0 else int(result_step_id)
+        trace_record["eager_result_transfer_plan_id"] = int(result_plan_id)
+        trace_record["eager_result_received_num_results"] = int(num_results)
+        trace_record["eager_result_received_payload_len"] = int(payload_len)
+        trace_record["eager_result_received_proposal_ids"] = [int(result["proposal_id"]) for result in results]
+        trace_record["eager_result_received_seq_ids"] = [int(result["seq_id"]) for result in results]
+        trace_record["eager_result_validated_proposal_ids"] = [int(result["proposal_id"]) for result in validated]
+        trace_record["eager_result_invalid_proposal_ids"] = [int(result["proposal_id"]) for result in invalid]
+        trace_record["eager_result_validation_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in validation_reason_by_proposal_id.items()
+        }
+        trace_record["eager_result_received_accepted_len_by_seq_id"] = {
+            str(result["seq_id"]): int(result["accepted_len"]) for result in results
+        }
+        trace_record["eager_result_received_full_accept_by_seq_id"] = {
+            str(result["seq_id"]): bool(result["full_accept"]) for result in results
+        }
+        trace_record["eager_result_received_reject_position_by_seq_id"] = {
+            str(result["seq_id"]): int(result["reject_position"]) for result in results
+        }
+        trace_record["eager_result_received_invalidated_len_by_seq_id"] = {
+            str(result["seq_id"]): int(result["invalidated_len"]) for result in results
+        }
+        trace_record["eager_result_received_revised_token_by_seq_id"] = {
+            str(result["seq_id"]): int(result["revised_token"]) for result in results
+        }
+        trace_record["eager_result_received_proposal_len_by_proposal_id"] = {
+            str(result["proposal_id"]): int(result["proposal_len"]) for result in results
+        }
+        trace_record["eager_result_received_to_verify_len_by_proposal_id"] = {
+            str(result["proposal_id"]): int(result["to_verify_len"]) for result in results
+        }
+        trace_record["eager_result_draft_current_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
+        }
+        trace_record["eager_result_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_len_matches_base_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in len_match_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_seq_pre_verify_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in pre_verify_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_status_before_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in status_before_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_status_after_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in status_after_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_checkpoint_ok_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in checkpoint_ok_by_seq_id.items()
+        }
+        trace_record["eager_result_draft_mutation_detected_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in mutation_detected_by_seq_id.items()
+        }
+        trace_record["eager_tokens_result_transfer_received"] = sum(
+            int(result["proposal_len"]) for result in results
+        )
+        trace_record["eager_tokens_result_transfer_validated"] = sum(
+            int(result["proposal_len"]) for result in validated
+        )
+        trace_record["eager_tokens_result_transfer_invalid"] = sum(
+            int(result["proposal_len"]) for result in invalid
+        )
+        trace_record["eager_result_zero_result_step"] = len(results) == 0
 
     def _local_sequence_by_id(self) -> dict[int, Sequence]:
         seq_by_id = {}
@@ -2197,6 +2669,13 @@ class ModelRunnerBase:
                 trace_record,
                 scheduled,
                 plan_context,
+            )
+        if self._eager_result_transfer_dry_run_enabled():
+            plan.eager_result_transfer_dry_run_enabled = True
+            self._send_eager_result_transfer_dry_run(
+                plan,
+                trace_record,
+                scheduled,
             )
 
         clear_reason_by_proposal_id = {
@@ -3625,6 +4104,12 @@ class DraftModelRunner(ModelRunnerBase):
                 plan,
                 transfer_trace_record,
             )
+            if self._eager_result_transfer_dry_run_enabled():
+                self._receive_eager_result_transfer_dry_run(
+                    plan,
+                    transfer_trace_record,
+                    eager_proposals,
+                )
             self._finalize_record_profile(transfer_trace_record)
     
     def pearl_step(self):

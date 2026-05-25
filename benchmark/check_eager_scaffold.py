@@ -166,6 +166,10 @@ EAGER_ZERO_COUNTER_FIELDS = [
     "eager_tokens_apply_dry_run_discarded",
     "eager_apply_dry_run_append_tokens",
     "eager_apply_dry_run_rollback_failure_count",
+    "eager_tokens_result_transfer_sent",
+    "eager_tokens_result_transfer_received",
+    "eager_tokens_result_transfer_validated",
+    "eager_tokens_result_transfer_invalid",
 ]
 
 EAGER_EMPTY_LIST_FIELDS = [
@@ -212,6 +216,12 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_apply_executed_proposal_ids",
     "eager_apply_executed_seq_ids",
     "eager_apply_skipped_proposal_ids",
+    "eager_result_sent_proposal_ids",
+    "eager_result_sent_seq_ids",
+    "eager_result_received_proposal_ids",
+    "eager_result_received_seq_ids",
+    "eager_result_validated_proposal_ids",
+    "eager_result_invalid_proposal_ids",
     "eager_pending_received_proposal_ids",
     "eager_pending_received_seq_ids",
     "eager_pending_base_not_reached_proposal_ids",
@@ -752,6 +762,8 @@ def check_trace(path: Path) -> None:
             errors.append(f"dual_record[{idx}] enable_eager_verify_dry_run must be false")
         if record.get("enable_eager_apply_dry_run") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] enable_eager_apply_dry_run must be false")
+        if record.get("enable_eager_result_transfer_dry_run") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] enable_eager_result_transfer_dry_run must be false")
         if record.get("eager_execution_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_execution_enabled must be false")
         if record.get("eager_draft_dry_run_enabled") not in (False, 0, None):
@@ -766,6 +778,8 @@ def check_trace(path: Path) -> None:
             errors.append(f"dual_record[{idx}] eager_verify_dry_run_enabled must be false")
         if record.get("eager_apply_dry_run_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_apply_dry_run_enabled must be false")
+        if record.get("eager_result_transfer_dry_run_enabled") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] eager_result_transfer_dry_run_enabled must be false")
         if not eager_trace_enabled and record.get("target_eager_set"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
         if not eager_trace_enabled and record.get("draft_eager_set"):
