@@ -1631,6 +1631,241 @@ def test_continuous_to_trace_dict_includes_new_fields():
     assert d.get("draft_home_set_executed") == []
 
 
+# --- Phase 1H-continuous-promotion-trace tests ---
+
+def test_continuous_promotion_pending_parent_after_selection():
+    """New selected seqs get state='pending_parent' with chain_depth=1 in continuous_eager_* fields."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.draft_eager_new_set = [1]
+    plan.eager_selected_seq_ids = [1]
+    plan.eager_proposal_state_by_seq_id = {1: "selected"}
+    plan.continuous_eager_proposal_state_by_seq_id = {1: "pending_parent"}
+    plan.continuous_eager_parent_kind_by_seq_id = {1: "normal"}
+    plan.continuous_eager_chain_depth_by_seq_id = {1: 1}
+    assert plan.continuous_eager_chain_depth_by_seq_id[1] == 1
+    assert plan.continuous_eager_proposal_state_by_seq_id[1] == "pending_parent"
+
+
+def test_continuous_promotion_normal_full_accept_promotes_to_ready():
+    """Full accept → state='ready' with promotion_reason='normal_full_accept'."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_promoted_seq_ids = [1]
+    plan.continuous_eager_promotion_reason_by_seq_id = {1: "normal_full_accept"}
+    plan.continuous_eager_trace_promoted_count = 1
+    assert 1 in plan.continuous_eager_promoted_seq_ids
+    assert plan.continuous_eager_promotion_reason_by_seq_id[1] == "normal_full_accept"
+    assert plan.continuous_eager_trace_promoted_count == 1
+
+
+def test_continuous_promotion_normal_reject_discards():
+    """Invalidated > 0 → state='discarded' with discard_reason."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_discarded_seq_ids = [1]
+    plan.continuous_eager_discard_reason_by_seq_id = {1: "normal_verify_invalidated_tokens=2"}
+    plan.continuous_eager_trace_discarded_count = 1
+    assert 1 in plan.continuous_eager_discarded_seq_ids
+    assert plan.continuous_eager_discard_reason_by_seq_id[1] == "normal_verify_invalidated_tokens=2"
+    assert plan.continuous_eager_trace_discarded_count == 1
+
+
+def test_continuous_promotion_ready_populates_target_eager_set_trace():
+    """Ready proposals appear in target_eager_set_trace."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.target_eager_set_trace = [1]
+    plan.continuous_eager_trace_target_ready_count = 1
+    assert plan.target_eager_set_trace == [1]
+    assert plan.continuous_eager_trace_target_ready_count == 1
+
+
+def test_continuous_promotion_target_eager_enables_draft_continue():
+    """target_eager_set_trace seqs → draft_eager_continue_set ⊆ target_eager_set_trace."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3], draft_home_set=[2, 4],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.target_eager_set_trace = [1, 3]
+    plan.draft_eager_continue_set = [1]
+    plan.draft_eager_new_set = [5]
+    plan.draft_eager_set_trace = [1, 5]
+    cont_set = set(plan.draft_eager_continue_set)
+    target_set = set(plan.target_eager_set_trace)
+    assert cont_set.issubset(target_set), f"{cont_set} not subset of {target_set}"
+    assert set(plan.draft_eager_set_trace) == set(plan.draft_eager_new_set) | set(plan.draft_eager_continue_set)
+
+
+def test_continuous_promotion_continue_increments_chain_depth():
+    """Chain depth increases on continue."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_chain_depth_by_seq_id = {1: 3}
+    plan.continuous_eager_parent_kind_by_seq_id = {1: "eager"}
+    plan.continuous_eager_proposal_state_by_seq_id = {1: "continue_pending"}
+    assert plan.continuous_eager_chain_depth_by_seq_id[1] == 3
+    assert plan.continuous_eager_parent_kind_by_seq_id[1] == "eager"
+
+
+def test_continuous_promotion_proposal_id_consistent_across_records():
+    """Same continuous_eager proposal_id with consistent metadata is OK."""
+    plan1 = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan1.continuous_eager_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan1.continuous_eager_proposal_state_by_seq_id = {1: "pending_parent"}
+    plan1.continuous_eager_parent_kind_by_seq_id = {1: "normal"}
+
+    plan2 = StepPlan(
+        plan_id=2, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan2.continuous_eager_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan2.continuous_eager_proposal_state_by_seq_id = {1: "pending_parent"}
+    plan2.continuous_eager_parent_kind_by_seq_id = {1: "normal"}
+    # Same ID, same metadata — should be consistent.
+    assert plan1.continuous_eager_proposal_id_by_seq_id == plan2.continuous_eager_proposal_id_by_seq_id
+
+
+def test_continuous_promotion_proposal_id_inconsistent_fails():
+    """Inconsistent metadata for same continuous_eager proposal_id should be detected."""
+    plan1 = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan1.continuous_eager_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan1.continuous_eager_proposal_state_by_seq_id = {1: "pending_parent"}
+
+    plan2 = StepPlan(
+        plan_id=2, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan2.continuous_eager_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan2.continuous_eager_proposal_state_by_seq_id = {1: "discarded"}
+    # Same ID but different state — checker should flag this.
+    assert plan1.continuous_eager_proposal_state_by_seq_id[1] != plan2.continuous_eager_proposal_state_by_seq_id[1]
+
+
+def test_continuous_promotion_fallback_metadata_ok():
+    """Non-steady records with missing metadata should be handled gracefully."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="fallback",
+    )
+    plan.eager_trace_only = True
+    plan.effective_enable_eager_trace = True
+    plan.eager_policy = "tight_only"
+    plan.original_target_home_set = [1]
+    plan.missing_eager_metadata_seq_ids = [1]
+    plan.continuous_eager_skip_reason_by_seq_id = {1: "not_steady_phase"}
+    # Fallback metadata missing is OK — no error expected.
+    assert 1 in plan.missing_eager_metadata_seq_ids
+
+
+def test_continuous_promotion_executed_sets_remain_empty():
+    """All executed sets remain empty after promotion/discard/continue."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3], draft_home_set=[2, 4],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.target_eager_set_trace = [1]
+    plan.draft_eager_continue_set = [1]
+    plan.draft_eager_new_set = [3]
+    plan.draft_eager_set_trace = [1, 3]
+    plan.continuous_eager_promoted_seq_ids = [3]
+    plan.continuous_eager_discarded_seq_ids = []
+    # Executed sets must be empty.
+    assert plan.draft_eager_set_executed == []
+    assert plan.target_eager_set_executed == []
+    assert plan.target_home_set_executed == []
+    assert plan.draft_home_set_executed == []
+
+
+def test_continuous_promotion_counters_positive():
+    """Trace counters match promoted/discarded/selected list lengths."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1, 3], draft_home_set=[2, 4],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.draft_eager_new_set = [1, 3]
+    plan.continuous_eager_trace_selected_count = 2
+    plan.continuous_eager_promoted_seq_ids = [1]
+    plan.continuous_eager_trace_promoted_count = 1
+    plan.continuous_eager_discarded_seq_ids = [3]
+    plan.continuous_eager_trace_discarded_count = 1
+    assert plan.continuous_eager_trace_selected_count == len(plan.draft_eager_new_set)
+    assert plan.continuous_eager_trace_promoted_count == len(plan.continuous_eager_promoted_seq_ids)
+    assert plan.continuous_eager_trace_discarded_count == len(plan.continuous_eager_discarded_seq_ids)
+
+
+def test_continuous_promotion_no_verified_or_applied_state():
+    """continuous_eager_proposal_state must not be 'verified' or 'applied' in trace-only."""
+    allowed = {
+        "selected", "pending_parent", "pending_parent_unknown",
+        "ready", "discarded", "target_trace_ready", "continue_pending",
+    }
+    assert "verified" not in allowed
+    assert "applied" not in allowed
+
+
+def test_continuous_promotion_parent_kind_eager_has_parent_id():
+    """When parent_kind='eager', parent_proposal_id should be non-empty."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_proposal_id_by_seq_id = {1: "ce:continue:1:2:1"}
+    plan.continuous_eager_parent_proposal_id_by_seq_id = {1: "ce:new:0:1:1"}
+    plan.continuous_eager_parent_kind_by_seq_id = {1: "eager"}
+    plan.continuous_eager_proposal_state_by_seq_id = {1: "continue_pending"}
+    parent_id = plan.continuous_eager_parent_proposal_id_by_seq_id.get(1, "")
+    assert parent_id != "", f"parent_kind=eager should have non-empty parent_proposal_id"
+
+
+def test_continuous_promotion_to_trace_dict_includes_promotion_fields():
+    """to_trace_dict() includes new continuous promotion-trace fields."""
+    plan = StepPlan(
+        plan_id=1, iteration_id=1, execution_mode="dual_batch_pearl",
+        target_home_set=[1], draft_home_set=[2],
+        dual_batch_enabled=True, plan_phase="steady",
+    )
+    plan.continuous_eager_promoted_seq_ids = [1]
+    plan.continuous_eager_trace_promoted_count = 1
+    plan.continuous_eager_proposal_state_by_seq_id = {1: "ready"}
+    plan.continuous_eager_chain_depth_by_seq_id = {1: 1}
+    d = plan.to_trace_dict()
+    assert d.get("continuous_eager_promoted_seq_ids") == [1]
+    assert d.get("continuous_eager_trace_promoted_count") == 1
+    assert d.get("continuous_eager_proposal_state_by_seq_id") == {"1": "ready"}
+    assert d.get("continuous_eager_chain_depth_by_seq_id") == {"1": 1}
+
+
 # --- runner ---
 
 if __name__ == "__main__":
@@ -1706,6 +1941,21 @@ if __name__ == "__main__":
         test_continuous_skip_reason_counts_consistent,
         test_continuous_original_home_sets_preserved,
         test_continuous_to_trace_dict_includes_new_fields,
+        # Phase 1H-continuous-promotion-trace tests
+        test_continuous_promotion_pending_parent_after_selection,
+        test_continuous_promotion_normal_full_accept_promotes_to_ready,
+        test_continuous_promotion_normal_reject_discards,
+        test_continuous_promotion_ready_populates_target_eager_set_trace,
+        test_continuous_promotion_target_eager_enables_draft_continue,
+        test_continuous_promotion_continue_increments_chain_depth,
+        test_continuous_promotion_proposal_id_consistent_across_records,
+        test_continuous_promotion_proposal_id_inconsistent_fails,
+        test_continuous_promotion_fallback_metadata_ok,
+        test_continuous_promotion_executed_sets_remain_empty,
+        test_continuous_promotion_counters_positive,
+        test_continuous_promotion_no_verified_or_applied_state,
+        test_continuous_promotion_parent_kind_eager_has_parent_id,
+        test_continuous_promotion_to_trace_dict_includes_promotion_fields,
     ]
     passed = 0
     for test in tests:

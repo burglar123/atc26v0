@@ -20,6 +20,7 @@ from nano_pearl.utils.context import set_context, reset_context, get_context
 from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.continuous_eager_trace_state import ContinuousEagerTraceState
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from nano_pearl.pearl_engine.dual_batch import (
     BufferedProposal,
@@ -126,6 +127,7 @@ class ModelRunnerBase:
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
+        self.continuous_eager_trace_state = ContinuousEagerTraceState()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -734,15 +736,69 @@ class ModelRunnerBase:
                 plan.missing_eager_metadata_seq_ids.append(int(seq_id))
                 plan.eager_metadata_lookup_source_by_seq_id[seq_id] = "missing"
 
-        # 5. Candidate iteration — select post-verify (pre_verify=False) only.
+        # 5. Read trace state from previous steps — populate target_eager_set_trace
+        #    and draft_eager_continue_set from ready/consumed proposals.
+        _trace_state = self.continuous_eager_trace_state
+        threshold = float(self.global_config.eager_accept_threshold)
+
+        # 5a. Ready proposals → target_eager_set_trace.
+        _target_eager_trace: list[int] = []
+        for _sid in sorted(_trace_state.get_ready_seq_ids()):
+            if _sid not in running_seq_ids:
+                continue
+            _seq_list = self.scheduler.find_by_seq_ids([_sid])
+            if not _seq_list or _seq_list[0].is_finished:
+                continue
+            _meta = _trace_state.consume_ready_for_target_trace(_sid)
+            if _meta:
+                _target_eager_trace.append(_sid)
+                plan.continuous_eager_trace_target_ready_count += 1
+
+        # 5b. target_eager_set_trace seqs → draft_eager_continue_set (if still urgent).
+        _draft_continue: list[int] = []
+        for _sid in _target_eager_trace:
+            _seq_list = self.scheduler.find_by_seq_ids([_sid])
+            if not _seq_list:
+                continue
+            _seq = _seq_list[0]
+            if _seq.is_finished:
+                continue
+            _score, _ = self._eager_candidate_score(_seq, time.time())
+            if _score > threshold:
+                _draft_continue.append(_sid)
+                plan.continuous_eager_trace_continue_count += 1
+                _chain = _trace_state.get_chain_depth(_sid)
+                _pmeta = _trace_state.get_proposal_metadata(_sid)
+                _new_pid = f"ce:continue:{plan.step_id}:{plan.plan_id}:{_sid}"
+                _parent_pid = _pmeta.get("proposal_id", "") if _pmeta else ""
+                _trace_state.create_continue_pending(
+                    _sid, _new_pid, _parent_pid,
+                    step_id=plan.step_id, plan_id=plan.plan_id,
+                    base_len=len(_seq),
+                )
+                plan.continuous_eager_proposal_id_by_seq_id[_sid] = _new_pid
+                plan.continuous_eager_parent_proposal_id_by_seq_id[_sid] = _parent_pid
+                plan.continuous_eager_parent_kind_by_seq_id[_sid] = "eager"
+                plan.continuous_eager_proposal_state_by_seq_id[_sid] = "continue_pending"
+                plan.continuous_eager_base_len_by_seq_id[_sid] = int(len(_seq))
+                plan.continuous_eager_source_step_id_by_seq_id[_sid] = plan.step_id
+                plan.continuous_eager_source_plan_id_by_seq_id[_sid] = plan.plan_id
+                plan.continuous_eager_chain_depth_by_seq_id[_sid] = _chain + 1
+
+        # 6. Candidate iteration — select post-verify (pre_verify=False) only.
         now = time.time()
         scored = []
-        threshold = float(self.global_config.eager_accept_threshold)
+        _draft_continue_set = set(_draft_continue)
         for seq in self.scheduler.find_by_seq_ids(plan.original_target_home_set):
             _sid = int(seq.seq_id)
 
             # Skip non-running, finished, or pending-eager seqs.
             if seq.seq_id not in running_seq_ids or seq.is_finished or self._has_pending_eager_state(seq):
+                continue
+
+            # Skip seqs already in draft_eager_continue_set (modelled from
+            # target_eager_set_trace) — they are handled by the continue path.
+            if _sid in _draft_continue_set:
                 continue
 
             # Continuous eager: select post-verify (pre_verify=False) as stable.
@@ -798,8 +854,8 @@ class ModelRunnerBase:
         # 7. Populate trace-only eager sets.
         #    Do NOT set plan.draft_eager_set — runtime set stays empty.
         plan.draft_eager_new_set = list(plan.eager_selected_seq_ids)
-        plan.draft_eager_continue_set = []   # empty — no target_eager_set_trace in first version
-        plan.target_eager_set_trace = []     # empty — no simulated ready proposals
+        plan.draft_eager_continue_set = list(_draft_continue)
+        plan.target_eager_set_trace = list(_target_eager_trace)
         plan.draft_eager_set_trace = sorted(
             set(plan.draft_eager_new_set) | set(plan.draft_eager_continue_set)
         )
@@ -808,15 +864,18 @@ class ModelRunnerBase:
         # target_eager_set_executed = [] (default)
 
         # 8. Trace exclusion views — apply continuous lane rules as trace-only computation.
-        _target_eager_trace = set(plan.target_eager_set_trace)      # empty in first version
-        _draft_continue = set(plan.draft_eager_continue_set)         # empty in first version
-        plan.target_home_set_after_eager_exclusion_trace = list(plan.original_target_home_set)
+        _target_eager = set(plan.target_eager_set_trace)
+        _continue_set = set(plan.draft_eager_continue_set)
+        plan.target_home_set_after_eager_exclusion_trace = [
+            s for s in plan.original_target_home_set
+            if s not in _target_eager and s not in _continue_set
+        ]
         plan.draft_home_set_after_eager_exclusion_trace = [
             s for s in plan.original_draft_home_set
-            if s not in _target_eager_trace and s not in _draft_continue
+            if s not in _target_eager and s not in _continue_set
         ]
 
-        # 9. Proposal metadata — string IDs, stable, only "selected" state.
+        # 9. Proposal metadata — string IDs + trace state entries.
         for seq_id in plan.draft_eager_new_set:
             plan.eager_proposal_id_by_seq_id[seq_id] = (
                 f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}"
@@ -827,6 +886,40 @@ class ModelRunnerBase:
             plan.eager_parent_kind_by_seq_id[seq_id] = "normal"
             plan.eager_proposal_state_by_seq_id[seq_id] = "selected"
             plan.eager_promotion_condition_pending_by_seq_id[seq_id] = True
+
+            # Write to trace state tracker.
+            _seq_list = self.scheduler.find_by_seq_ids([seq_id])
+            _base_len = int(len(_seq_list[0])) if _seq_list else 0
+            _trace_state.create_new_pending(
+                seq_id,
+                proposal_id=f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}",
+                parent_proposal_id=f"normal:{plan.step_id}:{plan.plan_id}:{seq_id}",
+                parent_kind="normal",
+                step_id=plan.step_id,
+                plan_id=plan.plan_id,
+                base_len=_base_len,
+            )
+
+            # Populate continuous_eager_* proposal metadata on plan.
+            plan.continuous_eager_proposal_id_by_seq_id[seq_id] = (
+                f"ce:new:{plan.step_id}:{plan.plan_id}:{seq_id}"
+            )
+            plan.continuous_eager_parent_proposal_id_by_seq_id[seq_id] = (
+                f"normal:{plan.step_id}:{plan.plan_id}:{seq_id}"
+            )
+            plan.continuous_eager_parent_kind_by_seq_id[seq_id] = "normal"
+            plan.continuous_eager_proposal_state_by_seq_id[seq_id] = "pending_parent"
+            plan.continuous_eager_base_len_by_seq_id[seq_id] = _base_len
+            plan.continuous_eager_source_step_id_by_seq_id[seq_id] = plan.step_id
+            plan.continuous_eager_source_plan_id_by_seq_id[seq_id] = plan.plan_id
+            plan.continuous_eager_chain_depth_by_seq_id[seq_id] = 1
+
+        # 10. Per-step state snapshots for diagnostics.
+        plan.continuous_eager_pending_seq_ids = sorted(_trace_state.get_pending_seq_ids())
+        plan.continuous_eager_ready_seq_ids = sorted(_trace_state.get_ready_seq_ids())
+        plan.continuous_eager_trace_selected_count = len(plan.draft_eager_new_set)
+        plan.continuous_eager_trace_pending_count = len(plan.continuous_eager_pending_seq_ids)
+        plan.continuous_eager_trace_ready_count = len(plan.continuous_eager_ready_seq_ids)
 
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
         # Phase 1H-continuous-trace: delegate to corrected selection logic.
@@ -2175,6 +2268,83 @@ class ModelRunnerBase:
                 trace_record["eager_tokens_discarded"] = discarded_tokens
             self._finalize_record_profile(trace_record)
 
+    def _promote_or_discard_continuous_eager_trace(
+        self,
+        plan: StepPlan,
+        accepted_lens: dict[int, int],
+        invalidated_lens: dict[int, int],
+    ) -> None:
+        """Trace-only promotion/discard based on normal verify results.
+
+        Gates on enable_continuous_eager_trace.  For each pending proposal in the
+        continuous eager trace state, checks accepted_lens/invalidated_lens from
+        the just-completed normal verification to determine whether the parent
+        fully accepted (promote to ready) or not (discard).
+        """
+        if not self.global_config.enable_continuous_eager_trace:
+            return
+
+        _trace_state = self.continuous_eager_trace_state
+        running_seq_ids = {seq.seq_id for seq in self.scheduler.running}
+
+        promoted: list[int] = []
+        discarded: list[int] = []
+        unknown: list[int] = []
+        discard_reasons: dict[int, str] = {}
+        promote_reasons: dict[int, str] = {}
+
+        for seq_id in sorted(_trace_state.get_pending_seq_ids()):
+            plan.continuous_eager_promotion_checked_seq_ids.append(int(seq_id))
+
+            in_normal_verify = seq_id in accepted_lens or seq_id in invalidated_lens
+            if not in_normal_verify:
+                _trace_state.mark_pending_unknown(
+                    seq_id,
+                    _trace_state._latest_proposal_id.get(seq_id, ""),
+                    "not_in_normal_verify_batch",
+                )
+                unknown.append(int(seq_id))
+                continue
+
+            full_accept = (
+                seq_id in running_seq_ids
+                and invalidated_lens.get(seq_id, 0) == 0
+                and accepted_lens.get(seq_id, 0) > 0
+            )
+
+            if full_accept:
+                _trace_state.promote_pending(
+                    seq_id,
+                    _trace_state._latest_proposal_id.get(seq_id, ""),
+                    "normal_full_accept",
+                )
+                promoted.append(int(seq_id))
+                promote_reasons[int(seq_id)] = "normal_full_accept"
+            else:
+                _inv = invalidated_lens.get(seq_id, 0)
+                _acc = accepted_lens.get(seq_id, 0)
+                if _inv > 0:
+                    reason = f"normal_verify_invalidated_tokens={_inv}"
+                elif _acc == 0:
+                    reason = "normal_verify_zero_accept"
+                else:
+                    reason = "normal_verify_partial_or_finished"
+                _trace_state.discard_pending(
+                    seq_id,
+                    _trace_state._latest_proposal_id.get(seq_id, ""),
+                    reason,
+                )
+                discarded.append(int(seq_id))
+                discard_reasons[int(seq_id)] = reason
+
+        plan.continuous_eager_promoted_seq_ids = promoted
+        plan.continuous_eager_discarded_seq_ids = discarded
+        plan.continuous_eager_parent_acceptance_unknown_seq_ids = unknown
+        plan.continuous_eager_discard_reason_by_seq_id = discard_reasons
+        plan.continuous_eager_promotion_reason_by_seq_id = promote_reasons
+        plan.continuous_eager_trace_promoted_count = len(promoted)
+        plan.continuous_eager_trace_discarded_count = len(discarded)
+
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on
         # the broadcast meta, NOT on local len(seqs).  This prevents shape mismatch
@@ -3408,6 +3578,9 @@ class DraftModelRunner(ModelRunnerBase):
                 self._promote_or_discard_eager_after_normal(
                     plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
                 )
+                self._promote_or_discard_continuous_eager_trace(
+                    plan, accepted_lens, invalidated_lens,
+                )
                 _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
                 assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
                     plan,
@@ -3681,6 +3854,9 @@ class DraftModelRunner(ModelRunnerBase):
                 _pre_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
                 self._promote_or_discard_eager_after_normal(
                     plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
+                )
+                self._promote_or_discard_continuous_eager_trace(
+                    plan, accepted_lens, invalidated_lens,
                 )
                 _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
                 assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(

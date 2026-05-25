@@ -132,6 +132,32 @@ class StepPlan:
     eager_proposal_state_by_seq_id: Dict[int, str] = field(default_factory=dict)
     #   states: "selected" | "pending_parent"  (no "ready"/"verified" in trace-only)
     eager_promotion_condition_pending_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    # Phase 1H-continuous-promotion-trace: per-step state snapshots.
+    continuous_eager_pending_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_ready_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_promoted_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_discarded_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_promotion_checked_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_parent_acceptance_unknown_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_promotion_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_chain_depth_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    # Phase 1H-continuous-promotion-trace: proposal version metadata.
+    continuous_eager_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_parent_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_parent_kind_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_proposal_state_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    continuous_eager_source_step_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    continuous_eager_source_plan_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    # Phase 1H-continuous-promotion-trace: per-step counters (proposal/seq counts).
+    continuous_eager_trace_selected_count: int = 0
+    continuous_eager_trace_pending_count: int = 0
+    continuous_eager_trace_promoted_count: int = 0
+    continuous_eager_trace_discarded_count: int = 0
+    continuous_eager_trace_ready_count: int = 0
+    continuous_eager_trace_target_ready_count: int = 0
+    continuous_eager_trace_continue_count: int = 0
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
     eager_rejected_seq_ids: List[int] = field(default_factory=list)
@@ -529,6 +555,74 @@ class StepPlan:
                 str(seq_id): bool(pending)
                 for seq_id, pending in self.eager_promotion_condition_pending_by_seq_id.items()
             },
+            # Phase 1H-continuous-promotion-trace: per-step state snapshots
+            "continuous_eager_pending_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_pending_seq_ids
+            ],
+            "continuous_eager_ready_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_ready_seq_ids
+            ],
+            "continuous_eager_promoted_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_promoted_seq_ids
+            ],
+            "continuous_eager_discarded_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_discarded_seq_ids
+            ],
+            "continuous_eager_promotion_checked_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_promotion_checked_seq_ids
+            ],
+            "continuous_eager_parent_acceptance_unknown_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_parent_acceptance_unknown_seq_ids
+            ],
+            "continuous_eager_discard_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_discard_reason_by_seq_id.items()
+            },
+            "continuous_eager_promotion_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_promotion_reason_by_seq_id.items()
+            },
+            "continuous_eager_chain_depth_by_seq_id": {
+                str(seq_id): int(depth)
+                for seq_id, depth in self.continuous_eager_chain_depth_by_seq_id.items()
+            },
+            # Phase 1H-continuous-promotion-trace: proposal version metadata
+            "continuous_eager_proposal_id_by_seq_id": {
+                str(seq_id): str(proposal_id)
+                for seq_id, proposal_id in self.continuous_eager_proposal_id_by_seq_id.items()
+            },
+            "continuous_eager_parent_proposal_id_by_seq_id": {
+                str(seq_id): str(parent_id)
+                for seq_id, parent_id in self.continuous_eager_parent_proposal_id_by_seq_id.items()
+            },
+            "continuous_eager_parent_kind_by_seq_id": {
+                str(seq_id): str(kind)
+                for seq_id, kind in self.continuous_eager_parent_kind_by_seq_id.items()
+            },
+            "continuous_eager_proposal_state_by_seq_id": {
+                str(seq_id): str(state)
+                for seq_id, state in self.continuous_eager_proposal_state_by_seq_id.items()
+            },
+            "continuous_eager_base_len_by_seq_id": {
+                str(seq_id): int(base_len)
+                for seq_id, base_len in self.continuous_eager_base_len_by_seq_id.items()
+            },
+            "continuous_eager_source_step_id_by_seq_id": {
+                str(seq_id): int(step_id)
+                for seq_id, step_id in self.continuous_eager_source_step_id_by_seq_id.items()
+            },
+            "continuous_eager_source_plan_id_by_seq_id": {
+                str(seq_id): int(plan_id)
+                for seq_id, plan_id in self.continuous_eager_source_plan_id_by_seq_id.items()
+            },
+            # Phase 1H-continuous-promotion-trace: per-step counters
+            "continuous_eager_trace_selected_count": int(self.continuous_eager_trace_selected_count),
+            "continuous_eager_trace_pending_count": int(self.continuous_eager_trace_pending_count),
+            "continuous_eager_trace_promoted_count": int(self.continuous_eager_trace_promoted_count),
+            "continuous_eager_trace_discarded_count": int(self.continuous_eager_trace_discarded_count),
+            "continuous_eager_trace_ready_count": int(self.continuous_eager_trace_ready_count),
+            "continuous_eager_trace_target_ready_count": int(self.continuous_eager_trace_target_ready_count),
+            "continuous_eager_trace_continue_count": int(self.continuous_eager_trace_continue_count),
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],
             "eager_rejected_seq_ids": [int(seq_id) for seq_id in self.eager_rejected_seq_ids],

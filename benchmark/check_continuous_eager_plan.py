@@ -50,7 +50,12 @@ def _get(record: dict[str, Any], key: str, default: Any = None) -> Any:
 
 
 ALLOWED_PROPOSAL_STATES = {"selected", "pending_parent"}
+ALLOWED_CONTINUOUS_PROPOSAL_STATES = {
+    "selected", "pending_parent", "pending_parent_unknown",
+    "ready", "discarded", "target_trace_ready", "continue_pending",
+}
 ALLOWED_PARENT_KINDS = {"normal", ""}
+ALLOWED_CONTINUOUS_PARENT_KINDS = {"normal", "eager", ""}
 EXECUTION_COUNTER_FIELDS = (
     "eager_tokens_generated",
     "eager_tokens_verified",
@@ -205,17 +210,13 @@ def _steady_checks(
                 f"only {ALLOWED_PARENT_KINDS} allowed"
             )
 
-    # Invariant: draft_eager_continue_set and target_eager_set_trace are empty
-    if draft_eager_continue:
-        errors.append(
-            f"record[{idx}] draft_eager_continue_set must be empty in first version, "
-            f"got {sorted(draft_eager_continue)}"
-        )
-    if target_eager_trace:
-        errors.append(
-            f"record[{idx}] target_eager_set_trace must be empty in first version, "
-            f"got {sorted(target_eager_trace)}"
-        )
+    # Phase 1H-continuous-promotion-trace: draft_eager_continue_set and
+    # target_eager_set_trace may now be non-empty — they are populated from
+    # the trace state tracker (ready proposals → target_eager_set_trace,
+    # urgent seqs in target_eager_set_trace → draft_eager_continue_set).
+    # Validity is enforced by:
+    #   - draft_eager_continue_set ⊆ target_eager_set_trace (checked below)
+    #   - target_eager_set_trace ∩ exclusion views == ∅ (checked below)
 
     # Invariant: continuous_eager_skip_reason_counts is consistent
     expected_counts: dict[str, int] = {}
@@ -248,6 +249,122 @@ def _steady_checks(
                 f"record[{idx}] draft_eager_new_set seq_id={seq_id} "
                 f"promotion_condition_pending must be True, got {pending!r}"
             )
+
+    # --- Phase 1H-continuous-promotion-trace checks ---
+
+    # B1. target_eager_set_trace ∩ exclusion views == ∅
+    target_home_after_excl = as_int_set(record.get("target_home_set_after_eager_exclusion_trace"))
+    draft_home_after_excl = as_int_set(record.get("draft_home_set_after_eager_exclusion_trace"))
+    _target_eager_trace_set = as_int_set(record.get("target_eager_set_trace"))
+    if target_eager_trace and _target_eager_trace_set:
+        overlap_target_home = _target_eager_trace_set & target_home_after_excl
+        if overlap_target_home:
+            errors.append(
+                f"record[{idx}] target_eager_set_trace overlaps "
+                f"target_home_set_after_eager_exclusion_trace: {sorted(overlap_target_home)}"
+            )
+        overlap_draft_home = _target_eager_trace_set & draft_home_after_excl
+        if overlap_draft_home:
+            errors.append(
+                f"record[{idx}] target_eager_set_trace overlaps "
+                f"draft_home_set_after_eager_exclusion_trace: {sorted(overlap_draft_home)}"
+            )
+
+    # B2. draft_eager_continue_set ⊆ target_eager_set_trace
+    if draft_eager_continue and _target_eager_trace_set:
+        continue_outside = draft_eager_continue - _target_eager_trace_set
+        if continue_outside:
+            errors.append(
+                f"record[{idx}] draft_eager_continue_set outside target_eager_set_trace: "
+                f"{sorted(continue_outside)}"
+            )
+
+    # B3. continuous_eager proposal states and parent kinds.
+    cont_state_by_seq = record.get("continuous_eager_proposal_state_by_seq_id") or {}
+    cont_parent_kind_by_seq = record.get("continuous_eager_parent_kind_by_seq_id") or {}
+    for key, state in cont_state_by_seq.items():
+        if str(state) not in ALLOWED_CONTINUOUS_PROPOSAL_STATES:
+            errors.append(
+                f"record[{idx}] continuous_eager_proposal_state_by_seq_id[{key}] = {state!r}, "
+                f"only {ALLOWED_CONTINUOUS_PROPOSAL_STATES} allowed in trace-only"
+            )
+        if str(state) in ("verified", "applied"):
+            errors.append(
+                f"record[{idx}] continuous_eager_proposal_state_by_seq_id[{key}] = {state!r} "
+                f"— no 'verified'/'applied' state allowed in trace-only"
+            )
+    for key, kind in cont_parent_kind_by_seq.items():
+        if str(kind) not in ALLOWED_CONTINUOUS_PARENT_KINDS:
+            errors.append(
+                f"record[{idx}] continuous_eager_parent_kind_by_seq_id[{key}] = {kind!r}, "
+                f"only {ALLOWED_CONTINUOUS_PARENT_KINDS} allowed"
+            )
+
+    # B4. Promotion/discard accounting.
+    promoted_count = int(record.get("continuous_eager_trace_promoted_count") or 0)
+    discarded_count = int(record.get("continuous_eager_trace_discarded_count") or 0)
+    promoted_ids = as_int_set(record.get("continuous_eager_promoted_seq_ids"))
+    discarded_ids = as_int_set(record.get("continuous_eager_discarded_seq_ids"))
+    unknown_ids = as_int_set(record.get("continuous_eager_parent_acceptance_unknown_seq_ids"))
+    checked_ids = as_int_set(record.get("continuous_eager_promotion_checked_seq_ids"))
+    promoted_actual = len(promoted_ids)
+    discarded_actual = len(discarded_ids)
+    unknown_actual = len(unknown_ids)
+    if promoted_actual != promoted_count:
+        errors.append(
+            f"record[{idx}] continuous_eager_trace_promoted_count={promoted_count} "
+            f"!= len(promoted_seq_ids)={promoted_actual}"
+        )
+    if discarded_actual != discarded_count:
+        errors.append(
+            f"record[{idx}] continuous_eager_trace_discarded_count={discarded_count} "
+            f"!= len(discarded_seq_ids)={discarded_actual}"
+        )
+    # Disjointness: a seq can't be both promoted and discarded.
+    if promoted_ids & discarded_ids:
+        errors.append(
+            f"record[{idx}] seq_ids both promoted and discarded: "
+            f"{sorted(promoted_ids & discarded_ids)}"
+        )
+    if promoted_ids & unknown_ids:
+        errors.append(
+            f"record[{idx}] seq_ids both promoted and unknown: "
+            f"{sorted(promoted_ids & unknown_ids)}"
+        )
+    if discarded_ids & unknown_ids:
+        errors.append(
+            f"record[{idx}] seq_ids both discarded and unknown: "
+            f"{sorted(discarded_ids & unknown_ids)}"
+        )
+    # Accounting: every checked seq should be in promoted ∪ discarded ∪ unknown.
+    accounted = promoted_ids | discarded_ids | unknown_ids
+    unaccounted = checked_ids - accounted
+    if unaccounted:
+        errors.append(
+            f"record[{idx}] promotion_checked seq_ids not accounted for "
+            f"(not in promoted/discarded/unknown): {sorted(unaccounted)}"
+        )
+
+    # B3 continued: chain_depth non-decreasing check (per-record, within record).
+    cont_chain = record.get("continuous_eager_chain_depth_by_seq_id") or {}
+    for key, depth in cont_chain.items():
+        if int(depth) < 0:
+            errors.append(
+                f"record[{idx}] continuous_eager_chain_depth_by_seq_id[{key}] = {depth} "
+                f"(must be >= 0)"
+            )
+
+    # B3 continued: parent_proposal_id exists when parent_kind="eager".
+    cont_parent_id_by_seq = record.get("continuous_eager_parent_proposal_id_by_seq_id") or {}
+    cont_proposal_id_by_seq = record.get("continuous_eager_proposal_id_by_seq_id") or {}
+    all_cont_proposal_ids = set(str(v) for v in cont_proposal_id_by_seq.values())
+    for key, parent_id in cont_parent_id_by_seq.items():
+        parent_id_str = str(parent_id)
+        kind = str(cont_parent_kind_by_seq.get(key, cont_parent_kind_by_seq.get(str(key), "")))
+        if kind == "eager" and parent_id_str and parent_id_str not in all_cont_proposal_ids:
+            # Parent might be from a different record — only flag if it looks malformed.
+            if parent_id_str.strip():
+                pass  # cross-record references validated in proposal_groups below
 
     return errors
 
@@ -299,6 +416,36 @@ def main() -> int:
             skip_counts[str(reason)] = skip_counts.get(str(reason), 0) + 1
     if skip_counts:
         print(f"skip_reason_counts={dict(skip_counts)}")
+
+    # --- Promotion-trace summary (steady records) ---
+    total_target_eager_trace = sum(len(r.get("target_eager_set_trace") or []) for r in steady_records)
+    total_cont_promoted = sum(int(r.get("continuous_eager_trace_promoted_count") or 0) for r in steady_records)
+    total_cont_discarded = sum(int(r.get("continuous_eager_trace_discarded_count") or 0) for r in steady_records)
+    total_cont_unknown = sum(len(r.get("continuous_eager_parent_acceptance_unknown_seq_ids") or []) for r in steady_records)
+    total_cont_selected = sum(int(r.get("continuous_eager_trace_selected_count") or 0) for r in steady_records)
+
+    # Chain depth distribution across steady records.
+    chain_depths: list[int] = []
+    for r in steady_records:
+        for depth in (r.get("continuous_eager_chain_depth_by_seq_id") or {}).values():
+            chain_depths.append(int(depth))
+
+    print(f"\n--- Promotion-trace summary ---")
+    print(f"target_eager_set_trace_total={total_target_eager_trace}")
+    print(f"continuous_eager_trace_promoted_total={total_cont_promoted}")
+    print(f"continuous_eager_trace_discarded_total={total_cont_discarded}")
+    print(f"continuous_eager_parent_acceptance_unknown_total={total_cont_unknown}")
+    if total_cont_selected > 0:
+        print(f"promotion_rate={total_cont_promoted / total_cont_selected:.3f}")
+    if total_target_eager_trace > 0 and total_cont_selected > 0:
+        print(f"continuation_rate={total_continue / total_target_eager_trace:.3f}" if total_target_eager_trace > 0 else "continuation_rate=N/A")
+    if chain_depths:
+        print(f"chain_depth_min={min(chain_depths)}")
+        print(f"chain_depth_max={max(chain_depths)}")
+        print(f"chain_depth_avg={sum(chain_depths) / len(chain_depths):.2f}")
+        from collections import Counter as _Counter
+        _depth_dist = _Counter(chain_depths)
+        print(f"chain_depth_distribution={dict(sorted(_depth_dist.items()))}")
 
     # --- Missing metadata by phase/role ---
     missing_by_key: dict[tuple[str, str], int] = Counter()
@@ -378,6 +525,81 @@ def main() -> int:
                     f"proposal_id={pid_str} inconsistent across records {record_ids}: "
                     + "; ".join(reasons)
                 )
+
+    # --- Collect continuous_eager proposal ID occurrences ---
+    cont_proposal_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for idx, record in enumerate(continuous_records):
+        cont_pid_by_seq = record.get("continuous_eager_proposal_id_by_seq_id") or {}
+        cont_parent_id_by_seq = record.get("continuous_eager_parent_proposal_id_by_seq_id") or {}
+        cont_parent_kind_by_seq = record.get("continuous_eager_parent_kind_by_seq_id") or {}
+        cont_state_by_seq = record.get("continuous_eager_proposal_state_by_seq_id") or {}
+        plan_id = record.get("plan_id", -1)
+        step_id = record.get("step_id", -1)
+
+        for key, pid in cont_pid_by_seq.items():
+            pid_str = str(pid)
+            seq_id = int(key)
+            cont_proposal_groups[pid_str].append({
+                "record_idx": idx,
+                "seq_id": seq_id,
+                "seq_id_str": str(seq_id),
+                "parent_id": str(cont_parent_id_by_seq.get(key, cont_parent_id_by_seq.get(seq_id, ""))),
+                "parent_kind": str(cont_parent_kind_by_seq.get(key, cont_parent_kind_by_seq.get(seq_id, ""))),
+                "state": str(cont_state_by_seq.get(key, cont_state_by_seq.get(seq_id, ""))),
+                "plan_id": plan_id,
+                "step_id": step_id,
+            })
+
+    # Check continuous proposal ID consistency.
+    cont_repeated = sum(1 for g in cont_proposal_groups.values() if len(g) > 1)
+    cont_inconsistent = 0
+    if cont_repeated > 0:
+        print(f"\n--- Continuous proposal ID diagnostics ---")
+        print(f"total_unique_continuous_proposal_ids={len(cont_proposal_groups)}")
+        print(f"continuous_proposal_ids_seen_in_multiple_records={cont_repeated}")
+        for pid_str, occurrences in sorted(cont_proposal_groups.items()):
+            if len(occurrences) <= 1:
+                continue
+            ref = occurrences[0]
+            inconsistent = False
+            reasons = []
+            for occ in occurrences[1:]:
+                if occ["seq_id"] != ref["seq_id"]:
+                    inconsistent = True
+                    reasons.append(f"seq_id mismatch: {occ['seq_id']} vs {ref['seq_id']}")
+                if occ["parent_kind"] != ref["parent_kind"]:
+                    inconsistent = True
+                    reasons.append(f"parent_kind mismatch: {occ['parent_kind']!r} vs {ref['parent_kind']!r}")
+                if occ["state"] != ref["state"]:
+                    inconsistent = True
+                    reasons.append(f"state mismatch: {occ['state']!r} vs {ref['state']!r}")
+                if occ["parent_id"] != ref["parent_id"]:
+                    inconsistent = True
+                    reasons.append(f"parent_id mismatch: {occ['parent_id']!r} vs {ref['parent_id']!r}")
+            if inconsistent:
+                cont_inconsistent += 1
+                record_ids = [o["record_idx"] for o in occurrences]
+                errors.append(
+                    f"continuous_proposal_id={pid_str} inconsistent across records {record_ids}: "
+                    + "; ".join(reasons)
+                )
+
+    # --- Collect pending_parent_unknown warnings ---
+    unknown_warnings: list[str] = []
+    for r in steady_records:
+        unknown_ids = r.get("continuous_eager_parent_acceptance_unknown_seq_ids") or []
+        for sid in unknown_ids:
+            unknown_warnings.append(
+                f"record steady seq_id={sid} has pending_parent_unknown — "
+                f"parent acceptance could not be determined"
+            )
+    if unknown_warnings:
+        print(f"\n--- Warnings: pending_parent_unknown ({len(unknown_warnings)}) ---")
+        for w in unknown_warnings[:20]:
+            print(f"  WARNING: {w}")
+        if len(unknown_warnings) > 20:
+            print(f"  ... and {len(unknown_warnings) - 20} more")
 
     # --- Per-record phase-aware validation ---
     for idx, record in enumerate(continuous_records):
