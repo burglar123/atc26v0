@@ -561,6 +561,33 @@ class ModelRunnerBase:
                 getattr(self.global_config, "enable_eager_transfer_dry_run", False)
             ),
             "eager_transfer_dry_run_enabled": False,
+            "enable_eager_schedule_dry_run": bool(
+                getattr(self.global_config, "enable_eager_schedule_dry_run", False)
+            ),
+            "eager_schedule_dry_run_enabled": False,
+            "eager_schedule_step_id": None,
+            "eager_schedule_plan_id": None,
+            "target_eager_set_dry_run": [],
+            "eager_schedule_candidate_proposal_ids": [],
+            "eager_schedule_candidate_seq_ids": [],
+            "eager_scheduled_proposal_ids": [],
+            "eager_scheduled_seq_ids": [],
+            "eager_schedule_skipped_proposal_ids": [],
+            "eager_schedule_skip_reason_by_proposal_id": {},
+            "eager_schedule_clear_reason_by_proposal_id": {},
+            "eager_schedule_proposal_id_by_seq_id": {},
+            "eager_schedule_base_len_by_seq_id": {},
+            "eager_schedule_current_len_by_seq_id": {},
+            "eager_schedule_base_match_by_seq_id": {},
+            "eager_schedule_seq_pre_verify_by_seq_id": {},
+            "eager_schedule_base_pre_verify_by_proposal_id": {},
+            "eager_schedule_proposal_len_by_proposal_id": {},
+            "eager_schedule_to_verify_len_by_proposal_id": {},
+            "eager_schedule_intersects_target_home": False,
+            "eager_schedule_intersects_draft_home": False,
+            "eager_ready_buffer_size_before_schedule": self.eager_proposal_buffer.size(),
+            "eager_ready_buffer_size_after_schedule": self.eager_proposal_buffer.size(),
+            "eager_ready_buffer_size_after_clear": self.eager_proposal_buffer.size(),
             "eager_transfer_step_id": None,
             "eager_transfer_plan_id": None,
             "eager_transfer_num_proposals": 0,
@@ -636,6 +663,8 @@ class ModelRunnerBase:
             "eager_tokens_transfer_pending": 0,
             "eager_tokens_transfer_validated": 0,
             "eager_tokens_transfer_dropped": 0,
+            "eager_tokens_schedule_candidates": 0,
+            "eager_tokens_scheduled_dry_run": 0,
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -741,6 +770,9 @@ class ModelRunnerBase:
     def _eager_transfer_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_transfer_dry_run", False))
 
+    def _eager_schedule_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_schedule_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -751,7 +783,8 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled()
+        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled()
+        transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled() or schedule_dry_run_enabled
         promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled() or transfer_dry_run_enabled
         draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
         dry_run_enabled = self._eager_plan_dry_run_enabled() or draft_dry_run_enabled
@@ -761,6 +794,7 @@ class ModelRunnerBase:
         plan.enable_eager_draft_dry_run = draft_dry_run_enabled
         plan.enable_eager_promotion_dry_run = promotion_dry_run_enabled
         plan.enable_eager_transfer_dry_run = transfer_dry_run_enabled
+        plan.enable_eager_schedule_dry_run = schedule_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -795,6 +829,7 @@ class ModelRunnerBase:
                 enable_eager_draft_dry_run=draft_dry_run_enabled,
                 enable_eager_promotion_dry_run=promotion_dry_run_enabled,
                 enable_eager_transfer_dry_run=transfer_dry_run_enabled,
+                enable_eager_schedule_dry_run=schedule_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -880,6 +915,7 @@ class ModelRunnerBase:
             enable_eager_draft_dry_run=draft_dry_run_enabled,
             enable_eager_promotion_dry_run=promotion_dry_run_enabled,
             enable_eager_transfer_dry_run=transfer_dry_run_enabled,
+            enable_eager_schedule_dry_run=schedule_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1383,9 +1419,173 @@ class ModelRunnerBase:
                 dropped.append(proposal)
 
         self.eager_proposal_buffer.remove_many(
-            [proposal.proposal_id for proposal in ready + dropped]
+            [proposal.proposal_id for proposal in dropped]
         )
         return ready, still_pending, dropped, state_by_proposal_id
+
+    def _ready_eager_proposals(self) -> list[EagerProposal]:
+        return sorted(
+            [
+                proposal
+                for proposal in self.eager_proposal_buffer.proposals()
+                if proposal.valid and proposal.state == EAGER_STATE_READY_TO_VERIFY_DRY_RUN
+            ],
+            key=lambda proposal: (int(proposal.proposal_id), int(proposal.seq_id)),
+        )
+
+    def _schedule_ready_eager_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        plan_context: dict[str, set[int]],
+    ) -> None:
+        ready_proposals = self._ready_eager_proposals()
+        ready_size_before = len(ready_proposals)
+        seq_by_id = self._local_sequence_by_id()
+        target_home = {int(seq_id) for seq_id in plan.target_home_set}
+        draft_home = {int(seq_id) for seq_id in plan.draft_home_set}
+        max_requests = int(getattr(self.global_config, "max_eager_requests_per_step", 0) or 0)
+        gamma = int(self.gamma)
+
+        candidates: list[EagerProposal] = []
+        scheduled: list[EagerProposal] = []
+        skipped: list[EagerProposal] = []
+        skip_reason_by_proposal_id: dict[int, str] = {}
+        seen_seq_ids: set[int] = set()
+        proposal_id_by_seq_id: dict[int, int] = {}
+        base_len_by_seq_id: dict[int, int] = {}
+        current_len_by_seq_id: dict[int, int] = {}
+        base_match_by_seq_id: dict[int, bool] = {}
+        seq_pre_verify_by_seq_id: dict[int, bool] = {}
+        base_pre_verify_by_proposal_id: dict[int, bool] = {}
+        proposal_len_by_proposal_id: dict[int, int] = {}
+        to_verify_len_by_proposal_id: dict[int, int] = {}
+
+        for proposal in ready_proposals:
+            proposal_id = int(proposal.proposal_id)
+            seq_id = int(proposal.seq_id)
+            seq = seq_by_id.get(seq_id)
+            current_len = -1 if seq is None else int(len(seq))
+            candidates.append(proposal)
+            base_len_by_seq_id[seq_id] = int(proposal.base_len)
+            current_len_by_seq_id[seq_id] = current_len
+            base_match_by_seq_id[seq_id] = seq is not None and current_len == int(proposal.base_len)
+            seq_pre_verify_by_seq_id[seq_id] = bool(getattr(seq, "pre_verify", True)) if seq is not None else True
+            base_pre_verify_by_proposal_id[proposal_id] = bool(proposal.base_pre_verify)
+            proposal_len_by_proposal_id[proposal_id] = int(proposal.proposal_len)
+            to_verify_len_by_proposal_id[proposal_id] = len(proposal.to_be_verified_token_ids)
+
+            reason = None
+            if plan.plan_phase != "steady":
+                reason = "non_steady_phase"
+            elif proposal.state != EAGER_STATE_READY_TO_VERIFY_DRY_RUN:
+                reason = "not_ready"
+            elif seq is None:
+                reason = "seq_not_found"
+            elif self.is_request_level_finished(seq, plan_context):
+                reason = "seq_finished_before_schedule"
+            elif self.is_speculative_span_invalidated(seq, plan_context):
+                reason = "seq_span_invalidated_before_schedule"
+            elif bool(getattr(seq, "pre_verify", True)):
+                reason = "seq_pre_verify"
+            elif int(len(seq)) != int(proposal.base_len):
+                reason = "base_not_reached" if int(len(seq)) < int(proposal.base_len) else "base_overshot_or_stale"
+            elif bool(proposal.base_pre_verify):
+                reason = "invalid_base_pre_verify"
+            elif int(proposal.proposal_len) != gamma:
+                reason = "invalid_proposal_len"
+            elif len(proposal.to_be_verified_token_ids) != gamma:
+                reason = "invalid_to_verify_len"
+            elif len(proposal.proposal_token_ids) != gamma:
+                reason = "invalid_proposal_token_len"
+            elif seq_id in target_home:
+                reason = "intersects_target_home"
+            elif seq_id in draft_home:
+                reason = "intersects_draft_home"
+            elif seq_id in seen_seq_ids:
+                reason = "duplicate_ready_seq"
+
+            if reason is None:
+                seen_seq_ids.add(seq_id)
+                scheduled.append(proposal)
+                proposal_id_by_seq_id[seq_id] = proposal_id
+            else:
+                skipped.append(proposal)
+                skip_reason_by_proposal_id[proposal_id] = reason
+
+        if max_requests > 0 and len(scheduled) > max_requests:
+            overflow = scheduled[max_requests:]
+            scheduled = scheduled[:max_requests]
+            for proposal in overflow:
+                skipped.append(proposal)
+                skip_reason_by_proposal_id[int(proposal.proposal_id)] = "max_eager_requests_per_step"
+
+        scheduled_seq_ids = [int(proposal.seq_id) for proposal in scheduled]
+        scheduled_proposal_ids = [int(proposal.proposal_id) for proposal in scheduled]
+        skipped_proposal_ids = [int(proposal.proposal_id) for proposal in skipped]
+        target_eager_set_dry_run = list(scheduled_seq_ids)
+        plan.target_eager_set_dry_run = list(target_eager_set_dry_run)
+        plan.eager_schedule_dry_run_enabled = True
+
+        clear_reason_by_proposal_id = {
+            str(proposal.proposal_id): "phase1h4c_schedule_dry_run_no_verify_yet"
+            for proposal in ready_proposals
+        }
+        ready_size_after_schedule = len(self._ready_eager_proposals())
+        self.eager_proposal_buffer.remove_many([proposal.proposal_id for proposal in ready_proposals])
+        ready_size_after_clear = len(self._ready_eager_proposals())
+
+        trace_record["enable_eager_schedule_dry_run"] = True
+        trace_record["eager_schedule_dry_run_enabled"] = True
+        trace_record["eager_schedule_step_id"] = None if plan.step_id is None else int(plan.step_id)
+        trace_record["eager_schedule_plan_id"] = int(plan.plan_id)
+        trace_record["target_eager_set_dry_run"] = target_eager_set_dry_run
+        trace_record["eager_schedule_candidate_proposal_ids"] = [
+            int(proposal.proposal_id) for proposal in candidates
+        ]
+        trace_record["eager_schedule_candidate_seq_ids"] = [int(proposal.seq_id) for proposal in candidates]
+        trace_record["eager_scheduled_proposal_ids"] = scheduled_proposal_ids
+        trace_record["eager_scheduled_seq_ids"] = scheduled_seq_ids
+        trace_record["eager_schedule_skipped_proposal_ids"] = skipped_proposal_ids
+        trace_record["eager_schedule_skip_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in skip_reason_by_proposal_id.items()
+        }
+        trace_record["eager_schedule_clear_reason_by_proposal_id"] = clear_reason_by_proposal_id
+        trace_record["eager_schedule_proposal_id_by_seq_id"] = {
+            str(seq_id): proposal_id for seq_id, proposal_id in proposal_id_by_seq_id.items()
+        }
+        trace_record["eager_schedule_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_schedule_current_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
+        }
+        trace_record["eager_schedule_base_match_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_match_by_seq_id.items()
+        }
+        trace_record["eager_schedule_seq_pre_verify_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in seq_pre_verify_by_seq_id.items()
+        }
+        trace_record["eager_schedule_base_pre_verify_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in base_pre_verify_by_proposal_id.items()
+        }
+        trace_record["eager_schedule_proposal_len_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in proposal_len_by_proposal_id.items()
+        }
+        trace_record["eager_schedule_to_verify_len_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in to_verify_len_by_proposal_id.items()
+        }
+        trace_record["eager_schedule_intersects_target_home"] = bool(set(scheduled_seq_ids) & target_home)
+        trace_record["eager_schedule_intersects_draft_home"] = bool(set(scheduled_seq_ids) & draft_home)
+        trace_record["eager_ready_buffer_size_before_schedule"] = int(ready_size_before)
+        trace_record["eager_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
+        trace_record["eager_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
+        trace_record["eager_tokens_schedule_candidates"] = sum(
+            int(proposal.proposal_len) for proposal in candidates
+        )
+        trace_record["eager_tokens_scheduled_dry_run"] = sum(
+            int(proposal.proposal_len) for proposal in scheduled
+        )
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
         seq_by_id = self._local_sequence_by_id()
@@ -1488,9 +1688,12 @@ class ModelRunnerBase:
                 drop_reason_by_proposal_id[int(proposal.proposal_id)] = reason
 
         buffer_size_after_receive = self.eager_proposal_buffer.size()
-        self.eager_proposal_buffer.remove_many(
-            [proposal.proposal_id for proposal in validated]
-        )
+        if self._eager_schedule_dry_run_enabled():
+            self._schedule_ready_eager_dry_run(plan, trace_record, plan_context)
+        else:
+            self.eager_proposal_buffer.remove_many(
+                [proposal.proposal_id for proposal in validated + pending_ready]
+            )
         buffer_size_after_clear = self.eager_proposal_buffer.size()
         active_pending = [
             proposal

@@ -43,6 +43,7 @@ class StepPlan:
 
     target_home_set: List[int] = field(default_factory=list)
     target_eager_set: List[int] = field(default_factory=list)
+    target_eager_set_dry_run: List[int] = field(default_factory=list)
     draft_home_set: List[int] = field(default_factory=list)
     draft_eager_set: List[int] = field(default_factory=list)
 
@@ -136,6 +137,8 @@ class StepPlan:
     eager_promotion_dry_run_enabled: bool = False
     enable_eager_transfer_dry_run: bool = False
     eager_transfer_dry_run_enabled: bool = False
+    enable_eager_schedule_dry_run: bool = False
+    eager_schedule_dry_run_enabled: bool = False
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -210,11 +213,13 @@ class StepPlan:
         enable_eager_draft_dry_run: bool = False,
         enable_eager_promotion_dry_run: bool = False,
         enable_eager_transfer_dry_run: bool = False,
+        enable_eager_schedule_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
         draft_home = set(int(seq_id) for seq_id in self.draft_home_set)
         target_eager = set(int(seq_id) for seq_id in self.target_eager_set)
+        target_eager_dry_run = set(int(seq_id) for seq_id in self.target_eager_set_dry_run)
         draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
 
         assert not (target_eager & target_home), (
@@ -228,6 +233,14 @@ class StepPlan:
         assert not (draft_eager & draft_home), (
             f"draft_eager_set cannot overlap draft_home_set: "
             f"{sorted(draft_eager & draft_home)}"
+        )
+        assert not (target_eager_dry_run & target_home), (
+            f"target_eager_set_dry_run cannot overlap target_home_set: "
+            f"{sorted(target_eager_dry_run & target_home)}"
+        )
+        assert not (target_eager_dry_run & draft_home), (
+            f"target_eager_set_dry_run cannot overlap draft_home_set: "
+            f"{sorted(target_eager_dry_run & draft_home)}"
         )
 
         eager_new_selected = set(int(seq_id) for seq_id in self.eager_new_selected_set)
@@ -270,6 +283,7 @@ class StepPlan:
 
         eager_list_fields = [
             self.target_eager_set,
+            self.target_eager_set_dry_run,
             self.draft_eager_set,
             self.eager_new_selected_set,
             self.eager_continuing_set,
@@ -301,10 +315,18 @@ class StepPlan:
             or bool(enable_eager_draft_dry_run)
             or bool(enable_eager_promotion_dry_run)
             or bool(enable_eager_transfer_dry_run)
+            or bool(enable_eager_schedule_dry_run)
             or not has_eager_scaffold
         ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+        if enable_eager_schedule_dry_run:
+            assert enable_eager_transfer_dry_run, "Phase 1H-4c schedule dry-run requires eager transfer dry-run"
+        else:
+            assert not target_eager_dry_run, (
+                f"target_eager_set_dry_run requires Phase 1H-4c schedule dry-run, "
+                f"got {self.target_eager_set_dry_run}"
+            )
         if enable_eager_transfer_dry_run:
             assert enable_eager_promotion_dry_run, "Phase 1H-4 transfer dry-run requires eager promotion dry-run"
         if enable_eager_promotion_dry_run:
@@ -360,6 +382,7 @@ class StepPlan:
             "execution_mode": self.execution_mode,
             "target_home_set": _int_list(self.target_home_set),
             "target_eager_set": _int_list(self.target_eager_set),
+            "target_eager_set_dry_run": _int_list(self.target_eager_set_dry_run),
             "draft_home_set": _int_list(self.draft_home_set),
             "draft_eager_set": _int_list(self.draft_eager_set),
             "budgets": {
@@ -492,4 +515,6 @@ class StepPlan:
             "eager_promotion_dry_run_enabled": bool(self.eager_promotion_dry_run_enabled),
             "enable_eager_transfer_dry_run": bool(self.enable_eager_transfer_dry_run),
             "eager_transfer_dry_run_enabled": bool(self.eager_transfer_dry_run_enabled),
+            "enable_eager_schedule_dry_run": bool(self.enable_eager_schedule_dry_run),
+            "eager_schedule_dry_run_enabled": bool(self.eager_schedule_dry_run_enabled),
         }
