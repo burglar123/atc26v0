@@ -150,6 +150,20 @@ class StepPlan:
     continuous_eager_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
     continuous_eager_source_step_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
     continuous_eager_source_plan_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    # Phase 1H-continuous-promotion-trace: split target/draft proposal metadata.
+    # target_eager_*  = the target-side ready proposal (eager_k) in target_eager_set_trace.
+    # draft_eager_continue_* = the draft-side continuation proposal (eager_{k+1}).
+    target_eager_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_eager_parent_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_eager_proposal_state_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_eager_promotion_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    target_eager_source_step_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    target_eager_source_plan_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    draft_eager_continue_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    draft_eager_continue_parent_proposal_id_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    draft_eager_continue_proposal_state_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    draft_eager_continue_source_step_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    draft_eager_continue_source_plan_id_by_seq_id: Dict[int, int] = field(default_factory=dict)
     # Phase 1H-continuous-promotion-trace: per-step counters (proposal/seq counts).
     continuous_eager_trace_selected_count: int = 0
     continuous_eager_trace_pending_count: int = 0
@@ -619,6 +633,51 @@ class StepPlan:
             "continuous_eager_source_plan_id_by_seq_id": {
                 str(seq_id): int(plan_id)
                 for seq_id, plan_id in self.continuous_eager_source_plan_id_by_seq_id.items()
+            },
+            # Phase 1H-continuous-promotion-trace: split target/draft proposal metadata
+            "target_eager_proposal_id_by_seq_id": {
+                str(seq_id): str(proposal_id)
+                for seq_id, proposal_id in self.target_eager_proposal_id_by_seq_id.items()
+            },
+            "target_eager_parent_proposal_id_by_seq_id": {
+                str(seq_id): str(parent_id)
+                for seq_id, parent_id in self.target_eager_parent_proposal_id_by_seq_id.items()
+            },
+            "target_eager_proposal_state_by_seq_id": {
+                str(seq_id): str(state)
+                for seq_id, state in self.target_eager_proposal_state_by_seq_id.items()
+            },
+            "target_eager_promotion_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.target_eager_promotion_reason_by_seq_id.items()
+            },
+            "target_eager_source_step_id_by_seq_id": {
+                str(seq_id): int(step_id)
+                for seq_id, step_id in self.target_eager_source_step_id_by_seq_id.items()
+            },
+            "target_eager_source_plan_id_by_seq_id": {
+                str(seq_id): int(plan_id)
+                for seq_id, plan_id in self.target_eager_source_plan_id_by_seq_id.items()
+            },
+            "draft_eager_continue_proposal_id_by_seq_id": {
+                str(seq_id): str(proposal_id)
+                for seq_id, proposal_id in self.draft_eager_continue_proposal_id_by_seq_id.items()
+            },
+            "draft_eager_continue_parent_proposal_id_by_seq_id": {
+                str(seq_id): str(parent_id)
+                for seq_id, parent_id in self.draft_eager_continue_parent_proposal_id_by_seq_id.items()
+            },
+            "draft_eager_continue_proposal_state_by_seq_id": {
+                str(seq_id): str(state)
+                for seq_id, state in self.draft_eager_continue_proposal_state_by_seq_id.items()
+            },
+            "draft_eager_continue_source_step_id_by_seq_id": {
+                str(seq_id): int(step_id)
+                for seq_id, step_id in self.draft_eager_continue_source_step_id_by_seq_id.items()
+            },
+            "draft_eager_continue_source_plan_id_by_seq_id": {
+                str(seq_id): int(plan_id)
+                for seq_id, plan_id in self.draft_eager_continue_source_plan_id_by_seq_id.items()
             },
             # Phase 1H-continuous-promotion-trace: per-step counters
             "continuous_eager_trace_selected_count": int(self.continuous_eager_trace_selected_count),

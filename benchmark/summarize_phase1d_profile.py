@@ -189,6 +189,32 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         for d in (r.get("continuous_eager_chain_depth_by_seq_id") or {}).values():
             ce_chain_depths.append(int(d))
 
+    # Split target/draft metadata: count ready target proposals.
+    target_eager_ready_count = 0
+    target_eager_total = 0
+    for r in records:
+        target_state = r.get("target_eager_proposal_state_by_seq_id") or {}
+        for state in target_state.values():
+            target_eager_total += 1
+            if str(state) in ("ready", "target_trace_ready"):
+                target_eager_ready_count += 1
+    target_eager_without_ready = target_eager_total - target_eager_ready_count
+
+    # Count continuation entries with/without valid target parent.
+    cont_with_parent = 0
+    cont_without_parent = 0
+    for r in records:
+        continue_set = r.get("draft_eager_continue_set") or []
+        cont_parent = r.get("draft_eager_continue_parent_proposal_id_by_seq_id") or {}
+        target_pid = r.get("target_eager_proposal_id_by_seq_id") or {}
+        for sid in continue_set:
+            cp = str(cont_parent.get(str(sid), cont_parent.get(sid, "")))
+            tp = str(target_pid.get(str(sid), target_pid.get(sid, "")))
+            if cp and tp and cp == tp:
+                cont_with_parent += 1
+            else:
+                cont_without_parent += 1
+
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
         "phase": phase,
@@ -243,6 +269,11 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "ce_trace_mean_chain_depth": mean(ce_chain_depths) if ce_chain_depths else 0.0,
         "ce_trace_promotion_rate": ce_promoted / max(1, ce_selected),
         "ce_trace_continuation_rate": ce_continue / max(1, ce_target_trace),
+        "target_eager_ready_count": target_eager_ready_count,
+        "target_eager_total": target_eager_total,
+        "target_eager_without_ready": target_eager_without_ready,
+        "cont_with_parent": cont_with_parent,
+        "cont_without_parent": cont_without_parent,
     }
 
 
@@ -307,6 +338,12 @@ def summarize(path: Path) -> dict[str, Any]:
     for p in step_profiles:
         all_ce_chain_depths.extend(p["ce_trace_chain_depths"])
 
+    total_target_eager_ready = sum(p["target_eager_ready_count"] for p in step_profiles)
+    total_target_eager = sum(p["target_eager_total"] for p in step_profiles)
+    total_target_without_ready = sum(p["target_eager_without_ready"] for p in step_profiles)
+    total_cont_with_parent = sum(p["cont_with_parent"] for p in step_profiles)
+    total_cont_without_parent = sum(p["cont_without_parent"] for p in step_profiles)
+
     return {
         "path": str(path),
         "mode": mode,
@@ -364,6 +401,10 @@ def summarize(path: Path) -> dict[str, Any]:
         "ce_trace_mean_chain_depth": mean(all_ce_chain_depths) if all_ce_chain_depths else 0.0,
         "ce_trace_promotion_rate": total_ce_promoted / max(1, total_ce_selected),
         "ce_trace_continuation_rate": total_ce_continue_set / max(1, total_ce_target_set),
+        "total_target_eager_ready": total_target_eager_ready,
+        "total_target_eager_without_ready": total_target_without_ready,
+        "total_cont_with_parent": total_cont_with_parent,
+        "total_cont_without_parent": total_cont_without_parent,
         "steps": step_profiles,
     }
 
@@ -549,6 +590,10 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
         print(f"  ce_trace_mean_chain_depth={row['ce_trace_mean_chain_depth']:.3f}")
         print(f"  ce_trace_promotion_rate={row['ce_trace_promotion_rate']:.3f}")
         print(f"  ce_trace_continuation_rate={row['ce_trace_continuation_rate']:.3f}")
+        print(f"  total_target_eager_ready={row['total_target_eager_ready']}")
+        print(f"  total_target_eager_without_ready={row['total_target_eager_without_ready']}")
+        print(f"  total_cont_with_parent={row['total_cont_with_parent']}")
+        print(f"  total_cont_without_parent={row['total_cont_without_parent']}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

@@ -753,6 +753,24 @@ class ModelRunnerBase:
             if _meta:
                 _target_eager_trace.append(_sid)
                 plan.continuous_eager_trace_target_ready_count += 1
+                # Populate target_eager_* metadata — the ready proposal (eager_k)
+                # that was promoted/readied in a prior step.
+                plan.target_eager_proposal_id_by_seq_id[_sid] = str(
+                    _meta.get("proposal_id", "")
+                )
+                plan.target_eager_parent_proposal_id_by_seq_id[_sid] = str(
+                    _meta.get("parent_proposal_id", "")
+                )
+                plan.target_eager_proposal_state_by_seq_id[_sid] = "target_trace_ready"
+                plan.target_eager_promotion_reason_by_seq_id[_sid] = str(
+                    _meta.get("promotion_reason", "")
+                )
+                plan.target_eager_source_step_id_by_seq_id[_sid] = int(
+                    _meta.get("source_step_id", 0)
+                )
+                plan.target_eager_source_plan_id_by_seq_id[_sid] = int(
+                    _meta.get("source_plan_id", 0)
+                )
 
         # 5b. target_eager_set_trace seqs → draft_eager_continue_set (if still urgent).
         _draft_continue: list[int] = []
@@ -784,6 +802,13 @@ class ModelRunnerBase:
                 plan.continuous_eager_source_step_id_by_seq_id[_sid] = plan.step_id
                 plan.continuous_eager_source_plan_id_by_seq_id[_sid] = plan.plan_id
                 plan.continuous_eager_chain_depth_by_seq_id[_sid] = _chain + 1
+                # Populate draft_eager_continue_* metadata — the continuation
+                # proposal (eager_{k+1}) that DRAFT will generate in this step.
+                plan.draft_eager_continue_proposal_id_by_seq_id[_sid] = _new_pid
+                plan.draft_eager_continue_parent_proposal_id_by_seq_id[_sid] = _parent_pid
+                plan.draft_eager_continue_proposal_state_by_seq_id[_sid] = "continue_pending"
+                plan.draft_eager_continue_source_step_id_by_seq_id[_sid] = plan.step_id
+                plan.draft_eager_continue_source_plan_id_by_seq_id[_sid] = plan.plan_id
 
         # 6. Candidate iteration — select post-verify (pre_verify=False) only.
         now = time.time()
@@ -2358,6 +2383,16 @@ class ModelRunnerBase:
             }
             trace_record["continuous_eager_trace_promoted_count"] = len(promoted)
             trace_record["continuous_eager_trace_discarded_count"] = len(discarded)
+            # Record per-seq state transitions so the trace JSON reflects the
+            # actual post-promotion state (ready/discarded/pending_parent_unknown).
+            _cont_state = dict(trace_record.get("continuous_eager_proposal_state_by_seq_id") or {})
+            for _sid in promoted:
+                _cont_state[str(_sid)] = "ready"
+            for _sid in discarded:
+                _cont_state[str(_sid)] = "discarded"
+            for _sid in unknown:
+                _cont_state[str(_sid)] = "pending_parent_unknown"
+            trace_record["continuous_eager_proposal_state_by_seq_id"] = _cont_state
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on
