@@ -158,6 +158,9 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_draft_seq_ids",
     "eager_draft_proposal_ids",
     "eager_draft_rollback_seq_ids",
+    "eager_parent_seq_ids",
+    "eager_promoted_proposal_ids",
+    "eager_discarded_proposal_ids",
 ]
 
 REQUIRED_EAGER_META_KEYS = [
@@ -455,6 +458,7 @@ def check_step_plan_validation() -> None:
         enable_eager_execution=False,
         enable_eager_plan_dry_run=True,
         enable_eager_draft_dry_run=True,
+        enable_eager_promotion_dry_run=True,
         global_gamma=4,
     )
     expect_raises(
@@ -466,6 +470,17 @@ def check_step_plan_validation() -> None:
         ),
         AssertionError,
         "draft dry-run requires plan dry-run",
+    )
+    expect_raises(
+        lambda: dry_run_allowed.validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=True,
+            enable_eager_draft_dry_run=False,
+            enable_eager_promotion_dry_run=True,
+            global_gamma=4,
+        ),
+        AssertionError,
+        "promotion dry-run requires draft dry-run",
     )
     expect_raises(
         lambda: make_step_plan(
@@ -601,6 +616,21 @@ def check_eager_gamma_validation() -> None:
         ValueError,
         "draft dry-run rejects eager_gamma mismatch",
     )
+    expect_raises(
+        lambda: PEARLConfig(
+            draft_model_path="/synthetic/draft",
+            target_model_path="/synthetic/target",
+            execution_mode="dual_batch_pearl",
+            enable_eager_promotion_dry_run=True,
+            eager_policy="none",
+            gamma=4,
+            max_eager_requests_per_step=1,
+            max_eager_tokens_per_step=4,
+            max_eager_tokens_per_request=4,
+        ),
+        ValueError,
+        "promotion dry-run rejects eager_policy none",
+    )
 
 
 def run_synthetic_checks() -> None:
@@ -626,10 +656,14 @@ def check_trace(path: Path) -> None:
             errors.append(f"dual_record[{idx}] enable_eager_execution must be false")
         if record.get("enable_eager_draft_dry_run") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] enable_eager_draft_dry_run must be false")
+        if record.get("enable_eager_promotion_dry_run") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] enable_eager_promotion_dry_run must be false")
         if record.get("eager_execution_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_execution_enabled must be false")
         if record.get("eager_draft_dry_run_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_draft_dry_run_enabled must be false")
+        if record.get("eager_promotion_dry_run_enabled") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] eager_promotion_dry_run_enabled must be false")
         if not eager_trace_enabled and record.get("target_eager_set"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
         if not eager_trace_enabled and record.get("draft_eager_set"):

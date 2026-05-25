@@ -10,8 +10,6 @@ from typing import Any
 
 
 ALWAYS_ZERO_COUNTER_FIELDS = [
-    "eager_tokens_promoted",
-    "eager_tokens_discarded",
     "eager_tokens_verified",
     "eager_tokens_accepted",
     "eager_tokens_rejected",
@@ -88,6 +86,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
 
         enable_plan_dry_run = bool(record.get("enable_eager_plan_dry_run", False))
         enable_draft_dry_run = bool(record.get("enable_eager_draft_dry_run", False))
+        enable_promotion_dry_run = bool(record.get("enable_eager_promotion_dry_run", False))
         draft_dry_run_enabled = bool(record.get("eager_draft_dry_run_enabled", False))
         phase = record.get("plan_phase")
         target_home = as_int_set(record.get("target_home_set"))
@@ -111,6 +110,12 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if nonzero_always_zero:
             promoted_or_verified_rows += 1
             errors.append(f"record[{idx}] eager execution counters must stay zero: {nonzero_always_zero}")
+        if int_value(record.get("eager_tokens_promoted"), 0) and not enable_promotion_dry_run:
+            promoted_or_verified_rows += 1
+            errors.append(f"record[{idx}] eager_tokens_promoted requires promotion dry-run")
+        if int_value(record.get("eager_tokens_discarded"), 0) and not enable_promotion_dry_run:
+            promoted_or_verified_rows += 1
+            errors.append(f"record[{idx}] eager_tokens_discarded requires promotion dry-run")
 
         if target_eager:
             errors.append(f"record[{idx}] target_eager_set must remain empty, got {sorted(target_eager)}")
@@ -137,6 +142,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
 
         if enable_draft_dry_run and not enable_plan_dry_run:
             errors.append(f"record[{idx}] draft dry-run must imply plan dry-run")
+        if enable_promotion_dry_run and not enable_draft_dry_run:
+            errors.append(f"record[{idx}] promotion dry-run must imply draft dry-run")
 
         if not draft_dry_run_enabled:
             if generated or dry_run_generated:
@@ -311,11 +318,39 @@ def synthetic_draft_record() -> dict[str, Any]:
     return record
 
 
+def synthetic_promotion_record() -> dict[str, Any]:
+    record = synthetic_draft_record()
+    record.update(
+        {
+            "enable_eager_promotion_dry_run": True,
+            "eager_promotion_dry_run_enabled": True,
+            "eager_parent_seq_ids": [1],
+            "eager_parent_accepted_len_by_seq_id": {"1": 4},
+            "eager_parent_invalidated_len_by_seq_id": {"1": 0},
+            "eager_parent_full_accept_by_seq_id": {"1": True},
+            "eager_parent_finished_by_seq_id": {"1": False},
+            "eager_promoted_seq_ids": [1],
+            "eager_promoted_proposal_ids": [101],
+            "eager_discarded_seq_ids": [],
+            "eager_discarded_proposal_ids": [],
+            "eager_promotion_reason_by_seq_id": {"1": "parent_normal_full_accept"},
+            "eager_discard_reason_by_seq_id": {},
+            "eager_promotion_base_len_by_seq_id": {"1": 12},
+            "eager_promotion_current_len_by_seq_id": {"1": 12},
+            "eager_promotion_base_match_by_seq_id": {"1": True},
+            "eager_tokens_promoted": 4,
+            "eager_tokens_discarded": 0,
+        }
+    )
+    return record
+
+
 def run_synthetic_tests() -> None:
     valid_records = [
         synthetic_default_record(),
         synthetic_plan_record(),
         synthetic_draft_record(),
+        synthetic_promotion_record(),
     ]
     errors, _ = validate_records(valid_records)
     assert not errors, f"valid synthetic eager draft dry-run trace failed: {errors}"

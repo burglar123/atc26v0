@@ -10,8 +10,6 @@ from typing import Any
 
 
 EAGER_ALWAYS_ZERO_COUNTER_FIELDS = [
-    "eager_tokens_promoted",
-    "eager_tokens_discarded",
     "eager_tokens_verified",
     "eager_tokens_accepted",
     "eager_tokens_rejected",
@@ -87,6 +85,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             record.get("enable_eager_draft_dry_run", False)
             or record.get("eager_draft_dry_run_enabled", False)
         )
+        promotion_dry_run = bool(
+            record.get("enable_eager_promotion_dry_run", False)
+            or record.get("eager_promotion_dry_run_enabled", False)
+        )
         if dry_run:
             dry_run_records += 1
         phase = record.get("plan_phase")
@@ -109,6 +111,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         eager_tokens_generated = int_value(record.get("eager_tokens_generated"), 0)
         if eager_tokens_generated and not draft_dry_run:
             nonzero_fields.append("eager_tokens_generated")
+        if int_value(record.get("eager_tokens_promoted"), 0) and not promotion_dry_run:
+            nonzero_fields.append("eager_tokens_promoted")
+        if int_value(record.get("eager_tokens_discarded"), 0) and not promotion_dry_run:
+            nonzero_fields.append("eager_tokens_discarded")
         if nonzero_fields:
             nonzero_counter_rows += 1
             errors.append(f"record[{idx}] nonzero eager counters: {nonzero_fields}")
@@ -285,6 +291,13 @@ def run_synthetic_tests() -> None:
     valid_draft[1]["eager_tokens_generated"] = 4
     errors, _ = validate_records(valid_draft)
     assert not errors, f"plan checker should allow generated eager tokens in draft dry-run: {errors}"
+
+    valid_promotion = deepcopy(valid_draft)
+    valid_promotion[1]["enable_eager_promotion_dry_run"] = True
+    valid_promotion[1]["eager_promotion_dry_run_enabled"] = True
+    valid_promotion[1]["eager_tokens_promoted"] = 4
+    errors, _ = validate_records(valid_promotion)
+    assert not errors, f"plan checker should allow promoted eager tokens in promotion dry-run: {errors}"
     print("Synthetic eager plan dry-run checks passed.")
 
 

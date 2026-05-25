@@ -131,6 +131,7 @@ class PEARLConfig:
     enable_eager_execution: bool = False
     enable_eager_plan_dry_run: bool = False
     enable_eager_draft_dry_run: bool = False
+    enable_eager_promotion_dry_run: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -145,6 +146,9 @@ class PEARLConfig:
         self.enable_eager_execution = bool(self.enable_eager_execution)
         self.enable_eager_plan_dry_run = bool(self.enable_eager_plan_dry_run)
         self.enable_eager_draft_dry_run = bool(self.enable_eager_draft_dry_run)
+        self.enable_eager_promotion_dry_run = bool(self.enable_eager_promotion_dry_run)
+        if self.enable_eager_promotion_dry_run:
+            self.enable_eager_draft_dry_run = True
         if self.enable_eager_draft_dry_run:
             self.enable_eager_plan_dry_run = True
         self.eager_policy = str(self.eager_policy)
@@ -197,6 +201,7 @@ class PEARLConfig:
         logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
         logger.info(f"Enable_Eager_Plan_Dry_Run={self.enable_eager_plan_dry_run}")
         logger.info(f"Enable_Eager_Draft_Dry_Run={self.enable_eager_draft_dry_run}")
+        logger.info(f"Enable_Eager_Promotion_Dry_Run={self.enable_eager_promotion_dry_run}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")

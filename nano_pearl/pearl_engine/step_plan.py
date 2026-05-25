@@ -132,6 +132,8 @@ class StepPlan:
     eager_draft_rollback_ok_by_seq_id: Dict[int, bool] = field(default_factory=dict)
     eager_draft_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     eager_dry_run_tokens_generated: int = 0
+    enable_eager_promotion_dry_run: bool = False
+    eager_promotion_dry_run_enabled: bool = False
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -204,6 +206,7 @@ class StepPlan:
         enable_eager_execution: bool,
         enable_eager_plan_dry_run: bool = False,
         enable_eager_draft_dry_run: bool = False,
+        enable_eager_promotion_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
@@ -293,10 +296,13 @@ class StepPlan:
             bool(enable_eager_execution)
             or bool(enable_eager_plan_dry_run)
             or bool(enable_eager_draft_dry_run)
+            or bool(enable_eager_promotion_dry_run)
             or not has_eager_scaffold
         ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+        if enable_eager_promotion_dry_run:
+            assert enable_eager_draft_dry_run, "Phase 1H-3 promotion dry-run requires eager draft dry-run"
         if enable_eager_draft_dry_run:
             assert enable_eager_plan_dry_run, "Phase 1H-2 draft dry-run requires eager plan dry-run"
 
@@ -476,4 +482,6 @@ class StepPlan:
                 for seq_id, reason in self.eager_draft_discard_reason_by_seq_id.items()
             },
             "eager_dry_run_tokens_generated": int(self.eager_dry_run_tokens_generated),
+            "enable_eager_promotion_dry_run": bool(self.enable_eager_promotion_dry_run),
+            "eager_promotion_dry_run_enabled": bool(self.eager_promotion_dry_run_enabled),
         }

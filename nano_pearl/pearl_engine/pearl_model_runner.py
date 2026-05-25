@@ -30,7 +30,9 @@ from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from nano_pearl.pearl_engine.dual_batch import (
     BufferedProposal,
     DualBatchManager,
+    EAGER_STATE_DISCARDED,
     EAGER_STATE_DRAFTED_DRY_RUN,
+    EAGER_STATE_READY_TO_VERIFY,
     EagerProposal,
     EagerProposalBuffer,
     LANE_EAGER,
@@ -546,10 +548,26 @@ class ModelRunnerBase:
                 getattr(self.global_config, "enable_eager_draft_dry_run", False)
             ),
             "eager_draft_dry_run_enabled": False,
+            "enable_eager_promotion_dry_run": bool(
+                getattr(self.global_config, "enable_eager_promotion_dry_run", False)
+            ),
+            "eager_promotion_dry_run_enabled": False,
             "eager_buffer_size_before": self.eager_proposal_buffer.size(),
             "eager_buffer_size_after": self.eager_proposal_buffer.size(),
+            "eager_parent_seq_ids": [],
+            "eager_parent_accepted_len_by_seq_id": {},
+            "eager_parent_invalidated_len_by_seq_id": {},
+            "eager_parent_full_accept_by_seq_id": {},
+            "eager_parent_finished_by_seq_id": {},
             "eager_promoted_seq_ids": [],
+            "eager_promoted_proposal_ids": [],
             "eager_discarded_seq_ids": [],
+            "eager_discarded_proposal_ids": [],
+            "eager_promotion_reason_by_seq_id": {},
+            "eager_discard_reason_by_seq_id": {},
+            "eager_promotion_base_len_by_seq_id": {},
+            "eager_promotion_current_len_by_seq_id": {},
+            "eager_promotion_base_match_by_seq_id": {},
             "eager_verified_seq_ids": [],
             "eager_accepted_seq_ids": [],
             "eager_rejected_seq_ids": [],
@@ -655,6 +673,9 @@ class ModelRunnerBase:
     def _eager_draft_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_draft_dry_run", False))
 
+    def _eager_promotion_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_promotion_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -665,12 +686,14 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        draft_dry_run_enabled = self._eager_draft_dry_run_enabled()
+        promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled()
+        draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
         dry_run_enabled = self._eager_plan_dry_run_enabled() or draft_dry_run_enabled
         policy = str(getattr(self.global_config, "eager_policy", "none"))
         gamma = int(self.gamma)
         plan.enable_eager_plan_dry_run = dry_run_enabled
         plan.enable_eager_draft_dry_run = draft_dry_run_enabled
+        plan.enable_eager_promotion_dry_run = promotion_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -703,6 +726,7 @@ class ModelRunnerBase:
                 enable_eager_execution=False,
                 enable_eager_plan_dry_run=True,
                 enable_eager_draft_dry_run=draft_dry_run_enabled,
+                enable_eager_promotion_dry_run=promotion_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -786,6 +810,7 @@ class ModelRunnerBase:
             enable_eager_execution=False,
             enable_eager_plan_dry_run=True,
             enable_eager_draft_dry_run=draft_dry_run_enabled,
+            enable_eager_promotion_dry_run=promotion_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1846,6 +1871,139 @@ class DraftModelRunner(ModelRunnerBase):
             raise draft_error
         return proposals
 
+    def _parent_discard_reason(
+        self,
+        proposal: EagerProposal,
+        seq: Sequence | None,
+        accepted_len: int | None,
+        invalidated_len: int | None,
+    ) -> str | None:
+        if proposal.base_pre_verify:
+            return "selected_seq_pre_verify"
+        if seq is None or accepted_len is None or invalidated_len is None:
+            return "missing_parent_result"
+        if seq.is_finished:
+            return "parent_finished"
+        if getattr(seq, "status", None) != SequenceStatus.RUNNING:
+            return "selected_seq_not_running"
+        if int(accepted_len) != int(self.gamma) or int(invalidated_len) != 0:
+            return "parent_rejected" if int(accepted_len) == 0 else "parent_partial_accept"
+        if bool(seq.pre_verify):
+            return "parent_pre_verify_after_apply"
+        if len(seq) != int(proposal.base_len):
+            return "base_len_mismatch"
+        return None
+
+    def _evaluate_eager_promotion_dry_run(
+        self,
+        proposals: list[EagerProposal],
+        plan: StepPlan,
+        target_seqs: list[Sequence],
+        accepted_lens: dict[int, int],
+        invalidated_lens: dict[int, int],
+        trace_record: dict,
+    ) -> None:
+        if not proposals:
+            return
+
+        seq_by_id = {int(seq.seq_id): seq for seq in target_seqs}
+        target_home = {int(seq_id) for seq_id in plan.target_home_set}
+        promoted_seq_ids: list[int] = []
+        promoted_proposal_ids: list[int] = []
+        discarded_seq_ids: list[int] = []
+        discarded_proposal_ids: list[int] = []
+        parent_seq_ids: list[int] = []
+        parent_accepted_len_by_seq_id: dict[int, int] = {}
+        parent_invalidated_len_by_seq_id: dict[int, int] = {}
+        parent_full_accept_by_seq_id: dict[int, bool] = {}
+        parent_finished_by_seq_id: dict[int, bool] = {}
+        promotion_reason_by_seq_id: dict[int, str] = {}
+        discard_reason_by_seq_id: dict[int, str] = {}
+        base_len_by_seq_id: dict[int, int] = {}
+        current_len_by_seq_id: dict[int, int] = {}
+        base_match_by_seq_id: dict[int, bool] = {}
+        promoted_tokens = 0
+        discarded_tokens = 0
+
+        for proposal in proposals:
+            seq_id = int(proposal.seq_id)
+            seq = seq_by_id.get(seq_id)
+            accepted_len = accepted_lens.get(seq_id)
+            invalidated_len = invalidated_lens.get(seq_id)
+            parent_seq_ids.append(seq_id)
+            if accepted_len is not None:
+                parent_accepted_len_by_seq_id[seq_id] = int(accepted_len)
+            if invalidated_len is not None:
+                parent_invalidated_len_by_seq_id[seq_id] = int(invalidated_len)
+            parent_finished_by_seq_id[seq_id] = bool(seq.is_finished) if seq is not None else False
+            base_len_by_seq_id[seq_id] = int(proposal.base_len)
+            current_len_by_seq_id[seq_id] = -1 if seq is None else int(len(seq))
+            base_match_by_seq_id[seq_id] = seq is not None and int(len(seq)) == int(proposal.base_len)
+
+            if seq_id not in target_home:
+                discard_reason = "missing_parent_result"
+            else:
+                discard_reason = self._parent_discard_reason(
+                    proposal,
+                    seq,
+                    accepted_len,
+                    invalidated_len,
+                )
+            parent_full_accept = discard_reason is None
+            parent_full_accept_by_seq_id[seq_id] = parent_full_accept
+
+            if parent_full_accept:
+                proposal.state = EAGER_STATE_READY_TO_VERIFY
+                promoted_seq_ids.append(seq_id)
+                promoted_proposal_ids.append(int(proposal.proposal_id))
+                promoted_tokens += int(proposal.proposal_len)
+                promotion_reason_by_seq_id[seq_id] = "parent_normal_full_accept"
+            else:
+                proposal.state = EAGER_STATE_DISCARDED
+                proposal.valid = False
+                discarded_seq_ids.append(seq_id)
+                discarded_proposal_ids.append(int(proposal.proposal_id))
+                discarded_tokens += int(proposal.proposal_len)
+                discard_reason_by_seq_id[seq_id] = str(discard_reason)
+
+        trace_record["enable_eager_promotion_dry_run"] = True
+        trace_record["eager_promotion_dry_run_enabled"] = True
+        trace_record["eager_parent_seq_ids"] = parent_seq_ids
+        trace_record["eager_parent_accepted_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in parent_accepted_len_by_seq_id.items()
+        }
+        trace_record["eager_parent_invalidated_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in parent_invalidated_len_by_seq_id.items()
+        }
+        trace_record["eager_parent_full_accept_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in parent_full_accept_by_seq_id.items()
+        }
+        trace_record["eager_parent_finished_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in parent_finished_by_seq_id.items()
+        }
+        trace_record["eager_promoted_seq_ids"] = promoted_seq_ids
+        trace_record["eager_promoted_proposal_ids"] = promoted_proposal_ids
+        trace_record["eager_discarded_seq_ids"] = discarded_seq_ids
+        trace_record["eager_discarded_proposal_ids"] = discarded_proposal_ids
+        trace_record["eager_promotion_reason_by_seq_id"] = {
+            str(seq_id): reason for seq_id, reason in promotion_reason_by_seq_id.items()
+        }
+        trace_record["eager_discard_reason_by_seq_id"] = {
+            str(seq_id): reason for seq_id, reason in discard_reason_by_seq_id.items()
+        }
+        trace_record["eager_promotion_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_promotion_current_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in current_len_by_seq_id.items()
+        }
+        trace_record["eager_promotion_base_match_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_match_by_seq_id.items()
+        }
+        trace_record["eager_tokens_promoted"] = promoted_tokens
+        trace_record["eager_tokens_discarded"] = discarded_tokens
+        trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+
     def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
@@ -1903,6 +2061,8 @@ class DraftModelRunner(ModelRunnerBase):
 
         proposals = []
         draft_records = []
+        eager_proposals = []
+        eager_trace_record = None
         if draft_seqs:
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             if plan.plan_phase in {"priming", "steady"}:
@@ -1917,7 +2077,7 @@ class DraftModelRunner(ModelRunnerBase):
                 eager_trace_record = draft_records[-1]
             else:
                 eager_trace_record = self._trace_dual_batch_schedule([], plan, "eager_draft_dry_run")
-            self._run_eager_draft_dry_run(eager_draft_seqs, plan, eager_trace_record)
+            eager_proposals = self._run_eager_draft_dry_run(eager_draft_seqs, plan, eager_trace_record)
             self._finalize_record_profile(eager_trace_record)
 
         if target_seqs:
@@ -1928,6 +2088,15 @@ class DraftModelRunner(ModelRunnerBase):
             self._mark_trace_start(trace_record)
             verify_res = self._receive_verify_result(target_seqs)
             accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
+            if self._eager_promotion_dry_run_enabled() and eager_proposals:
+                self._evaluate_eager_promotion_dry_run(
+                    eager_proposals,
+                    plan,
+                    target_seqs,
+                    accepted_lens,
+                    invalidated_lens,
+                    eager_trace_record or trace_record,
+                )
             consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)

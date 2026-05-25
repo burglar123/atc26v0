@@ -134,8 +134,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "execution_mode": args.execution_mode,
         "enable_eager_execution": args.enable_eager_execution,
         "enable_eager_plan_dry_run": args.enable_eager_plan_dry_run
+        or args.enable_eager_promotion_dry_run
         or args.enable_eager_draft_dry_run,
-        "enable_eager_draft_dry_run": args.enable_eager_draft_dry_run,
+        "enable_eager_draft_dry_run": args.enable_eager_draft_dry_run
+        or args.enable_eager_promotion_dry_run,
+        "enable_eager_promotion_dry_run": args.enable_eager_promotion_dry_run,
         "eager_policy": args.eager_policy,
         "max_eager_requests_per_step": args.max_eager_requests_per_step,
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
@@ -160,6 +163,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_eager_execution",
         "enable_eager_plan_dry_run",
         "enable_eager_draft_dry_run",
+        "enable_eager_promotion_dry_run",
         "eager_policy",
         "max_eager_requests_per_step",
         "max_eager_tokens_per_step",
@@ -1433,6 +1437,11 @@ def main() -> None:
         "--enable-eager-draft-dry-run",
         action="store_true",
         help="Enable Phase 1H-2 eager draft dry-run with immediate rollback.",
+    )
+    parser.add_argument(
+        "--enable-eager-promotion-dry-run",
+        action="store_true",
+        help="Enable Phase 1H-3 parent promotion/discard dry-run without target eager verification.",
     )
     parser.add_argument(
         "--eager-policy",
