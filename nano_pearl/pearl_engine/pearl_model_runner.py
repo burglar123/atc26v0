@@ -709,6 +709,12 @@ class ModelRunnerBase:
 
         # 3. Early exit: policy disabled or not in steady phase.
         if plan.eager_policy == "none" or plan.plan_phase != "steady":
+            # Trace diagnostics for non-steady records: mark all target_home
+            # seqs as missing metadata with phase-based skip reason so the
+            # checker can distinguish expected absence from real gaps.
+            for _sid in plan.original_target_home_set:
+                plan.missing_eager_metadata_seq_ids.append(int(_sid))
+                plan.continuous_eager_skip_reason_by_seq_id[int(_sid)] = "not_steady_phase"
             return
 
         # 4. Populate rank-safe per-seq metadata snapshots for every seq in
