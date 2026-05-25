@@ -9,7 +9,7 @@ Validates:
   A. draft_eager_new_set_executed non-empty implies proposals were generated.
   B. draft_eager_continue_set seqs are NOT in draft_eager_new_set_executed.
   C. target_eager_set_executed remains empty (no target verification).
-  D. Executed seqs have continuous_eager_exec_base_kind = "draft_eager_new_set".
+  D. Executed seqs have base_kind = "normal_parent_full_accept_prefix"; skipped seqs may have base_kind = "draft_eager_new_set".
   E. scaffold_proposals_sent >= scaffold_proposals_received (cross-record).
   F. Promoted proposals have parent_acceptance_status = "accepted".
   G. tokens_generated > 0 iff draft_eager_new_set_executed non-empty.
@@ -25,6 +25,8 @@ Validates:
   Q. Sent/received proposal ids match.
   R. Sent/received token counts match.
   S. Proposals generated => sent > 0, received > 0.
+  T. unsupported_post_verify_seq must never appear as a skip reason.
+  U. Non-empty draft_eager_new_set with zero executed must have valid skip reasons.
 """
 
 from __future__ import annotations
@@ -272,19 +274,21 @@ def main() -> int:
                 f"{sorted(bad_continue)}"
             )
 
-        # Check D: executed seqs have base_kind = "draft_eager_new_set"
+        # Check D: executed seqs must have base_kind = "normal_parent_full_accept_prefix"
+        # (skipped seqs may have base_kind = "draft_eager_new_set").
         base_kind = record.get("continuous_eager_exec_base_kind_by_seq_id") or {}
         for sid in sorted(executed):
-            if str(sid) not in base_kind:
+            kind = base_kind.get(str(sid))
+            if kind is None:
                 if is_steady:
                     errors.append(
                         f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
                         f"in draft_eager_new_set_executed missing exec_base_kind"
                     )
-            elif base_kind[str(sid)] != "draft_eager_new_set":
+            elif kind not in ("normal_parent_full_accept_prefix", "draft_eager_new_set"):
                 errors.append(
                     f"record[{idx}] role={role} phase={phase}: seq_id={sid} "
-                    f"exec_base_kind='{base_kind[str(sid)]}' expected 'draft_eager_new_set'"
+                    f"exec_base_kind='{kind}' expected 'normal_parent_full_accept_prefix'"
                 )
 
         # Check J: base validation ok for all executed seqs
@@ -364,6 +368,37 @@ def main() -> int:
                 f"record[{idx}] role={role} phase={phase}: "
                 f"sent_proposal_ids != received_proposal_ids"
             )
+
+        # Check T: unsupported_post_verify_seq must NEVER appear as a skip reason.
+        # Post-verify seqs are the intended input for continuous eager.
+        _val_reasons = record.get("continuous_eager_exec_base_validation_reason_by_seq_id") or {}
+        for _sid_str, _reason in _val_reasons.items():
+            if _reason == "unsupported_post_verify_seq":
+                errors.append(
+                    f"record[{idx}] role={role} phase={phase}: seq_id={_sid_str} "
+                    f"has forbidden skip reason 'unsupported_post_verify_seq'. "
+                    f"Post-verify seqs are intended input for continuous eager; "
+                    f"use 'unsupported_missing_parent_tokens' if no parent proposal exists."
+                )
+
+        # Check U: non-empty draft_eager_new_set with zero executed must have
+        # all skipped seqs explained by valid reasons (not unsupported_post_verify_seq).
+        draft_new_set = as_int_set(record.get("draft_eager_new_set"))
+        if is_steady and draft_new_set and not executed:
+            _val_reasons_u = record.get("continuous_eager_exec_base_validation_reason_by_seq_id") or {}
+            for _sid in sorted(draft_new_set):
+                _reason_u = _val_reasons_u.get(str(_sid))
+                if _reason_u is None:
+                    errors.append(
+                        f"record[{idx}] role={role} phase={phase}: seq_id={_sid} "
+                        f"in draft_eager_new_set but not executed and has no validation reason"
+                    )
+                elif _reason_u == "unsupported_post_verify_seq":
+                    errors.append(
+                        f"record[{idx}] role={role} phase={phase}: seq_id={_sid} "
+                        f"in draft_eager_new_set skipped with forbidden reason "
+                        f"'unsupported_post_verify_seq'"
+                    )
 
     # --- Cross-record checks ---
 

@@ -3676,21 +3676,57 @@ class DraftModelRunner(ModelRunnerBase):
         ce_scaffold_trace_record = None
         if (self.global_config.enable_continuous_eager_draft_execution
                 and plan.draft_eager_new_set and plan.plan_phase == "steady"):
-            # Base validation: validate each seq before execution.
-            # Skip seqs with missing tokens, missing seqs, or base validation failures.
+            # Conditional base construction: for each seq in draft_eager_new_set,
+            # locate the normal parent proposal in dual_proposal_buffer.
+            # The eager draft base = verified prefix + parent proposal tokens.
+            # Post-verify seqs are the intended input — do NOT reject them.
             _all_new_seqs = self._resolve_dual_seq_ids(
                 plan.draft_eager_new_set, plan, "ce_scaffold_draft",
             )
             ce_new_seqs = []
             _skipped_base_validation: dict[int, str] = {}
+            _post_verify_parent_append: dict[int, int] = {}  # seq_id -> parent token count
+
             for _s in _all_new_seqs:
                 _sid = int(_s.seq_id)
-                if not _s.pre_verify:
-                    _skipped_base_validation[_sid] = "unsupported_post_verify_seq"
-                elif len(_s) == 0:
+                if len(_s) == 0:
                     _skipped_base_validation[_sid] = "unsupported_empty_seq"
-                else:
+                    continue
+
+                # Locate parent proposal in dual_proposal_buffer.
+                _parent_proposals = self.dual_proposal_buffer.get_many([_sid])
+                if not _parent_proposals:
+                    _skipped_base_validation[_sid] = "unsupported_missing_parent_tokens"
+                    continue
+                _parent = _parent_proposals[0]
+                _parent_tokens = list(_parent.to_be_verified_token_ids)
+                if not _parent_tokens:
+                    _skipped_base_validation[_sid] = "unsupported_missing_parent_tokens"
+                    continue
+
+                _parent_len = len(_parent_tokens)
+                _verified_len = len(_s) if not _s.pre_verify else (len(_s) - _parent_len)
+                _expected_base = _verified_len + _parent_len
+
+                if not _s.pre_verify:
+                    # Post-verify: parent tokens are NOT yet in the seq.
+                    # Temporarily append them to construct the eager draft base.
+                    for _tid in _parent_tokens:
+                        _s.append_token(_tid)
+                    _post_verify_parent_append[_sid] = _parent_len
                     ce_new_seqs.append(_s)
+                else:
+                    # Pre-verify: parent tokens (from Phase 1 normal draft)
+                    # are already in the seq. No temporary append needed.
+                    ce_new_seqs.append(_s)
+
+                # Record per-seq metadata BEFORE generation.
+                plan.continuous_eager_exec_base_kind_by_seq_id[_sid] = (
+                    "normal_parent_full_accept_prefix"
+                )
+                plan.continuous_eager_exec_parent_len_by_seq_id[_sid] = _parent_len
+                plan.continuous_eager_exec_expected_base_len_by_seq_id[_sid] = _expected_base
+
             if _skipped_base_validation:
                 plan.continuous_eager_exec_base_validation_ok_by_seq_id.update({
                     int(sid): False for sid in _skipped_base_validation
@@ -3707,26 +3743,37 @@ class DraftModelRunner(ModelRunnerBase):
 
             ce_scaffold_proposals, ce_scaffold_trace_record = \
                 self._draft_continuous_eager_scaffold_proposals(ce_new_seqs, plan)
+
+            # Rollback parent tokens that were temporarily appended for
+            # post-verify seqs (eager tokens already rolled back inside
+            # _draft_continuous_eager_scaffold_proposals).
+            for _s in ce_new_seqs:
+                _sid = int(_s.seq_id)
+                if _sid in _post_verify_parent_append:
+                    _extra = _post_verify_parent_append[_sid]
+                    self.scheduler.rollback(_s, _extra)
+                    assert len(_s) == plan.continuous_eager_exec_expected_base_len_by_seq_id.get(_sid, len(_s)) - _extra, \
+                        self._proposal_assertion_message(
+                            plan,
+                            f"ce scaffold parent rollback failed for seq_id={_sid}: "
+                            f"expected_len={plan.continuous_eager_exec_expected_base_len_by_seq_id.get(_sid, 0) - _extra}, "
+                            f"got={len(_s)}",
+                        )
+
             self.continuous_eager_draft_buffer.store(ce_scaffold_proposals)
             plan.draft_eager_new_set_executed = sorted(p.seq_id for p in ce_scaffold_proposals)
             plan.continuous_eager_scaffold_tokens_generated = sum(
                 p.eager_len for p in ce_scaffold_proposals
             )
             plan.continuous_eager_scaffold_proposals_generated = len(ce_scaffold_proposals)
-            _ce_seq_map = {int(s.seq_id): s for s in ce_new_seqs}
             for p in ce_scaffold_proposals:
-                plan.continuous_eager_exec_base_kind_by_seq_id[p.seq_id] = "draft_eager_new_set"
                 plan.continuous_eager_exec_base_len_by_seq_id[p.seq_id] = int(p.eager_base_len)
                 plan.continuous_eager_exec_base_is_valid_by_seq_id[p.seq_id] = True
                 plan.continuous_eager_exec_base_validation_ok_by_seq_id[p.seq_id] = True
                 plan.continuous_eager_exec_base_validation_reason_by_seq_id[p.seq_id] = (
-                    "seq_len_matches_eager_base_len"
+                    "normal_parent_full_accept_prefix"
                 )
-                plan.continuous_eager_exec_expected_base_len_by_seq_id[p.seq_id] = int(p.eager_base_len)
-                _ce_seq = _ce_seq_map.get(int(p.seq_id))
-                plan.continuous_eager_exec_parent_len_by_seq_id[p.seq_id] = (
-                    int(len(_ce_seq)) if _ce_seq is not None else int(p.eager_base_len)
-                )
+                # base_kind and parent_len are already set above (pre-generation).
 
             # Write base validation metadata to the scaffold trace record
             # (set after _trace_dual_batch_schedule already captured plan snapshot).
