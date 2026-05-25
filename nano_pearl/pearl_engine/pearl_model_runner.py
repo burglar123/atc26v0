@@ -4069,34 +4069,27 @@ class TargetModelRunner(ModelRunnerBase):
                     _target_receive_eager_info.append(_info)
                 if _target_receive_eager_info:
                     plan.t_eager_receive_info = _target_receive_eager_info
-                # Fail-fast 1: no eager proposal for post-verify seq on TARGET.
+                # Validate received eager proposals against local target seq state.
+                # In H2 steady, the target seq may already be post-verify because
+                # normal verification runs before eager proposal receive.  The
+                # compatibility check is base_len match, not pre_verify.
+                receive_ok = True
+                receive_reasons = []
                 for ep in received_eager:
                     _sid = int(ep.seq_id)
                     _seq = _running_ids.get(_sid)
-                    if _seq is not None and not _seq.pre_verify:
+                    if _seq is None:
                         assert False, self._proposal_assertion_message(
                             plan,
-                            f"eager proposal received for post-verify seq on TARGET: "
-                            f"seq_id={_sid}, "
-                            f"target_seq_pre_verify_at_receive={bool(_seq.pre_verify)}, "
-                            f"draft_eager_set={plan.draft_eager_set}, "
-                            f"expected_eager_proposal_seq_ids={plan.expected_eager_proposal_seq_ids}, "
-                            f"source_step_id={ep.source_step_id}, "
-                            f"source_plan_id={ep.source_plan_id}, "
-                            f"source_home_batch_id={ep.source_home_batch_id}, "
-                            f"eager_base_len={ep.eager_base_len}, "
-                            f"original_eager_base_len_at_generation={ep.original_eager_base_len_at_generation}, "
-                            f"local_seq_len={len(_seq)}",
+                            f"eager proposal received for unknown seq on TARGET: "
+                            f"seq_id={_sid}, source_plan_id={ep.source_plan_id}, "
+                            f"source_step_id={ep.source_step_id}",
                         )
-                # Fail-fast 2: verify eager_base_len matches local seq length.
-                for ep in received_eager:
-                    _sid = int(ep.seq_id)
-                    _seq = _running_ids.get(_sid)
-                    if _seq is not None:
-                        _ep_base = int(ep.eager_base_len)
-                        _seq_len = int(len(_seq))
-                        _orig_base = int(ep.original_eager_base_len_at_generation)
-                        assert _ep_base == _seq_len, self._proposal_assertion_message(
+                    _ep_base = int(ep.eager_base_len)
+                    _seq_len = int(len(_seq))
+                    _orig_base = int(ep.original_eager_base_len_at_generation)
+                    if _ep_base != _seq_len:
+                        assert False, self._proposal_assertion_message(
                             plan,
                             f"eager_base_len mismatch at TARGET receive for seq_id={_sid}: "
                             f"eager_base_len={_ep_base}, local_seq_len={_seq_len}, "
@@ -4109,6 +4102,20 @@ class TargetModelRunner(ModelRunnerBase):
                             f"fixup_skipped={getattr(plan, 'eager_base_len_fixup_skipped', None)}, "
                             f"before_send_info={getattr(plan, 'before_send_eager_info', None)}",
                         )
+                    if not _seq.pre_verify:
+                        receive_reasons.append(
+                            f"seq_id={_sid} post-verify at receive (base_len OK: {_ep_base}=={_seq_len})"
+                        )
+                    if _ep_base != _orig_base:
+                        receive_reasons.append(
+                            f"seq_id={_sid} base_len fixup detected: orig={_orig_base} current={_ep_base}"
+                        )
+                plan.eager_receive_validation_ok = True if received_eager else plan.eager_receive_validation_ok
+                if receive_reasons:
+                    plan.eager_receive_validation_reason = (
+                        (plan.eager_receive_validation_reason + "; " if plan.eager_receive_validation_reason else "")
+                        + "; ".join(receive_reasons)
+                    )
             plan.normal_proposal_buffer_keys_after_receive = self.dual_proposal_buffer.pending_seq_ids()
             plan.eager_buffer_keys_after_receive = self.eager_proposal_buffer.keys()
         else:
