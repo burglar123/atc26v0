@@ -134,26 +134,33 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "execution_mode": args.execution_mode,
         "enable_eager_execution": args.enable_eager_execution,
         "enable_eager_plan_dry_run": args.enable_eager_plan_dry_run
+        or args.enable_eager_apply_dry_run
         or args.enable_eager_verify_dry_run
         or args.enable_eager_schedule_dry_run
         or args.enable_eager_transfer_dry_run
         or args.enable_eager_promotion_dry_run
         or args.enable_eager_draft_dry_run,
         "enable_eager_draft_dry_run": args.enable_eager_draft_dry_run
+        or args.enable_eager_apply_dry_run
         or args.enable_eager_verify_dry_run
         or args.enable_eager_schedule_dry_run
         or args.enable_eager_transfer_dry_run
         or args.enable_eager_promotion_dry_run,
         "enable_eager_promotion_dry_run": args.enable_eager_promotion_dry_run
+        or args.enable_eager_apply_dry_run
         or args.enable_eager_verify_dry_run
         or args.enable_eager_schedule_dry_run
         or args.enable_eager_transfer_dry_run,
         "enable_eager_transfer_dry_run": args.enable_eager_transfer_dry_run
+        or args.enable_eager_apply_dry_run
         or args.enable_eager_verify_dry_run
         or args.enable_eager_schedule_dry_run,
         "enable_eager_schedule_dry_run": args.enable_eager_schedule_dry_run
+        or args.enable_eager_apply_dry_run
         or args.enable_eager_verify_dry_run,
-        "enable_eager_verify_dry_run": args.enable_eager_verify_dry_run,
+        "enable_eager_verify_dry_run": args.enable_eager_verify_dry_run
+        or args.enable_eager_apply_dry_run,
+        "enable_eager_apply_dry_run": args.enable_eager_apply_dry_run,
         "eager_policy": args.eager_policy,
         "max_eager_requests_per_step": args.max_eager_requests_per_step,
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
@@ -182,6 +189,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_eager_transfer_dry_run",
         "enable_eager_schedule_dry_run",
         "enable_eager_verify_dry_run",
+        "enable_eager_apply_dry_run",
         "eager_policy",
         "max_eager_requests_per_step",
         "max_eager_tokens_per_step",
@@ -1475,6 +1483,11 @@ def main() -> None:
         "--enable-eager-verify-dry-run",
         action="store_true",
         help="Enable Phase 1H-5a target eager verification dry-run without eager apply.",
+    )
+    parser.add_argument(
+        "--enable-eager-apply-dry-run",
+        action="store_true",
+        help="Enable Phase 1H-5b target eager apply dry-run with immediate rollback.",
     )
     parser.add_argument(
         "--eager-policy",
