@@ -12,7 +12,7 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from nano_pearl.utils.pearl_logger import logger
-from nano_pearl.pearl_config import PEARLConfig
+from nano_pearl.pearl_config import PEARLConfig, validate_eager_gamma
 from dataclasses import dataclass
 from nano_pearl.models import model_dict
 from nano_pearl.utils.loader import load_model
@@ -635,6 +635,130 @@ class ModelRunnerBase:
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
         return self.dual_proposal_buffer.discard_inactive(active_seq_ids)
 
+    def _eager_plan_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_plan_dry_run", False))
+
+    def _pending_eager_seq_ids(self) -> set[int]:
+        return {
+            int(seq_id)
+            for seq_id in (
+                self.eager_proposal_buffer.pending_seq_ids()
+                + self.eager_proposal_buffer.ready_seq_ids()
+            )
+        }
+
+    def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
+        dry_run_enabled = self._eager_plan_dry_run_enabled()
+        policy = str(getattr(self.global_config, "eager_policy", "none"))
+        gamma = int(self.gamma)
+        plan.enable_eager_plan_dry_run = dry_run_enabled
+        plan.eager_policy = policy
+        plan.eager_post_verify_only = True
+        plan.eager_gamma_equals_global_gamma = (
+            int(getattr(self.global_config, "max_eager_tokens_per_request", 0) or 0) == gamma
+        )
+        plan.eager_active_seq_ids = []
+        plan.eager_ready_seq_ids = self.eager_proposal_buffer.ready_seq_ids()
+        plan.eager_continuing_set = []
+        plan.target_eager_set = []
+
+        if not dry_run_enabled:
+            return
+
+        if policy == "none":
+            return
+        if policy != "tight_only":
+            raise ValueError(f"Unsupported eager_policy={policy!r}; Phase 1H-1 supports only 'none' and 'tight_only'")
+
+        if plan.execution_mode != "dual_batch_pearl" or plan.plan_phase != "steady":
+            plan.validate_phase1h_eager_scaffold(
+                enable_eager_execution=False,
+                enable_eager_plan_dry_run=True,
+                global_gamma=gamma,
+            )
+            return
+
+        target_seq_ids = [int(seq_id) for seq_id in plan.target_home_set]
+        target_home_set = set(target_seq_ids)
+        target_seqs = self.scheduler.find_by_seq_ids(target_seq_ids) if target_seq_ids else []
+        seq_by_id = {int(seq.seq_id): seq for seq in target_seqs}
+        running_seq_ids = {int(seq.seq_id) for seq in self.scheduler.running}
+        pending_eager_seq_ids = self._pending_eager_seq_ids()
+
+        plan.eager_candidate_seq_ids = list(target_seq_ids)
+        plan.eager_skipped_not_in_target_home_set_seq_ids = []
+        selected_candidates = []
+        reject_reasons: dict[int, str] = {}
+        skipped_pre_verify = []
+        skipped_non_tight = []
+        pre_verify_candidate_count = 0
+        post_verify_candidate_count = 0
+
+        for seq_id in target_seq_ids:
+            seq = seq_by_id.get(seq_id)
+            reason = None
+            if seq_id not in target_home_set:
+                reason = "not_in_target_home_set"
+            elif seq is None:
+                reason = "missing_sequence"
+            elif int(seq.seq_id) not in running_seq_ids or getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                reason = "not_running"
+            elif seq.is_finished:
+                reason = "finished"
+            elif seq_id in plan.eager_active_seq_ids:
+                reason = "already_eager_active"
+            elif seq_id in pending_eager_seq_ids:
+                reason = "pending_eager_proposal"
+            elif bool(seq.pre_verify):
+                reason = "pre_verify"
+                pre_verify_candidate_count += 1
+                skipped_pre_verify.append(seq_id)
+            else:
+                post_verify_candidate_count += 1
+                if getattr(seq, "slo_class", None) != "tight":
+                    reason = "non_tight"
+                    skipped_non_tight.append(seq_id)
+
+            if reason is None:
+                selected_candidates.append(seq)
+            else:
+                reject_reasons[seq_id] = reason
+
+        plan.eager_pre_verify_candidate_count = pre_verify_candidate_count
+        plan.eager_post_verify_candidate_count = post_verify_candidate_count
+        plan.eager_skipped_pre_verify_seq_ids = sorted(skipped_pre_verify)
+        plan.eager_skipped_non_tight_seq_ids = sorted(skipped_non_tight)
+        plan.eager_candidate_reject_reason_by_seq_id = reject_reasons
+
+        selected_candidates = sorted(selected_candidates, key=lambda seq: int(seq.seq_id))
+        if selected_candidates and int(getattr(self.global_config, "max_eager_requests_per_step", 0) or 0) > 0:
+            validate_eager_gamma(self.global_config, gamma)
+
+        max_requests = int(getattr(self.global_config, "max_eager_requests_per_step", 0) or 0)
+        selected = selected_candidates[:max_requests]
+        selected_seq_ids = [int(seq.seq_id) for seq in selected]
+
+        plan.eager_new_selected_set = list(selected_seq_ids)
+        plan.draft_eager_set = list(selected_seq_ids)
+        plan.target_eager_set = []
+        plan.eager_selected_seq_ids = list(selected_seq_ids)
+        plan.eager_budget_by_seq_id = {seq_id: gamma for seq_id in selected_seq_ids}
+        plan.eager_total_budget = len(selected_seq_ids) * gamma
+        for seq in selected:
+            seq_id = int(seq.seq_id)
+            if seq_id not in plan.budgets:
+                plan.budgets[seq_id] = RequestBudget(normal_gamma=gamma, eager_gamma=0)
+            plan.budgets[seq_id].eager_gamma = gamma
+            plan.eager_base_len_by_seq_id[seq_id] = len(seq)
+            plan.eager_base_pre_verify_by_seq_id[seq_id] = bool(seq.pre_verify)
+            plan.eager_parent_kind_by_seq_id[seq_id] = "normal"
+
+        plan.validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=True,
+            global_gamma=gamma,
+        )
+
     def _build_dual_batch_step_plan(self) -> StepPlan:
         proposal_buffer_size_before = self.dual_proposal_buffer.size()
         dropped_seq_ids = self._prepare_dual_batch_state()
@@ -650,6 +774,7 @@ class ModelRunnerBase:
             pending_batch_ids=self.dual_proposal_buffer.pending_batch_ids(),
             enable_eager_execution=bool(getattr(self.global_config, "enable_eager_execution", False)),
         )
+        self._apply_eager_plan_dry_run(plan)
         buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()

@@ -133,6 +133,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "execution_mode": args.execution_mode,
         "enable_eager_execution": args.enable_eager_execution,
+        "enable_eager_plan_dry_run": args.enable_eager_plan_dry_run,
         "eager_policy": args.eager_policy,
         "max_eager_requests_per_step": args.max_eager_requests_per_step,
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
@@ -155,6 +156,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
     for key in (
         "execution_mode",
         "enable_eager_execution",
+        "enable_eager_plan_dry_run",
         "eager_policy",
         "max_eager_requests_per_step",
         "max_eager_tokens_per_step",
@@ -1418,6 +1420,11 @@ def main() -> None:
         "--enable-eager-execution",
         action="store_true",
         help="Enable future continuous eager execution. Phase 1H-0 raises NotImplementedError.",
+    )
+    parser.add_argument(
+        "--enable-eager-plan-dry-run",
+        action="store_true",
+        help="Enable Phase 1H-1 eager planning trace dry-run without eager execution.",
     )
     parser.add_argument(
         "--eager-policy",

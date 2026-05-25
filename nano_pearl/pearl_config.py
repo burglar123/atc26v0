@@ -11,6 +11,7 @@ import torch.distributed as dist
 PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
     "Phase 1H-0 only adds eager scaffolding; eager execution is not implemented yet."
 )
+EAGER_POLICIES = {"none", "tight_only"}
 
 
 def validate_eager_gamma(config, gamma: int) -> bool:
@@ -128,6 +129,7 @@ class PEARLConfig:
     gamma: int = -1
     execution_mode: str = "parallel_pearl"
     enable_eager_execution: bool = False
+    enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -140,7 +142,13 @@ class PEARLConfig:
                 f"Expected one of {sorted(self.ALLOWED_EXECUTION_MODES)}."
             )
         self.enable_eager_execution = bool(self.enable_eager_execution)
+        self.enable_eager_plan_dry_run = bool(self.enable_eager_plan_dry_run)
         self.eager_policy = str(self.eager_policy)
+        if self.eager_policy not in EAGER_POLICIES:
+            raise ValueError(
+                f"Invalid eager_policy={self.eager_policy!r}. "
+                f"Expected one of {sorted(EAGER_POLICIES)}."
+            )
         for field_name in (
             "max_eager_requests_per_step",
             "max_eager_tokens_per_step",
@@ -170,6 +178,7 @@ class PEARLConfig:
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Execution_Mode={self.execution_mode}")
         logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
+        logger.info(f"Enable_Eager_Plan_Dry_Run={self.enable_eager_plan_dry_run}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")

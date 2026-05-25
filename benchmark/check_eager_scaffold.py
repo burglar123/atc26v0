@@ -374,6 +374,46 @@ def check_step_plan_validation() -> None:
         "continuing eager subset",
     )
 
+    dry_run_allowed = make_step_plan(
+        target_eager_set=[],
+        draft_eager_set=[1],
+        budgets={1: RequestBudget(normal_gamma=4, eager_gamma=4)},
+        eager_gamma=0,
+        eager_new_selected_set=[1],
+        eager_continuing_set=[],
+        eager_active_seq_ids=[],
+        eager_ready_seq_ids=[],
+        eager_selected_seq_ids=[1],
+        eager_budget_by_seq_id={1: 4},
+        eager_total_budget=4,
+        eager_base_pre_verify_by_seq_id={1: False},
+        eager_base_len_by_seq_id={1: 32},
+        eager_parent_kind_by_seq_id={1: LANE_NORMAL},
+    )
+    dry_run_allowed.validate_phase1h_eager_scaffold(
+        enable_eager_execution=False,
+        enable_eager_plan_dry_run=True,
+        global_gamma=4,
+    )
+    expect_raises(
+        lambda: make_step_plan(
+            target_eager_set=[],
+            draft_eager_set=[1],
+            budgets={1: RequestBudget(normal_gamma=4, eager_gamma=4)},
+            eager_new_selected_set=[1],
+            eager_selected_seq_ids=[1],
+            eager_budget_by_seq_id={1: 4},
+            eager_total_budget=4,
+            eager_base_pre_verify_by_seq_id={1: True},
+        ).validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=True,
+            global_gamma=4,
+        ),
+        AssertionError,
+        "dry-run rejects pre_verify selected seq",
+    )
+
 
 def check_eager_gamma_validation() -> None:
     valid = SimpleNamespace(

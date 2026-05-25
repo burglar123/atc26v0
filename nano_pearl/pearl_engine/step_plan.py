@@ -106,6 +106,21 @@ class StepPlan:
     proposal_buffer_dropped_count: int = 0
     proposal_buffer_invalid_count: int = 0
 
+    enable_eager_plan_dry_run: bool = False
+    eager_policy: str = "none"
+    eager_candidate_seq_ids: List[int] = field(default_factory=list)
+    eager_candidate_reject_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    eager_selected_seq_ids: List[int] = field(default_factory=list)
+    eager_budget_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_total_budget: int = 0
+    eager_post_verify_only: bool = True
+    eager_gamma_equals_global_gamma: bool = False
+    eager_pre_verify_candidate_count: int = 0
+    eager_post_verify_candidate_count: int = 0
+    eager_skipped_pre_verify_seq_ids: List[int] = field(default_factory=list)
+    eager_skipped_non_tight_seq_ids: List[int] = field(default_factory=list)
+    eager_skipped_not_in_target_home_set_seq_ids: List[int] = field(default_factory=list)
+
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
 
@@ -172,7 +187,12 @@ class StepPlan:
             return int(self.eager_gamma)
         return None
 
-    def validate_phase1h_eager_scaffold(self, enable_eager_execution: bool):
+    def validate_phase1h_eager_scaffold(
+        self,
+        enable_eager_execution: bool,
+        enable_eager_plan_dry_run: bool = False,
+        global_gamma: int | None = None,
+    ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
         draft_home = set(int(seq_id) for seq_id in self.draft_home_set)
         target_eager = set(int(seq_id) for seq_id in self.target_eager_set)
@@ -211,7 +231,7 @@ class StepPlan:
             f"extra={sorted(represented_continuing - target_eager)}"
         )
 
-        gamma = self._inferred_gamma_for_eager_validation()
+        gamma = int(global_gamma) if global_gamma is not None else self._inferred_gamma_for_eager_validation()
         if self.eager_gamma and gamma is not None:
             assert int(self.eager_gamma) in {0, int(gamma)}, (
                 f"plan eager_gamma must be 0 or gamma={gamma}, got {self.eager_gamma}"
@@ -247,9 +267,50 @@ class StepPlan:
             self.eager_parent_kind_by_seq_id,
         ]
         has_eager_scaffold = any(eager_list_fields) or any(eager_mapping_fields)
-        assert bool(enable_eager_execution) or not has_eager_scaffold, (
+        assert bool(enable_eager_execution) or bool(enable_eager_plan_dry_run) or not has_eager_scaffold, (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+
+        if enable_eager_plan_dry_run:
+            assert not target_eager, (
+                f"Phase 1H-1 dry-run requires empty target_eager_set, got {self.target_eager_set}"
+            )
+            assert draft_eager <= target_home, (
+                f"Phase 1H-1 dry-run requires draft_eager_set subset of target_home_set: "
+                f"extra={sorted(draft_eager - target_home)}"
+            )
+            assert set(int(seq_id) for seq_id in self.eager_new_selected_set) == draft_eager, (
+                f"Phase 1H-1 dry-run requires eager_new_selected_set == draft_eager_set: "
+                f"eager_new_selected_set={self.eager_new_selected_set}, draft_eager_set={self.draft_eager_set}"
+            )
+            assert not self.eager_continuing_set, (
+                f"Phase 1H-1 dry-run requires empty eager_continuing_set, got {self.eager_continuing_set}"
+            )
+            selected = sorted(draft_eager)
+            for seq_id in selected:
+                budget = self.budgets.get(seq_id)
+                assert budget is not None, f"missing budget for selected eager seq_id={seq_id}"
+                assert gamma is not None, f"missing global gamma for selected eager seq_id={seq_id}"
+                assert int(budget.eager_gamma) == int(budget.normal_gamma) == int(gamma), (
+                    f"selected eager seq_id={seq_id} must have eager_gamma == normal_gamma == "
+                    f"global gamma={gamma}, got eager_gamma={budget.eager_gamma}, "
+                    f"normal_gamma={budget.normal_gamma}"
+                )
+                assert int(self.eager_budget_by_seq_id.get(seq_id, 0)) == int(gamma), (
+                    f"selected eager seq_id={seq_id} must have eager budget gamma={gamma}, "
+                    f"got {self.eager_budget_by_seq_id.get(seq_id)}"
+                )
+                assert self.eager_base_pre_verify_by_seq_id.get(seq_id) is False, (
+                    f"selected eager seq_id={seq_id} must be post_verify"
+                )
+            assert set(int(seq_id) for seq_id in self.eager_selected_seq_ids) == draft_eager, (
+                f"Phase 1H-1 dry-run requires eager_selected_seq_ids == draft_eager_set: "
+                f"eager_selected_seq_ids={self.eager_selected_seq_ids}, draft_eager_set={self.draft_eager_set}"
+            )
+            assert int(self.eager_total_budget) == len(selected) * (int(gamma) if gamma is not None else 0), (
+                f"eager_total_budget mismatch: expected={len(selected) * (int(gamma) if gamma is not None else 0)}, "
+                f"got={self.eager_total_budget}"
+            )
 
     def to_trace_dict(self) -> dict:
         return {
@@ -334,4 +395,26 @@ class StepPlan:
             "proposal_buffer_consumed_count": int(self.proposal_buffer_consumed_count),
             "proposal_buffer_dropped_count": int(self.proposal_buffer_dropped_count),
             "proposal_buffer_invalid_count": int(self.proposal_buffer_invalid_count),
+            "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
+            "eager_policy": self.eager_policy,
+            "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),
+            "eager_candidate_reject_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.eager_candidate_reject_reason_by_seq_id.items()
+            },
+            "eager_selected_seq_ids": _int_list(self.eager_selected_seq_ids),
+            "eager_budget_by_seq_id": _trace_mapping(
+                self.eager_budget_by_seq_id,
+                lambda value: int(value),
+            ),
+            "eager_total_budget": int(self.eager_total_budget),
+            "eager_post_verify_only": bool(self.eager_post_verify_only),
+            "eager_gamma_equals_global_gamma": bool(self.eager_gamma_equals_global_gamma),
+            "eager_pre_verify_candidate_count": int(self.eager_pre_verify_candidate_count),
+            "eager_post_verify_candidate_count": int(self.eager_post_verify_candidate_count),
+            "eager_skipped_pre_verify_seq_ids": _int_list(self.eager_skipped_pre_verify_seq_ids),
+            "eager_skipped_non_tight_seq_ids": _int_list(self.eager_skipped_non_tight_seq_ids),
+            "eager_skipped_not_in_target_home_set_seq_ids": _int_list(
+                self.eager_skipped_not_in_target_home_set_seq_ids
+            ),
         }
