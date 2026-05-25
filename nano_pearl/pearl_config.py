@@ -130,6 +130,7 @@ class PEARLConfig:
     execution_mode: str = "parallel_pearl"
     enable_eager_execution: bool = False
     enable_eager_plan_dry_run: bool = False
+    enable_eager_draft_dry_run: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -143,6 +144,9 @@ class PEARLConfig:
             )
         self.enable_eager_execution = bool(self.enable_eager_execution)
         self.enable_eager_plan_dry_run = bool(self.enable_eager_plan_dry_run)
+        self.enable_eager_draft_dry_run = bool(self.enable_eager_draft_dry_run)
+        if self.enable_eager_draft_dry_run:
+            self.enable_eager_plan_dry_run = True
         self.eager_policy = str(self.eager_policy)
         if self.eager_policy not in EAGER_POLICIES:
             raise ValueError(
@@ -160,6 +164,19 @@ class PEARLConfig:
             setattr(self, field_name, value)
         if self.enable_eager_execution:
             raise NotImplementedError(PHASE_1H0_EAGER_NOT_IMPLEMENTED)
+        if self.enable_eager_draft_dry_run:
+            if self.execution_mode != "dual_batch_pearl":
+                raise ValueError(
+                    "enable_eager_draft_dry_run requires execution_mode='dual_batch_pearl'"
+                )
+            if self.eager_policy == "none":
+                raise ValueError("enable_eager_draft_dry_run requires eager_policy != 'none'")
+            if self.max_eager_requests_per_step <= 0:
+                raise ValueError(
+                    "enable_eager_draft_dry_run requires max_eager_requests_per_step > 0"
+                )
+            if int(self.gamma) > 0:
+                validate_eager_gamma(self, int(self.gamma))
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
         draft_devices = list(range(self.draft_tensor_parallel_size))
@@ -179,6 +196,7 @@ class PEARLConfig:
         logger.info(f"Execution_Mode={self.execution_mode}")
         logger.info(f"Enable_Eager_Execution={self.enable_eager_execution}")
         logger.info(f"Enable_Eager_Plan_Dry_Run={self.enable_eager_plan_dry_run}")
+        logger.info(f"Enable_Eager_Draft_Dry_Run={self.enable_eager_draft_dry_run}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")

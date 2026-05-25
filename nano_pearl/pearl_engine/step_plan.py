@@ -120,6 +120,18 @@ class StepPlan:
     eager_skipped_pre_verify_seq_ids: List[int] = field(default_factory=list)
     eager_skipped_non_tight_seq_ids: List[int] = field(default_factory=list)
     eager_skipped_not_in_target_home_set_seq_ids: List[int] = field(default_factory=list)
+    enable_eager_draft_dry_run: bool = False
+    eager_draft_dry_run_enabled: bool = False
+    eager_draft_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_proposal_ids: List[int] = field(default_factory=list)
+    eager_draft_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_draft_base_pre_verify_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    eager_draft_to_verify_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_draft_proposal_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
+    eager_draft_rollback_seq_ids: List[int] = field(default_factory=list)
+    eager_draft_rollback_ok_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    eager_draft_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    eager_dry_run_tokens_generated: int = 0
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -191,6 +203,7 @@ class StepPlan:
         self,
         enable_eager_execution: bool,
         enable_eager_plan_dry_run: bool = False,
+        enable_eager_draft_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
@@ -256,6 +269,9 @@ class StepPlan:
             self.eager_continuing_set,
             self.eager_active_seq_ids,
             self.eager_ready_seq_ids,
+            self.eager_draft_seq_ids,
+            self.eager_draft_proposal_ids,
+            self.eager_draft_rollback_seq_ids,
             list(getattr(self, "draft_eager_set_new", [])),
             list(getattr(self, "continuing_eager_set", [])),
         ]
@@ -265,26 +281,39 @@ class StepPlan:
             self.eager_base_len_by_seq_id,
             self.eager_base_pre_verify_by_seq_id,
             self.eager_parent_kind_by_seq_id,
+            self.eager_draft_base_len_by_seq_id,
+            self.eager_draft_base_pre_verify_by_seq_id,
+            self.eager_draft_to_verify_len_by_seq_id,
+            self.eager_draft_proposal_len_by_seq_id,
+            self.eager_draft_rollback_ok_by_seq_id,
+            self.eager_draft_discard_reason_by_seq_id,
         ]
         has_eager_scaffold = any(eager_list_fields) or any(eager_mapping_fields)
-        assert bool(enable_eager_execution) or bool(enable_eager_plan_dry_run) or not has_eager_scaffold, (
+        assert (
+            bool(enable_eager_execution)
+            or bool(enable_eager_plan_dry_run)
+            or bool(enable_eager_draft_dry_run)
+            or not has_eager_scaffold
+        ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+        if enable_eager_draft_dry_run:
+            assert enable_eager_plan_dry_run, "Phase 1H-2 draft dry-run requires eager plan dry-run"
 
         if enable_eager_plan_dry_run:
             assert not target_eager, (
-                f"Phase 1H-1 dry-run requires empty target_eager_set, got {self.target_eager_set}"
+                f"Phase 1H dry-run requires empty target_eager_set, got {self.target_eager_set}"
             )
             assert draft_eager <= target_home, (
-                f"Phase 1H-1 dry-run requires draft_eager_set subset of target_home_set: "
+                f"Phase 1H dry-run requires draft_eager_set subset of target_home_set: "
                 f"extra={sorted(draft_eager - target_home)}"
             )
             assert set(int(seq_id) for seq_id in self.eager_new_selected_set) == draft_eager, (
-                f"Phase 1H-1 dry-run requires eager_new_selected_set == draft_eager_set: "
+                f"Phase 1H dry-run requires eager_new_selected_set == draft_eager_set: "
                 f"eager_new_selected_set={self.eager_new_selected_set}, draft_eager_set={self.draft_eager_set}"
             )
             assert not self.eager_continuing_set, (
-                f"Phase 1H-1 dry-run requires empty eager_continuing_set, got {self.eager_continuing_set}"
+                f"Phase 1H dry-run requires empty eager_continuing_set, got {self.eager_continuing_set}"
             )
             selected = sorted(draft_eager)
             for seq_id in selected:
@@ -417,4 +446,34 @@ class StepPlan:
             "eager_skipped_not_in_target_home_set_seq_ids": _int_list(
                 self.eager_skipped_not_in_target_home_set_seq_ids
             ),
+            "enable_eager_draft_dry_run": bool(self.enable_eager_draft_dry_run),
+            "eager_draft_dry_run_enabled": bool(self.eager_draft_dry_run_enabled),
+            "eager_draft_seq_ids": _int_list(self.eager_draft_seq_ids),
+            "eager_draft_proposal_ids": _int_list(self.eager_draft_proposal_ids),
+            "eager_draft_base_len_by_seq_id": _trace_mapping(
+                self.eager_draft_base_len_by_seq_id,
+                lambda value: int(value),
+            ),
+            "eager_draft_base_pre_verify_by_seq_id": _trace_mapping(
+                self.eager_draft_base_pre_verify_by_seq_id,
+                lambda value: bool(value),
+            ),
+            "eager_draft_to_verify_len_by_seq_id": _trace_mapping(
+                self.eager_draft_to_verify_len_by_seq_id,
+                lambda value: int(value),
+            ),
+            "eager_draft_proposal_len_by_seq_id": _trace_mapping(
+                self.eager_draft_proposal_len_by_seq_id,
+                lambda value: int(value),
+            ),
+            "eager_draft_rollback_seq_ids": _int_list(self.eager_draft_rollback_seq_ids),
+            "eager_draft_rollback_ok_by_seq_id": _trace_mapping(
+                self.eager_draft_rollback_ok_by_seq_id,
+                lambda value: bool(value),
+            ),
+            "eager_draft_discard_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.eager_draft_discard_reason_by_seq_id.items()
+            },
+            "eager_dry_run_tokens_generated": int(self.eager_dry_run_tokens_generated),
         }

@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-EAGER_COUNTER_FIELDS = [
-    "eager_tokens_generated",
+EAGER_ALWAYS_ZERO_COUNTER_FIELDS = [
     "eager_tokens_promoted",
     "eager_tokens_discarded",
     "eager_tokens_verified",
@@ -59,7 +58,7 @@ def int_value(value: Any, default: int = 0) -> int:
 def nonzero_eager_counter_fields(record: dict[str, Any]) -> list[str]:
     return [
         field
-        for field in EAGER_COUNTER_FIELDS
+        for field in EAGER_ALWAYS_ZERO_COUNTER_FIELDS
         if int_value(record.get(field), 0) != 0
     ]
 
@@ -84,6 +83,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             continue
 
         dry_run = bool(record.get("enable_eager_plan_dry_run", False))
+        draft_dry_run = bool(
+            record.get("enable_eager_draft_dry_run", False)
+            or record.get("eager_draft_dry_run_enabled", False)
+        )
         if dry_run:
             dry_run_records += 1
         phase = record.get("plan_phase")
@@ -103,6 +106,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         skipped_pre_verify_count += len(record.get("eager_skipped_pre_verify_seq_ids") or [])
 
         nonzero_fields = nonzero_eager_counter_fields(record)
+        eager_tokens_generated = int_value(record.get("eager_tokens_generated"), 0)
+        if eager_tokens_generated and not draft_dry_run:
+            nonzero_fields.append("eager_tokens_generated")
         if nonzero_fields:
             nonzero_counter_rows += 1
             errors.append(f"record[{idx}] nonzero eager counters: {nonzero_fields}")
@@ -232,8 +238,10 @@ def synthetic_records() -> list[dict[str, Any]]:
         "eager_skipped_non_tight_seq_ids": [3],
         "eager_base_pre_verify_by_seq_id": {"2": False},
     }
-    for field in EAGER_COUNTER_FIELDS:
+    for field in EAGER_ALWAYS_ZERO_COUNTER_FIELDS:
         base[field] = 0
+    base["eager_tokens_generated"] = 0
+    base["eager_dry_run_tokens_generated"] = 0
 
     default = deepcopy(base)
     default["enable_eager_plan_dry_run"] = False
@@ -270,6 +278,13 @@ def run_synthetic_tests() -> None:
     invalid[1]["eager_tokens_generated"] = 1
     errors, _ = validate_records(invalid)
     assert any("nonzero eager counters" in error for error in errors), "checker missed nonzero counter"
+
+    valid_draft = deepcopy(records)
+    valid_draft[1]["enable_eager_draft_dry_run"] = True
+    valid_draft[1]["eager_draft_dry_run_enabled"] = True
+    valid_draft[1]["eager_tokens_generated"] = 4
+    errors, _ = validate_records(valid_draft)
+    assert not errors, f"plan checker should allow generated eager tokens in draft dry-run: {errors}"
     print("Synthetic eager plan dry-run checks passed.")
 
 

@@ -19,14 +19,22 @@ from nano_pearl.utils.loader import load_model
 from nano_pearl.pearl_config import TPParams
 from nano_pearl.layers.sampler import Sampler, norm_logits, SamplingParams
 from nano_pearl.utils.context import set_context, reset_context, get_context
-from nano_pearl.pearl_engine.sequence import Sequence
+from nano_pearl.pearl_engine.sequence import (
+    Sequence,
+    assert_sequence_matches_checkpoint,
+    make_sequence_checkpoint,
+)
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from nano_pearl.pearl_engine.dual_batch import (
     BufferedProposal,
     DualBatchManager,
+    EAGER_STATE_DRAFTED_DRY_RUN,
+    EagerProposal,
     EagerProposalBuffer,
+    LANE_EAGER,
+    LANE_NORMAL,
     ProposalBuffer,
 )
 from transformers import AutoTokenizer
@@ -126,6 +134,7 @@ class ModelRunnerBase:
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
+        self._eager_proposal_id = 0
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -533,6 +542,10 @@ class ModelRunnerBase:
             "target_to_draft_size_ratio": target_to_draft_size_ratio,
             "enable_eager_execution": bool(getattr(self.global_config, "enable_eager_execution", False)),
             "eager_execution_enabled": False,
+            "enable_eager_draft_dry_run": bool(
+                getattr(self.global_config, "enable_eager_draft_dry_run", False)
+            ),
+            "eager_draft_dry_run_enabled": False,
             "eager_buffer_size_before": self.eager_proposal_buffer.size(),
             "eager_buffer_size_after": self.eager_proposal_buffer.size(),
             "eager_promoted_seq_ids": [],
@@ -547,6 +560,7 @@ class ModelRunnerBase:
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
             "eager_tokens_invalidated": 0,
+            "eager_dry_run_tokens_generated": 0,
             "eager_waste_rate": 0.0,
         }
 
@@ -638,6 +652,9 @@ class ModelRunnerBase:
     def _eager_plan_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_plan_dry_run", False))
 
+    def _eager_draft_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_draft_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -648,10 +665,12 @@ class ModelRunnerBase:
         }
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        dry_run_enabled = self._eager_plan_dry_run_enabled()
+        draft_dry_run_enabled = self._eager_draft_dry_run_enabled()
+        dry_run_enabled = self._eager_plan_dry_run_enabled() or draft_dry_run_enabled
         policy = str(getattr(self.global_config, "eager_policy", "none"))
         gamma = int(self.gamma)
         plan.enable_eager_plan_dry_run = dry_run_enabled
+        plan.enable_eager_draft_dry_run = draft_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -665,6 +684,15 @@ class ModelRunnerBase:
         if not dry_run_enabled:
             return
 
+        if draft_dry_run_enabled:
+            if self.active_execution_mode != "dual_batch_pearl":
+                raise ValueError("enable_eager_draft_dry_run requires execution_mode='dual_batch_pearl'")
+            if policy == "none":
+                raise ValueError("enable_eager_draft_dry_run requires eager_policy != 'none'")
+            if int(getattr(self.global_config, "max_eager_requests_per_step", 0) or 0) <= 0:
+                raise ValueError("enable_eager_draft_dry_run requires max_eager_requests_per_step > 0")
+            validate_eager_gamma(self.global_config, gamma)
+
         if policy == "none":
             return
         if policy != "tight_only":
@@ -674,6 +702,7 @@ class ModelRunnerBase:
             plan.validate_phase1h_eager_scaffold(
                 enable_eager_execution=False,
                 enable_eager_plan_dry_run=True,
+                enable_eager_draft_dry_run=draft_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -751,11 +780,12 @@ class ModelRunnerBase:
             plan.budgets[seq_id].eager_gamma = gamma
             plan.eager_base_len_by_seq_id[seq_id] = len(seq)
             plan.eager_base_pre_verify_by_seq_id[seq_id] = bool(seq.pre_verify)
-            plan.eager_parent_kind_by_seq_id[seq_id] = "normal"
+            plan.eager_parent_kind_by_seq_id[seq_id] = LANE_NORMAL
 
         plan.validate_phase1h_eager_scaffold(
             enable_eager_execution=False,
             enable_eager_plan_dry_run=True,
+            enable_eager_draft_dry_run=draft_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1219,6 +1249,7 @@ class ModelRunnerBase:
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
         self.eager_proposal_buffer.clear()
+        self._eager_proposal_id = 0
         dist.barrier()
 
     def prepare_decode_ready(self):
@@ -1648,6 +1679,173 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
         return proposals, draft_records
 
+    def _next_eager_proposal_id(self) -> int:
+        self._eager_proposal_id += 1
+        return int(self._eager_proposal_id)
+
+    def _run_eager_draft_dry_run(
+        self,
+        seqs: list[Sequence],
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> list[EagerProposal]:
+        if not seqs:
+            return []
+
+        gamma = int(self.gamma)
+        buffer_size_before = self.eager_proposal_buffer.size()
+        checkpoints = {int(seq.seq_id): make_sequence_checkpoint(seq) for seq in seqs}
+        generated_by_seq_id: dict[int, list[int]] = {int(seq.seq_id): [] for seq in seqs}
+        proposals: list[EagerProposal] = []
+        rollback_ok_by_seq_id: dict[int, bool] = {}
+        rollback_seq_ids: list[int] = []
+        draft_error: BaseException | None = None
+
+        for seq in seqs:
+            checkpoint = checkpoints[int(seq.seq_id)]
+            assert checkpoint["pre_verify"] is False, (
+                f"Phase 1H-2 eager draft dry-run requires post_verify seq_id={seq.seq_id}"
+            )
+
+        try:
+            for _ in range(gamma):
+                self._allocate_decode_slots_for_dual(seqs, plan, "eager_draft_dry_run")
+                input_ids, positions = self.prepare_pearl_decode(seqs)
+                torch.cuda.synchronize()
+                logits = self.run_model(input_ids, positions, False)
+                if self.tp_params.local_rank == 0:
+                    sample_tokens = logits.argmax(dim=-1)
+                else:
+                    sample_tokens = torch.zeros(
+                        len(seqs),
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    ).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                torch.cuda.synchronize()
+                token_ids = sample_tokens.tolist()
+                reset_context(self.tp_params)
+                for seq, token_id in zip(seqs, token_ids):
+                    int_token_id = int(token_id)
+                    seq.append_token(int_token_id)
+                    generated_by_seq_id[int(seq.seq_id)].append(int_token_id)
+
+            for seq in seqs:
+                seq_id = int(seq.seq_id)
+                checkpoint = checkpoints[seq_id]
+                proposal_tokens = [int(token_id) for token_id in generated_by_seq_id[seq_id]]
+                to_be_verified = [int(token_id) for token_id in seq.token_ids[-2 * gamma + 1:-gamma + 1]]
+                assert len(proposal_tokens) == gamma, (
+                    f"eager proposal length mismatch for seq_id={seq_id}: "
+                    f"expected={gamma}, got={len(proposal_tokens)}"
+                )
+                assert len(to_be_verified) == gamma, (
+                    f"eager to_be_verified length mismatch for seq_id={seq_id}: "
+                    f"expected={gamma}, got={len(to_be_verified)}"
+                )
+                assert int(checkpoint["len"]) == len(seq) - gamma, (
+                    f"eager base_len mismatch for seq_id={seq_id}: "
+                    f"base_len={checkpoint['len']}, len_after_eager={len(seq)}"
+                )
+                proposals.append(
+                    EagerProposal(
+                        proposal_id=self._next_eager_proposal_id(),
+                        seq_id=seq_id,
+                        request_id=seq.request_id,
+                        lane=LANE_EAGER,
+                        parent_proposal_id=None,
+                        parent_kind=LANE_NORMAL,
+                        parent_step_id=None,
+                        source_step_id=0 if plan.step_id is None else int(plan.step_id),
+                        source_plan_id=int(plan.plan_id),
+                        home_batch_id=int(seq.home_batch_id),
+                        base_len=int(checkpoint["len"]),
+                        base_pre_verify=bool(checkpoint["pre_verify"]),
+                        base_num_completion_tokens=int(checkpoint["num_completion_tokens"]),
+                        proposal_token_ids=proposal_tokens,
+                        to_be_verified_token_ids=to_be_verified,
+                        proposal_len=gamma,
+                        state=EAGER_STATE_DRAFTED_DRY_RUN,
+                        valid=True,
+                    )
+                )
+        except BaseException as exc:
+            draft_error = exc
+        finally:
+            for seq in seqs:
+                seq_id = int(seq.seq_id)
+                checkpoint = checkpoints[seq_id]
+                rollback_seq_ids.append(seq_id)
+                try:
+                    rollback_len = len(seq) - int(checkpoint["len"])
+                    if rollback_len > 0:
+                        self.scheduler.rollback(seq, rollback_len)
+                    assert_sequence_matches_checkpoint(seq, checkpoint)
+                    rollback_ok_by_seq_id[seq_id] = True
+                except BaseException:
+                    rollback_ok_by_seq_id[seq_id] = False
+                    raise
+
+        proposal_ids = [int(proposal.proposal_id) for proposal in proposals]
+        proposal_ids_by_seq_id = {int(proposal.seq_id): int(proposal.proposal_id) for proposal in proposals}
+        base_len_by_seq_id = {
+            seq_id: int(checkpoint["len"])
+            for seq_id, checkpoint in checkpoints.items()
+        }
+        base_pre_verify_by_seq_id = {
+            seq_id: bool(checkpoint["pre_verify"])
+            for seq_id, checkpoint in checkpoints.items()
+        }
+        proposal_len_by_seq_id = {
+            int(proposal.seq_id): int(proposal.proposal_len)
+            for proposal in proposals
+        }
+        to_verify_len_by_seq_id = {
+            int(proposal.seq_id): len(proposal.to_be_verified_token_ids)
+            for proposal in proposals
+        }
+        discard_reason_by_seq_id = {
+            int(seq.seq_id): "phase1h2_dry_run_rollback"
+            for seq in seqs
+        }
+        total_generated = sum(len(tokens) for tokens in generated_by_seq_id.values())
+
+        trace_record["enable_eager_draft_dry_run"] = True
+        trace_record["eager_draft_dry_run_enabled"] = True
+        trace_record["eager_draft_seq_ids"] = [int(seq.seq_id) for seq in seqs]
+        trace_record["eager_draft_proposal_ids"] = proposal_ids
+        trace_record["eager_draft_base_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_len_by_seq_id.items()
+        }
+        trace_record["eager_draft_base_pre_verify_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in base_pre_verify_by_seq_id.items()
+        }
+        trace_record["eager_draft_to_verify_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in to_verify_len_by_seq_id.items()
+        }
+        trace_record["eager_draft_proposal_len_by_seq_id"] = {
+            str(seq_id): value for seq_id, value in proposal_len_by_seq_id.items()
+        }
+        trace_record["eager_draft_rollback_seq_ids"] = rollback_seq_ids
+        trace_record["eager_draft_rollback_ok_by_seq_id"] = {
+            str(seq_id): ok for seq_id, ok in rollback_ok_by_seq_id.items()
+        }
+        trace_record["eager_draft_discard_reason_by_seq_id"] = {
+            str(seq_id): reason for seq_id, reason in discard_reason_by_seq_id.items()
+        }
+        trace_record["eager_proposal_ids_by_seq_id"] = {
+            str(seq_id): [proposal_id]
+            for seq_id, proposal_id in proposal_ids_by_seq_id.items()
+        }
+        trace_record["eager_tokens_generated"] = total_generated
+        trace_record["eager_dry_run_tokens_generated"] = total_generated
+        trace_record["eager_buffer_size_before"] = int(buffer_size_before)
+        trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
+
+        if draft_error is not None:
+            raise draft_error
+        return proposals
+
     def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
@@ -1697,6 +1895,11 @@ class DraftModelRunner(ModelRunnerBase):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
+        eager_draft_seqs = self._resolve_dual_seq_ids(
+            plan.draft_eager_set,
+            plan,
+            "eager_draft_dry_run",
+        )
 
         proposals = []
         draft_records = []
@@ -1708,6 +1911,14 @@ class DraftModelRunner(ModelRunnerBase):
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
+
+        if self._eager_draft_dry_run_enabled() and eager_draft_seqs:
+            if draft_records:
+                eager_trace_record = draft_records[-1]
+            else:
+                eager_trace_record = self._trace_dual_batch_schedule([], plan, "eager_draft_dry_run")
+            self._run_eager_draft_dry_run(eager_draft_seqs, plan, eager_trace_record)
+            self._finalize_record_profile(eager_trace_record)
 
         if target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")

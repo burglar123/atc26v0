@@ -25,6 +25,7 @@ try:
     from nano_pearl.pearl_engine.dual_batch import (  # type: ignore  # noqa: E402
         EAGER_STATE_CONSUMED,
         EAGER_STATE_DISCARDED,
+        EAGER_STATE_DRAFTED_DRY_RUN,
         EAGER_STATE_DRAFTED_PENDING_PARENT,
         EAGER_STATE_READY_TO_VERIFY,
         EagerProposal,
@@ -121,6 +122,7 @@ except ModuleNotFoundError:
     validate_eager_gamma = pearl_config_module.validate_eager_gamma
     EAGER_STATE_CONSUMED = dual_batch_module.EAGER_STATE_CONSUMED
     EAGER_STATE_DISCARDED = dual_batch_module.EAGER_STATE_DISCARDED
+    EAGER_STATE_DRAFTED_DRY_RUN = dual_batch_module.EAGER_STATE_DRAFTED_DRY_RUN
     EAGER_STATE_DRAFTED_PENDING_PARENT = dual_batch_module.EAGER_STATE_DRAFTED_PENDING_PARENT
     EAGER_STATE_READY_TO_VERIFY = dual_batch_module.EAGER_STATE_READY_TO_VERIFY
     EagerProposal = dual_batch_module.EagerProposal
@@ -142,6 +144,7 @@ EAGER_ZERO_COUNTER_FIELDS = [
     "eager_tokens_accepted",
     "eager_tokens_rejected",
     "eager_tokens_invalidated",
+    "eager_dry_run_tokens_generated",
 ]
 
 EAGER_EMPTY_LIST_FIELDS = [
@@ -152,6 +155,9 @@ EAGER_EMPTY_LIST_FIELDS = [
     "eager_verified_seq_ids",
     "eager_accepted_seq_ids",
     "eager_rejected_seq_ids",
+    "eager_draft_seq_ids",
+    "eager_draft_proposal_ids",
+    "eager_draft_rollback_seq_ids",
 ]
 
 REQUIRED_EAGER_META_KEYS = [
@@ -291,6 +297,56 @@ def check_metadata_roundtrip() -> None:
     expect_raises(lambda: deserialize_eager_proposal_meta(bad_meta, payload), ValueError, "payload length mismatch")
 
 
+def check_eager_draft_dry_run_proposal_construction() -> None:
+    gamma = 4
+    checkpoint = {
+        "seq_id": 7,
+        "request_id": "req-7",
+        "len": 12,
+        "pre_verify": False,
+        "num_completion_tokens": 8,
+        "cur_acc_tokens": 0,
+        "status": "RUNNING",
+        "home_batch_id": 1,
+    }
+    token_ids = list(range(100, 112))
+    eager_child_tokens = [201, 202, 203, 204]
+    token_ids_after_eager = token_ids + eager_child_tokens
+    to_verify = token_ids_after_eager[-2 * gamma + 1:-gamma + 1]
+    proposal = EagerProposal(
+        proposal_id=77,
+        seq_id=checkpoint["seq_id"],
+        request_id=checkpoint["request_id"],
+        lane=LANE_EAGER,
+        parent_proposal_id=None,
+        parent_kind=LANE_NORMAL,
+        parent_step_id=None,
+        source_step_id=5,
+        source_plan_id=6,
+        home_batch_id=checkpoint["home_batch_id"],
+        base_len=checkpoint["len"],
+        base_pre_verify=checkpoint["pre_verify"],
+        base_num_completion_tokens=checkpoint["num_completion_tokens"],
+        proposal_token_ids=eager_child_tokens,
+        to_be_verified_token_ids=to_verify,
+        proposal_len=gamma,
+        state=EAGER_STATE_DRAFTED_DRY_RUN,
+        valid=True,
+    )
+    assert proposal.state == EAGER_STATE_DRAFTED_DRY_RUN
+    assert proposal.base_pre_verify is False
+    assert len(proposal.proposal_token_ids) == gamma
+    assert len(proposal.to_be_verified_token_ids) == gamma
+    assert proposal.base_len == len(token_ids_after_eager) - gamma
+    meta, payload = serialize_eager_proposal_meta([proposal], gamma=gamma, plan_id=6)
+    roundtrip = deserialize_eager_proposal_meta(meta, payload)
+    assert roundtrip[0].state == EAGER_STATE_DRAFTED_DRY_RUN
+
+    rolled_back_tokens = token_ids_after_eager[:-gamma]
+    assert rolled_back_tokens == token_ids
+    assert len(rolled_back_tokens) == checkpoint["len"]
+
+
 def make_step_plan(**overrides: Any) -> StepPlan:
     kwargs = {
         "plan_id": 1,
@@ -395,6 +451,22 @@ def check_step_plan_validation() -> None:
         enable_eager_plan_dry_run=True,
         global_gamma=4,
     )
+    dry_run_allowed.validate_phase1h_eager_scaffold(
+        enable_eager_execution=False,
+        enable_eager_plan_dry_run=True,
+        enable_eager_draft_dry_run=True,
+        global_gamma=4,
+    )
+    expect_raises(
+        lambda: dry_run_allowed.validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=False,
+            enable_eager_draft_dry_run=True,
+            global_gamma=4,
+        ),
+        AssertionError,
+        "draft dry-run requires plan dry-run",
+    )
     expect_raises(
         lambda: make_step_plan(
             target_eager_set=[],
@@ -484,11 +556,57 @@ def check_eager_gamma_validation() -> None:
         ),
         PHASE_1H0_EAGER_NOT_IMPLEMENTED,
     )
+    expect_raises(
+        lambda: PEARLConfig(
+            draft_model_path="/synthetic/draft",
+            target_model_path="/synthetic/target",
+            execution_mode="parallel_pearl",
+            enable_eager_draft_dry_run=True,
+            eager_policy="tight_only",
+            gamma=4,
+            max_eager_requests_per_step=1,
+            max_eager_tokens_per_step=4,
+            max_eager_tokens_per_request=4,
+        ),
+        ValueError,
+        "draft dry-run rejects non-dual execution mode",
+    )
+    expect_raises(
+        lambda: PEARLConfig(
+            draft_model_path="/synthetic/draft",
+            target_model_path="/synthetic/target",
+            execution_mode="dual_batch_pearl",
+            enable_eager_draft_dry_run=True,
+            eager_policy="none",
+            gamma=4,
+            max_eager_requests_per_step=1,
+            max_eager_tokens_per_step=4,
+            max_eager_tokens_per_request=4,
+        ),
+        ValueError,
+        "draft dry-run rejects eager_policy none",
+    )
+    expect_raises(
+        lambda: PEARLConfig(
+            draft_model_path="/synthetic/draft",
+            target_model_path="/synthetic/target",
+            execution_mode="dual_batch_pearl",
+            enable_eager_draft_dry_run=True,
+            eager_policy="tight_only",
+            gamma=4,
+            max_eager_requests_per_step=1,
+            max_eager_tokens_per_step=4,
+            max_eager_tokens_per_request=2,
+        ),
+        ValueError,
+        "draft dry-run rejects eager_gamma mismatch",
+    )
 
 
 def run_synthetic_checks() -> None:
     check_buffer_lifecycle()
     check_metadata_roundtrip()
+    check_eager_draft_dry_run_proposal_construction()
     check_step_plan_validation()
     check_eager_gamma_validation()
     print("Synthetic eager scaffold checks passed.")
@@ -506,8 +624,12 @@ def check_trace(path: Path) -> None:
         eager_trace_enabled = bool(record.get("eager_trace_enabled", False))
         if record.get("enable_eager_execution") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] enable_eager_execution must be false")
+        if record.get("enable_eager_draft_dry_run") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] enable_eager_draft_dry_run must be false")
         if record.get("eager_execution_enabled") not in (False, 0, None):
             errors.append(f"dual_record[{idx}] eager_execution_enabled must be false")
+        if record.get("eager_draft_dry_run_enabled") not in (False, 0, None):
+            errors.append(f"dual_record[{idx}] eager_draft_dry_run_enabled must be false")
         if not eager_trace_enabled and record.get("target_eager_set"):
             errors.append(f"dual_record[{idx}] has non-empty target_eager_set")
         if not eager_trace_enabled and record.get("draft_eager_set"):
