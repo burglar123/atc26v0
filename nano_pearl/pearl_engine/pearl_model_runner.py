@@ -689,6 +689,7 @@ class ModelRunnerBase:
     def _annotate_eager_trace_plan(self, plan: StepPlan) -> None:
         plan.eager_trace_enabled = bool(self.global_config.enable_eager_trace or self.global_config.enable_eager_execution)
         plan.effective_enable_eager_trace = plan.eager_trace_enabled
+        plan.eager_trace_only = bool(plan.eager_trace_enabled and not self.global_config.enable_eager_execution)
         plan.eager_policy = self.global_config.eager_policy
         plan.max_eager_requests_per_step = max(0, int(self.global_config.max_eager_requests_per_step))
         plan.max_eager_tokens_per_step = max(0, int(self.global_config.max_eager_tokens_per_step))
@@ -3012,7 +3013,7 @@ class DraftModelRunner(ModelRunnerBase):
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
         target_eager_seqs = self._resolve_dual_seq_ids(plan.target_eager_set, plan, "draft_apply_eager_verify")
         draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
-        draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft")
+        draft_eager_seqs = self._resolve_dual_seq_ids(plan.draft_eager_set, plan, "dual_eager_draft") if self.global_config.enable_eager_execution else []
 
         # Debug: log all skipped eager candidates with reason and seq state.
         _skipped = list(plan.eager_draft_skipped_seq_ids)

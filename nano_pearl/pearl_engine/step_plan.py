@@ -80,6 +80,7 @@ class StepPlan:
     missing_eager_metadata_seq_ids: List[int] = field(default_factory=list)
     eager_metadata_lookup_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
     effective_enable_eager_trace: bool = False
+    eager_trace_only: bool = False
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
@@ -415,6 +416,7 @@ class StepPlan:
                 for seq_id, source in self.eager_metadata_lookup_source_by_seq_id.items()
             },
             "effective_enable_eager_trace": bool(self.effective_enable_eager_trace),
+            "eager_trace_only": bool(self.eager_trace_only),
             "max_eager_requests_per_step": int(self.max_eager_requests_per_step),
             "max_eager_tokens_per_step": int(self.max_eager_tokens_per_step),
             "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
