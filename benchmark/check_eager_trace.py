@@ -76,6 +76,10 @@ def main() -> int:
     print(f"eager_tokens_accepted={accepted_tokens}")
     print(f"target_eager_set_non_empty_records={target_eager_records}")
     print(f"eager_buffer_max_size={eager_buffer_max_size}")
+    print(f"draft_eager_set_trace_non_empty={sum(1 for r in records if r.get('draft_eager_set_trace'))}")
+    print(f"draft_eager_set_executed_non_empty={sum(1 for r in records if r.get('draft_eager_set_executed'))}")
+    print(f"eager_promotion_checked={sum(len(r.get('eager_promotion_checked_seq_ids') or []) for r in records)}")
+    print(f"eager_discard_with_reason={sum(1 for r in records if r.get('eager_discard_reason_by_seq_id'))}")
 
     errors = []
     seen_promoted_seq_ids = set()
@@ -184,7 +188,11 @@ def main() -> int:
                 errors.append(
                     f"record[{idx}] received {len(received_eager)} eager seqs above cap {max_requests}"
                 )
-            if local_draft_eager_after and local_draft_eager_after != received_eager:
+            # In trace-only mode, draft_eager_set may be non-empty for trace
+            # annotations while received_eager_seq_ids is empty (no eager
+            # proposals are actually sent).  Only enforce equality when
+            # eager execution is enabled.
+            if execution_enabled and local_draft_eager_after and local_draft_eager_after != received_eager:
                 errors.append(
                     f"record[{idx}] local_plan_draft_eager_set_after_receive "
                     f"must equal received_eager_seq_ids: "
@@ -241,6 +249,35 @@ def main() -> int:
             ):
                 if int(record.get(field) or 0) != 0:
                     errors.append(f"record[{idx}] {field} must stay 0 when eager execution is disabled")
+        # Send packaging validation: must not be False.
+        send_val_ok = record.get("eager_send_packaging_validation_ok")
+        if send_val_ok is False:
+            reason = record.get("eager_send_packaging_validation_reason") or "unknown"
+            errors.append(
+                f"record[{idx}] eager send packaging validation failed: {reason}"
+            )
+
+        # In execution mode, if eager proposals were generated but none promoted,
+        # discard reasons must be recorded.
+        if execution_enabled:
+            generated_ids = as_int_set(record.get("eager_proposal_generated_seq_ids"))
+            promoted_ids = as_int_set(record.get("eager_promoted_seq_ids"))
+            if generated_ids and not promoted_ids:
+                discard_reasons = record.get("eager_discard_reason_by_seq_id") or {}
+                if not discard_reasons:
+                    errors.append(
+                        f"record[{idx}] eager proposals generated but none promoted "
+                        f"and no discard_reason_by_seq_id recorded: "
+                        f"generated={sorted(generated_ids)}"
+                    )
+                else:
+                    for sid in sorted(generated_ids):
+                        if str(sid) not in discard_reasons and sid not in discard_reasons:
+                            errors.append(
+                                f"record[{idx}] eager proposal for seq_id={sid} "
+                                f"generated but neither promoted nor has discard reason"
+                            )
+
         seen_promoted_seq_ids.update(as_int_set(record.get("eager_promoted_seq_ids")))
 
     # Check for missing metadata in eager trace records.

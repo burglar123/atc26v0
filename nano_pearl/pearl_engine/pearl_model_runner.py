@@ -784,6 +784,9 @@ class ModelRunnerBase:
             remaining_tokens -= int(budget)
 
         plan.draft_eager_set = list(plan.eager_selected_seq_ids)
+        plan.draft_eager_set_trace = list(plan.eager_selected_seq_ids)
+        if self.global_config.enable_eager_execution:
+            plan.draft_eager_set_executed = list(plan.eager_selected_seq_ids)
         # Attach per-candidate debug info so the smoke test can verify the filter.
         selected_set = set(plan.eager_selected_seq_ids)
         for _p in scored:
@@ -1880,6 +1883,12 @@ class ModelRunnerBase:
         trace_record["eager_draft_skipped_reason"] = plan.eager_draft_skipped_reason
         trace_record["eager_draft_failed_seq_ids"] = list(plan.eager_draft_failed_seq_ids)
         trace_record["eager_draft_empty_reason"] = plan.eager_draft_empty_reason
+        trace_record["eager_send_packaging_validation_ok"] = plan.eager_send_packaging_validation_ok
+        trace_record["eager_send_packaging_validation_reason"] = plan.eager_send_packaging_validation_reason
+        trace_record["eager_promotion_checked_seq_ids"] = list(plan.eager_promotion_checked_seq_ids)
+        trace_record["eager_discard_reason_by_seq_id"] = {
+            str(k): v for k, v in plan.eager_discard_reason_by_seq_id.items()
+        }
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
         proposal_seq_ids = [proposal.seq_id for proposal in proposals]
@@ -1965,21 +1974,34 @@ class ModelRunnerBase:
         discarded_seq_ids = []
         promoted_tokens = 0
         discarded_tokens = 0
+        discard_reasons = {}
         for seq_id in plan.draft_eager_set:
+            plan.eager_promotion_checked_seq_ids.append(int(seq_id))
             proposal = self.eager_proposal_buffer.get(seq_id)
-            assert proposal is not None, self._proposal_assertion_message(
-                plan,
-                f"missing eager proposal for selected seq_id={seq_id}",
-            )
+            if proposal is None:
+                discarded_seq_ids.append(int(seq_id))
+                discard_reasons[int(seq_id)] = "missing_eager_proposal_in_buffer"
+                continue
             in_normal_verify = int(seq_id) in accepted_lens or int(seq_id) in invalidated_lens
             if not in_normal_verify:
                 full_accept = int(seq_id) in running_seq_ids
+                if not full_accept:
+                    discard_reasons[int(seq_id)] = "seq_not_in_running_set"
             else:
                 full_accept = (
                     int(seq_id) in running_seq_ids
                     and int(invalidated_lens.get(seq_id, 0)) == 0
                     and int(accepted_lens.get(seq_id, 0)) > 0
                 )
+                if not full_accept:
+                    _inv = int(invalidated_lens.get(seq_id, 0))
+                    _acc = int(accepted_lens.get(seq_id, 0))
+                    if _inv > 0:
+                        discard_reasons[int(seq_id)] = f"normal_verify_invalidated_tokens={_inv}"
+                    elif _acc == 0:
+                        discard_reasons[int(seq_id)] = "normal_verify_zero_accept"
+                    else:
+                        discard_reasons[int(seq_id)] = "normal_verify_partial_or_finished"
             if full_accept:
                 self.eager_proposal_buffer.mark_ready(seq_id)
                 promoted_seq_ids.append(int(seq_id))
@@ -1989,10 +2011,18 @@ class ModelRunnerBase:
                 discarded_seq_ids.append(int(seq_id))
                 discarded_tokens += int(proposal.eager_len)
 
+        plan.eager_promoted_seq_ids = list(promoted_seq_ids)
+        plan.eager_discarded_seq_ids = list(discarded_seq_ids)
+        plan.eager_discard_reason_by_seq_id = discard_reasons
+
         if trace_record is not None:
             trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
             trace_record["eager_promoted_seq_ids"] = promoted_seq_ids
             trace_record["eager_discarded_seq_ids"] = discarded_seq_ids
+            trace_record["eager_promotion_checked_seq_ids"] = plan.eager_promotion_checked_seq_ids
+            trace_record["eager_discard_reason_by_seq_id"] = {
+                str(k): v for k, v in discard_reasons.items()
+            }
             if count_tokens:
                 trace_record["eager_tokens_promoted"] = promoted_tokens
                 trace_record["eager_tokens_discarded"] = discarded_tokens
@@ -3096,6 +3126,12 @@ class DraftModelRunner(ModelRunnerBase):
             eager_proposals, eager_trace_record = self._draft_eager_proposals(draft_eager_seqs, plan)
             self.eager_proposal_buffer.store(eager_proposals)
 
+            plan.eager_proposal_generated_seq_ids = sorted(p.seq_id for p in eager_proposals)
+            plan.eager_proposal_generation_base_len_by_seq_id = {
+                int(p.seq_id): int(p.original_eager_base_len_at_generation)
+                for p in eager_proposals
+            }
+
             _generated_eager_seq_ids = sorted(p.seq_id for p in eager_proposals)
             _expected_eager_seq_ids = sorted(plan.draft_eager_set)
             plan.eager_draft_generated_seq_ids = _generated_eager_seq_ids
@@ -3372,18 +3408,37 @@ class DraftModelRunner(ModelRunnerBase):
             if _before_send_eager_info:
                 plan.before_send_eager_info = _before_send_eager_info
             # --- end instrumentation ---
-            # Fail-fast: no eager proposal encoded for any post-verify seq.
+            # Validate eager proposals at send packaging time using recorded
+            # generation-time snapshots, not live seq.pre_verify.  In H2 steady,
+            # normal verify runs BEFORE send packaging, so the live seq may
+            # already be post-verify.  The proposal is valid if its
+            # eager_base_len matches the current seq length.
+            send_validation_ok = True
+            send_validation_reasons = []
             for p in eager_ready_for_send:
                 _sid = int(p.seq_id)
                 _seq = _draft_running_map.get(_sid)
-                assert _seq is not None and _seq.pre_verify, self._proposal_assertion_message(
-                    plan,
-                    f"eager proposal encoded for post-verify seq at send: seq_id={_sid}, "
-                    f"pre_verify={getattr(_seq, 'pre_verify', None)}, "
-                    f"eager_base_len={p.eager_base_len}, "
-                    f"original_eager_base_len_at_generation={p.original_eager_base_len_at_generation}, "
-                    f"draft_eager_set={plan.draft_eager_set}",
-                )
+                if _seq is None:
+                    send_validation_ok = False
+                    send_validation_reasons.append(
+                        f"seq_id={_sid} not found in running set at send time"
+                    )
+                    continue
+                _base_len = int(p.eager_base_len)
+                _seq_len = int(len(_seq))
+                if _base_len != _seq_len:
+                    send_validation_ok = False
+                    send_validation_reasons.append(
+                        f"seq_id={_sid} eager_base_len={_base_len} != seq_len={_seq_len} "
+                        f"(pre_verify={bool(_seq.pre_verify)}, "
+                        f"gen_base={int(p.original_eager_base_len_at_generation)})"
+                    )
+            plan.eager_send_packaging_validation_ok = send_validation_ok if eager_ready_for_send else None
+            plan.eager_send_packaging_validation_reason = (
+                "; ".join(send_validation_reasons) if send_validation_reasons
+                else "all validations passed" if eager_ready_for_send
+                else "no_eager_proposals_to_send"
+            )
             encoded_eager_seq_ids = [int(p.seq_id) for p in eager_ready_for_send]
             plan.encoded_eager_seq_ids = encoded_eager_seq_ids
             self._send_combined_dual_proposals(

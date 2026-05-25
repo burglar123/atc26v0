@@ -68,6 +68,8 @@ class StepPlan:
     eager_policy: str = "none"
     eager_candidate_seq_ids: List[int] = field(default_factory=list)
     eager_selected_seq_ids: List[int] = field(default_factory=list)
+    eager_proposal_generated_seq_ids: List[int] = field(default_factory=list)
+    eager_proposal_generation_base_len_by_seq_id: Dict[int, int] = field(default_factory=dict)
     eager_score_by_seq_id: Dict[int, float] = field(default_factory=dict)
     eager_budget_by_seq_id: Dict[int, int] = field(default_factory=dict)
     eager_total_budget: int = 0
@@ -81,6 +83,8 @@ class StepPlan:
     eager_metadata_lookup_source_by_seq_id: Dict[int, str] = field(default_factory=dict)
     effective_enable_eager_trace: bool = False
     eager_trace_only: bool = False
+    draft_eager_set_trace: List[int] = field(default_factory=list)
+    draft_eager_set_executed: List[int] = field(default_factory=list)
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
@@ -97,6 +101,8 @@ class StepPlan:
     eager_ready_seq_ids: List[int] = field(default_factory=list)
     eager_promoted_seq_ids: List[int] = field(default_factory=list)
     eager_discarded_seq_ids: List[int] = field(default_factory=list)
+    eager_promotion_checked_seq_ids: List[int] = field(default_factory=list)
+    eager_discard_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
     eager_rejected_seq_ids: List[int] = field(default_factory=list)
@@ -133,6 +139,8 @@ class StepPlan:
     eager_receive_validation_error: Optional[str] = None
     eager_receive_validation_ok: Optional[bool] = None
     eager_receive_validation_reason: Optional[str] = None
+    eager_send_packaging_validation_ok: Optional[bool] = None
+    eager_send_packaging_validation_reason: Optional[str] = None
     local_plan_draft_eager_set_before_receive: List[int] = field(default_factory=list)
     local_plan_draft_eager_set_after_receive: List[int] = field(default_factory=list)
     send_expected_normal_seq_ids: List[int] = field(default_factory=list)
@@ -379,6 +387,11 @@ class StepPlan:
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": [int(seq_id) for seq_id in self.eager_candidate_seq_ids],
             "eager_selected_seq_ids": [int(seq_id) for seq_id in self.eager_selected_seq_ids],
+            "eager_proposal_generated_seq_ids": [int(seq_id) for seq_id in self.eager_proposal_generated_seq_ids],
+            "eager_proposal_generation_base_len_by_seq_id": {
+                str(seq_id): int(base_len)
+                for seq_id, base_len in self.eager_proposal_generation_base_len_by_seq_id.items()
+            },
             "eager_score_by_seq_id": {
                 str(seq_id): float(score)
                 for seq_id, score in self.eager_score_by_seq_id.items()
@@ -417,6 +430,8 @@ class StepPlan:
             },
             "effective_enable_eager_trace": bool(self.effective_enable_eager_trace),
             "eager_trace_only": bool(self.eager_trace_only),
+            "draft_eager_set_trace": [int(seq_id) for seq_id in self.draft_eager_set_trace],
+            "draft_eager_set_executed": [int(seq_id) for seq_id in self.draft_eager_set_executed],
             "max_eager_requests_per_step": int(self.max_eager_requests_per_step),
             "max_eager_tokens_per_step": int(self.max_eager_tokens_per_step),
             "max_eager_tokens_per_request": int(self.max_eager_tokens_per_request),
@@ -433,6 +448,11 @@ class StepPlan:
             "eager_ready_seq_ids": [int(seq_id) for seq_id in self.eager_ready_seq_ids],
             "eager_promoted_seq_ids": [int(seq_id) for seq_id in self.eager_promoted_seq_ids],
             "eager_discarded_seq_ids": [int(seq_id) for seq_id in self.eager_discarded_seq_ids],
+            "eager_promotion_checked_seq_ids": [int(seq_id) for seq_id in self.eager_promotion_checked_seq_ids],
+            "eager_discard_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.eager_discard_reason_by_seq_id.items()
+            },
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],
             "eager_rejected_seq_ids": [int(seq_id) for seq_id in self.eager_rejected_seq_ids],
@@ -493,6 +513,8 @@ class StepPlan:
             "eager_receive_validation_error": self.eager_receive_validation_error,
             "eager_receive_validation_ok": self.eager_receive_validation_ok,
             "eager_receive_validation_reason": self.eager_receive_validation_reason,
+            "eager_send_packaging_validation_ok": self.eager_send_packaging_validation_ok,
+            "eager_send_packaging_validation_reason": self.eager_send_packaging_validation_reason,
             "local_plan_draft_eager_set_before_receive": [
                 int(seq_id) for seq_id in self.local_plan_draft_eager_set_before_receive
             ],
