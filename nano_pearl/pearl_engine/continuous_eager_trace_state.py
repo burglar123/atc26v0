@@ -147,9 +147,11 @@ class ContinuousEagerTraceState:
         self._record_history(seq_id, "create_continue_pending")
 
     def get_pending_seq_ids(self) -> set[int]:
-        """Return seq_ids with state 'pending_parent' or 'pending_parent_unknown'."""
+        """Return seq_ids with state 'pending_parent', 'pending_parent_unknown', or 'continue_pending'."""
         return {s for s in self._pending_seq_ids
-                if self._latest_state.get(s) in ("pending_parent", "pending_parent_unknown")}
+                if self._latest_state.get(s) in (
+                    "pending_parent", "pending_parent_unknown", "continue_pending",
+                )}
 
     def get_chain_depth(self, seq_id: int) -> int:
         """Return the chain depth for a seq_id (0 if unknown)."""

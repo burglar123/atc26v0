@@ -176,6 +176,19 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
     eager_tokens_rejected = isum([r.get("eager_tokens_rejected") for r in records])
     records_with_target_eager_set = 1 if any(r.get("target_eager_set") for r in records) else 0
 
+    # Continuous eager trace-only metrics (Phase 1H-continuous-promotion-trace).
+    ce_selected = isum([r.get("continuous_eager_trace_selected_count") for r in records])
+    ce_promoted = isum([r.get("continuous_eager_trace_promoted_count") for r in records])
+    ce_simulated = isum([r.get("continuous_eager_trace_simulated_promoted_total") for r in records])
+    ce_discarded = isum([r.get("continuous_eager_trace_discarded_count") for r in records])
+    ce_unknown = sum(len(r.get("continuous_eager_parent_acceptance_unknown_seq_ids") or []) for r in records)
+    ce_target_trace = sum(len(r.get("target_eager_set_trace") or []) for r in records)
+    ce_continue = sum(len(r.get("draft_eager_continue_set") or []) for r in records)
+    ce_chain_depths = []
+    for r in records:
+        for d in (r.get("continuous_eager_chain_depth_by_seq_id") or {}).values():
+            ce_chain_depths.append(int(d))
+
     return {
         "mode": first_present(records, "execution_mode", "unknown"),
         "phase": phase,
@@ -218,6 +231,18 @@ def group_profile(records: list[dict[str, Any]]) -> dict[str, Any]:
         "eager_tokens_accepted": eager_tokens_accepted,
         "eager_tokens_rejected": eager_tokens_rejected,
         "records_with_target_eager_set": records_with_target_eager_set,
+        "ce_trace_selected": ce_selected,
+        "ce_trace_promoted": ce_promoted,
+        "ce_trace_simulated_promoted": ce_simulated,
+        "ce_trace_discarded": ce_discarded,
+        "ce_trace_unknown": ce_unknown,
+        "ce_trace_target_set": ce_target_trace,
+        "ce_trace_continue_set": ce_continue,
+        "ce_trace_chain_depths": ce_chain_depths,
+        "ce_trace_max_chain_depth": max(ce_chain_depths) if ce_chain_depths else 0,
+        "ce_trace_mean_chain_depth": mean(ce_chain_depths) if ce_chain_depths else 0.0,
+        "ce_trace_promotion_rate": ce_promoted / max(1, ce_selected),
+        "ce_trace_continuation_rate": ce_continue / max(1, ce_target_trace),
     }
 
 
@@ -271,6 +296,17 @@ def summarize(path: Path) -> dict[str, Any]:
     total_eager_rejected = sum(p["eager_tokens_rejected"] for p in step_profiles)
     records_with_target_eager_set = sum(p["records_with_target_eager_set"] for p in step_profiles)
 
+    total_ce_selected = sum(p["ce_trace_selected"] for p in step_profiles)
+    total_ce_promoted = sum(p["ce_trace_promoted"] for p in step_profiles)
+    total_ce_simulated = sum(p["ce_trace_simulated_promoted"] for p in step_profiles)
+    total_ce_discarded = sum(p["ce_trace_discarded"] for p in step_profiles)
+    total_ce_unknown = sum(p["ce_trace_unknown"] for p in step_profiles)
+    total_ce_target_set = sum(p["ce_trace_target_set"] for p in step_profiles)
+    total_ce_continue_set = sum(p["ce_trace_continue_set"] for p in step_profiles)
+    all_ce_chain_depths = []
+    for p in step_profiles:
+        all_ce_chain_depths.extend(p["ce_trace_chain_depths"])
+
     return {
         "path": str(path),
         "mode": mode,
@@ -317,6 +353,17 @@ def summarize(path: Path) -> dict[str, Any]:
         "eager_waste_rate": (total_eager_discarded + total_eager_rejected) / max(1, total_eager_generated),
         "records_with_target_eager_set": records_with_target_eager_set,
         "eager_benefit_proxy": total_eager_verified / max(1, proposal_tokens_verified + total_eager_verified),
+        "total_ce_trace_selected": total_ce_selected,
+        "total_ce_trace_promoted": total_ce_promoted,
+        "total_ce_trace_simulated_promoted": total_ce_simulated,
+        "total_ce_trace_discarded": total_ce_discarded,
+        "total_ce_trace_unknown": total_ce_unknown,
+        "total_ce_trace_target_set": total_ce_target_set,
+        "total_ce_trace_continue_set": total_ce_continue_set,
+        "ce_trace_max_chain_depth": max(all_ce_chain_depths) if all_ce_chain_depths else 0,
+        "ce_trace_mean_chain_depth": mean(all_ce_chain_depths) if all_ce_chain_depths else 0.0,
+        "ce_trace_promotion_rate": total_ce_promoted / max(1, total_ce_selected),
+        "ce_trace_continuation_rate": total_ce_continue_set / max(1, total_ce_target_set),
         "steps": step_profiles,
     }
 
@@ -491,6 +538,17 @@ def print_dual_details(rows: list[dict[str, Any]]) -> None:
         print(f"  eager_waste_rate={row['eager_waste_rate']:.3f}")
         print(f"  records_with_target_eager_set={row['records_with_target_eager_set']}")
         print(f"  eager_benefit_proxy={row['eager_benefit_proxy']:.3f}")
+        print(f"  total_ce_trace_selected={row['total_ce_trace_selected']}")
+        print(f"  total_ce_trace_promoted={row['total_ce_trace_promoted']}")
+        print(f"  total_ce_trace_simulated_promoted={row['total_ce_trace_simulated_promoted']}")
+        print(f"  total_ce_trace_discarded={row['total_ce_trace_discarded']}")
+        print(f"  total_ce_trace_unknown={row['total_ce_trace_unknown']}")
+        print(f"  total_ce_trace_target_set={row['total_ce_trace_target_set']}")
+        print(f"  total_ce_trace_continue_set={row['total_ce_trace_continue_set']}")
+        print(f"  ce_trace_max_chain_depth={row['ce_trace_max_chain_depth']}")
+        print(f"  ce_trace_mean_chain_depth={row['ce_trace_mean_chain_depth']:.3f}")
+        print(f"  ce_trace_promotion_rate={row['ce_trace_promotion_rate']:.3f}")
+        print(f"  ce_trace_continuation_rate={row['ce_trace_continuation_rate']:.3f}")
         print(f"  suspected_bottleneck={dual_bottleneck(row)}")
         print(f"  warnings={dual_warnings(row)}")
 

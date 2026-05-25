@@ -158,6 +158,11 @@ class StepPlan:
     continuous_eager_trace_ready_count: int = 0
     continuous_eager_trace_target_ready_count: int = 0
     continuous_eager_trace_continue_count: int = 0
+    # Phase 1H-continuous-promotion-trace: simulated promotion (when real
+    # full-accept signal is unavailable but chain testing is desired).
+    continuous_eager_promotion_simulated_seq_ids: List[int] = field(default_factory=list)
+    continuous_eager_promotion_simulation_reason_by_seq_id: Dict[int, str] = field(default_factory=dict)
+    continuous_eager_trace_simulated_promoted_total: int = 0
     eager_verified_seq_ids: List[int] = field(default_factory=list)
     eager_accepted_seq_ids: List[int] = field(default_factory=list)
     eager_rejected_seq_ids: List[int] = field(default_factory=list)
@@ -623,6 +628,17 @@ class StepPlan:
             "continuous_eager_trace_ready_count": int(self.continuous_eager_trace_ready_count),
             "continuous_eager_trace_target_ready_count": int(self.continuous_eager_trace_target_ready_count),
             "continuous_eager_trace_continue_count": int(self.continuous_eager_trace_continue_count),
+            # Phase 1H-continuous-promotion-trace: simulated promotion
+            "continuous_eager_promotion_simulated_seq_ids": [
+                int(seq_id) for seq_id in self.continuous_eager_promotion_simulated_seq_ids
+            ],
+            "continuous_eager_promotion_simulation_reason_by_seq_id": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.continuous_eager_promotion_simulation_reason_by_seq_id.items()
+            },
+            "continuous_eager_trace_simulated_promoted_total": int(
+                self.continuous_eager_trace_simulated_promoted_total
+            ),
             "eager_verified_seq_ids": [int(seq_id) for seq_id in self.eager_verified_seq_ids],
             "eager_accepted_seq_ids": [int(seq_id) for seq_id in self.eager_accepted_seq_ids],
             "eager_rejected_seq_ids": [int(seq_id) for seq_id in self.eager_rejected_seq_ids],

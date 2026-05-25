@@ -601,6 +601,86 @@ def main() -> int:
         if len(unknown_warnings) > 20:
             print(f"  ... and {len(unknown_warnings) - 20} more")
 
+    # --- Cross-record evidence-chain validation ---
+    # Every seq in target_eager_set_trace must have a prior promotion/ready event.
+    # Build an index: proposal_id -> set of records where it was promoted/readied.
+    promoted_proposal_ids: set[str] = set()
+    simulated_proposal_ids: set[str] = set()
+    for r in continuous_records:
+        promoted = r.get("continuous_eager_promoted_seq_ids") or []
+        simulated = r.get("continuous_eager_promotion_simulated_seq_ids") or []
+        pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
+        for sid in promoted:
+            pid = pid_by_seq.get(str(sid), pid_by_seq.get(sid, ""))
+            if pid:
+                promoted_proposal_ids.add(str(pid))
+        for sid in simulated:
+            pid = pid_by_seq.get(str(sid), pid_by_seq.get(sid, ""))
+            if pid:
+                simulated_proposal_ids.add(str(pid))
+
+    all_evidenced_ids = promoted_proposal_ids | simulated_proposal_ids
+
+    # Also track proposals that were ever in "ready" state (from trace state).
+    ready_proposal_ids: set[str] = set()
+    for r in continuous_records:
+        state_by_seq = r.get("continuous_eager_proposal_state_by_seq_id") or {}
+        pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
+        for key, state in state_by_seq.items():
+            if str(state) == "ready":
+                pid = pid_by_seq.get(key, pid_by_seq.get(str(key), ""))
+                if pid:
+                    ready_proposal_ids.add(str(pid))
+    all_evidenced_ids |= ready_proposal_ids
+
+    # Validate: every seq in target_eager_set_trace must have evidence.
+    evidence_errors = []
+    for r in continuous_records:
+        target_trace = r.get("target_eager_set_trace") or []
+        if not target_trace:
+            continue
+        pid_by_seq = r.get("continuous_eager_proposal_id_by_seq_id") or {}
+        for sid in target_trace:
+            pid = pid_by_seq.get(str(sid), pid_by_seq.get(sid, ""))
+            if pid and str(pid) not in all_evidenced_ids:
+                evidence_errors.append(
+                    f"seq_id={sid} proposal_id={pid} in target_eager_set_trace "
+                    f"has no prior promotion/ready evidence"
+                )
+    if evidence_errors:
+        print(f"\n--- Evidence-chain errors ({len(evidence_errors)}) ---")
+        for e in evidence_errors[:20]:
+            print(f"  EVIDENCE ERROR: {e}")
+        if len(evidence_errors) > 20:
+            print(f"  ... and {len(evidence_errors) - 20} more")
+        errors.extend(evidence_errors)
+
+    # Validate: if target_eager_set_trace_total > 0, at least some promotions
+    # or simulated promotions must exist.
+    if total_target_eager_trace > 0 and not all_evidenced_ids:
+        errors.append(
+            f"target_eager_set_trace_total={total_target_eager_trace} > 0 "
+            f"but no promoted, simulated, or ready proposals found across all records"
+        )
+
+    # Validate: continue_pending proposals must have a parent that was promoted/ready.
+    for r in continuous_records:
+        state_by_seq = r.get("continuous_eager_proposal_state_by_seq_id") or {}
+        parent_kind_by_seq = r.get("continuous_eager_parent_kind_by_seq_id") or {}
+        parent_id_by_seq = r.get("continuous_eager_parent_proposal_id_by_seq_id") or {}
+        for key, state in state_by_seq.items():
+            if str(state) != "continue_pending":
+                continue
+            parent_kind = str(parent_kind_by_seq.get(key, parent_kind_by_seq.get(str(key), "")))
+            if parent_kind != "eager":
+                continue
+            parent_pid = str(parent_id_by_seq.get(key, parent_id_by_seq.get(str(key), "")))
+            if parent_pid and parent_pid not in all_evidenced_ids:
+                errors.append(
+                    f"continue_pending proposal {key} has parent_proposal_id={parent_pid} "
+                    f"which was never promoted/readied"
+                )
+
     # --- Per-record phase-aware validation ---
     for idx, record in enumerate(continuous_records):
         phase = record.get("plan_phase", "unknown")

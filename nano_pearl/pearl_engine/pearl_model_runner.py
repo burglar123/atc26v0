@@ -2273,6 +2273,7 @@ class ModelRunnerBase:
         plan: StepPlan,
         accepted_lens: dict[int, int],
         invalidated_lens: dict[int, int],
+        trace_record: dict | None = None,
     ) -> None:
         """Trace-only promotion/discard based on normal verify results.
 
@@ -2344,6 +2345,19 @@ class ModelRunnerBase:
         plan.continuous_eager_promotion_reason_by_seq_id = promote_reasons
         plan.continuous_eager_trace_promoted_count = len(promoted)
         plan.continuous_eager_trace_discarded_count = len(discarded)
+
+        if trace_record is not None:
+            trace_record["continuous_eager_promoted_seq_ids"] = promoted
+            trace_record["continuous_eager_discarded_seq_ids"] = discarded
+            trace_record["continuous_eager_parent_acceptance_unknown_seq_ids"] = unknown
+            trace_record["continuous_eager_discard_reason_by_seq_id"] = {
+                str(k): v for k, v in discard_reasons.items()
+            }
+            trace_record["continuous_eager_promotion_reason_by_seq_id"] = {
+                str(k): v for k, v in promote_reasons.items()
+            }
+            trace_record["continuous_eager_trace_promoted_count"] = len(promoted)
+            trace_record["continuous_eager_trace_discarded_count"] = len(discarded)
 
     def _receive_eager_verify_result(self, seqs: list[Sequence], *, group=None) -> torch.Tensor:
         # Source-authoritative meta+payload protocol: receiver allocates based on
@@ -3579,7 +3593,7 @@ class DraftModelRunner(ModelRunnerBase):
                     plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
                 )
                 self._promote_or_discard_continuous_eager_trace(
-                    plan, accepted_lens, invalidated_lens,
+                    plan, accepted_lens, invalidated_lens, trace_record=trace_record,
                 )
                 _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
                 assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
@@ -3856,7 +3870,7 @@ class DraftModelRunner(ModelRunnerBase):
                     plan, accepted_lens, invalidated_lens, trace_record, count_tokens=False,
                 )
                 self._promote_or_discard_continuous_eager_trace(
-                    plan, accepted_lens, invalidated_lens,
+                    plan, accepted_lens, invalidated_lens, trace_record=trace_record,
                 )
                 _post_promote_keys = self.dual_proposal_buffer.pending_seq_ids()
                 assert _pre_promote_keys == _post_promote_keys, self._proposal_assertion_message(
