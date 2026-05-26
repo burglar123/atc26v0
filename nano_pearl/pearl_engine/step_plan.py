@@ -150,6 +150,8 @@ class StepPlan:
     eager_apply_dry_run_enabled: bool = False
     enable_eager_result_transfer_dry_run: bool = False
     eager_result_transfer_dry_run_enabled: bool = False
+    enable_eager_sync_apply_dry_run: bool = False
+    eager_sync_apply_dry_run_enabled: bool = False
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -228,6 +230,7 @@ class StepPlan:
         enable_eager_verify_dry_run: bool = False,
         enable_eager_apply_dry_run: bool = False,
         enable_eager_result_transfer_dry_run: bool = False,
+        enable_eager_sync_apply_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
@@ -369,10 +372,15 @@ class StepPlan:
             or bool(enable_eager_verify_dry_run)
             or bool(enable_eager_apply_dry_run)
             or bool(enable_eager_result_transfer_dry_run)
+            or bool(enable_eager_sync_apply_dry_run)
             or not has_eager_scaffold
         ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+        if enable_eager_sync_apply_dry_run:
+            assert enable_eager_result_transfer_dry_run, (
+                "Phase 1H-5d sync apply dry-run requires eager result transfer dry-run"
+            )
         if enable_eager_result_transfer_dry_run:
             assert enable_eager_apply_dry_run, (
                 "Phase 1H-5c result transfer dry-run requires eager apply dry-run"
@@ -606,4 +614,6 @@ class StepPlan:
             "eager_apply_dry_run_enabled": bool(self.eager_apply_dry_run_enabled),
             "enable_eager_result_transfer_dry_run": bool(self.enable_eager_result_transfer_dry_run),
             "eager_result_transfer_dry_run_enabled": bool(self.eager_result_transfer_dry_run_enabled),
+            "enable_eager_sync_apply_dry_run": bool(self.enable_eager_sync_apply_dry_run),
+            "eager_sync_apply_dry_run_enabled": bool(self.eager_sync_apply_dry_run_enabled),
         }
