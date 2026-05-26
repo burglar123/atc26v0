@@ -144,6 +144,8 @@ class ModelRunnerBase:
         self.eager_proposal_buffer = EagerProposalBuffer()
         self._eager_proposal_id = 0
         self._draft_sent_eager_proposals_by_id = {}
+        self._pending_lane_exclusion_by_seq_id = {}
+        self._lane_exclusion_done_proposal_ids = set()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -701,14 +703,75 @@ class ModelRunnerBase:
             "draft_sync_apply_expected_normal_draft_conflict_by_seq_id": {},
             "draft_sync_apply_original_draft_home_intersection_by_seq_id": {},
             "draft_sync_apply_adjusted_draft_home_exclusion_by_seq_id": {},
+            "enable_eager_lane_exclusion_dry_run": bool(
+                getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False)
+            ),
+            "eager_lane_exclusion_dry_run_enabled": bool(
+                step_plan.eager_lane_exclusion_dry_run_enabled
+            ),
+            "original_draft_home_set": list(step_plan.original_draft_home_set or step_plan.draft_home_set),
+            "actual_draft_home_set_for_normal_draft": list(
+                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
+            ),
+            "excluded_from_actual_draft_home_for_eager": list(step_plan.lane_excluded_seq_ids),
+            "lane_excluded_seq_ids": list(step_plan.lane_excluded_seq_ids),
+            "lane_exclusion_decision_available_before_draft": bool(
+                step_plan.lane_exclusion_decision_available_before_draft
+            ),
+            "lane_exclusion_deferred_until_next_step": bool(
+                step_plan.lane_exclusion_deferred_until_next_step
+            ),
+            "lane_exclusion_defer_reason": step_plan.lane_exclusion_defer_reason,
+            "eager_lane_exclusion_proposal_ids": list(
+                getattr(step_plan, "eager_lane_exclusion_proposal_ids", [])
+            ),
+            "eager_lane_exclusion_seq_ids": list(
+                getattr(step_plan, "eager_lane_exclusion_seq_ids", step_plan.lane_excluded_seq_ids)
+            ),
+            "eager_lane_exclusion_reason_by_seq_id": dict(
+                getattr(step_plan, "eager_lane_exclusion_reason_by_seq_id", {})
+            ),
+            "lane_exclusion_dry_run_done": bool(
+                getattr(step_plan, "lane_exclusion_dry_run_done", False)
+            ),
+            "lane_exclusion_dry_run_done_proposal_ids": list(
+                getattr(step_plan, "lane_exclusion_dry_run_done_proposal_ids", [])
+            ),
+            "lane_exclusion_dry_run_done_seq_ids": list(
+                getattr(step_plan, "lane_exclusion_dry_run_done_seq_ids", step_plan.lane_excluded_seq_ids)
+            ),
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": list(
+                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
+            ),
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [],
+            "normal_proposal_missing_excluded_seq_ids": [],
+            "adjusted_normal_proposal_expected_seq_ids": list(
+                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
+            ),
+            "adjusted_normal_proposal_received_seq_ids": [],
+            "missing_normal_proposal_after_lane_exclusion": [],
+            "missing_normal_proposal_handled_by_fallback": [],
+            "excluded_eager_seq_ids": list(step_plan.lane_excluded_seq_ids),
+            "excluded_eager_seq_rejoin_required": bool(step_plan.lane_excluded_seq_ids),
+            "lane_exclusion_expected_normal_draft_conflict_count": len(step_plan.lane_excluded_seq_ids),
+            "lane_exclusion_resolved_normal_draft_conflict_count": len(step_plan.lane_excluded_seq_ids),
+            "lane_exclusion_unexpected_missing_proposal_count": 0,
+            "lane_exclusion_decision_late_count": 0,
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
-            "target_eager_set_dry_run": [],
-            "scheduled_target_eager_set_dry_run": [],
-            "scheduled_target_eager_proposal_ids_dry_run": [],
-            "scheduled_target_eager_seq_ids_dry_run": [],
-            "adjusted_draft_home_set_dry_run": [],
-            "excluded_from_draft_home_for_eager_dry_run": [],
+            "target_eager_set_dry_run": list(step_plan.target_eager_set_dry_run),
+            "scheduled_target_eager_set_dry_run": list(step_plan.scheduled_target_eager_set_dry_run),
+            "scheduled_target_eager_proposal_ids_dry_run": list(
+                step_plan.scheduled_target_eager_proposal_ids_dry_run
+            ),
+            "scheduled_target_eager_seq_ids_dry_run": list(
+                step_plan.scheduled_target_eager_seq_ids_dry_run
+            ),
+            "adjusted_draft_home_set_dry_run": list(step_plan.adjusted_draft_home_set_dry_run),
+            "excluded_from_draft_home_for_eager_dry_run": list(
+                step_plan.excluded_from_draft_home_for_eager_dry_run
+            ),
             "eager_schedule_candidate_proposal_ids": [],
             "eager_schedule_candidate_seq_ids": [],
             "eager_scheduled_proposal_ids": [],
@@ -838,6 +901,7 @@ class ModelRunnerBase:
             "eager_tokens_sync_apply_dry_run_draft_side": 0,
             "eager_sync_apply_target_mutation_remaining_count": 0,
             "eager_sync_apply_draft_mutation_remaining_count": 0,
+            "eager_tokens_lane_excluded_dry_run": len(step_plan.lane_excluded_seq_ids) * int(self.gamma),
             "eager_tokens_verified": 0,
             "eager_tokens_accepted": 0,
             "eager_tokens_rejected": 0,
@@ -958,6 +1022,9 @@ class ModelRunnerBase:
     def _eager_sync_apply_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_sync_apply_dry_run", False))
 
+    def _eager_lane_exclusion_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False))
+
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
             int(seq_id)
@@ -967,12 +1034,110 @@ class ModelRunnerBase:
             )
         }
 
+    def _validate_phase1h_plan(self, plan: StepPlan) -> None:
+        plan.validate_phase1h_eager_scaffold(
+            enable_eager_execution=False,
+            enable_eager_plan_dry_run=bool(plan.enable_eager_plan_dry_run),
+            enable_eager_draft_dry_run=bool(plan.enable_eager_draft_dry_run),
+            enable_eager_promotion_dry_run=bool(plan.enable_eager_promotion_dry_run),
+            enable_eager_transfer_dry_run=bool(plan.enable_eager_transfer_dry_run),
+            enable_eager_schedule_dry_run=bool(plan.enable_eager_schedule_dry_run),
+            enable_eager_verify_dry_run=bool(plan.enable_eager_verify_dry_run),
+            enable_eager_apply_dry_run=bool(plan.enable_eager_apply_dry_run),
+            enable_eager_result_transfer_dry_run=bool(plan.enable_eager_result_transfer_dry_run),
+            enable_eager_sync_apply_dry_run=bool(plan.enable_eager_sync_apply_dry_run),
+            enable_eager_lane_exclusion_dry_run=bool(plan.enable_eager_lane_exclusion_dry_run),
+            global_gamma=int(self.gamma),
+        )
+
+    def _actual_normal_draft_seq_ids(self, plan: StepPlan) -> list[int]:
+        return [
+            int(seq_id)
+            for seq_id in (plan.actual_draft_home_set_for_normal_draft or plan.draft_home_set)
+        ]
+
+    def _apply_eager_lane_exclusion_to_plan(self, plan: StepPlan) -> None:
+        if not self._eager_lane_exclusion_dry_run_enabled():
+            return
+
+        original_draft_home = [int(seq_id) for seq_id in plan.draft_home_set]
+        plan.enable_eager_lane_exclusion_dry_run = True
+        plan.eager_lane_exclusion_dry_run_enabled = True
+        plan.original_draft_home_set = list(original_draft_home)
+        plan.actual_draft_home_set_for_normal_draft = list(original_draft_home)
+        plan.adjusted_draft_home_set_dry_run = list(original_draft_home)
+        plan.excluded_from_draft_home_for_eager_dry_run = []
+        plan.lane_excluded_seq_ids = []
+        plan.lane_exclusion_decision_available_before_draft = False
+        plan.lane_exclusion_deferred_until_next_step = False
+        plan.lane_exclusion_defer_reason = None
+
+        if plan.execution_mode != "dual_batch_pearl" or plan.plan_phase != "steady":
+            return
+
+        original_set = set(original_draft_home)
+        available_entries = []
+        for seq_id in original_draft_home:
+            entry = self._pending_lane_exclusion_by_seq_id.get(int(seq_id))
+            if not entry:
+                continue
+            proposal_id = int(entry.get("proposal_id", -1))
+            if proposal_id in self._lane_exclusion_done_proposal_ids:
+                continue
+            if not bool(entry.get("authoritative", False)):
+                continue
+            available_entries.append(entry)
+
+        if not available_entries:
+            return
+
+        available_entries = sorted(
+            available_entries,
+            key=lambda entry: (int(entry.get("proposal_id", -1)), int(entry.get("seq_id", -1))),
+        )
+        excluded_seq_ids = sorted({int(entry["seq_id"]) for entry in available_entries} & original_set)
+        proposal_ids = [
+            int(entry["proposal_id"])
+            for entry in available_entries
+            if int(entry["seq_id"]) in set(excluded_seq_ids)
+        ]
+        adjusted_draft_home = [seq_id for seq_id in original_draft_home if seq_id not in set(excluded_seq_ids)]
+
+        plan.draft_home_set = list(adjusted_draft_home)
+        plan.actual_draft_home_set_for_normal_draft = list(adjusted_draft_home)
+        plan.adjusted_draft_home_set_dry_run = list(adjusted_draft_home)
+        plan.excluded_from_draft_home_for_eager_dry_run = list(excluded_seq_ids)
+        plan.lane_excluded_seq_ids = list(excluded_seq_ids)
+        plan.target_eager_set_dry_run = list(excluded_seq_ids)
+        plan.scheduled_target_eager_set_dry_run = list(excluded_seq_ids)
+        plan.scheduled_target_eager_seq_ids_dry_run = list(excluded_seq_ids)
+        plan.scheduled_target_eager_proposal_ids_dry_run = list(proposal_ids)
+        plan.lane_exclusion_decision_available_before_draft = True
+        plan.lane_exclusion_deferred_until_next_step = False
+        plan.lane_exclusion_defer_reason = None
+        plan.eager_schedule_dry_run_enabled = True
+        setattr(plan, "eager_lane_exclusion_proposal_ids", list(proposal_ids))
+        setattr(plan, "eager_lane_exclusion_seq_ids", list(excluded_seq_ids))
+        setattr(
+            plan,
+            "eager_lane_exclusion_reason_by_seq_id",
+            {seq_id: "decision_available_before_normal_draft" for seq_id in excluded_seq_ids},
+        )
+        setattr(plan, "lane_exclusion_dry_run_done", True)
+        setattr(plan, "lane_exclusion_dry_run_done_proposal_ids", list(proposal_ids))
+        setattr(plan, "lane_exclusion_dry_run_done_seq_ids", list(excluded_seq_ids))
+        for proposal_id in proposal_ids:
+            self._lane_exclusion_done_proposal_ids.add(int(proposal_id))
+        for seq_id in excluded_seq_ids:
+            self._pending_lane_exclusion_by_seq_id.pop(int(seq_id), None)
+
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
         sync_apply_dry_run_enabled = self._eager_sync_apply_dry_run_enabled()
+        lane_exclusion_dry_run_enabled = self._eager_lane_exclusion_dry_run_enabled()
         result_transfer_dry_run_enabled = self._eager_result_transfer_dry_run_enabled() or sync_apply_dry_run_enabled
         apply_dry_run_enabled = self._eager_apply_dry_run_enabled() or result_transfer_dry_run_enabled
         verify_dry_run_enabled = self._eager_verify_dry_run_enabled() or apply_dry_run_enabled
-        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled
+        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled or lane_exclusion_dry_run_enabled
         transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled() or schedule_dry_run_enabled
         promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled() or transfer_dry_run_enabled
         draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
@@ -988,6 +1153,7 @@ class ModelRunnerBase:
         plan.enable_eager_apply_dry_run = apply_dry_run_enabled
         plan.enable_eager_result_transfer_dry_run = result_transfer_dry_run_enabled
         plan.enable_eager_sync_apply_dry_run = sync_apply_dry_run_enabled
+        plan.enable_eager_lane_exclusion_dry_run = lane_exclusion_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
         plan.eager_gamma_equals_global_gamma = (
@@ -1027,6 +1193,7 @@ class ModelRunnerBase:
                 enable_eager_apply_dry_run=apply_dry_run_enabled,
                 enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
                 enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
+                enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
                 global_gamma=gamma,
             )
             return
@@ -1117,6 +1284,7 @@ class ModelRunnerBase:
             enable_eager_apply_dry_run=apply_dry_run_enabled,
             enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
             enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
+            enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
             global_gamma=gamma,
         )
 
@@ -1136,6 +1304,9 @@ class ModelRunnerBase:
             enable_eager_execution=bool(getattr(self.global_config, "enable_eager_execution", False)),
         )
         self._apply_eager_plan_dry_run(plan)
+        self._apply_eager_lane_exclusion_to_plan(plan)
+        if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
+            self._validate_phase1h_plan(plan)
         buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
@@ -1233,9 +1404,64 @@ class ModelRunnerBase:
     def _proposal_assertion_message(self, plan: StepPlan, detail: str) -> str:
         return (
             f"{detail}: plan_id={plan.plan_id}, target_home_set={plan.target_home_set}, "
-            f"draft_home_set={plan.draft_home_set}, buffered_proposal_seq_ids="
+            f"draft_home_set={plan.draft_home_set}, original_draft_home_set="
+            f"{plan.original_draft_home_set}, actual_draft_home_set_for_normal_draft="
+            f"{self._actual_normal_draft_seq_ids(plan)}, buffered_proposal_seq_ids="
             f"{self.dual_proposal_buffer.pending_seq_ids()}"
         )
+
+    def _update_lane_exclusion_proposal_trace(
+        self,
+        trace_record: dict,
+        plan: StepPlan,
+        sent_proposals: list[BufferedProposal] | None = None,
+        received_proposals: list[BufferedProposal] | None = None,
+    ) -> None:
+        expected_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        sent_seq_ids = (
+            [int(proposal.seq_id) for proposal in sent_proposals]
+            if sent_proposals is not None
+            else list(trace_record.get("normal_proposal_sent_seq_ids_after_lane_exclusion", []))
+        )
+        received_seq_ids = (
+            [int(proposal.seq_id) for proposal in received_proposals]
+            if received_proposals is not None
+            else list(trace_record.get("normal_proposal_received_seq_ids_after_lane_exclusion", []))
+        )
+        excluded_seq_ids = [int(seq_id) for seq_id in plan.lane_excluded_seq_ids]
+        missing_sent = [seq_id for seq_id in expected_seq_ids if seq_id not in set(sent_seq_ids)]
+        missing_received = [seq_id for seq_id in expected_seq_ids if seq_id not in set(received_seq_ids)]
+        trace_record["original_draft_home_set"] = list(plan.original_draft_home_set or plan.draft_home_set)
+        trace_record["actual_draft_home_set_for_normal_draft"] = list(expected_seq_ids)
+        if (
+            self._eager_lane_exclusion_dry_run_enabled()
+            or plan.adjusted_draft_home_set_dry_run
+            or plan.excluded_from_draft_home_for_eager_dry_run
+        ):
+            trace_record["adjusted_draft_home_set_dry_run"] = list(
+                plan.adjusted_draft_home_set_dry_run or expected_seq_ids
+            )
+            trace_record["excluded_from_draft_home_for_eager_dry_run"] = list(
+                plan.excluded_from_draft_home_for_eager_dry_run
+            )
+        trace_record["excluded_from_actual_draft_home_for_eager"] = list(excluded_seq_ids)
+        trace_record["lane_excluded_seq_ids"] = list(excluded_seq_ids)
+        trace_record["normal_proposal_expected_seq_ids_after_lane_exclusion"] = list(expected_seq_ids)
+        trace_record["adjusted_normal_proposal_expected_seq_ids"] = list(expected_seq_ids)
+        trace_record["normal_proposal_sent_seq_ids_after_lane_exclusion"] = list(sent_seq_ids)
+        trace_record["normal_proposal_received_seq_ids_after_lane_exclusion"] = list(received_seq_ids)
+        trace_record["adjusted_normal_proposal_received_seq_ids"] = list(received_seq_ids)
+        trace_record["normal_proposal_missing_excluded_seq_ids"] = list(excluded_seq_ids)
+        trace_record["missing_normal_proposal_after_lane_exclusion"] = (
+            list(missing_sent) if sent_proposals is not None else list(missing_received)
+        )
+        trace_record["missing_normal_proposal_handled_by_fallback"] = list(excluded_seq_ids)
+        trace_record["lane_exclusion_expected_normal_draft_conflict_count"] = len(excluded_seq_ids)
+        trace_record["lane_exclusion_resolved_normal_draft_conflict_count"] = len(excluded_seq_ids)
+        trace_record["lane_exclusion_unexpected_missing_proposal_count"] = len(
+            list(missing_sent) if sent_proposals is not None else list(missing_received)
+        )
+        trace_record["eager_tokens_lane_excluded_dry_run"] = len(excluded_seq_ids) * int(self.gamma)
 
     def _build_buffered_proposals(self, seqs: list[Sequence], plan: StepPlan) -> list[BufferedProposal]:
         proposals = []
@@ -2995,6 +3221,29 @@ class ModelRunnerBase:
         deferred_seq_ids = [int(proposal.seq_id) for proposal in deferred]
         deferred_proposal_ids = [int(proposal.proposal_id) for proposal in deferred]
         skipped_proposal_ids = [int(proposal.proposal_id) for proposal in skipped]
+        original_draft_home_for_lane = {
+            int(seq_id) for seq_id in (plan.original_draft_home_set or plan.draft_home_set)
+        }
+        late_lane_proposals = [
+            proposal
+            for proposal in scheduled
+            if self._eager_lane_exclusion_dry_run_enabled()
+            and int(proposal.seq_id) in original_draft_home_for_lane
+        ]
+        for proposal in late_lane_proposals:
+            self._pending_lane_exclusion_by_seq_id[int(proposal.seq_id)] = {
+                "proposal_id": int(proposal.proposal_id),
+                "seq_id": int(proposal.seq_id),
+                "proposal_len": int(proposal.proposal_len),
+                "base_len": int(proposal.base_len),
+                "base_pre_verify": bool(proposal.base_pre_verify),
+                "source_step_id": int(proposal.source_step_id),
+                "source_plan_id": int(proposal.source_plan_id),
+                "to_verify_len": len(proposal.to_be_verified_token_ids),
+                "proposal_token_len": len(proposal.proposal_token_ids),
+                "authoritative": False,
+                "defer_reason": "decision_not_available_before_normal_draft",
+            }
         scheduled_target_eager_set_dry_run = list(scheduled_seq_ids)
         adjusted_draft_home_set_dry_run = [
             int(seq_id) for seq_id in plan.draft_home_set if int(seq_id) not in set(scheduled_seq_ids)
@@ -3115,6 +3364,26 @@ class ModelRunnerBase:
         trace_record["eager_ready_buffer_size_before_schedule"] = int(ready_size_before)
         trace_record["eager_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
         trace_record["eager_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
+        if self._eager_lane_exclusion_dry_run_enabled() and late_lane_proposals:
+            late_seq_ids = [int(proposal.seq_id) for proposal in late_lane_proposals]
+            late_proposal_ids = [int(proposal.proposal_id) for proposal in late_lane_proposals]
+            trace_record["eager_lane_exclusion_dry_run_enabled"] = True
+            trace_record["lane_exclusion_decision_available_before_draft"] = False
+            trace_record["lane_exclusion_deferred_until_next_step"] = True
+            trace_record["lane_exclusion_defer_reason"] = "decision_not_available_before_normal_draft"
+            trace_record["lane_exclusion_decision_late_count"] = len(late_seq_ids)
+            trace_record["eager_lane_exclusion_proposal_ids"] = late_proposal_ids
+            trace_record["eager_lane_exclusion_seq_ids"] = late_seq_ids
+            trace_record["eager_lane_exclusion_reason_by_seq_id"] = {
+                str(seq_id): "decision_not_available_before_normal_draft"
+                for seq_id in late_seq_ids
+            }
+            trace_record["lane_exclusion_dry_run_done"] = False
+            trace_record["excluded_from_actual_draft_home_for_eager"] = []
+            trace_record["lane_excluded_seq_ids"] = []
+            trace_record["actual_draft_home_set_for_normal_draft"] = list(
+                plan.actual_draft_home_set_for_normal_draft or plan.draft_home_set
+            )
         trace_record["eager_tokens_schedule_candidates"] = sum(
             int(proposal.proposal_len) for proposal in candidates
         )
@@ -4390,7 +4659,8 @@ class DraftModelRunner(ModelRunnerBase):
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
-        draft_seqs = self._resolve_dual_seq_ids(plan.draft_home_set, plan, "dual_draft")
+        normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        draft_seqs = self._resolve_dual_seq_ids(normal_draft_seq_ids, plan, "dual_draft")
         eager_draft_seqs = self._resolve_dual_seq_ids(
             plan.draft_eager_set,
             plan,
@@ -4408,10 +4678,15 @@ class DraftModelRunner(ModelRunnerBase):
                 self.dual_proposal_buffer.store(proposals)
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=proposals)
                 self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
             for trace_record in draft_records:
                 trace_record["normal_proposal_transfer_called"] = True
+        elif self._eager_lane_exclusion_dry_run_enabled() and plan.lane_excluded_seq_ids:
+            trace_record = self._trace_dual_batch_schedule([], plan, "dual_draft_lane_exclusion")
+            self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=[])
+            self._finalize_record_profile(trace_record)
 
         if self._eager_draft_dry_run_enabled() and eager_draft_seqs:
             if draft_records:
@@ -4605,7 +4880,7 @@ class TargetModelRunner(ModelRunnerBase):
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")
-        draft_seq_ids = list(plan.draft_home_set)
+        draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         target_seq_ids = [seq.seq_id for seq in target_seqs]
         fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"
 
@@ -4637,6 +4912,11 @@ class TargetModelRunner(ModelRunnerBase):
             received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
             if trace_record is not None:
                 trace_record["normal_proposal_transfer_called"] = True
+                self._update_lane_exclusion_proposal_trace(
+                    trace_record,
+                    plan,
+                    received_proposals=received_proposals,
+                )
             if fallback_same_batch:
                 target_proposals = received_proposals
                 if trace_record is not None:
@@ -4667,6 +4947,8 @@ class TargetModelRunner(ModelRunnerBase):
             priming_record["normal_proposal_transfer_called"] = True
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             self._finalize_record_profile(priming_record)
+        elif trace_record is not None and self._eager_lane_exclusion_dry_run_enabled():
+            self._update_lane_exclusion_proposal_trace(trace_record, plan, received_proposals=[])
 
         if self._eager_transfer_dry_run_enabled():
             transfer_trace_record = trace_record or priming_record

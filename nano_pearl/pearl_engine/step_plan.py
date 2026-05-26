@@ -49,6 +49,12 @@ class StepPlan:
     scheduled_target_eager_seq_ids_dry_run: List[int] = field(default_factory=list)
     adjusted_draft_home_set_dry_run: List[int] = field(default_factory=list)
     excluded_from_draft_home_for_eager_dry_run: List[int] = field(default_factory=list)
+    original_draft_home_set: List[int] = field(default_factory=list)
+    actual_draft_home_set_for_normal_draft: List[int] = field(default_factory=list)
+    lane_excluded_seq_ids: List[int] = field(default_factory=list)
+    lane_exclusion_decision_available_before_draft: bool = False
+    lane_exclusion_deferred_until_next_step: bool = False
+    lane_exclusion_defer_reason: Optional[str] = None
     draft_home_set: List[int] = field(default_factory=list)
     draft_eager_set: List[int] = field(default_factory=list)
 
@@ -152,6 +158,8 @@ class StepPlan:
     eager_result_transfer_dry_run_enabled: bool = False
     enable_eager_sync_apply_dry_run: bool = False
     eager_sync_apply_dry_run_enabled: bool = False
+    enable_eager_lane_exclusion_dry_run: bool = False
+    eager_lane_exclusion_dry_run_enabled: bool = False
 
     def all_seq_ids(self) -> List[int]:
         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
@@ -231,6 +239,7 @@ class StepPlan:
         enable_eager_apply_dry_run: bool = False,
         enable_eager_result_transfer_dry_run: bool = False,
         enable_eager_sync_apply_dry_run: bool = False,
+        enable_eager_lane_exclusion_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
@@ -249,6 +258,9 @@ class StepPlan:
         excluded_from_draft_home = set(
             int(seq_id) for seq_id in self.excluded_from_draft_home_for_eager_dry_run
         )
+        original_draft_home = set(int(seq_id) for seq_id in self.original_draft_home_set)
+        actual_draft_home = set(int(seq_id) for seq_id in self.actual_draft_home_set_for_normal_draft)
+        lane_excluded = set(int(seq_id) for seq_id in self.lane_excluded_seq_ids)
         draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
 
         assert not (target_eager & target_home), (
@@ -281,15 +293,31 @@ class StepPlan:
                 f"adjusted_draft_home_set_dry_run: "
                 f"{sorted(scheduled_target_eager_dry_run & adjusted_draft_home_dry_run)}"
             )
-            assert adjusted_draft_home_dry_run == draft_home - excluded_from_draft_home, (
-                "adjusted_draft_home_set_dry_run must equal draft_home_set minus "
+            adjustment_parent_home = original_draft_home if original_draft_home else draft_home
+            assert adjusted_draft_home_dry_run == adjustment_parent_home - excluded_from_draft_home, (
+                "adjusted_draft_home_set_dry_run must equal the original draft home set minus "
                 f"excluded_from_draft_home_for_eager_dry_run: adjusted={sorted(adjusted_draft_home_dry_run)}, "
-                f"expected={sorted(draft_home - excluded_from_draft_home)}"
+                f"expected={sorted(adjustment_parent_home - excluded_from_draft_home)}"
             )
-        assert excluded_from_draft_home <= draft_home, (
-            "excluded_from_draft_home_for_eager_dry_run must be a subset of draft_home_set: "
-            f"extra={sorted(excluded_from_draft_home - draft_home)}"
+        excluded_parent_home = original_draft_home if original_draft_home else draft_home
+        assert excluded_from_draft_home <= excluded_parent_home, (
+            "excluded_from_draft_home_for_eager_dry_run must be a subset of the original draft home set: "
+            f"extra={sorted(excluded_from_draft_home - excluded_parent_home)}"
         )
+        if enable_eager_lane_exclusion_dry_run and original_draft_home:
+            assert actual_draft_home == draft_home, (
+                "actual_draft_home_set_for_normal_draft must match current draft_home_set "
+                f"after lane exclusion: actual={sorted(actual_draft_home)}, draft={sorted(draft_home)}"
+            )
+            assert lane_excluded <= original_draft_home, (
+                f"lane_excluded_seq_ids must be a subset of original_draft_home_set: "
+                f"extra={sorted(lane_excluded - original_draft_home)}"
+            )
+            assert draft_home == original_draft_home - lane_excluded, (
+                "draft_home_set must equal original_draft_home_set minus lane_excluded_seq_ids "
+                f"when lane exclusion is enabled: draft={sorted(draft_home)}, "
+                f"expected={sorted(original_draft_home - lane_excluded)}"
+            )
 
         eager_new_selected = set(int(seq_id) for seq_id in self.eager_new_selected_set)
         draft_eager_set_new = set(
@@ -373,6 +401,7 @@ class StepPlan:
             or bool(enable_eager_apply_dry_run)
             or bool(enable_eager_result_transfer_dry_run)
             or bool(enable_eager_sync_apply_dry_run)
+            or bool(enable_eager_lane_exclusion_dry_run)
             or not has_eager_scaffold
         ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
@@ -389,6 +418,10 @@ class StepPlan:
             assert enable_eager_verify_dry_run, "Phase 1H-5b apply dry-run requires eager verify dry-run"
         if enable_eager_verify_dry_run:
             assert enable_eager_schedule_dry_run, "Phase 1H-5a verify dry-run requires eager schedule dry-run"
+        if enable_eager_lane_exclusion_dry_run:
+            assert enable_eager_schedule_dry_run, (
+                "Phase 1H-5e lane exclusion dry-run requires eager schedule dry-run"
+            )
         if enable_eager_schedule_dry_run:
             assert enable_eager_transfer_dry_run, "Phase 1H-4c schedule dry-run requires eager transfer dry-run"
             assert target_eager_dry_run == scheduled_target_eager_dry_run == scheduled_target_eager_seq_ids, (
@@ -474,6 +507,18 @@ class StepPlan:
             "excluded_from_draft_home_for_eager_dry_run": _int_list(
                 self.excluded_from_draft_home_for_eager_dry_run
             ),
+            "original_draft_home_set": _int_list(self.original_draft_home_set),
+            "actual_draft_home_set_for_normal_draft": _int_list(
+                self.actual_draft_home_set_for_normal_draft
+            ),
+            "lane_excluded_seq_ids": _int_list(self.lane_excluded_seq_ids),
+            "lane_exclusion_decision_available_before_draft": bool(
+                self.lane_exclusion_decision_available_before_draft
+            ),
+            "lane_exclusion_deferred_until_next_step": bool(
+                self.lane_exclusion_deferred_until_next_step
+            ),
+            "lane_exclusion_defer_reason": self.lane_exclusion_defer_reason,
             "draft_home_set": _int_list(self.draft_home_set),
             "draft_eager_set": _int_list(self.draft_eager_set),
             "budgets": {
@@ -616,4 +661,6 @@ class StepPlan:
             "eager_result_transfer_dry_run_enabled": bool(self.eager_result_transfer_dry_run_enabled),
             "enable_eager_sync_apply_dry_run": bool(self.enable_eager_sync_apply_dry_run),
             "eager_sync_apply_dry_run_enabled": bool(self.eager_sync_apply_dry_run_enabled),
+            "enable_eager_lane_exclusion_dry_run": bool(self.enable_eager_lane_exclusion_dry_run),
+            "eager_lane_exclusion_dry_run_enabled": bool(self.eager_lane_exclusion_dry_run_enabled),
         }

@@ -1,0 +1,343 @@
+diff --git a/benchmark/eval_multi_slo.py b/benchmark/eval_multi_slo.py
+index 53ad6d8..5829562 100644
+--- a/benchmark/eval_multi_slo.py
++++ b/benchmark/eval_multi_slo.py
+@@ -134,6 +134,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         "execution_mode": args.execution_mode,
+         "enable_eager_execution": args.enable_eager_execution,
+         "enable_eager_plan_dry_run": args.enable_eager_plan_dry_run
++        or args.enable_eager_lane_exclusion_dry_run
+         or args.enable_eager_sync_apply_dry_run
+         or args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_apply_dry_run
+@@ -143,6 +144,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         or args.enable_eager_promotion_dry_run
+         or args.enable_eager_draft_dry_run,
+         "enable_eager_draft_dry_run": args.enable_eager_draft_dry_run
++        or args.enable_eager_lane_exclusion_dry_run
+         or args.enable_eager_sync_apply_dry_run
+         or args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_apply_dry_run
+@@ -151,6 +153,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         or args.enable_eager_transfer_dry_run
+         or args.enable_eager_promotion_dry_run,
+         "enable_eager_promotion_dry_run": args.enable_eager_promotion_dry_run
++        or args.enable_eager_lane_exclusion_dry_run
+         or args.enable_eager_sync_apply_dry_run
+         or args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_apply_dry_run
+@@ -158,12 +161,14 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         or args.enable_eager_schedule_dry_run
+         or args.enable_eager_transfer_dry_run,
+         "enable_eager_transfer_dry_run": args.enable_eager_transfer_dry_run
++        or args.enable_eager_lane_exclusion_dry_run
+         or args.enable_eager_sync_apply_dry_run
+         or args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_apply_dry_run
+         or args.enable_eager_verify_dry_run
+         or args.enable_eager_schedule_dry_run,
+         "enable_eager_schedule_dry_run": args.enable_eager_schedule_dry_run
++        or args.enable_eager_lane_exclusion_dry_run
+         or args.enable_eager_sync_apply_dry_run
+         or args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_apply_dry_run
+@@ -178,6 +183,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         "enable_eager_result_transfer_dry_run": args.enable_eager_result_transfer_dry_run
+         or args.enable_eager_sync_apply_dry_run,
+         "enable_eager_sync_apply_dry_run": args.enable_eager_sync_apply_dry_run,
++        "enable_eager_lane_exclusion_dry_run": args.enable_eager_lane_exclusion_dry_run,
+         "eager_policy": args.eager_policy,
+         "max_eager_requests_per_step": args.max_eager_requests_per_step,
+         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
+@@ -209,6 +215,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
+         "enable_eager_apply_dry_run",
+         "enable_eager_result_transfer_dry_run",
+         "enable_eager_sync_apply_dry_run",
++        "enable_eager_lane_exclusion_dry_run",
+         "eager_policy",
+         "max_eager_requests_per_step",
+         "max_eager_tokens_per_step",
+@@ -1518,6 +1525,11 @@ def main() -> None:
+         action="store_true",
+         help="Enable Phase 1H-5d synchronized eager apply dry-run with rollback on target and draft.",
+     )
++    parser.add_argument(
++        "--enable-eager-lane-exclusion-dry-run",
++        action="store_true",
++        help="Enable Phase 1H-5e actual normal-lane exclusion dry-run without eager verify/apply.",
++    )
+     parser.add_argument(
+         "--eager-policy",
+         type=str,
+diff --git a/nano_pearl/pearl_config.py b/nano_pearl/pearl_config.py
+index ecc1697..e750930 100644
+--- a/nano_pearl/pearl_config.py
++++ b/nano_pearl/pearl_config.py
+@@ -138,6 +138,7 @@ class PEARLConfig:
+     enable_eager_apply_dry_run: bool = False
+     enable_eager_result_transfer_dry_run: bool = False
+     enable_eager_sync_apply_dry_run: bool = False
++    enable_eager_lane_exclusion_dry_run: bool = False
+     eager_policy: str = "none"
+     max_eager_requests_per_step: int = 0
+     max_eager_tokens_per_step: int = 0
+@@ -159,6 +160,7 @@ class PEARLConfig:
+         self.enable_eager_apply_dry_run = bool(self.enable_eager_apply_dry_run)
+         self.enable_eager_result_transfer_dry_run = bool(self.enable_eager_result_transfer_dry_run)
+         self.enable_eager_sync_apply_dry_run = bool(self.enable_eager_sync_apply_dry_run)
++        self.enable_eager_lane_exclusion_dry_run = bool(self.enable_eager_lane_exclusion_dry_run)
+         if self.enable_eager_sync_apply_dry_run:
+             self.enable_eager_result_transfer_dry_run = True
+         if self.enable_eager_result_transfer_dry_run:
+@@ -169,6 +171,9 @@ class PEARLConfig:
+             self.enable_eager_schedule_dry_run = True
+         if self.enable_eager_schedule_dry_run:
+             self.enable_eager_transfer_dry_run = True
++        if self.enable_eager_lane_exclusion_dry_run:
++            self.enable_eager_schedule_dry_run = True
++            self.enable_eager_transfer_dry_run = True
+         if self.enable_eager_transfer_dry_run:
+             self.enable_eager_promotion_dry_run = True
+         if self.enable_eager_promotion_dry_run:
+@@ -232,6 +237,7 @@ class PEARLConfig:
+         logger.info(f"Enable_Eager_Apply_Dry_Run={self.enable_eager_apply_dry_run}")
+         logger.info(f"Enable_Eager_Result_Transfer_Dry_Run={self.enable_eager_result_transfer_dry_run}")
+         logger.info(f"Enable_Eager_Sync_Apply_Dry_Run={self.enable_eager_sync_apply_dry_run}")
++        logger.info(f"Enable_Eager_Lane_Exclusion_Dry_Run={self.enable_eager_lane_exclusion_dry_run}")
+         logger.info(f"Eager_Policy={self.eager_policy}")
+         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
+         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")
+diff --git a/nano_pearl/pearl_engine/pearl_model_runner.py b/nano_pearl/pearl_engine/pearl_model_runner.py
+index 36f3922..6adca84 100644
+--- a/nano_pearl/pearl_engine/pearl_model_runner.py
++++ b/nano_pearl/pearl_engine/pearl_model_runner.py
+@@ -144,6 +144,8 @@ class ModelRunnerBase:
+         self.eager_proposal_buffer = EagerProposalBuffer()
+         self._eager_proposal_id = 0
+         self._draft_sent_eager_proposals_by_id = {}
++        self._pending_lane_exclusion_by_seq_id = {}
++        self._lane_exclusion_done_proposal_ids = set()
+         self.cached_kv_store = {}
+         self.cached_admission_log_interval = 32
+         self.last_result_used_file_fallback = False
+@@ -701,6 +703,47 @@ class ModelRunnerBase:
+             "draft_sync_apply_expected_normal_draft_conflict_by_seq_id": {},
+             "draft_sync_apply_original_draft_home_intersection_by_seq_id": {},
+             "draft_sync_apply_adjusted_draft_home_exclusion_by_seq_id": {},
++            "enable_eager_lane_exclusion_dry_run": bool(
++                getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False)
++            ),
++            "eager_lane_exclusion_dry_run_enabled": False,
++            "original_draft_home_set": list(step_plan.original_draft_home_set or step_plan.draft_home_set),
++            "actual_draft_home_set_for_normal_draft": list(
++                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
++            ),
++            "excluded_from_actual_draft_home_for_eager": list(step_plan.lane_excluded_seq_ids),
++            "lane_excluded_seq_ids": list(step_plan.lane_excluded_seq_ids),
++            "lane_exclusion_decision_available_before_draft": bool(
++                step_plan.lane_exclusion_decision_available_before_draft
++            ),
++            "lane_exclusion_deferred_until_next_step": bool(
++                step_plan.lane_exclusion_deferred_until_next_step
++            ),
++            "lane_exclusion_defer_reason": step_plan.lane_exclusion_defer_reason,
++            "eager_lane_exclusion_proposal_ids": [],
++            "eager_lane_exclusion_seq_ids": [],
++            "eager_lane_exclusion_reason_by_seq_id": {},
++            "lane_exclusion_dry_run_done": False,
++            "lane_exclusion_dry_run_done_proposal_ids": [],
++            "lane_exclusion_dry_run_done_seq_ids": [],
++            "normal_proposal_expected_seq_ids_after_lane_exclusion": list(
++                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
++            ),
++            "normal_proposal_sent_seq_ids_after_lane_exclusion": [],
++            "normal_proposal_received_seq_ids_after_lane_exclusion": [],
++            "normal_proposal_missing_excluded_seq_ids": [],
++            "adjusted_normal_proposal_expected_seq_ids": list(
++                step_plan.actual_draft_home_set_for_normal_draft or step_plan.draft_home_set
++            ),
++            "adjusted_normal_proposal_received_seq_ids": [],
++            "missing_normal_proposal_after_lane_exclusion": [],
++            "missing_normal_proposal_handled_by_fallback": [],
++            "excluded_eager_seq_ids": list(step_plan.lane_excluded_seq_ids),
++            "excluded_eager_seq_rejoin_required": bool(step_plan.lane_excluded_seq_ids),
++            "lane_exclusion_expected_normal_draft_conflict_count": len(step_plan.lane_excluded_seq_ids),
++            "lane_exclusion_resolved_normal_draft_conflict_count": len(step_plan.lane_excluded_seq_ids),
++            "lane_exclusion_unexpected_missing_proposal_count": 0,
++            "lane_exclusion_decision_late_count": 0,
+             "eager_schedule_step_id": None,
+             "eager_schedule_plan_id": None,
+             "target_eager_set_dry_run": [],
+@@ -838,6 +881,7 @@ class ModelRunnerBase:
+             "eager_tokens_sync_apply_dry_run_draft_side": 0,
+             "eager_sync_apply_target_mutation_remaining_count": 0,
+             "eager_sync_apply_draft_mutation_remaining_count": 0,
++            "eager_tokens_lane_excluded_dry_run": 0,
+             "eager_tokens_verified": 0,
+             "eager_tokens_accepted": 0,
+             "eager_tokens_rejected": 0,
+@@ -958,6 +1002,9 @@ class ModelRunnerBase:
+     def _eager_sync_apply_dry_run_enabled(self) -> bool:
+         return bool(getattr(self.global_config, "enable_eager_sync_apply_dry_run", False))
+ 
++    def _eager_lane_exclusion_dry_run_enabled(self) -> bool:
++        return bool(getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False))
++
+     def _pending_eager_seq_ids(self) -> set[int]:
+         return {
+             int(seq_id)
+@@ -969,10 +1016,11 @@ class ModelRunnerBase:
+ 
+     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
+         sync_apply_dry_run_enabled = self._eager_sync_apply_dry_run_enabled()
++        lane_exclusion_dry_run_enabled = self._eager_lane_exclusion_dry_run_enabled()
+         result_transfer_dry_run_enabled = self._eager_result_transfer_dry_run_enabled() or sync_apply_dry_run_enabled
+         apply_dry_run_enabled = self._eager_apply_dry_run_enabled() or result_transfer_dry_run_enabled
+         verify_dry_run_enabled = self._eager_verify_dry_run_enabled() or apply_dry_run_enabled
+-        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled
++        schedule_dry_run_enabled = self._eager_schedule_dry_run_enabled() or verify_dry_run_enabled or lane_exclusion_dry_run_enabled
+         transfer_dry_run_enabled = self._eager_transfer_dry_run_enabled() or schedule_dry_run_enabled
+         promotion_dry_run_enabled = self._eager_promotion_dry_run_enabled() or transfer_dry_run_enabled
+         draft_dry_run_enabled = self._eager_draft_dry_run_enabled() or promotion_dry_run_enabled
+@@ -988,6 +1036,7 @@ class ModelRunnerBase:
+         plan.enable_eager_apply_dry_run = apply_dry_run_enabled
+         plan.enable_eager_result_transfer_dry_run = result_transfer_dry_run_enabled
+         plan.enable_eager_sync_apply_dry_run = sync_apply_dry_run_enabled
++        plan.enable_eager_lane_exclusion_dry_run = lane_exclusion_dry_run_enabled
+         plan.eager_policy = policy
+         plan.eager_post_verify_only = True
+         plan.eager_gamma_equals_global_gamma = (
+@@ -1027,6 +1076,7 @@ class ModelRunnerBase:
+                 enable_eager_apply_dry_run=apply_dry_run_enabled,
+                 enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
+                 enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
++                enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
+                 global_gamma=gamma,
+             )
+             return
+@@ -1117,6 +1167,7 @@ class ModelRunnerBase:
+             enable_eager_apply_dry_run=apply_dry_run_enabled,
+             enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
+             enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
++            enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
+             global_gamma=gamma,
+         )
+ 
+diff --git a/nano_pearl/pearl_engine/step_plan.py b/nano_pearl/pearl_engine/step_plan.py
+index e9a8075..02f1ba9 100644
+--- a/nano_pearl/pearl_engine/step_plan.py
++++ b/nano_pearl/pearl_engine/step_plan.py
+@@ -49,6 +49,12 @@ class StepPlan:
+     scheduled_target_eager_seq_ids_dry_run: List[int] = field(default_factory=list)
+     adjusted_draft_home_set_dry_run: List[int] = field(default_factory=list)
+     excluded_from_draft_home_for_eager_dry_run: List[int] = field(default_factory=list)
++    original_draft_home_set: List[int] = field(default_factory=list)
++    actual_draft_home_set_for_normal_draft: List[int] = field(default_factory=list)
++    lane_excluded_seq_ids: List[int] = field(default_factory=list)
++    lane_exclusion_decision_available_before_draft: bool = False
++    lane_exclusion_deferred_until_next_step: bool = False
++    lane_exclusion_defer_reason: Optional[str] = None
+     draft_home_set: List[int] = field(default_factory=list)
+     draft_eager_set: List[int] = field(default_factory=list)
+ 
+@@ -152,6 +158,8 @@ class StepPlan:
+     eager_result_transfer_dry_run_enabled: bool = False
+     enable_eager_sync_apply_dry_run: bool = False
+     eager_sync_apply_dry_run_enabled: bool = False
++    enable_eager_lane_exclusion_dry_run: bool = False
++    eager_lane_exclusion_dry_run_enabled: bool = False
+ 
+     def all_seq_ids(self) -> List[int]:
+         return list(self.target_home_set) + list(self.target_eager_set) + list(self.draft_home_set) + list(self.draft_eager_set)
+@@ -231,6 +239,7 @@ class StepPlan:
+         enable_eager_apply_dry_run: bool = False,
+         enable_eager_result_transfer_dry_run: bool = False,
+         enable_eager_sync_apply_dry_run: bool = False,
++        enable_eager_lane_exclusion_dry_run: bool = False,
+         global_gamma: int | None = None,
+     ):
+         target_home = set(int(seq_id) for seq_id in self.target_home_set)
+@@ -249,6 +258,9 @@ class StepPlan:
+         excluded_from_draft_home = set(
+             int(seq_id) for seq_id in self.excluded_from_draft_home_for_eager_dry_run
+         )
++        original_draft_home = set(int(seq_id) for seq_id in self.original_draft_home_set)
++        actual_draft_home = set(int(seq_id) for seq_id in self.actual_draft_home_set_for_normal_draft)
++        lane_excluded = set(int(seq_id) for seq_id in self.lane_excluded_seq_ids)
+         draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
+ 
+         assert not (target_eager & target_home), (
+@@ -286,10 +298,25 @@ class StepPlan:
+                 f"excluded_from_draft_home_for_eager_dry_run: adjusted={sorted(adjusted_draft_home_dry_run)}, "
+                 f"expected={sorted(draft_home - excluded_from_draft_home)}"
+             )
+-        assert excluded_from_draft_home <= draft_home, (
+-            "excluded_from_draft_home_for_eager_dry_run must be a subset of draft_home_set: "
+-            f"extra={sorted(excluded_from_draft_home - draft_home)}"
++        excluded_parent_home = original_draft_home if original_draft_home else draft_home
++        assert excluded_from_draft_home <= excluded_parent_home, (
++            "excluded_from_draft_home_for_eager_dry_run must be a subset of the original draft home set: "
++            f"extra={sorted(excluded_from_draft_home - excluded_parent_home)}"
+         )
++        if enable_eager_lane_exclusion_dry_run and original_draft_home:
++            assert actual_draft_home == draft_home, (
++                "actual_draft_home_set_for_normal_draft must match current draft_home_set "
++                f"after lane exclusion: actual={sorted(actual_draft_home)}, draft={sorted(draft_home)}"
++            )
++            assert lane_excluded <= original_draft_home, (
++                f"lane_excluded_seq_ids must be a subset of original_draft_home_set: "
++                f"extra={sorted(lane_excluded - original_draft_home)}"
++            )
++            assert draft_home == original_draft_home - lane_excluded, (
++                "draft_home_set must equal original_draft_home_set minus lane_excluded_seq_ids "
++                f"when lane exclusion is enabled: draft={sorted(draft_home)}, "
++                f"expected={sorted(original_draft_home - lane_excluded)}"
++            )
+ 
+         eager_new_selected = set(int(seq_id) for seq_id in self.eager_new_selected_set)
+         draft_eager_set_new = set(
+@@ -373,6 +400,7 @@ class StepPlan:
+             or bool(enable_eager_apply_dry_run)
+             or bool(enable_eager_result_transfer_dry_run)
+             or bool(enable_eager_sync_apply_dry_run)
++            or bool(enable_eager_lane_exclusion_dry_run)
+             or not has_eager_scaffold
+         ), (
+             "non-empty eager scaffold fields require eager trace/execution to be enabled"
+@@ -389,6 +417,10 @@ class StepPlan:
+             assert enable_eager_verify_dry_run, "Phase 1H-5b apply dry-run requires eager verify dry-run"
+         if enable_eager_verify_dry_run:
+             assert enable_eager_schedule_dry_run, "Phase 1H-5a verify dry-run requires eager schedule dry-run"
++        if enable_eager_lane_exclusion_dry_run:
++            assert enable_eager_schedule_dry_run, (
++                "Phase 1H-5e lane exclusion dry-run requires eager schedule dry-run"
++            )
+         if enable_eager_schedule_dry_run:
+             assert enable_eager_transfer_dry_run, "Phase 1H-4c schedule dry-run requires eager transfer dry-run"
+             assert target_eager_dry_run == scheduled_target_eager_dry_run == scheduled_target_eager_seq_ids, (
+@@ -474,6 +506,18 @@ class StepPlan:
+             "excluded_from_draft_home_for_eager_dry_run": _int_list(
+                 self.excluded_from_draft_home_for_eager_dry_run
+             ),
++            "original_draft_home_set": _int_list(self.original_draft_home_set),
++            "actual_draft_home_set_for_normal_draft": _int_list(
++                self.actual_draft_home_set_for_normal_draft
++            ),
++            "lane_excluded_seq_ids": _int_list(self.lane_excluded_seq_ids),
++            "lane_exclusion_decision_available_before_draft": bool(
++                self.lane_exclusion_decision_available_before_draft
++            ),
++            "lane_exclusion_deferred_until_next_step": bool(
++                self.lane_exclusion_deferred_until_next_step
++            ),
++            "lane_exclusion_defer_reason": self.lane_exclusion_defer_reason,
+             "draft_home_set": _int_list(self.draft_home_set),
+             "draft_eager_set": _int_list(self.draft_eager_set),
+             "budgets": {
+@@ -616,4 +660,6 @@ class StepPlan:
+             "eager_result_transfer_dry_run_enabled": bool(self.eager_result_transfer_dry_run_enabled),
+             "enable_eager_sync_apply_dry_run": bool(self.enable_eager_sync_apply_dry_run),
+             "eager_sync_apply_dry_run_enabled": bool(self.eager_sync_apply_dry_run_enabled),
++            "enable_eager_lane_exclusion_dry_run": bool(self.enable_eager_lane_exclusion_dry_run),
++            "eager_lane_exclusion_dry_run_enabled": bool(self.eager_lane_exclusion_dry_run_enabled),
+         }

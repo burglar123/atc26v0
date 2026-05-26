@@ -110,6 +110,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         phase = record.get("plan_phase")
         target_home = as_int_set(record.get("target_home_set"))
         draft_home = as_int_set(record.get("draft_home_set"))
+        original_draft_home = as_int_set(record.get("original_draft_home_set")) or draft_home
         target_eager = as_int_set(record.get("target_eager_set"))
         legacy_target_eager_dry_run = as_int_set(record.get("target_eager_set_dry_run"))
         named_target_eager_dry_run = as_int_set(record.get("scheduled_target_eager_set_dry_run"))
@@ -297,14 +298,15 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             )
         if target_eager_dry_run and not adjusted_draft_home:
             errors.append(f"record[{idx}] scheduled dry-run must trace adjusted_draft_home_set_dry_run")
-        if adjusted_draft_home and adjusted_draft_home != draft_home - excluded_from_draft_home:
+        adjustment_parent_home = original_draft_home if original_draft_home else draft_home
+        if adjusted_draft_home and adjusted_draft_home != adjustment_parent_home - excluded_from_draft_home:
             errors.append(
-                f"record[{idx}] adjusted_draft_home_set_dry_run must equal draft_home minus excluded seqs"
+                f"record[{idx}] adjusted_draft_home_set_dry_run must equal original draft_home minus excluded seqs"
             )
-        if excluded_from_draft_home - draft_home:
+        if excluded_from_draft_home - adjustment_parent_home:
             errors.append(
                 f"record[{idx}] excluded_from_draft_home_for_eager_dry_run contains non-draft seqs: "
-                f"{sorted(excluded_from_draft_home - draft_home)}"
+                f"{sorted(excluded_from_draft_home - adjustment_parent_home)}"
             )
 
         for seq_id in sorted(scheduled_seq_ids):
@@ -322,7 +324,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(
                     f"record[{idx}] scheduled proposal_id={proposal_id} not in schedule candidates"
                 )
-            if seq_id in draft_home:
+            if seq_id in original_draft_home:
                 scheduled_from_original_draft_home_count += 1
                 if seq_id not in excluded_from_draft_home:
                     errors.append(
