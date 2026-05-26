@@ -800,6 +800,22 @@ class ModelRunnerBase:
             "ready_eager_proposal_current_status_by_id": dict(
                 step_plan.ready_eager_proposal_current_status_by_id
             ),
+            "ready_eager_proposal_apply_step_by_id": dict(
+                step_plan.ready_eager_proposal_apply_step_by_id
+            ),
+            "ready_eager_proposal_takeover_routed_step_by_id": dict(
+                step_plan.ready_eager_proposal_takeover_routed_step_by_id
+            ),
+            "ready_eager_proposal_takeover_routed_ids": list(
+                step_plan.ready_eager_proposal_takeover_routed_ids
+            ),
+            "ready_eager_proposal_pending_takeover_ids": list(
+                step_plan.ready_eager_proposal_pending_takeover_ids
+            ),
+            "ready_eager_proposal_already_takeover_routed_ids": list(
+                step_plan.ready_eager_proposal_already_takeover_routed_ids
+            ),
+            "repeated_takeover_proposal_ids": list(step_plan.repeated_takeover_proposal_ids),
             "ready_eager_proposals_synchronized_before_plan": bool(
                 step_plan.ready_eager_proposals_synchronized_before_plan
             ),
@@ -844,6 +860,12 @@ class ModelRunnerBase:
             ),
             "missing_buffered_proposal_unexpected_seq_ids": list(
                 step_plan.missing_buffered_proposal_unexpected_seq_ids
+            ),
+            "fallback_same_batch": bool(step_plan.fallback_same_batch),
+            "fallback_pending_receive_seq_ids": list(step_plan.fallback_pending_receive_seq_ids),
+            "fallback_received_seq_ids": list(step_plan.fallback_received_seq_ids),
+            "fallback_missing_after_receive_seq_ids": list(
+                step_plan.fallback_missing_after_receive_seq_ids
             ),
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
@@ -1474,18 +1496,37 @@ class ModelRunnerBase:
             self._validate_phase1h_plan(plan)
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
         allowed_missing = sorted(
             set(raw_buffer_inspect["miss_seq_ids"])
             & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
         )
-        unexpected_missing = sorted(set(raw_buffer_inspect["miss_seq_ids"]) - set(allowed_missing))
+        fallback_same_batch = (
+            bool(target_normal_verify_seq_ids)
+            and plan.plan_phase == "fallback"
+            and target_normal_verify_seq_ids == actual_normal_draft_seq_ids
+        )
+        fallback_pending_receive = (
+            sorted(set(raw_buffer_inspect["miss_seq_ids"]) & set(target_normal_verify_seq_ids))
+            if fallback_same_batch
+            else []
+        )
+        unexpected_missing = sorted(
+            set(raw_buffer_inspect["miss_seq_ids"])
+            - set(allowed_missing)
+            - set(fallback_pending_receive)
+        )
         plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
         plan.missing_buffered_proposal_seq_ids = [int(seq_id) for seq_id in raw_buffer_inspect["miss_seq_ids"]]
         plan.missing_buffered_proposal_allowed_by_eager_seq_ids = [int(seq_id) for seq_id in allowed_missing]
         plan.missing_buffered_proposal_unexpected_seq_ids = [int(seq_id) for seq_id in unexpected_missing]
         plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(allowed_missing)
         plan.missing_normal_proposal_allowed_seq_ids_dry_run = [int(seq_id) for seq_id in allowed_missing]
+        plan.fallback_same_batch = bool(fallback_same_batch)
+        plan.fallback_pending_receive_seq_ids = [int(seq_id) for seq_id in fallback_pending_receive]
+        plan.fallback_received_seq_ids = []
+        plan.fallback_missing_after_receive_seq_ids = []
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
         plan.proposal_buffer_requested_seq_ids = buffer_inspect["requested_seq_ids"]
@@ -1500,7 +1541,11 @@ class ModelRunnerBase:
         if plan.plan_phase == "fallback":
             plan.fallback_buffer_hit_count = plan.proposal_buffer_hit_count
             plan.fallback_buffer_miss_count = plan.proposal_buffer_miss_count
-            if plan.proposal_buffer_miss_count and plan.fallback_reason == "single_active_batch_with_buffered_proposals":
+            if (
+                plan.proposal_buffer_miss_count
+                and not fallback_same_batch
+                and plan.fallback_reason == "single_active_batch_with_buffered_proposals"
+            ):
                 plan.fallback_reason = "missing_target_proposals"
             if plan.fallback_reason is None:
                 if not plan.target_home_set and plan.draft_home_set:
@@ -1658,6 +1703,12 @@ class ModelRunnerBase:
         )
         trace_record["missing_buffered_proposal_unexpected_seq_ids"] = list(
             plan.missing_buffered_proposal_unexpected_seq_ids
+        )
+        trace_record["fallback_same_batch"] = bool(plan.fallback_same_batch)
+        trace_record["fallback_pending_receive_seq_ids"] = list(plan.fallback_pending_receive_seq_ids)
+        trace_record["fallback_received_seq_ids"] = list(plan.fallback_received_seq_ids)
+        trace_record["fallback_missing_after_receive_seq_ids"] = list(
+            plan.fallback_missing_after_receive_seq_ids
         )
         trace_record["normal_proposal_expected_seq_ids_after_lane_exclusion"] = list(expected_seq_ids)
         trace_record["adjusted_normal_proposal_expected_seq_ids"] = list(expected_seq_ids)
@@ -5134,6 +5185,14 @@ class TargetModelRunner(ModelRunnerBase):
         received_proposals = []
         if draft_seq_ids:
             received_proposals = self._receive_dual_proposals(draft_seq_ids, plan)
+            if fallback_same_batch:
+                received_seq_ids = [int(proposal.seq_id) for proposal in received_proposals]
+                received_seq_id_set = set(received_seq_ids)
+                missing_after_receive = [
+                    int(seq_id) for seq_id in target_seq_ids if int(seq_id) not in received_seq_id_set
+                ]
+                plan.fallback_received_seq_ids = list(received_seq_ids)
+                plan.fallback_missing_after_receive_seq_ids = list(missing_after_receive)
             if trace_record is not None:
                 trace_record["normal_proposal_transfer_called"] = True
                 self._update_lane_exclusion_proposal_trace(
@@ -5143,6 +5202,11 @@ class TargetModelRunner(ModelRunnerBase):
                 )
             if fallback_same_batch:
                 target_proposals = received_proposals
+                assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
+                    plan,
+                    "fallback same-batch missing proposals after receive for target seq_ids="
+                    f"{target_seq_ids}",
+                )
                 if trace_record is not None:
                     trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
                     trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]

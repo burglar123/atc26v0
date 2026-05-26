@@ -1107,6 +1107,13 @@ class DualBatchManager:
         takeover_proposals = self.ready_eager_proposals.pending_takeover_for_target(plan.target_home_set)
         takeover_seq_ids = [int(proposal.seq_id) for proposal in takeover_proposals]
         takeover_proposal_ids = [int(proposal.proposal_id) for proposal in takeover_proposals]
+        already_takeover_routed_ids = [
+            int(proposal.proposal_id)
+            for proposal in self.ready_eager_proposals.proposals()
+            if proposal.state == READY_EAGER_STATE_CONSUMED_APPLIED
+            and proposal.takeover_routed_step_id is not None
+        ]
+        takeover_routed_step_by_id: dict[int, int] = {}
 
         plan.enable_eager_lane_exclusion_dry_run = True
         plan.eager_lane_exclusion_dry_run_enabled = True
@@ -1125,6 +1132,7 @@ class DualBatchManager:
         plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(takeover_seq_ids)
         for proposal in takeover_proposals:
             self.ready_eager_proposals.mark_takeover_routed(proposal.proposal_id, current_step_id)
+            takeover_routed_step_by_id[int(proposal.proposal_id)] = int(current_step_id)
         plan.original_draft_home_set = list(original_draft_home)
         plan.actual_draft_home_set_for_normal_draft = list(original_draft_home)
         plan.adjusted_draft_home_set_dry_run = list(original_draft_home)
@@ -1166,6 +1174,12 @@ class DualBatchManager:
         plan.ready_eager_proposal_current_len_by_id = {}
         plan.ready_eager_proposal_current_pre_verify_by_id = {}
         plan.ready_eager_proposal_current_status_by_id = {}
+        plan.ready_eager_proposal_apply_step_by_id = {}
+        plan.ready_eager_proposal_takeover_routed_step_by_id = dict(takeover_routed_step_by_id)
+        plan.ready_eager_proposal_takeover_routed_ids = list(takeover_proposal_ids)
+        plan.ready_eager_proposal_pending_takeover_ids = list(takeover_proposal_ids)
+        plan.ready_eager_proposal_already_takeover_routed_ids = sorted(already_takeover_routed_ids)
+        plan.repeated_takeover_proposal_ids = []
 
         if not ready_proposals:
             if takeover_proposals:
@@ -1361,6 +1375,9 @@ class DualBatchManager:
         plan.lane_exclusion_deferred_until_next_step = False
         plan.lane_exclusion_defer_reason = None
         plan.ready_eager_proposal_applied_ids = list(proposal_ids)
+        plan.ready_eager_proposal_apply_step_by_id = {
+            int(record.proposal_id): int(record.apply_step_id) for record in applied_records
+        }
         plan.lane_exclusion_applied_proposal_ids = list(proposal_ids)
         plan.lane_exclusion_applied_seq_ids = list(excluded_seq_ids)
         plan.lane_exclusion_apply_reason_by_proposal_id = {
@@ -1369,6 +1386,8 @@ class DualBatchManager:
         existing_takeover_seq_ids = list(plan.target_eager_verify_seq_ids_dry_run)
         existing_takeover_proposal_ids = list(plan.target_eager_verify_proposal_ids_dry_run)
         for record in applied_records:
+            self.ready_eager_proposals.mark_takeover_routed(record.proposal_id, current_step_id)
+            takeover_routed_step_by_id[int(record.proposal_id)] = int(current_step_id)
             if int(record.seq_id) not in set(existing_takeover_seq_ids):
                 existing_takeover_seq_ids.append(int(record.seq_id))
             if int(record.proposal_id) not in set(existing_takeover_proposal_ids):
@@ -1376,6 +1395,10 @@ class DualBatchManager:
             plan.target_eager_verify_reason_by_seq_id_dry_run[int(record.seq_id)] = record.reason
         plan.target_eager_verify_seq_ids_dry_run = list(existing_takeover_seq_ids)
         plan.target_eager_verify_proposal_ids_dry_run = list(existing_takeover_proposal_ids)
+        plan.ready_eager_proposal_takeover_routed_ids = list(existing_takeover_proposal_ids)
+        plan.ready_eager_proposal_takeover_routed_step_by_id = dict(
+            sorted(takeover_routed_step_by_id.items())
+        )
         plan.excluded_from_target_normal_verify_for_eager_dry_run = list(existing_takeover_seq_ids)
         plan.target_normal_verify_seq_ids = [
             int(seq_id)

@@ -76,6 +76,18 @@ def as_str_map(value: Any) -> dict[int, str]:
     return result
 
 
+def as_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
 def int_value(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -87,6 +99,19 @@ def int_value(value: Any, default: int = 0) -> int:
 
 def _normal_metadata_present(record: dict[str, Any], key: str) -> bool:
     return key in record and isinstance(record.get(key), list) and bool(record.get(key))
+
+
+def _proposal_lifecycle_key(
+    record: dict[str, Any],
+    proposal_id: int,
+    step_by_id: dict[int, int],
+) -> tuple[str, int]:
+    if proposal_id in step_by_id:
+        return ("step", int(step_by_id[proposal_id]))
+    step_id = int_value(record.get("step_id"), -1)
+    if step_id >= 0:
+        return ("step", step_id)
+    return ("plan", int_value(record.get("plan_id"), -1))
 
 
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
@@ -113,7 +138,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     verify_or_apply_rows = 0
     original_draft_sizes: list[int] = []
     adjusted_draft_sizes: list[int] = []
-    applied_proposal_counts: Counter[int] = Counter()
+    apply_keys_by_proposal_id: dict[int, set[tuple[str, int]]] = {}
+    takeover_keys_by_proposal_id: dict[int, set[tuple[str, int]]] = {}
     skip_reason_counts: Counter[str] = Counter()
     stale_reason_counts: Counter[str] = Counter()
 
@@ -186,6 +212,22 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         adjusted_expected = as_int_set(record.get("adjusted_normal_proposal_expected_seq_ids")) or actual
         sent_seq_ids = as_int_set(record.get("normal_proposal_sent_seq_ids_after_lane_exclusion"))
         received_seq_ids = as_int_set(record.get("normal_proposal_received_seq_ids_after_lane_exclusion"))
+        fallback_same_batch = bool(record.get("fallback_same_batch", False)) or (
+            record.get("plan_phase") == "fallback"
+            and bool(target_home)
+            and target_home == actual
+            and target_normal_verify == target_home
+        )
+        fallback_pending_receive = as_int_set(record.get("fallback_pending_receive_seq_ids"))
+        if fallback_same_batch and not fallback_pending_receive:
+            fallback_pending_receive = missing_buffered & target_normal_verify
+        fallback_received = as_int_set(record.get("fallback_received_seq_ids"))
+        fallback_missing_after_receive = as_int_set(record.get("fallback_missing_after_receive_seq_ids"))
+        effective_missing_unexpected = (
+            missing_unexpected - fallback_pending_receive
+            if fallback_same_batch
+            else set(missing_unexpected)
+        )
         original_draft_sizes.append(len(original))
         adjusted_draft_sizes.append(len(actual))
 
@@ -216,6 +258,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         state_by_id = as_str_map(record.get("ready_eager_proposal_state_by_id"))
         skip_reason_by_id = as_str_map(record.get("ready_eager_proposal_skip_reason_by_id"))
         stale_reason_by_id = as_str_map(record.get("ready_eager_proposal_stale_reason_by_id"))
+        apply_step_by_id = as_int_map(record.get("ready_eager_proposal_apply_step_by_id"))
+        takeover_step_by_id = as_int_map(record.get("ready_eager_proposal_takeover_routed_step_by_id"))
+        takeover_routed_ids = as_int_set(record.get("ready_eager_proposal_takeover_routed_ids"))
         lane_applied_ids = as_int_set(record.get("lane_exclusion_applied_proposal_ids"))
         lane_applied_seq_ids = as_int_set(record.get("lane_exclusion_applied_seq_ids"))
         apply_reason_by_id = as_str_map(record.get("lane_exclusion_apply_reason_by_proposal_id"))
@@ -233,7 +278,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         excluded_from_actual_count += len(excluded)
         target_eager_verify_count += len(target_eager_verify)
         missing_buffered_allowed_count += len(missing_allowed)
-        missing_buffered_unexpected_count += len(missing_unexpected)
+        missing_buffered_unexpected_count += len(effective_missing_unexpected)
         skip_reason_counts.update(skip_reason_by_id.values())
         stale_reason_counts.update(stale_reason_by_id.values())
 
@@ -273,18 +318,33 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 f"record[{idx}] allowed missing normal proposals must be eager takeover seqs: "
                 f"extra={sorted(missing_allowed - target_eager_verify)}"
             )
-        if missing_unexpected:
+        if effective_missing_unexpected:
             errors.append(
-                f"record[{idx}] unexpected missing buffered normal proposals: {sorted(missing_unexpected)}"
+                f"record[{idx}] unexpected missing buffered normal proposals: "
+                f"{sorted(effective_missing_unexpected)}"
             )
-        if missing_buffered and missing_buffered != missing_allowed | missing_unexpected:
+        expected_missing_split = missing_allowed | effective_missing_unexpected | fallback_pending_receive
+        if missing_buffered and missing_buffered != expected_missing_split:
             errors.append(
                 f"record[{idx}] missing buffered proposal split is inconsistent: "
                 f"missing={sorted(missing_buffered)}, allowed={sorted(missing_allowed)}, "
-                f"unexpected={sorted(missing_unexpected)}"
+                f"fallback_pending={sorted(fallback_pending_receive)}, "
+                f"unexpected={sorted(effective_missing_unexpected)}"
             )
         if missing_allowed and not bool(record.get("missing_normal_proposal_allowed_by_eager_dry_run", False)):
             errors.append(f"record[{idx}] allowed eager-takeover missing proposals must set allow flag")
+        if fallback_same_batch:
+            fallback_coverage = fallback_received or received_seq_ids
+            if fallback_missing_after_receive:
+                errors.append(
+                    f"record[{idx}] fallback same-batch missing proposals after receive: "
+                    f"{sorted(fallback_missing_after_receive)}"
+                )
+            if fallback_coverage and not target_normal_verify <= fallback_coverage:
+                errors.append(
+                    f"record[{idx}] fallback same-batch received proposals do not cover target normal verify: "
+                    f"target_normal={sorted(target_normal_verify)}, received={sorted(fallback_coverage)}"
+                )
 
         if seen_ids and not bool(record.get("ready_eager_proposals_synchronized_before_plan", False)):
             errors.append(f"record[{idx}] scheduler saw ready proposals without pre-plan sync")
@@ -303,7 +363,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] terminal stale/expired/invalidated proposals were also applied")
 
         for proposal_id in applied_ids:
-            applied_proposal_counts[proposal_id] += 1
+            apply_keys_by_proposal_id.setdefault(proposal_id, set()).add(
+                _proposal_lifecycle_key(record, proposal_id, apply_step_by_id)
+            )
             if state_by_id.get(proposal_id) != "CONSUMED_APPLIED":
                 errors.append(
                     f"record[{idx}] applied proposal {proposal_id} must have state CONSUMED_APPLIED, "
@@ -311,6 +373,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 )
             if apply_reason_by_id.get(proposal_id) != "ready_eager_proposal_available_for_draft_home":
                 errors.append(f"record[{idx}] applied proposal {proposal_id} has missing/bad apply reason")
+        for proposal_id in target_eager_verify_proposal_ids | takeover_routed_ids:
+            takeover_keys_by_proposal_id.setdefault(proposal_id, set()).add(
+                _proposal_lifecycle_key(record, proposal_id, takeover_step_by_id)
+            )
         for proposal_id in terminal_ids:
             if state_by_id.get(proposal_id) == "READY":
                 errors.append(f"record[{idx}] proposal {proposal_id} is both READY and terminal")
@@ -395,9 +461,20 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                     f"missing={sorted(in_draft_ids - accounted)}"
                 )
 
-    repeated_applied = [proposal_id for proposal_id, count in applied_proposal_counts.items() if count > 1]
+    repeated_applied = [
+        proposal_id
+        for proposal_id, keys in apply_keys_by_proposal_id.items()
+        if len(keys) > 1
+    ]
     if repeated_applied:
         errors.append(f"ready proposals applied more than once: {sorted(repeated_applied)}")
+    repeated_takeover = [
+        proposal_id
+        for proposal_id, keys in takeover_keys_by_proposal_id.items()
+        if len(keys) > 1
+    ]
+    if repeated_takeover:
+        errors.append(f"ready proposals takeover-routed more than once: {sorted(repeated_takeover)}")
 
     if records_with_lane_enabled:
         if ready_created_count == 0:
@@ -440,6 +517,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "target_eager_verify_seq_ids_dry_run_count": target_eager_verify_count,
         "missing_buffered_proposal_allowed_by_eager_count": missing_buffered_allowed_count,
         "missing_buffered_proposal_unexpected_count": missing_buffered_unexpected_count,
+        "repeated_apply_proposal_ids": sorted(repeated_applied),
+        "repeated_takeover_proposal_ids": sorted(repeated_takeover),
         "original_draft_home_size_mean": mean(original_draft_sizes) if original_draft_sizes else 0.0,
         "adjusted_draft_home_size_mean": mean(adjusted_draft_sizes) if adjusted_draft_sizes else 0.0,
         "normal_proposal_sent_received_mismatch_count": sent_received_mismatch_count,
@@ -480,6 +559,10 @@ def base_record(*, lane_enabled: bool = True) -> dict[str, Any]:
         "missing_buffered_proposal_seq_ids": [],
         "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
         "missing_buffered_proposal_unexpected_seq_ids": [],
+        "fallback_same_batch": False,
+        "fallback_pending_receive_seq_ids": [],
+        "fallback_received_seq_ids": [],
+        "fallback_missing_after_receive_seq_ids": [],
         "draft_eager_set": [],
         "draft_home_set": [1, 3],
         "original_draft_home_set": [1, 3],
@@ -532,6 +615,12 @@ def base_record(*, lane_enabled: bool = True) -> dict[str, Any]:
         "ready_eager_proposal_current_len_by_id": {},
         "ready_eager_proposal_current_pre_verify_by_id": {},
         "ready_eager_proposal_current_status_by_id": {},
+        "ready_eager_proposal_apply_step_by_id": {},
+        "ready_eager_proposal_takeover_routed_step_by_id": {},
+        "ready_eager_proposal_takeover_routed_ids": [],
+        "ready_eager_proposal_pending_takeover_ids": [],
+        "ready_eager_proposal_already_takeover_routed_ids": [],
+        "repeated_takeover_proposal_ids": [],
         "ready_eager_proposals_synchronized_before_plan": lane_enabled,
         "ready_eager_proposal_transfer_called": lane_enabled,
         "ready_eager_proposal_sent_ids": [],
@@ -631,6 +720,9 @@ def applied_record() -> dict[str, Any]:
             "ready_eager_proposal_current_len_by_id": {"202": 8},
             "ready_eager_proposal_current_pre_verify_by_id": {"202": False},
             "ready_eager_proposal_current_status_by_id": {"202": "RUNNING"},
+            "ready_eager_proposal_apply_step_by_id": {"202": 12},
+            "ready_eager_proposal_takeover_routed_step_by_id": {"202": 12},
+            "ready_eager_proposal_takeover_routed_ids": [202],
             "lane_exclusion_applied_proposal_ids": [202],
             "lane_exclusion_applied_seq_ids": [3],
             "lane_exclusion_apply_reason_by_proposal_id": {
@@ -667,6 +759,8 @@ def takeover_target_verify_record() -> dict[str, Any]:
             "normal_proposal_received_seq_ids_after_lane_exclusion": [4, 6],
             "adjusted_normal_proposal_expected_seq_ids": [4, 6],
             "ready_eager_proposal_state_by_id": {"202": "CONSUMED_APPLIED"},
+            "ready_eager_proposal_takeover_routed_step_by_id": {"202": 12},
+            "ready_eager_proposal_takeover_routed_ids": [202],
         }
     )
     return record
@@ -725,13 +819,42 @@ def expired_record() -> dict[str, Any]:
     return record
 
 
+def fallback_same_batch_record() -> dict[str, Any]:
+    record = base_record()
+    record.update(
+        {
+            "plan_phase": "fallback",
+            "target_home_set": [6, 20],
+            "target_normal_verify_seq_ids": [6, 20],
+            "raw_target_home_set_for_normal_verify": [6, 20],
+            "draft_home_set": [6, 20],
+            "original_draft_home_set": [6, 20],
+            "actual_draft_home_set_for_normal_draft": [6, 20],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [6, 20],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [6, 20],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [6, 20],
+            "adjusted_normal_proposal_expected_seq_ids": [6, 20],
+            "missing_buffered_proposal_seq_ids": [6, 20],
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
+            "missing_buffered_proposal_unexpected_seq_ids": [],
+            "fallback_same_batch": True,
+            "fallback_pending_receive_seq_ids": [6, 20],
+            "fallback_received_seq_ids": [6, 20],
+            "fallback_missing_after_receive_seq_ids": [],
+        }
+    )
+    return record
+
+
 def run_synthetic_tests() -> None:
     valid = [
         base_record(lane_enabled=False),
         creation_record(),
         target_home_record(),
         applied_record(),
+        deepcopy(applied_record()),
         takeover_target_verify_record(),
+        fallback_same_batch_record(),
         stale_pre_verify_record(),
         stale_base_overshot_record(),
         expired_record(),
@@ -804,10 +927,30 @@ def run_synthetic_tests() -> None:
         "checker missed target eager takeover mixed with draft eager candidates"
     )
 
-    invalid = [creation_record(), applied_record(), applied_record()]
+    invalid = [creation_record(), deepcopy(fallback_same_batch_record())]
+    invalid[1]["fallback_received_seq_ids"] = [6]
+    invalid[1]["fallback_missing_after_receive_seq_ids"] = [20]
+    invalid[1]["normal_proposal_received_seq_ids_after_lane_exclusion"] = [6]
+    errors, _ = validate_records(invalid)
+    assert any("fallback same-batch missing proposals after receive" in error for error in errors), (
+        "checker missed fallback same-batch receive coverage failure"
+    )
+
+    invalid = [creation_record(), applied_record(), deepcopy(applied_record())]
+    invalid[2]["step_id"] = 13
+    invalid[2]["ready_eager_proposal_apply_step_by_id"] = {"202": 13}
+    invalid[2]["ready_eager_proposal_takeover_routed_step_by_id"] = {"202": 13}
     errors, _ = validate_records(invalid)
     assert any("applied more than once" in error for error in errors), (
         "checker missed repeated proposal application"
+    )
+
+    invalid = [creation_record(), takeover_target_verify_record(), deepcopy(takeover_target_verify_record())]
+    invalid[2]["step_id"] = 13
+    invalid[2]["ready_eager_proposal_takeover_routed_step_by_id"] = {"202": 13}
+    errors, _ = validate_records(invalid)
+    assert any("takeover-routed more than once" in error for error in errors), (
+        "checker missed repeated proposal takeover routing"
     )
 
     print("Synthetic eager lane-exclusion dry-run checks passed.")

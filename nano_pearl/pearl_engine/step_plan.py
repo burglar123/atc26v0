@@ -53,6 +53,10 @@ class StepPlan:
     missing_buffered_proposal_seq_ids: List[int] = field(default_factory=list)
     missing_buffered_proposal_allowed_by_eager_seq_ids: List[int] = field(default_factory=list)
     missing_buffered_proposal_unexpected_seq_ids: List[int] = field(default_factory=list)
+    fallback_same_batch: bool = False
+    fallback_pending_receive_seq_ids: List[int] = field(default_factory=list)
+    fallback_received_seq_ids: List[int] = field(default_factory=list)
+    fallback_missing_after_receive_seq_ids: List[int] = field(default_factory=list)
     target_eager_set: List[int] = field(default_factory=list)
     target_eager_set_dry_run: List[int] = field(default_factory=list)
     scheduled_target_eager_set_dry_run: List[int] = field(default_factory=list)
@@ -109,6 +113,12 @@ class StepPlan:
     ready_eager_proposal_current_len_by_id: Dict[int, int] = field(default_factory=dict)
     ready_eager_proposal_current_pre_verify_by_id: Dict[int, bool] = field(default_factory=dict)
     ready_eager_proposal_current_status_by_id: Dict[int, str] = field(default_factory=dict)
+    ready_eager_proposal_apply_step_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_takeover_routed_step_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_takeover_routed_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_pending_takeover_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_already_takeover_routed_ids: List[int] = field(default_factory=list)
+    repeated_takeover_proposal_ids: List[int] = field(default_factory=list)
     ready_eager_proposals_synchronized_before_plan: bool = False
     ready_eager_proposal_transfer_called: bool = False
     ready_eager_proposal_sent_ids: List[int] = field(default_factory=list)
@@ -480,6 +490,10 @@ class StepPlan:
             self.ready_eager_proposal_stale_ids,
             self.ready_eager_proposal_expired_ids,
             self.ready_eager_proposal_invalidated_ids,
+            self.ready_eager_proposal_takeover_routed_ids,
+            self.ready_eager_proposal_pending_takeover_ids,
+            self.ready_eager_proposal_already_takeover_routed_ids,
+            self.repeated_takeover_proposal_ids,
             self.target_eager_verify_seq_ids_dry_run,
             self.target_eager_verify_proposal_ids_dry_run,
             self.excluded_from_target_normal_verify_for_eager_dry_run,
@@ -510,6 +524,8 @@ class StepPlan:
             self.ready_eager_proposal_current_len_by_id,
             self.ready_eager_proposal_current_pre_verify_by_id,
             self.ready_eager_proposal_current_status_by_id,
+            self.ready_eager_proposal_apply_step_by_id,
+            self.ready_eager_proposal_takeover_routed_step_by_id,
             self.target_eager_verify_reason_by_seq_id_dry_run,
             self.lane_exclusion_apply_reason_by_proposal_id,
         ]
@@ -651,6 +667,14 @@ class StepPlan:
             ),
             "missing_buffered_proposal_unexpected_seq_ids": _int_list(
                 self.missing_buffered_proposal_unexpected_seq_ids
+            ),
+            "fallback_same_batch": bool(self.fallback_same_batch),
+            "fallback_pending_receive_seq_ids": _int_list(
+                self.fallback_pending_receive_seq_ids
+            ),
+            "fallback_received_seq_ids": _int_list(self.fallback_received_seq_ids),
+            "fallback_missing_after_receive_seq_ids": _int_list(
+                self.fallback_missing_after_receive_seq_ids
             ),
             "target_eager_set": _int_list(self.target_eager_set),
             "target_eager_set_dry_run": _int_list(self.target_eager_set_dry_run),
@@ -816,6 +840,24 @@ class StepPlan:
                 str(proposal_id): str(status)
                 for proposal_id, status in self.ready_eager_proposal_current_status_by_id.items()
             },
+            "ready_eager_proposal_apply_step_by_id": _trace_mapping(
+                self.ready_eager_proposal_apply_step_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_takeover_routed_step_by_id": _trace_mapping(
+                self.ready_eager_proposal_takeover_routed_step_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_takeover_routed_ids": _int_list(
+                self.ready_eager_proposal_takeover_routed_ids
+            ),
+            "ready_eager_proposal_pending_takeover_ids": _int_list(
+                self.ready_eager_proposal_pending_takeover_ids
+            ),
+            "ready_eager_proposal_already_takeover_routed_ids": _int_list(
+                self.ready_eager_proposal_already_takeover_routed_ids
+            ),
+            "repeated_takeover_proposal_ids": _int_list(self.repeated_takeover_proposal_ids),
             "ready_eager_proposals_synchronized_before_plan": bool(
                 self.ready_eager_proposals_synchronized_before_plan
             ),
