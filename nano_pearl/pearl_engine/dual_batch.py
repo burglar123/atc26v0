@@ -1088,6 +1088,38 @@ class DualBatchManager:
         ids.append(int(proposal_id))
         reason_by_id[int(proposal_id)] = str(reason)
 
+    def _refresh_ready_takeover_trace_fields(
+        self,
+        plan: StepPlan,
+        routed_proposals: list[ReadyEagerProposal],
+        routed_step_by_id: dict[int, int],
+    ) -> None:
+        routed_proposal_ids = [int(proposal.proposal_id) for proposal in routed_proposals]
+        routed_seq_ids = [int(proposal.seq_id) for proposal in routed_proposals]
+        pending_proposals = [
+            proposal
+            for proposal in self.ready_eager_proposals.proposals()
+            if proposal.state == READY_EAGER_STATE_CONSUMED_APPLIED
+            and proposal.takeover_routed_step_id is None
+        ]
+        target_seq_ids = {int(seq_id) for seq_id in plan.target_home_set}
+        pending_proposal_ids = [int(proposal.proposal_id) for proposal in pending_proposals]
+        plan.ready_eager_proposal_takeover_routed_ids = list(routed_proposal_ids)
+        plan.ready_eager_proposal_takeover_routed_seq_ids = list(routed_seq_ids)
+        plan.ready_eager_proposal_takeover_routed_step_by_id = dict(
+            sorted((int(proposal_id), int(step_id)) for proposal_id, step_id in routed_step_by_id.items())
+        )
+        plan.ready_eager_proposal_pending_takeover_ids = list(pending_proposal_ids)
+        plan.ready_eager_proposal_pending_takeover_proposal_ids = list(pending_proposal_ids)
+        plan.ready_eager_proposal_pending_takeover_seq_ids = [
+            int(proposal.seq_id) for proposal in pending_proposals
+        ]
+        plan.ready_eager_proposal_takeover_waiting_for_target_home_ids = [
+            int(proposal.proposal_id)
+            for proposal in pending_proposals
+            if int(proposal.seq_id) not in target_seq_ids
+        ]
+
     def _apply_ready_eager_proposals_to_plan(
         self,
         plan: StepPlan,
@@ -1175,11 +1207,9 @@ class DualBatchManager:
         plan.ready_eager_proposal_current_pre_verify_by_id = {}
         plan.ready_eager_proposal_current_status_by_id = {}
         plan.ready_eager_proposal_apply_step_by_id = {}
-        plan.ready_eager_proposal_takeover_routed_step_by_id = dict(takeover_routed_step_by_id)
-        plan.ready_eager_proposal_takeover_routed_ids = list(takeover_proposal_ids)
-        plan.ready_eager_proposal_pending_takeover_ids = list(takeover_proposal_ids)
         plan.ready_eager_proposal_already_takeover_routed_ids = sorted(already_takeover_routed_ids)
         plan.repeated_takeover_proposal_ids = []
+        self._refresh_ready_takeover_trace_fields(plan, takeover_proposals, takeover_routed_step_by_id)
 
         if not ready_proposals:
             if takeover_proposals:
@@ -1187,6 +1217,7 @@ class DualBatchManager:
                     int(proposal.proposal_id): proposal.state
                     for proposal in takeover_proposals
                 }
+            self._refresh_ready_takeover_trace_fields(plan, takeover_proposals, takeover_routed_step_by_id)
             return
 
         applied_records: list[LaneExclusionApplyRecord] = []
@@ -1383,30 +1414,18 @@ class DualBatchManager:
         plan.lane_exclusion_apply_reason_by_proposal_id = {
             int(record.proposal_id): record.reason for record in applied_records
         }
-        existing_takeover_seq_ids = list(plan.target_eager_verify_seq_ids_dry_run)
-        existing_takeover_proposal_ids = list(plan.target_eager_verify_proposal_ids_dry_run)
-        for record in applied_records:
-            self.ready_eager_proposals.mark_takeover_routed(record.proposal_id, current_step_id)
-            takeover_routed_step_by_id[int(record.proposal_id)] = int(current_step_id)
-            if int(record.seq_id) not in set(existing_takeover_seq_ids):
-                existing_takeover_seq_ids.append(int(record.seq_id))
-            if int(record.proposal_id) not in set(existing_takeover_proposal_ids):
-                existing_takeover_proposal_ids.append(int(record.proposal_id))
-            plan.target_eager_verify_reason_by_seq_id_dry_run[int(record.seq_id)] = record.reason
-        plan.target_eager_verify_seq_ids_dry_run = list(existing_takeover_seq_ids)
-        plan.target_eager_verify_proposal_ids_dry_run = list(existing_takeover_proposal_ids)
-        plan.ready_eager_proposal_takeover_routed_ids = list(existing_takeover_proposal_ids)
-        plan.ready_eager_proposal_takeover_routed_step_by_id = dict(
-            sorted(takeover_routed_step_by_id.items())
+        takeover_seq_id_set = set(int(seq_id) for seq_id in plan.target_eager_verify_seq_ids_dry_run)
+        plan.excluded_from_target_normal_verify_for_eager_dry_run = list(
+            plan.target_eager_verify_seq_ids_dry_run
         )
-        plan.excluded_from_target_normal_verify_for_eager_dry_run = list(existing_takeover_seq_ids)
         plan.target_normal_verify_seq_ids = [
             int(seq_id)
             for seq_id in plan.raw_target_home_set_for_normal_verify or plan.target_home_set
-            if int(seq_id) not in set(existing_takeover_seq_ids)
+            if int(seq_id) not in takeover_seq_id_set
         ]
-        plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(existing_takeover_seq_ids)
-        plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(existing_takeover_seq_ids)
+        plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(plan.target_eager_verify_seq_ids_dry_run)
+        plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(plan.target_eager_verify_seq_ids_dry_run)
+        self._refresh_ready_takeover_trace_fields(plan, takeover_proposals, takeover_routed_step_by_id)
         plan.eager_schedule_dry_run_enabled = True
         plan.eager_lane_exclusion_proposal_ids = list(proposal_ids)
         plan.eager_lane_exclusion_seq_ids = list(excluded_seq_ids)

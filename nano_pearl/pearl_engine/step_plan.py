@@ -116,7 +116,11 @@ class StepPlan:
     ready_eager_proposal_apply_step_by_id: Dict[int, int] = field(default_factory=dict)
     ready_eager_proposal_takeover_routed_step_by_id: Dict[int, int] = field(default_factory=dict)
     ready_eager_proposal_takeover_routed_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_takeover_routed_seq_ids: List[int] = field(default_factory=list)
     ready_eager_proposal_pending_takeover_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_pending_takeover_proposal_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_pending_takeover_seq_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_takeover_waiting_for_target_home_ids: List[int] = field(default_factory=list)
     ready_eager_proposal_already_takeover_routed_ids: List[int] = field(default_factory=list)
     repeated_takeover_proposal_ids: List[int] = field(default_factory=list)
     ready_eager_proposals_synchronized_before_plan: bool = False
@@ -362,6 +366,10 @@ class StepPlan:
             "target_normal_verify_seq_ids cannot overlap target_eager_verify_seq_ids_dry_run: "
             f"{sorted(target_normal_verify & target_eager_verify)}"
         )
+        assert target_eager_verify <= target_home, (
+            "target_eager_verify_seq_ids_dry_run must be routed only for current target_home_set: "
+            f"extra={sorted(target_eager_verify - target_home)}"
+        )
         assert not (draft_eager & target_eager_verify), (
             "draft_eager_set is a current target-home candidate set and must not overlap "
             f"one-shot target_eager_verify_seq_ids_dry_run: {sorted(draft_eager & target_eager_verify)}"
@@ -491,7 +499,11 @@ class StepPlan:
             self.ready_eager_proposal_expired_ids,
             self.ready_eager_proposal_invalidated_ids,
             self.ready_eager_proposal_takeover_routed_ids,
+            self.ready_eager_proposal_takeover_routed_seq_ids,
             self.ready_eager_proposal_pending_takeover_ids,
+            self.ready_eager_proposal_pending_takeover_proposal_ids,
+            self.ready_eager_proposal_pending_takeover_seq_ids,
+            self.ready_eager_proposal_takeover_waiting_for_target_home_ids,
             self.ready_eager_proposal_already_takeover_routed_ids,
             self.repeated_takeover_proposal_ids,
             self.target_eager_verify_seq_ids_dry_run,
@@ -851,8 +863,20 @@ class StepPlan:
             "ready_eager_proposal_takeover_routed_ids": _int_list(
                 self.ready_eager_proposal_takeover_routed_ids
             ),
+            "ready_eager_proposal_takeover_routed_seq_ids": _int_list(
+                self.ready_eager_proposal_takeover_routed_seq_ids
+            ),
             "ready_eager_proposal_pending_takeover_ids": _int_list(
                 self.ready_eager_proposal_pending_takeover_ids
+            ),
+            "ready_eager_proposal_pending_takeover_proposal_ids": _int_list(
+                self.ready_eager_proposal_pending_takeover_proposal_ids
+            ),
+            "ready_eager_proposal_pending_takeover_seq_ids": _int_list(
+                self.ready_eager_proposal_pending_takeover_seq_ids
+            ),
+            "ready_eager_proposal_takeover_waiting_for_target_home_ids": _int_list(
+                self.ready_eager_proposal_takeover_waiting_for_target_home_ids
             ),
             "ready_eager_proposal_already_takeover_routed_ids": _int_list(
                 self.ready_eager_proposal_already_takeover_routed_ids

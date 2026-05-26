@@ -809,8 +809,20 @@ class ModelRunnerBase:
             "ready_eager_proposal_takeover_routed_ids": list(
                 step_plan.ready_eager_proposal_takeover_routed_ids
             ),
+            "ready_eager_proposal_takeover_routed_seq_ids": list(
+                step_plan.ready_eager_proposal_takeover_routed_seq_ids
+            ),
             "ready_eager_proposal_pending_takeover_ids": list(
                 step_plan.ready_eager_proposal_pending_takeover_ids
+            ),
+            "ready_eager_proposal_pending_takeover_proposal_ids": list(
+                step_plan.ready_eager_proposal_pending_takeover_proposal_ids
+            ),
+            "ready_eager_proposal_pending_takeover_seq_ids": list(
+                step_plan.ready_eager_proposal_pending_takeover_seq_ids
+            ),
+            "ready_eager_proposal_takeover_waiting_for_target_home_ids": list(
+                step_plan.ready_eager_proposal_takeover_waiting_for_target_home_ids
             ),
             "ready_eager_proposal_already_takeover_routed_ids": list(
                 step_plan.ready_eager_proposal_already_takeover_routed_ids
