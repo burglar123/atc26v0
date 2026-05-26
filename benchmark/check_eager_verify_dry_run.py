@@ -142,11 +142,37 @@ def verify_step_key(record: dict[str, Any]) -> tuple[str, int]:
     return ("plan", int_value(record.get("eager_verify_dry_run_plan_id", record.get("plan_id")), -1))
 
 
-def is_takeover_source(record: dict[str, Any]) -> bool:
+def is_takeover_routing_row(record: dict[str, Any]) -> bool:
     return (
-        record.get("eager_verify_dry_run_source") == "phase1h5e3_takeover_lane"
-        or bool(record.get("target_eager_verify_proposal_ids_dry_run"))
+        bool(record.get("target_eager_verify_proposal_ids_dry_run"))
         or bool(record.get("target_eager_verify_seq_ids_dry_run"))
+    )
+
+
+def is_phase1h5f_source(record: dict[str, Any]) -> bool:
+    return record.get("eager_verify_dry_run_source") == "phase1h5e3_takeover_lane"
+
+
+def is_verify_execution_row(
+    record: dict[str, Any],
+    candidate_proposal_ids: set[int],
+    candidate_seq_ids: set[int],
+    executed_proposal_ids: set[int],
+    executed_seq_ids: set[int],
+    skipped_proposal_ids: set[int],
+    dry_run_tokens: int,
+    result_by_proposal: dict,
+) -> bool:
+    return (
+        bool(record.get("eager_verify_dry_run_enabled", False))
+        or is_phase1h5f_source(record)
+        or bool(candidate_proposal_ids)
+        or bool(candidate_seq_ids)
+        or bool(executed_proposal_ids)
+        or bool(executed_seq_ids)
+        or bool(skipped_proposal_ids)
+        or int(dry_run_tokens) > 0
+        or bool(result_by_proposal)
     )
 
 
@@ -171,14 +197,15 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     verify_tokens = 0
     target_eager_verify_seq_ids_dry_run_count = 0
     repeated_verify_steps_by_proposal: dict[int, set[tuple[str, int]]] = defaultdict(set)
+    takeover_proposal_ids_seen: set[int] = set()
+    takeover_seq_ids_by_proposal_id: dict[int, int] = {}
+    verify_executed_or_skipped_proposal_ids_seen: set[int] = set()
 
     for idx, record in enumerate(records):
         if not is_dual_record(record):
             continue
 
         verify_enabled = bool(record.get("enable_eager_verify_dry_run", False))
-        verify_active = bool(record.get("eager_verify_dry_run_enabled", False))
-        takeover_source = is_takeover_source(record)
         schedule_enabled = bool(record.get("enable_eager_schedule_dry_run", False))
         lane_enabled = bool(record.get("enable_eager_lane_exclusion_dry_run", False))
         target_eager = as_int_set(record.get("target_eager_set"))
@@ -261,6 +288,18 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         full_accept_tokens = int_value(record.get("eager_tokens_verify_dry_run_full_accept"), 0)
         rejected_tokens = int_value(record.get("eager_tokens_verify_dry_run_rejected"), 0)
         partial_tokens = int_value(record.get("eager_tokens_verify_dry_run_partial_accept"), 0)
+        takeover_routing_row = is_takeover_routing_row(record)
+        verify_execution_row = is_verify_execution_row(
+            record,
+            candidate_proposal_ids,
+            candidate_seq_ids,
+            executed_proposal_ids,
+            executed_seq_ids,
+            skipped_proposal_ids,
+            dry_run_tokens,
+            result_by_proposal,
+        )
+        phase1h5f_source = is_phase1h5f_source(record)
 
         if target_eager:
             real_target_eager_non_empty_count += 1
@@ -282,36 +321,16 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 f"{sorted(missing_unexpected)}"
             )
 
-        if not verify_enabled:
-            if verify_active or candidate_proposal_ids or executed_proposal_ids or skipped_proposal_ids or dry_run_tokens:
-                errors.append(f"record[{idx}] eager verify dry-run fields populated while disabled")
-            continue
-
-        verify_records += 1
-        if verify_active or candidate_proposal_ids or executed_proposal_ids or skipped_proposal_ids:
-            verify_active_records += 1
-        if not schedule_enabled:
-            errors.append(f"record[{idx}] verify dry-run must imply schedule dry-run")
-        if takeover_source and not lane_enabled:
-            errors.append(f"record[{idx}] takeover verify dry-run must imply lane exclusion dry-run")
-
-        scheduled_proposal_ids_seen.update(seq_by_proposal)
-        executed_proposal_ids_seen.update(executed_proposal_ids)
-        executed_seq_ids_seen.update(executed_seq_ids)
-        skipped_proposal_ids_seen.update(skipped_proposal_ids)
-        verify_tokens += dry_run_tokens
-
-        if takeover_source:
-            if candidate_proposal_ids != takeover_proposal_ids:
-                errors.append(
-                    f"record[{idx}] takeover verify candidates must equal target eager proposals: "
-                    f"candidates={sorted(candidate_proposal_ids)}, takeover={sorted(takeover_proposal_ids)}"
-                )
-            if candidate_seq_ids != takeover_seq_ids:
-                errors.append(
-                    f"record[{idx}] takeover verify candidate seqs must equal target eager seqs: "
-                    f"candidates={sorted(candidate_seq_ids)}, takeover={sorted(takeover_seq_ids)}"
-                )
+        if takeover_routing_row:
+            takeover_proposal_ids_seen.update(takeover_proposal_ids)
+            for proposal_id, seq_id in seq_by_proposal.items():
+                if proposal_id in takeover_proposal_ids:
+                    existing_seq_id = takeover_seq_ids_by_proposal_id.setdefault(proposal_id, seq_id)
+                    if existing_seq_id != seq_id:
+                        errors.append(
+                            f"record[{idx}] takeover proposal_id={proposal_id} maps to multiple seq ids: "
+                            f"{existing_seq_id} and {seq_id}"
+                        )
             if not takeover_seq_ids.issubset(target_home):
                 errors.append(
                     f"record[{idx}] target eager verify seqs must be in target_home_set: "
@@ -328,8 +347,58 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                     f"extra={sorted(missing_allowed - takeover_seq_ids)}"
                 )
 
+        if not verify_enabled:
+            if verify_execution_row:
+                errors.append(f"record[{idx}] eager verify dry-run fields populated while disabled")
+            continue
+
+        verify_records += 1
+        if verify_execution_row:
+            verify_active_records += 1
+        if not schedule_enabled:
+            errors.append(f"record[{idx}] verify dry-run must imply schedule dry-run")
+        if (takeover_routing_row or phase1h5f_source) and not lane_enabled:
+            errors.append(f"record[{idx}] takeover verify dry-run must imply lane exclusion dry-run")
+
+        scheduled_proposal_ids_seen.update(seq_by_proposal)
+
+        if not verify_execution_row:
+            continue
+
+        executed_proposal_ids_seen.update(executed_proposal_ids)
+        executed_seq_ids_seen.update(executed_seq_ids)
+        skipped_proposal_ids_seen.update(skipped_proposal_ids)
+        verify_executed_or_skipped_proposal_ids_seen.update(executed_proposal_ids | skipped_proposal_ids)
+        verify_tokens += dry_run_tokens
+
+        if takeover_routing_row:
+            if candidate_proposal_ids != takeover_proposal_ids:
+                errors.append(
+                    f"record[{idx}] takeover verify candidates must equal target eager proposals: "
+                    f"candidates={sorted(candidate_proposal_ids)}, takeover={sorted(takeover_proposal_ids)}"
+                )
+            if candidate_seq_ids != takeover_seq_ids:
+                errors.append(
+                    f"record[{idx}] takeover verify candidate seqs must equal target eager seqs: "
+                    f"candidates={sorted(candidate_seq_ids)}, takeover={sorted(takeover_seq_ids)}"
+                )
+        elif phase1h5f_source and not candidate_proposal_ids:
+            errors.append(f"record[{idx}] active takeover verify row missing candidate proposal ids")
+
+        if phase1h5f_source or takeover_routing_row:
+            if target_home and not executed_seq_ids.issubset(target_home):
+                errors.append(
+                    f"record[{idx}] executed takeover seqs must be in target_home_set: "
+                    f"extra={sorted(executed_seq_ids - target_home)}"
+                )
+            if executed_seq_ids & target_normal:
+                errors.append(
+                    f"record[{idx}] executed takeover seqs must be absent from target_normal_verify_seq_ids: "
+                    f"{sorted(executed_seq_ids & target_normal)}"
+                )
+
         classified = executed_proposal_ids | skipped_proposal_ids
-        if candidate_proposal_ids and classified != candidate_proposal_ids:
+        if (candidate_proposal_ids or classified) and classified != candidate_proposal_ids:
             errors.append(
                 f"record[{idx}] verify candidates must be executed or skipped: "
                 f"classified={sorted(classified)}, candidates={sorted(candidate_proposal_ids)}"
@@ -361,7 +430,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] executed proposal_id={proposal_id} missing from verify candidates")
             if seq_id not in executed_seq_ids:
                 errors.append(f"record[{idx}] executed proposal_id={proposal_id} seq_id={seq_id} missing executed seq")
-            if takeover_source:
+            expected_takeover_seq_id = takeover_seq_ids_by_proposal_id.get(proposal_id)
+            if expected_takeover_seq_id is not None and expected_takeover_seq_id != seq_id:
+                errors.append(
+                    f"record[{idx}] executed proposal_id={proposal_id} seq_id={seq_id} "
+                    f"does not match routed takeover seq_id={expected_takeover_seq_id}"
+                )
+            if takeover_routing_row:
                 if seq_id not in takeover_seq_ids:
                     errors.append(f"record[{idx}] executed takeover proposal_id={proposal_id} seq_id={seq_id} not in takeover lane")
                 if seq_id not in target_home:
@@ -474,12 +549,23 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             "proposal ids verify-dry-run executed in multiple unique steps/plans: "
             f"{repeated_verify_proposal_ids}"
         )
+    missing_verify_for_takeover_proposal_ids = []
+    if verify_records:
+        missing_verify_for_takeover_proposal_ids = sorted(
+            takeover_proposal_ids_seen - verify_executed_or_skipped_proposal_ids_seen
+        )
+        if missing_verify_for_takeover_proposal_ids:
+            errors.append(
+                "takeover proposal ids never verify-executed or skipped: "
+                f"{missing_verify_for_takeover_proposal_ids}"
+            )
 
     summary = {
         "total_trace_records": len(records),
         "records_with_eager_verify_dry_run_enabled": verify_records,
         "verify_active_records": verify_active_records,
         "scheduled_proposal_count": len(scheduled_proposal_ids_seen),
+        "takeover_proposal_count": len(takeover_proposal_ids_seen),
         "target_eager_verify_seq_ids_dry_run_count": target_eager_verify_seq_ids_dry_run_count,
         "verify_dry_run_executed_proposal_count": len(executed_proposal_ids_seen),
         "verify_dry_run_skipped_proposal_count": len(skipped_proposal_ids_seen),
@@ -496,6 +582,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "real_target_eager_non_empty_count": real_target_eager_non_empty_count,
         "missing_buffered_proposal_unexpected_count": missing_unexpected_count,
         "repeated_verify_proposal_ids": repeated_verify_proposal_ids,
+        "missing_verify_for_takeover_proposal_ids": missing_verify_for_takeover_proposal_ids,
         "eager_tokens_verify_dry_run": verify_tokens,
     }
     return errors, summary
@@ -507,6 +594,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "records_with_eager_verify_dry_run_enabled",
         "verify_active_records",
         "scheduled_proposal_count",
+        "takeover_proposal_count",
         "target_eager_verify_seq_ids_dry_run_count",
         "verify_dry_run_executed_proposal_count",
         "verify_dry_run_skipped_proposal_count",
@@ -523,6 +611,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "real_target_eager_non_empty_count",
         "missing_buffered_proposal_unexpected_count",
         "repeated_verify_proposal_ids",
+        "missing_verify_for_takeover_proposal_ids",
         "eager_tokens_verify_dry_run",
     ):
         print(f"{key}={summary[key]}")
@@ -562,6 +651,28 @@ def synthetic_base_record() -> dict[str, Any]:
     }
     for field in ALWAYS_ZERO_COUNTER_FIELDS:
         record[field] = 0
+    return record
+
+
+def synthetic_passive_takeover_record() -> dict[str, Any]:
+    record = synthetic_base_record()
+    record.update(
+        {
+            "enable_eager_plan_dry_run": True,
+            "enable_eager_draft_dry_run": True,
+            "enable_eager_promotion_dry_run": True,
+            "enable_eager_transfer_dry_run": True,
+            "enable_eager_schedule_dry_run": True,
+            "enable_eager_lane_exclusion_dry_run": True,
+            "enable_eager_verify_dry_run": True,
+            "eager_verify_dry_run_enabled": False,
+            "target_home_set": [3, 8],
+            "target_normal_verify_seq_ids": [8],
+            "target_eager_verify_seq_ids_dry_run": [3],
+            "target_eager_verify_proposal_ids_dry_run": [101],
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": [3],
+        }
+    )
     return record
 
 
@@ -693,6 +804,7 @@ def run_synthetic_tests() -> None:
     valid_records = [
         synthetic_base_record(),
         synthetic_old_verify_record(4),
+        synthetic_passive_takeover_record(),
         synthetic_takeover_record(4),
         synthetic_takeover_record(2),
         synthetic_takeover_record(0),
@@ -701,6 +813,14 @@ def run_synthetic_tests() -> None:
     ]
     errors, _ = validate_records(valid_records)
     assert not errors, f"valid synthetic eager verify records failed: {errors}"
+
+    errors, _ = validate_records([synthetic_passive_takeover_record()])
+    assert not any("takeover verify candidates must equal" in error for error in errors), (
+        "passive takeover rows must not require verify candidates"
+    )
+    assert any("never verify-executed or skipped" in error for error in errors), (
+        "checker missed takeover proposal with no verify execution or skip"
+    )
 
     repeated_same_step = [synthetic_takeover_record(4), synthetic_takeover_record(4)]
     errors, _ = validate_records(repeated_same_step)
@@ -711,22 +831,22 @@ def run_synthetic_tests() -> None:
     assert any("multiple unique steps" in error for error in errors), "checker missed repeated verify"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["eager_verify_full_accept_by_seq_id"] = {"3": False}
+    invalid[3]["eager_verify_full_accept_by_seq_id"] = {"3": False}
     errors, _ = validate_records(invalid)
     assert any("full_accept mismatch" in error for error in errors), "checker missed full_accept mismatch"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["target_normal_verify_seq_ids"] = [3, 4]
+    invalid[3]["target_normal_verify_seq_ids"] = [3, 4]
     errors, _ = validate_records(invalid)
     assert any("target_normal_verify_seq_ids" in error for error in errors), "checker missed target-normal overlap"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["eager_verify_dry_run_mutation_detected"] = True
+    invalid[3]["eager_verify_dry_run_mutation_detected"] = True
     errors, _ = validate_records(invalid)
     assert any("mutation_detected" in error for error in errors), "checker missed mutation flag"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["eager_verify_checkpoint_ok_by_seq_id"] = {"3": False}
+    invalid[3]["eager_verify_checkpoint_ok_by_seq_id"] = {"3": False}
     errors, _ = validate_records(invalid)
     assert any("checkpoint failed" in error for error in errors), "checker missed checkpoint failure"
 
@@ -743,16 +863,16 @@ def run_synthetic_tests() -> None:
     assert any("real target_eager_set" in error for error in errors), "checker missed real target eager set"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["eager_verify_dry_run_accept_len_by_proposal_id"] = {"101": 5}
-    invalid[2]["eager_verify_accepted_len_by_seq_id"] = {"3": 5}
+    invalid[3]["eager_verify_dry_run_accept_len_by_proposal_id"] = {"101": 5}
+    invalid[3]["eager_verify_accepted_len_by_seq_id"] = {"3": 5}
     errors, _ = validate_records(invalid)
     assert any("accepted_len out of range" in error for error in errors), "checker missed accepted_len range"
 
     invalid = deepcopy(valid_records)
-    invalid[2]["target_eager_verify_seq_ids_dry_run"] = [99]
+    invalid[3]["eager_verify_dry_run_candidate_proposal_ids"] = [999]
     errors, _ = validate_records(invalid)
-    assert any("candidate seqs must equal target eager seqs" in error for error in errors), (
-        "checker missed takeover candidate mismatch"
+    assert any("candidates must equal target eager proposals" in error for error in errors), (
+        "checker missed takeover candidate proposal mismatch"
     )
 
     print("Synthetic eager verify dry-run checks passed.")
