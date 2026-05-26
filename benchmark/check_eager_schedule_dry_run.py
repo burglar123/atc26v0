@@ -58,6 +58,24 @@ def as_int_list(value: Any) -> list[int]:
     return [int(item) for item in value]
 
 
+def as_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
+def record_int_set(record: dict[str, Any], key: str, default: set[int] | None = None) -> set[int]:
+    if key in record and isinstance(record.get(key), list):
+        return as_int_set(record.get(key))
+    return set() if default is None else set(default)
+
+
 def dict_get(mapping: Any, key: int, default: Any = None) -> Any:
     if not isinstance(mapping, dict):
         return default
@@ -75,9 +93,50 @@ def int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def normal_metadata_present(record: dict[str, Any], key: str) -> bool:
+    return key in record and isinstance(record.get(key), list) and bool(record.get(key))
+
+
+def proposal_lifecycle_key(
+    record: dict[str, Any],
+    proposal_id: int,
+    step_by_id: dict[int, int],
+) -> tuple[str, int]:
+    if proposal_id in step_by_id:
+        return ("step", int(step_by_id[proposal_id]))
+    step_id = int_value(record.get("step_id"), -1)
+    if step_id >= 0:
+        return ("step", step_id)
+    return ("plan", int_value(record.get("plan_id"), -1))
+
+
+def is_phase1h5e3_record(record: dict[str, Any]) -> bool:
+    if bool(record.get("enable_eager_lane_exclusion_dry_run", False)):
+        return True
+    if bool(record.get("eager_lane_exclusion_dry_run_enabled", False)):
+        return True
+    list_fields = (
+        "ready_eager_proposal_created_ids",
+        "ready_eager_proposal_seen_by_scheduler_ids",
+        "ready_eager_proposal_applied_ids",
+        "ready_eager_proposal_takeover_routed_ids",
+        "ready_eager_proposal_pending_takeover_ids",
+        "lane_exclusion_applied_seq_ids",
+        "lane_exclusion_applied_proposal_ids",
+        "target_eager_verify_seq_ids_dry_run",
+        "missing_buffered_proposal_allowed_by_eager_seq_ids",
+    )
+    return any(as_int_set(record.get(field)) for field in list_fields)
+
+
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     records_with_schedule_enabled = 0
+    records_with_phase1h5e3 = 0
+    phase1h5e3_apply_records = 0
+    phase1h5e3_takeover_records = 0
+    phase1h5e3_missing_allowed_total = 0
+    phase1h5e3_missing_unexpected_total = 0
     ready_proposal_ids: set[int] = set()
     scheduled_proposal_ids_seen: set[int] = set()
     scheduled_seq_ids_seen: set[int] = set()
@@ -96,6 +155,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     skip_reason_counts: Counter[str] = Counter()
     defer_reason_counts: Counter[str] = Counter()
     last_classification_by_proposal_id: dict[int, str] = {}
+    apply_keys_by_proposal_id: dict[int, set[tuple[str, int]]] = {}
+    takeover_keys_by_proposal_id: dict[int, set[tuple[str, int]]] = {}
+    apply_steps_by_proposal_id: dict[int, set[int]] = {}
+    takeover_steps_by_proposal_id: dict[int, set[int]] = {}
 
     for idx, record in enumerate(records):
         if not is_dual_record(record):
@@ -148,6 +211,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         schedule_tokens = int_value(record.get("eager_tokens_scheduled_dry_run"), 0)
         deferred_tokens = int_value(record.get("eager_tokens_deferred_dry_run"), 0)
         ready_size_after_clear = int_value(record.get("eager_schedule_ready_buffer_size_after_clear"), 0)
+        phase1h5e3_record = is_phase1h5e3_record(record)
 
         if target_eager:
             errors.append(f"record[{idx}] target_eager_set must remain empty, got {sorted(target_eager)}")
@@ -168,6 +232,187 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if nonzero_verified:
             verified_counter_rows += 1
             errors.append(f"record[{idx}] eager verification counters must stay zero: {nonzero_verified}")
+
+        if phase1h5e3_record:
+            records_with_phase1h5e3 += 1
+            actual_draft_home = (
+                as_int_set(record.get("actual_draft_home_set_for_normal_draft"))
+                or as_int_set(record.get("draft_home_set"))
+            )
+            lane_applied_seq_ids = as_int_set(record.get("lane_exclusion_applied_seq_ids"))
+            lane_applied_proposal_ids = as_int_set(record.get("lane_exclusion_applied_proposal_ids"))
+            ready_applied_ids = as_int_set(record.get("ready_eager_proposal_applied_ids"))
+            stale_ids = as_int_set(record.get("ready_eager_proposal_stale_ids"))
+            expired_ids = as_int_set(record.get("ready_eager_proposal_expired_ids"))
+            invalidated_ids = as_int_set(record.get("ready_eager_proposal_invalidated_ids"))
+            target_normal_verify = record_int_set(record, "target_normal_verify_seq_ids", target_home)
+            target_eager_verify = as_int_set(record.get("target_eager_verify_seq_ids_dry_run"))
+            target_eager_verify_proposal_ids = as_int_set(
+                record.get("target_eager_verify_proposal_ids_dry_run")
+            )
+            routed_ids = as_int_set(record.get("ready_eager_proposal_takeover_routed_ids"))
+            missing_allowed = (
+                as_int_set(record.get("missing_buffered_proposal_allowed_by_eager_seq_ids"))
+                or as_int_set(record.get("missing_normal_proposal_allowed_seq_ids_dry_run"))
+            )
+            missing_unexpected = as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids"))
+            missing_buffered = as_int_set(record.get("missing_buffered_proposal_seq_ids"))
+            fallback_same_batch = bool(record.get("fallback_same_batch", False)) or (
+                record.get("plan_phase") == "fallback"
+                and bool(target_home)
+                and target_home == actual_draft_home
+                and target_normal_verify == target_home
+            )
+            fallback_pending = as_int_set(record.get("fallback_pending_receive_seq_ids"))
+            if fallback_same_batch and not fallback_pending:
+                fallback_pending = missing_buffered & target_normal_verify
+            fallback_received = as_int_set(record.get("fallback_received_seq_ids"))
+            fallback_missing_after_receive = as_int_set(record.get("fallback_missing_after_receive_seq_ids"))
+            effective_missing_unexpected = (
+                missing_unexpected - fallback_pending
+                if fallback_same_batch
+                else set(missing_unexpected)
+            )
+
+            phase1h5e3_missing_allowed_total += len(missing_allowed)
+            phase1h5e3_missing_unexpected_total += len(effective_missing_unexpected)
+            phase1h5e3_apply_records += int(bool(lane_applied_seq_ids or lane_applied_proposal_ids))
+            phase1h5e3_takeover_records += int(bool(target_eager_verify or target_eager_verify_proposal_ids))
+
+            if lane_applied_seq_ids:
+                if lane_applied_seq_ids - original_draft_home:
+                    errors.append(
+                        f"record[{idx}] 5e3 lane_exclusion_applied_seq_ids must be in "
+                        f"original_draft_home_set: extra={sorted(lane_applied_seq_ids - original_draft_home)}"
+                    )
+                if lane_applied_seq_ids & actual_draft_home:
+                    errors.append(
+                        f"record[{idx}] 5e3 applied lane-excluded seqs remained in actual draft home: "
+                        f"{sorted(lane_applied_seq_ids & actual_draft_home)}"
+                    )
+                if original_draft_home and actual_draft_home != original_draft_home - lane_applied_seq_ids:
+                    errors.append(
+                        f"record[{idx}] 5e3 actual draft home must equal original draft home minus "
+                        "lane_exclusion_applied_seq_ids"
+                    )
+                lane_applied_in_target = lane_applied_seq_ids & target_home
+                if lane_applied_in_target - target_eager_verify:
+                    errors.append(
+                        f"record[{idx}] 5e3 lane-excluded seqs in target_home must be routed as takeover: "
+                        f"missing={sorted(lane_applied_in_target - target_eager_verify)}"
+                    )
+                if lane_applied_in_target & target_normal_verify:
+                    errors.append(
+                        f"record[{idx}] 5e3 lane-excluded seqs in target_home must not be normal-verified: "
+                        f"overlap={sorted(lane_applied_in_target & target_normal_verify)}"
+                    )
+            if lane_applied_proposal_ids and ready_applied_ids and lane_applied_proposal_ids != ready_applied_ids:
+                errors.append(
+                    f"record[{idx}] 5e3 lane applied proposal ids must match ready applied ids: "
+                    f"lane={sorted(lane_applied_proposal_ids)}, ready={sorted(ready_applied_ids)}"
+                )
+            if lane_applied_proposal_ids & (stale_ids | expired_ids | invalidated_ids):
+                errors.append(f"record[{idx}] 5e3 stale/expired/invalidated proposals were applied")
+
+            if target_eager_verify - target_home:
+                errors.append(
+                    f"record[{idx}] 5e3 target eager takeover seqs must be in target_home_set: "
+                    f"extra={sorted(target_eager_verify - target_home)}"
+                )
+            if target_eager_verify & target_normal_verify:
+                errors.append(
+                    f"record[{idx}] 5e3 target eager takeover seqs must be absent from "
+                    f"target_normal_verify_seq_ids: overlap={sorted(target_eager_verify & target_normal_verify)}"
+                )
+            expected_target_normal = target_home - target_eager_verify
+            if target_normal_verify != expected_target_normal:
+                errors.append(
+                    f"record[{idx}] 5e3 target_normal_verify_seq_ids must equal target_home minus "
+                    f"target_eager_verify_seq_ids_dry_run: target_normal={sorted(target_normal_verify)}, "
+                    f"expected={sorted(expected_target_normal)}"
+                )
+            if missing_allowed - target_eager_verify:
+                errors.append(
+                    f"record[{idx}] 5e3 allowed missing proposals must be covered by eager takeover: "
+                    f"extra={sorted(missing_allowed - target_eager_verify)}"
+                )
+            if effective_missing_unexpected:
+                errors.append(
+                    f"record[{idx}] 5e3 unexpected missing buffered normal proposals: "
+                    f"{sorted(effective_missing_unexpected)}"
+                )
+            expected_missing_split = missing_allowed | effective_missing_unexpected | fallback_pending
+            if missing_buffered and missing_buffered != expected_missing_split:
+                errors.append(
+                    f"record[{idx}] 5e3 missing buffered proposal split is inconsistent: "
+                    f"missing={sorted(missing_buffered)}, allowed={sorted(missing_allowed)}, "
+                    f"fallback_pending={sorted(fallback_pending)}, "
+                    f"unexpected={sorted(effective_missing_unexpected)}"
+                )
+            if fallback_same_batch:
+                fallback_coverage = fallback_received or as_int_set(
+                    record.get("normal_proposal_received_seq_ids_after_lane_exclusion")
+                )
+                if fallback_missing_after_receive:
+                    errors.append(
+                        f"record[{idx}] fallback same-batch missing proposals after receive: "
+                        f"{sorted(fallback_missing_after_receive)}"
+                    )
+                if fallback_coverage and not target_normal_verify <= fallback_coverage:
+                    errors.append(
+                        f"record[{idx}] fallback same-batch received proposals do not cover target normal verify: "
+                        f"target_normal={sorted(target_normal_verify)}, received={sorted(fallback_coverage)}"
+                    )
+            if target_eager_verify and len(target_eager_verify_proposal_ids) != len(target_eager_verify):
+                errors.append(
+                    f"record[{idx}] 5e3 target eager takeover seqs need matching proposal ids: "
+                    f"seqs={sorted(target_eager_verify)}, proposals={sorted(target_eager_verify_proposal_ids)}"
+                )
+            if target_eager_verify_proposal_ids and routed_ids and target_eager_verify_proposal_ids != routed_ids:
+                errors.append(
+                    f"record[{idx}] 5e3 target eager takeover proposal ids must match routed ready proposals: "
+                    f"target={sorted(target_eager_verify_proposal_ids)}, routed={sorted(routed_ids)}"
+                )
+
+            sent_seq_ids = as_int_set(record.get("normal_proposal_sent_seq_ids_after_lane_exclusion"))
+            received_seq_ids = as_int_set(record.get("normal_proposal_received_seq_ids_after_lane_exclusion"))
+            expected_seq_ids = (
+                as_int_set(record.get("normal_proposal_expected_seq_ids_after_lane_exclusion"))
+                or actual_draft_home
+            )
+            if normal_metadata_present(record, "normal_proposal_sent_seq_ids_after_lane_exclusion"):
+                if sent_seq_ids != actual_draft_home:
+                    errors.append(
+                        f"record[{idx}] 5e3 sent normal proposal seq ids must match actual draft home: "
+                        f"sent={sorted(sent_seq_ids)}, expected={sorted(actual_draft_home)}"
+                    )
+            if normal_metadata_present(record, "normal_proposal_received_seq_ids_after_lane_exclusion"):
+                if received_seq_ids != actual_draft_home:
+                    errors.append(
+                        f"record[{idx}] 5e3 received normal proposal seq ids must match actual draft home: "
+                        f"received={sorted(received_seq_ids)}, expected={sorted(actual_draft_home)}"
+                    )
+            if sent_seq_ids and received_seq_ids and sent_seq_ids != received_seq_ids:
+                errors.append(
+                    f"record[{idx}] 5e3 sent/received normal proposal metadata mismatch: "
+                    f"sent={sorted(sent_seq_ids)}, received={sorted(received_seq_ids)}"
+                )
+            if lane_applied_seq_ids & expected_seq_ids:
+                errors.append(f"record[{idx}] 5e3 excluded seqs were still expected by normal proposal receive")
+
+            apply_step_by_id = as_int_map(record.get("ready_eager_proposal_apply_step_by_id"))
+            takeover_step_by_id = as_int_map(record.get("ready_eager_proposal_takeover_routed_step_by_id"))
+            for proposal_id in lane_applied_proposal_ids | ready_applied_ids:
+                apply_key = proposal_lifecycle_key(record, proposal_id, apply_step_by_id)
+                apply_keys_by_proposal_id.setdefault(proposal_id, set()).add(apply_key)
+                if apply_key[0] == "step" and apply_key[1] >= 0:
+                    apply_steps_by_proposal_id.setdefault(proposal_id, set()).add(apply_key[1])
+            for proposal_id in target_eager_verify_proposal_ids | routed_ids:
+                takeover_key = proposal_lifecycle_key(record, proposal_id, takeover_step_by_id)
+                takeover_keys_by_proposal_id.setdefault(proposal_id, set()).add(takeover_key)
+                if takeover_key[0] == "step" and takeover_key[1] >= 0:
+                    takeover_steps_by_proposal_id.setdefault(proposal_id, set()).add(takeover_key[1])
+            continue
 
         if schedule_enabled:
             records_with_schedule_enabled += 1
@@ -377,10 +622,41 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             "ready proposals were observed but none were scheduled; unresolved deferred proposal ids="
             f"{sorted(unresolved_deferred)}"
         )
+    repeated_apply = [
+        proposal_id
+        for proposal_id, keys in apply_keys_by_proposal_id.items()
+        if len(keys) > 1
+    ]
+    if repeated_apply:
+        errors.append(f"5e3 ready proposals applied more than once: {sorted(repeated_apply)}")
+    repeated_takeover = [
+        proposal_id
+        for proposal_id, keys in takeover_keys_by_proposal_id.items()
+        if len(keys) > 1
+    ]
+    if repeated_takeover:
+        errors.append(f"5e3 ready proposals takeover-routed more than once: {sorted(repeated_takeover)}")
+    takeover_before_apply = []
+    for proposal_id, takeover_steps in takeover_steps_by_proposal_id.items():
+        apply_steps = apply_steps_by_proposal_id.get(proposal_id)
+        if apply_steps and min(takeover_steps) < min(apply_steps):
+            takeover_before_apply.append(proposal_id)
+    if takeover_before_apply:
+        errors.append(
+            f"5e3 ready proposals takeover-routed before lane-exclusion apply: "
+            f"{sorted(takeover_before_apply)}"
+        )
 
     summary = {
         "total_trace_records": len(records),
         "records_with_schedule_dry_run_enabled": records_with_schedule_enabled,
+        "records_with_phase1h5e3": records_with_phase1h5e3,
+        "phase1h5e3_apply_records": phase1h5e3_apply_records,
+        "phase1h5e3_takeover_records": phase1h5e3_takeover_records,
+        "phase1h5e3_missing_allowed_total": phase1h5e3_missing_allowed_total,
+        "phase1h5e3_missing_unexpected_total": phase1h5e3_missing_unexpected_total,
+        "phase1h5e3_repeated_apply_proposal_ids": sorted(repeated_apply),
+        "phase1h5e3_repeated_takeover_proposal_ids": sorted(repeated_takeover),
         "ready_proposal_count": len(ready_proposal_ids),
         "deferred_due_to_target_home_count": defer_reason_counts.get("defer_intersects_target_home", 0),
         "scheduled_target_eager_records": scheduled_target_eager_records,
@@ -408,6 +684,13 @@ def print_summary(summary: dict[str, Any]) -> None:
     for key in (
         "total_trace_records",
         "records_with_schedule_dry_run_enabled",
+        "records_with_phase1h5e3",
+        "phase1h5e3_apply_records",
+        "phase1h5e3_takeover_records",
+        "phase1h5e3_missing_allowed_total",
+        "phase1h5e3_missing_unexpected_total",
+        "phase1h5e3_repeated_apply_proposal_ids",
+        "phase1h5e3_repeated_takeover_proposal_ids",
         "ready_proposal_count",
         "deferred_due_to_target_home_count",
         "scheduled_target_eager_records",
@@ -637,6 +920,76 @@ def synthetic_schedule_skip_record(reason: str = "base_mismatch_before_schedule"
     return record
 
 
+def synthetic_5e3_apply_record(step_id: int = 12) -> dict[str, Any]:
+    record = synthetic_base_record()
+    record.update(
+        {
+            "step_id": step_id,
+            "plan_id": step_id,
+            "enable_eager_lane_exclusion_dry_run": True,
+            "eager_lane_exclusion_dry_run_enabled": True,
+            "target_home_set": [2, 4],
+            "target_normal_verify_seq_ids": [2, 4],
+            "target_eager_verify_seq_ids_dry_run": [],
+            "target_eager_verify_proposal_ids_dry_run": [],
+            "draft_home_set": [3, 5],
+            "original_draft_home_set": [1, 3, 5],
+            "actual_draft_home_set_for_normal_draft": [3, 5],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [3, 5],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [3, 5],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [3, 5],
+            "ready_eager_proposal_seen_by_scheduler_ids": [201],
+            "ready_eager_proposal_in_draft_home_ids": [201],
+            "ready_eager_proposal_applied_ids": [201],
+            "ready_eager_proposal_apply_step_by_id": {"201": step_id},
+            "ready_eager_proposal_pending_takeover_ids": [201],
+            "ready_eager_proposal_pending_takeover_proposal_ids": [201],
+            "ready_eager_proposal_pending_takeover_seq_ids": [1],
+            "ready_eager_proposal_takeover_waiting_for_target_home_ids": [201],
+            "lane_exclusion_applied_proposal_ids": [201],
+            "lane_exclusion_applied_seq_ids": [1],
+        }
+    )
+    return record
+
+
+def synthetic_5e3_takeover_record(step_id: int = 13) -> dict[str, Any]:
+    record = synthetic_base_record()
+    record.update(
+        {
+            "step_id": step_id,
+            "plan_id": step_id,
+            "enable_eager_lane_exclusion_dry_run": True,
+            "eager_lane_exclusion_dry_run_enabled": True,
+            "target_home_set": [1, 2, 4],
+            "target_normal_verify_seq_ids": [2, 4],
+            "target_eager_verify_seq_ids_dry_run": [1],
+            "target_eager_verify_proposal_ids_dry_run": [201],
+            "target_eager_verify_reason_by_seq_id_dry_run": {
+                "1": "ready_eager_takeover_for_target_normal_verify",
+            },
+            "excluded_from_target_normal_verify_for_eager_dry_run": [1],
+            "missing_normal_proposal_allowed_by_eager_dry_run": True,
+            "missing_normal_proposal_allowed_seq_ids_dry_run": [1],
+            "missing_buffered_proposal_seq_ids": [1],
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": [1],
+            "missing_buffered_proposal_unexpected_seq_ids": [],
+            "draft_home_set": [3, 5],
+            "original_draft_home_set": [3, 5],
+            "actual_draft_home_set_for_normal_draft": [3, 5],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [3, 5],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [3, 5],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [3, 5],
+            "ready_eager_proposal_seen_by_scheduler_ids": [201],
+            "ready_eager_proposal_apply_step_by_id": {"201": 12},
+            "ready_eager_proposal_takeover_routed_ids": [201],
+            "ready_eager_proposal_takeover_routed_seq_ids": [1],
+            "ready_eager_proposal_takeover_routed_step_by_id": {"201": step_id},
+        }
+    )
+    return record
+
+
 def synthetic_transfer_drop_record(reason: str, current_len: int = 11) -> dict[str, Any]:
     record = synthetic_transfer_record()
     record.update(
@@ -667,6 +1020,10 @@ def run_synthetic_tests() -> None:
         synthetic_transfer_drop_record("base_overshot_or_stale", current_len=13),
         synthetic_schedule_skip_record("base_mismatch_before_schedule"),
         synthetic_schedule_defer_record(),
+        synthetic_5e3_apply_record(),
+        deepcopy(synthetic_5e3_apply_record()),
+        synthetic_5e3_takeover_record(),
+        deepcopy(synthetic_5e3_takeover_record()),
         synthetic_schedule_from_draft_home_record(),
         synthetic_schedule_record(),
     ]
@@ -735,6 +1092,42 @@ def run_synthetic_tests() -> None:
     errors, _ = validate_records(invalid)
     assert any("must be scheduled" in error for error in errors), (
         "checker missed draft-home skip instead of schedule"
+    )
+
+    invalid = deepcopy(valid_records)
+    invalid[-1] = synthetic_5e3_takeover_record()
+    invalid[-1]["target_eager_verify_seq_ids_dry_run"] = [9]
+    invalid[-1]["target_eager_verify_reason_by_seq_id_dry_run"] = {
+        "9": "ready_eager_takeover_for_target_normal_verify",
+    }
+    invalid[-1]["missing_normal_proposal_allowed_seq_ids_dry_run"] = [9]
+    invalid[-1]["missing_buffered_proposal_seq_ids"] = [9]
+    invalid[-1]["missing_buffered_proposal_allowed_by_eager_seq_ids"] = [9]
+    errors, _ = validate_records(invalid)
+    assert any("target eager takeover seqs must be in target_home_set" in error for error in errors), (
+        "checker missed 5e3 takeover outside target_home_set"
+    )
+
+    invalid = deepcopy(valid_records)
+    invalid[-1] = synthetic_5e3_apply_record()
+    invalid[-1]["lane_exclusion_applied_seq_ids"] = [9]
+    errors, _ = validate_records(invalid)
+    assert any("lane_exclusion_applied_seq_ids must be in original_draft_home_set" in error for error in errors), (
+        "checker missed 5e3 apply outside original_draft_home_set"
+    )
+
+    invalid = deepcopy(valid_records)
+    invalid.extend([synthetic_5e3_apply_record(12), synthetic_5e3_apply_record(13)])
+    errors, _ = validate_records(invalid)
+    assert any("applied more than once" in error for error in errors), (
+        "checker missed 5e3 repeated apply across steps"
+    )
+
+    invalid = deepcopy(valid_records)
+    invalid.extend([synthetic_5e3_takeover_record(13), synthetic_5e3_takeover_record(14)])
+    errors, _ = validate_records(invalid)
+    assert any("takeover-routed more than once" in error for error in errors), (
+        "checker missed 5e3 repeated takeover across steps"
     )
 
     print("Synthetic eager schedule dry-run checks passed.")
