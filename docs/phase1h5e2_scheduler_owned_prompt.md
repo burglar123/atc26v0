@@ -4,7 +4,7 @@ Read first:
 - docs/phase1h_project_book.md
 
 You are working on branch:
-phase1h5e2-scheduler-owned-lane-exclusion
+before1Eactual1D1prepare-phase1h5estartnew
 
 Base commit:
 6c5c0a2a4db88c90c9236843541581eb497085cd

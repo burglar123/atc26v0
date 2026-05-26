@@ -55,6 +55,31 @@ class StepPlan:
     lane_exclusion_decision_available_before_draft: bool = False
     lane_exclusion_deferred_until_next_step: bool = False
     lane_exclusion_defer_reason: Optional[str] = None
+    pending_lane_exclusion_decision_ids_before_plan: List[int] = field(default_factory=list)
+    applied_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    stale_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    expired_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    lane_exclusion_drop_reason_by_decision_id: Dict[int, str] = field(default_factory=dict)
+    active_pending_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    terminal_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    touched_lane_exclusion_decision_ids: List[int] = field(default_factory=list)
+    lane_exclusion_source_step_by_decision_id: Dict[int, int] = field(default_factory=dict)
+    lane_exclusion_created_step_by_decision_id: Dict[int, int] = field(default_factory=dict)
+    lane_exclusion_applied_step_by_decision_id: Dict[int, int] = field(default_factory=dict)
+    lane_exclusion_defer_reason_by_decision_id: Dict[int, str] = field(default_factory=dict)
+    lane_exclusion_decisions_synchronized_before_plan: bool = False
+    lane_exclusion_decision_transfer_called: bool = False
+    lane_exclusion_decision_sent_proposal_ids: List[int] = field(default_factory=list)
+    lane_exclusion_decision_received_proposal_ids: List[int] = field(default_factory=list)
+    lane_exclusion_decision_sent_seq_ids: List[int] = field(default_factory=list)
+    lane_exclusion_decision_received_seq_ids: List[int] = field(default_factory=list)
+    lane_exclusion_decision_num_decisions: int = 0
+    lane_exclusion_decision_payload_len: int = 0
+    lane_exclusion_decision_zero_decision: bool = True
+    lane_exclusion_decision_sync_plan_id: Optional[int] = None
+    lane_exclusion_decision_sync_step_id: Optional[int] = None
+    normal_proposal_expected_seq_ids_after_lane_exclusion: List[int] = field(default_factory=list)
+    adjusted_normal_proposal_expected_seq_ids: List[int] = field(default_factory=list)
     draft_home_set: List[int] = field(default_factory=list)
     draft_eager_set: List[int] = field(default_factory=list)
 
@@ -519,6 +544,82 @@ class StepPlan:
                 self.lane_exclusion_deferred_until_next_step
             ),
             "lane_exclusion_defer_reason": self.lane_exclusion_defer_reason,
+            "pending_lane_exclusion_decision_ids_before_plan": _int_list(
+                self.pending_lane_exclusion_decision_ids_before_plan
+            ),
+            "applied_lane_exclusion_decision_ids": _int_list(
+                self.applied_lane_exclusion_decision_ids
+            ),
+            "stale_lane_exclusion_decision_ids": _int_list(
+                self.stale_lane_exclusion_decision_ids
+            ),
+            "expired_lane_exclusion_decision_ids": _int_list(
+                self.expired_lane_exclusion_decision_ids
+            ),
+            "lane_exclusion_drop_reason_by_decision_id": {
+                str(decision_id): str(reason)
+                for decision_id, reason in self.lane_exclusion_drop_reason_by_decision_id.items()
+            },
+            "active_pending_lane_exclusion_decision_ids": _int_list(
+                self.active_pending_lane_exclusion_decision_ids
+            ),
+            "terminal_lane_exclusion_decision_ids": _int_list(
+                self.terminal_lane_exclusion_decision_ids
+            ),
+            "touched_lane_exclusion_decision_ids": _int_list(
+                self.touched_lane_exclusion_decision_ids
+            ),
+            "lane_exclusion_source_step_by_decision_id": _trace_mapping(
+                self.lane_exclusion_source_step_by_decision_id,
+                lambda value: int(value),
+            ),
+            "lane_exclusion_created_step_by_decision_id": _trace_mapping(
+                self.lane_exclusion_created_step_by_decision_id,
+                lambda value: int(value),
+            ),
+            "lane_exclusion_applied_step_by_decision_id": _trace_mapping(
+                self.lane_exclusion_applied_step_by_decision_id,
+                lambda value: int(value),
+            ),
+            "lane_exclusion_defer_reason_by_decision_id": {
+                str(decision_id): str(reason)
+                for decision_id, reason in self.lane_exclusion_defer_reason_by_decision_id.items()
+            },
+            "lane_exclusion_decisions_synchronized_before_plan": bool(
+                self.lane_exclusion_decisions_synchronized_before_plan
+            ),
+            "lane_exclusion_decision_transfer_called": bool(
+                self.lane_exclusion_decision_transfer_called
+            ),
+            "lane_exclusion_decision_sent_proposal_ids": _int_list(
+                self.lane_exclusion_decision_sent_proposal_ids
+            ),
+            "lane_exclusion_decision_received_proposal_ids": _int_list(
+                self.lane_exclusion_decision_received_proposal_ids
+            ),
+            "lane_exclusion_decision_sent_seq_ids": _int_list(
+                self.lane_exclusion_decision_sent_seq_ids
+            ),
+            "lane_exclusion_decision_received_seq_ids": _int_list(
+                self.lane_exclusion_decision_received_seq_ids
+            ),
+            "lane_exclusion_decision_num_decisions": int(
+                self.lane_exclusion_decision_num_decisions
+            ),
+            "lane_exclusion_decision_payload_len": int(
+                self.lane_exclusion_decision_payload_len
+            ),
+            "lane_exclusion_decision_zero_decision": bool(
+                self.lane_exclusion_decision_zero_decision
+            ),
+            "lane_exclusion_decision_sync_plan_id": self.lane_exclusion_decision_sync_plan_id,
+            "lane_exclusion_decision_sync_step_id": self.lane_exclusion_decision_sync_step_id,
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": _int_list(
+                self.normal_proposal_expected_seq_ids_after_lane_exclusion
+            ),
+            "adjusted_normal_proposal_expected_seq_ids": _int_list(
+                self.adjusted_normal_proposal_expected_seq_ids
+            ),
             "draft_home_set": _int_list(self.draft_home_set),
             "draft_eager_set": _int_list(self.draft_eager_set),
             "budgets": {

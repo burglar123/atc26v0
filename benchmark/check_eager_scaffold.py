@@ -95,7 +95,12 @@ except ModuleNotFoundError:
     class _Sequence:
         pass
 
+    class _SequenceStatus:
+        RUNNING = "RUNNING"
+        FINISHED = "FINISHED"
+
     sequence_stub.Sequence = _Sequence
+    sequence_stub.SequenceStatus = _SequenceStatus
     sys.modules["nano_pearl.pearl_engine.sequence"] = sequence_stub
 
     def _load_module(module_name: str, path: str):
