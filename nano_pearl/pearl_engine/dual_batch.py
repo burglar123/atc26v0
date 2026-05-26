@@ -177,6 +177,7 @@ class ReadyEagerProposal:
     base_pre_verify: bool = True
     proposal_len: int = 0
     to_verify_len: int = 0
+    to_be_verified_token_ids: list[int] = field(default_factory=list)
     proposal_token_ids: list[int] = field(default_factory=list)
     created_step_id: int = 0
     source_plan_id: int = 0
@@ -190,6 +191,7 @@ class ReadyEagerProposal:
     state: str = READY_EAGER_STATE_READY
     max_ready_proposal_age: int = READY_EAGER_DEFAULT_MAX_AGE
     takeover_routed_step_id: int | None = None
+    verify_dry_run_step_id: int | None = None
 
     def __post_init__(self):
         self.proposal_id = int(self.proposal_id)
@@ -198,7 +200,12 @@ class ReadyEagerProposal:
         self.base_pre_verify = bool(self.base_pre_verify)
         self.proposal_len = int(self.proposal_len)
         self.to_verify_len = int(self.to_verify_len)
+        self.to_be_verified_token_ids = [
+            int(token_id) for token_id in self.to_be_verified_token_ids
+        ]
         self.proposal_token_ids = [int(token_id) for token_id in self.proposal_token_ids]
+        if self.to_verify_len == 0 and self.to_be_verified_token_ids:
+            self.to_verify_len = len(self.to_be_verified_token_ids)
         self.created_step_id = int(self.created_step_id)
         self.source_plan_id = int(self.source_plan_id)
         self.source_step_id = int(self.source_step_id)
@@ -213,6 +220,8 @@ class ReadyEagerProposal:
             self.tokens_digest = int(self.tokens_digest)
         if self.takeover_routed_step_id is not None:
             self.takeover_routed_step_id = int(self.takeover_routed_step_id)
+        if self.verify_dry_run_step_id is not None:
+            self.verify_dry_run_step_id = int(self.verify_dry_run_step_id)
         if self.state not in READY_EAGER_PROPOSAL_STATES:
             raise ValueError(f"invalid ready eager proposal state={self.state!r}")
         self.max_ready_proposal_age = int(self.max_ready_proposal_age)
@@ -324,6 +333,15 @@ class ReadyEagerProposalRegistry:
         if proposal is not None:
             proposal.takeover_routed_step_id = int(step_id)
         return proposal
+
+    def mark_verify_dry_run_executed(self, proposal_id: int, step_id: int) -> ReadyEagerProposal | None:
+        proposal = self._proposals.get(int(proposal_id))
+        if proposal is not None:
+            proposal.verify_dry_run_step_id = int(step_id)
+        return proposal
+
+    def by_id(self, proposal_id: int) -> ReadyEagerProposal | None:
+        return self._proposals.get(int(proposal_id))
 
     def pop_outbox(self) -> list[ReadyEagerProposal]:
         proposals = sorted(
@@ -841,6 +859,9 @@ def ready_eager_proposal_from_eager_proposal(
     scheduled: bool = False,
 ) -> ReadyEagerProposal:
     proposal_token_ids = [int(token_id) for token_id in proposal.proposal_token_ids]
+    to_be_verified_token_ids = [
+        int(token_id) for token_id in proposal.to_be_verified_token_ids
+    ]
     return ReadyEagerProposal(
         proposal_id=int(proposal.proposal_id),
         seq_id=int(proposal.seq_id),
@@ -849,6 +870,7 @@ def ready_eager_proposal_from_eager_proposal(
         base_pre_verify=bool(proposal.base_pre_verify),
         proposal_len=int(proposal.proposal_len),
         to_verify_len=len(proposal.to_be_verified_token_ids),
+        to_be_verified_token_ids=to_be_verified_token_ids,
         proposal_token_ids=proposal_token_ids,
         created_step_id=int(created_step_id),
         source_plan_id=int(proposal.source_plan_id),
@@ -873,6 +895,16 @@ def serialize_ready_eager_proposals(
     payload: list[int] = []
     for proposal in proposals:
         proposal_token_ids = [int(token_id) for token_id in proposal.proposal_token_ids]
+        to_be_verified_token_ids = [
+            int(token_id) for token_id in proposal.to_be_verified_token_ids
+        ]
+        if len(to_be_verified_token_ids) != int(proposal.to_verify_len):
+            raise ValueError(
+                "ready eager proposal to_verify_len does not match "
+                f"token payload for proposal_id={proposal.proposal_id}: "
+                f"to_verify_len={proposal.to_verify_len}, "
+                f"tokens={len(to_be_verified_token_ids)}"
+            )
         payload.extend(
             [
                 int(proposal.proposal_id),
@@ -896,6 +928,7 @@ def serialize_ready_eager_proposals(
                 -1 if proposal.tokens_digest is None else int(proposal.tokens_digest),
             ]
         )
+        payload.extend(to_be_verified_token_ids)
         payload.extend(proposal_token_ids)
     meta = [
         len(proposals),
@@ -958,8 +991,14 @@ def deserialize_ready_eager_proposals(
             seq_epoch,
             tokens_digest,
         ) = header
+        to_be_verified_token_ids = payload_values[offset:offset + to_verify_len]
+        offset += to_verify_len
         proposal_token_ids = payload_values[offset:offset + proposal_token_len]
         offset += proposal_token_len
+        if len(to_be_verified_token_ids) != to_verify_len:
+            raise ValueError(
+                f"ready eager proposal payload ended while reading verify tokens index={idx}"
+            )
         if len(proposal_token_ids) != proposal_token_len:
             raise ValueError(f"ready eager proposal payload ended while reading tokens index={idx}")
         proposals.append(
@@ -971,6 +1010,7 @@ def deserialize_ready_eager_proposals(
                 base_pre_verify=bool(base_pre_verify),
                 proposal_len=proposal_len,
                 to_verify_len=to_verify_len,
+                to_be_verified_token_ids=to_be_verified_token_ids,
                 proposal_token_ids=proposal_token_ids,
                 created_step_id=created_step_id,
                 source_plan_id=source_plan_id,

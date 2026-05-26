@@ -183,7 +183,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_eager_result_transfer_dry_run": args.enable_eager_result_transfer_dry_run
         or args.enable_eager_sync_apply_dry_run,
         "enable_eager_sync_apply_dry_run": args.enable_eager_sync_apply_dry_run,
-        "enable_eager_lane_exclusion_dry_run": args.enable_eager_lane_exclusion_dry_run,
+        "enable_eager_lane_exclusion_dry_run": args.enable_eager_lane_exclusion_dry_run
+        or args.enable_eager_sync_apply_dry_run
+        or args.enable_eager_result_transfer_dry_run
+        or args.enable_eager_apply_dry_run
+        or args.enable_eager_verify_dry_run,
         "eager_policy": args.eager_policy,
         "max_eager_requests_per_step": args.max_eager_requests_per_step,
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,

@@ -163,23 +163,31 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             actual_eager_counter_rows += 1
             errors.append(f"record[{idx}] actual eager counters must remain zero: {nonzero_actual}")
 
+        verify_dry_run_allowed = (
+            record.get("eager_verify_dry_run_source") == "phase1h5e3_takeover_lane"
+        )
+        forbidden_dry_run_fields = [
+            "eager_apply_dry_run_enabled",
+            "eager_result_transfer_dry_run_enabled",
+            "eager_sync_apply_dry_run_enabled",
+        ]
+        if not verify_dry_run_allowed:
+            forbidden_dry_run_fields.append("eager_verify_dry_run_enabled")
         forbidden_dry_run = [
+            field for field in forbidden_dry_run_fields if bool(record.get(field, False))
+        ]
+        zero_only_fields = [
             field
-            for field in (
-                "eager_verify_dry_run_enabled",
-                "eager_apply_dry_run_enabled",
-                "eager_result_transfer_dry_run_enabled",
-                "eager_sync_apply_dry_run_enabled",
-            )
-            if bool(record.get(field, False))
+            for field in ZERO_ONLY_DRY_RUN_FIELDS
+            if field != "eager_tokens_verify_dry_run" or not verify_dry_run_allowed
         ]
         nonzero_forbidden_tokens = [
-            field for field in ZERO_ONLY_DRY_RUN_FIELDS if int_value(record.get(field), 0) != 0
+            field for field in zero_only_fields if int_value(record.get(field), 0) != 0
         ]
         if lane_enabled and (forbidden_dry_run or nonzero_forbidden_tokens):
             verify_or_apply_rows += 1
             errors.append(
-                f"record[{idx}] Phase 1H-5e3 must not run eager verify/apply/result transfer: "
+                f"record[{idx}] Phase 1H lane exclusion must not run forbidden eager verify/apply/result transfer: "
                 f"flags={forbidden_dry_run}, tokens={nonzero_forbidden_tokens}"
             )
 
@@ -809,6 +817,10 @@ def takeover_target_verify_record() -> dict[str, Any]:
             "ready_eager_proposal_takeover_routed_step_by_id": {"202": 13},
             "ready_eager_proposal_takeover_routed_ids": [202],
             "ready_eager_proposal_takeover_routed_seq_ids": [3],
+            "enable_eager_verify_dry_run": True,
+            "eager_verify_dry_run_enabled": True,
+            "eager_verify_dry_run_source": "phase1h5e3_takeover_lane",
+            "eager_tokens_verify_dry_run": 4,
         }
     )
     return record
@@ -956,7 +968,7 @@ def run_synthetic_tests() -> None:
     invalid = [creation_record(), deepcopy(applied_record())]
     invalid[1]["eager_verify_dry_run_enabled"] = True
     errors, _ = validate_records(invalid)
-    assert any("must not run eager verify/apply" in error for error in errors), (
+    assert any("forbidden eager verify/apply" in error for error in errors), (
         "checker missed forbidden eager verify dry-run"
     )
 

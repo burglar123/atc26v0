@@ -168,6 +168,7 @@ class PEARLConfig:
         if self.enable_eager_apply_dry_run:
             self.enable_eager_verify_dry_run = True
         if self.enable_eager_verify_dry_run:
+            self.enable_eager_lane_exclusion_dry_run = True
             self.enable_eager_schedule_dry_run = True
         if self.enable_eager_schedule_dry_run:
             self.enable_eager_transfer_dry_run = True
