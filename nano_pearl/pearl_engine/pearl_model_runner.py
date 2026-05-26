@@ -40,14 +40,14 @@ from nano_pearl.pearl_engine.dual_batch import (
     EagerProposal,
     EagerProposalBuffer,
     LANE_EAGER,
-    LANE_EXCLUSION_TRANSFER_HEADER_LEN,
     LANE_NORMAL,
     ProposalBuffer,
+    READY_EAGER_TRANSFER_HEADER_LEN,
     deserialize_eager_transfer_payload,
-    deserialize_lane_exclusion_decisions,
-    lane_exclusion_decision_from_eager_proposal,
+    deserialize_ready_eager_proposals,
+    ready_eager_proposal_from_eager_proposal,
     serialize_eager_transfer_payload,
-    serialize_lane_exclusion_decisions,
+    serialize_ready_eager_proposals,
 )
 from transformers import AutoTokenizer
 from tqdm import trange
@@ -760,6 +760,60 @@ class ModelRunnerBase:
             "lane_exclusion_resolved_normal_draft_conflict_count": len(step_plan.lane_excluded_seq_ids),
             "lane_exclusion_unexpected_missing_proposal_count": 0,
             "lane_exclusion_decision_late_count": 0,
+            "ready_eager_proposal_created_ids": list(step_plan.ready_eager_proposal_created_ids),
+            "ready_eager_proposal_created_seq_ids": list(step_plan.ready_eager_proposal_created_seq_ids),
+            "ready_eager_proposal_synced_ids": list(step_plan.ready_eager_proposal_synced_ids),
+            "ready_eager_proposal_registry_ids_before_plan": list(
+                step_plan.ready_eager_proposal_registry_ids_before_plan
+            ),
+            "ready_eager_proposal_seen_by_scheduler_ids": list(
+                step_plan.ready_eager_proposal_seen_by_scheduler_ids
+            ),
+            "ready_eager_proposal_in_target_home_ids": list(
+                step_plan.ready_eager_proposal_in_target_home_ids
+            ),
+            "ready_eager_proposal_in_draft_home_ids": list(
+                step_plan.ready_eager_proposal_in_draft_home_ids
+            ),
+            "ready_eager_proposal_applied_ids": list(step_plan.ready_eager_proposal_applied_ids),
+            "ready_eager_proposal_stale_ids": list(step_plan.ready_eager_proposal_stale_ids),
+            "ready_eager_proposal_expired_ids": list(step_plan.ready_eager_proposal_expired_ids),
+            "ready_eager_proposal_invalidated_ids": list(
+                step_plan.ready_eager_proposal_invalidated_ids
+            ),
+            "ready_eager_proposal_state_by_id": dict(step_plan.ready_eager_proposal_state_by_id),
+            "ready_eager_proposal_skip_reason_by_id": dict(
+                step_plan.ready_eager_proposal_skip_reason_by_id
+            ),
+            "ready_eager_proposal_stale_reason_by_id": dict(
+                step_plan.ready_eager_proposal_stale_reason_by_id
+            ),
+            "ready_eager_proposal_age_by_id": dict(step_plan.ready_eager_proposal_age_by_id),
+            "ready_eager_proposal_seq_id_by_id": dict(step_plan.ready_eager_proposal_seq_id_by_id),
+            "ready_eager_proposal_base_len_by_id": dict(step_plan.ready_eager_proposal_base_len_by_id),
+            "ready_eager_proposal_current_len_by_id": dict(
+                step_plan.ready_eager_proposal_current_len_by_id
+            ),
+            "ready_eager_proposal_current_pre_verify_by_id": dict(
+                step_plan.ready_eager_proposal_current_pre_verify_by_id
+            ),
+            "ready_eager_proposal_current_status_by_id": dict(
+                step_plan.ready_eager_proposal_current_status_by_id
+            ),
+            "ready_eager_proposals_synchronized_before_plan": bool(
+                step_plan.ready_eager_proposals_synchronized_before_plan
+            ),
+            "ready_eager_proposal_transfer_called": bool(step_plan.ready_eager_proposal_transfer_called),
+            "ready_eager_proposal_sent_ids": list(step_plan.ready_eager_proposal_sent_ids),
+            "ready_eager_proposal_received_ids": list(step_plan.ready_eager_proposal_received_ids),
+            "ready_eager_proposal_num_proposals": int(step_plan.ready_eager_proposal_num_proposals),
+            "ready_eager_proposal_payload_len": int(step_plan.ready_eager_proposal_payload_len),
+            "ready_eager_proposal_zero_proposal": bool(step_plan.ready_eager_proposal_zero_proposal),
+            "lane_exclusion_applied_proposal_ids": list(step_plan.lane_exclusion_applied_proposal_ids),
+            "lane_exclusion_applied_seq_ids": list(step_plan.lane_exclusion_applied_seq_ids),
+            "lane_exclusion_apply_reason_by_proposal_id": dict(
+                step_plan.lane_exclusion_apply_reason_by_proposal_id
+            ),
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
             "target_eager_set_dry_run": list(step_plan.target_eager_set_dry_run),
@@ -1061,22 +1115,22 @@ class ModelRunnerBase:
     def _lane_exclusion_step_id_before_plan(self) -> int:
         return int(self.dual_batch_manager.step_id)
 
-    def _empty_lane_exclusion_sync_info(self) -> dict:
+    def _empty_ready_eager_proposal_sync_info(self) -> dict:
         return {
             "called": False,
             "sent_proposal_ids": [],
             "received_proposal_ids": [],
             "sent_seq_ids": [],
             "received_seq_ids": [],
-            "num_decisions": 0,
+            "num_proposals": 0,
             "payload_len": 0,
-            "zero_decision": True,
+            "zero_proposal": True,
             "plan_id": None,
             "step_id": None,
         }
 
-    def _sync_lane_exclusion_decisions_before_step_plan(self, plan_id: int) -> dict:
-        info = self._empty_lane_exclusion_sync_info()
+    def _sync_ready_eager_proposals_before_step_plan(self, plan_id: int) -> dict:
+        info = self._empty_ready_eager_proposal_sync_info()
         if not self._eager_lane_exclusion_dry_run_enabled():
             return info
 
@@ -1085,7 +1139,7 @@ class ModelRunnerBase:
         meta_len = 5
 
         if self.is_draft:
-            meta_values = [0, 0, int(plan_id), int(step_id), LANE_EXCLUSION_TRANSFER_HEADER_LEN]
+            meta_values = [0, 0, int(plan_id), int(step_id), READY_EAGER_TRANSFER_HEADER_LEN]
             payload_values: list[int] = []
             if self.tp_params.local_rank == 0:
                 meta = torch.zeros(meta_len, dtype=torch.int64, device="cuda")
@@ -1121,20 +1175,20 @@ class ModelRunnerBase:
                     group=self.group,
                 )
                 payload_values = [int(value) for value in draft_payload.tolist()]
-            decisions = deserialize_lane_exclusion_decisions(meta_values, payload_values)
-            self.dual_batch_manager.receive_lane_exclusion_decisions(decisions)
-            info["received_proposal_ids"] = [int(decision.proposal_id) for decision in decisions]
-            info["received_seq_ids"] = [int(decision.seq_id) for decision in decisions]
-            info["num_decisions"] = int(meta_values[0])
+            proposals = deserialize_ready_eager_proposals(meta_values, payload_values)
+            self.dual_batch_manager.receive_ready_eager_proposals(proposals)
+            info["received_proposal_ids"] = [int(proposal.proposal_id) for proposal in proposals]
+            info["received_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+            info["num_proposals"] = int(meta_values[0])
             info["payload_len"] = int(meta_values[1])
-            info["zero_decision"] = len(decisions) == 0
+            info["zero_proposal"] = len(proposals) == 0
             info["plan_id"] = None if int(meta_values[2]) < 0 else int(meta_values[2])
             info["step_id"] = None if int(meta_values[3]) < 0 else int(meta_values[3])
             return info
 
-        decisions = self.dual_batch_manager.pop_lane_exclusion_decisions_for_sync()
-        meta_values, payload_values = serialize_lane_exclusion_decisions(
-            decisions,
+        proposals = self.dual_batch_manager.pop_ready_eager_proposals_for_sync()
+        meta_values, payload_values = serialize_ready_eager_proposals(
+            proposals,
             plan_id=int(plan_id),
             step_id=step_id,
         )
@@ -1150,31 +1204,51 @@ class ModelRunnerBase:
             )
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
 
-        info["sent_proposal_ids"] = [int(decision.proposal_id) for decision in decisions]
-        info["sent_seq_ids"] = [int(decision.seq_id) for decision in decisions]
-        info["num_decisions"] = int(meta_values[0])
+        info["sent_proposal_ids"] = [int(proposal.proposal_id) for proposal in proposals]
+        info["sent_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+        info["num_proposals"] = int(meta_values[0])
         info["payload_len"] = int(meta_values[1])
-        info["zero_decision"] = len(decisions) == 0
+        info["zero_proposal"] = len(proposals) == 0
         return info
 
-    def _attach_lane_exclusion_sync_info(self, plan: StepPlan, sync_info: dict) -> None:
-        plan.lane_exclusion_decisions_synchronized_before_plan = bool(sync_info.get("called", False))
-        plan.lane_exclusion_decision_transfer_called = bool(sync_info.get("called", False))
-        plan.lane_exclusion_decision_sent_proposal_ids = [
+    def _attach_ready_eager_proposal_sync_info(self, plan: StepPlan, sync_info: dict) -> None:
+        called = bool(sync_info.get("called", False))
+        sent_ids = [
             int(proposal_id) for proposal_id in sync_info.get("sent_proposal_ids", [])
         ]
-        plan.lane_exclusion_decision_received_proposal_ids = [
+        received_ids = [
             int(proposal_id) for proposal_id in sync_info.get("received_proposal_ids", [])
         ]
-        plan.lane_exclusion_decision_sent_seq_ids = [
+        sent_seq_ids = [
             int(seq_id) for seq_id in sync_info.get("sent_seq_ids", [])
         ]
-        plan.lane_exclusion_decision_received_seq_ids = [
+        received_seq_ids = [
             int(seq_id) for seq_id in sync_info.get("received_seq_ids", [])
         ]
-        plan.lane_exclusion_decision_num_decisions = int(sync_info.get("num_decisions", 0))
+        plan.ready_eager_proposals_synchronized_before_plan = called
+        plan.ready_eager_proposal_transfer_called = called
+        plan.ready_eager_proposal_sent_ids = list(sent_ids)
+        plan.ready_eager_proposal_received_ids = list(received_ids)
+        plan.ready_eager_proposal_sent_seq_ids = list(sent_seq_ids)
+        plan.ready_eager_proposal_received_seq_ids = list(received_seq_ids)
+        plan.ready_eager_proposal_synced_ids = sorted(set(sent_ids) | set(received_ids))
+        plan.ready_eager_proposal_num_proposals = int(sync_info.get("num_proposals", 0))
+        plan.ready_eager_proposal_payload_len = int(sync_info.get("payload_len", 0))
+        plan.ready_eager_proposal_zero_proposal = bool(sync_info.get("zero_proposal", True))
+        plan.ready_eager_proposal_sync_plan_id = sync_info.get("plan_id")
+        plan.ready_eager_proposal_sync_step_id = sync_info.get("step_id")
+
+        # Deprecated 1H-5e2 decision sync fields stay empty in 1H-5e3; the
+        # synchronized cross-step object is ReadyEagerProposal.
+        plan.lane_exclusion_decisions_synchronized_before_plan = called
+        plan.lane_exclusion_decision_transfer_called = called
+        plan.lane_exclusion_decision_sent_proposal_ids = []
+        plan.lane_exclusion_decision_received_proposal_ids = []
+        plan.lane_exclusion_decision_sent_seq_ids = []
+        plan.lane_exclusion_decision_received_seq_ids = []
+        plan.lane_exclusion_decision_num_decisions = 0
         plan.lane_exclusion_decision_payload_len = int(sync_info.get("payload_len", 0))
-        plan.lane_exclusion_decision_zero_decision = bool(sync_info.get("zero_decision", True))
+        plan.lane_exclusion_decision_zero_decision = True
         plan.lane_exclusion_decision_sync_plan_id = sync_info.get("plan_id")
         plan.lane_exclusion_decision_sync_step_id = sync_info.get("step_id")
 
@@ -1340,7 +1414,7 @@ class ModelRunnerBase:
         iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
-        lane_sync_info = self._sync_lane_exclusion_decisions_before_step_plan(plan_id)
+        lane_sync_info = self._sync_ready_eager_proposals_before_step_plan(plan_id)
         dropped_seq_ids = self._prepare_dual_batch_state()
         plan = self.dual_batch_manager.build_step_plan(
             plan_id=plan_id,
@@ -1353,7 +1427,7 @@ class ModelRunnerBase:
             enable_eager_lane_exclusion_dry_run=self._eager_lane_exclusion_dry_run_enabled(),
             running_seqs=list(self.scheduler.running),
         )
-        self._attach_lane_exclusion_sync_info(plan, lane_sync_info)
+        self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
@@ -3272,20 +3346,23 @@ class ModelRunnerBase:
         deferred_proposal_ids = [int(proposal.proposal_id) for proposal in deferred]
         skipped_proposal_ids = [int(proposal.proposal_id) for proposal in skipped]
         actual_draft_home_for_lane = set(self._actual_normal_draft_seq_ids(plan))
-        late_lane_proposals = [
-            proposal
-            for proposal in scheduled
-            if self._eager_lane_exclusion_dry_run_enabled()
-            and int(proposal.seq_id) in actual_draft_home_for_lane
-        ]
-        late_lane_decisions = []
-        for proposal in late_lane_proposals:
-            decision = lane_exclusion_decision_from_eager_proposal(
+        registry_ready_proposals: list[tuple[EagerProposal, bool]] = []
+        if self._eager_lane_exclusion_dry_run_enabled():
+            registry_ready_proposals.extend((proposal, True) for proposal in scheduled)
+            registry_ready_proposals.extend(
+                (proposal, False)
+                for proposal in deferred
+                if defer_reason_by_proposal_id.get(int(proposal.proposal_id)) == "defer_intersects_target_home"
+            )
+        created_ready_proposals = []
+        for proposal, scheduled_for_eager in registry_ready_proposals:
+            ready_proposal = ready_eager_proposal_from_eager_proposal(
                 proposal,
                 created_step_id=0 if plan.step_id is None else int(plan.step_id),
+                scheduled=scheduled_for_eager,
             )
-            if self.dual_batch_manager.emit_lane_exclusion_decision(decision):
-                late_lane_decisions.append(decision)
+            if self.dual_batch_manager.emit_ready_eager_proposal(ready_proposal):
+                created_ready_proposals.append(ready_proposal)
         scheduled_target_eager_set_dry_run = list(scheduled_seq_ids)
         adjusted_draft_home_set_dry_run = [
             int(seq_id) for seq_id in plan.draft_home_set if int(seq_id) not in set(scheduled_seq_ids)
@@ -3406,26 +3483,29 @@ class ModelRunnerBase:
         trace_record["eager_ready_buffer_size_before_schedule"] = int(ready_size_before)
         trace_record["eager_ready_buffer_size_after_schedule"] = int(ready_size_after_schedule)
         trace_record["eager_ready_buffer_size_after_clear"] = int(ready_size_after_clear)
-        if self._eager_lane_exclusion_dry_run_enabled() and late_lane_proposals:
-            late_seq_ids = [int(proposal.seq_id) for proposal in late_lane_proposals]
-            late_proposal_ids = [int(proposal.proposal_id) for proposal in late_lane_proposals]
+        if self._eager_lane_exclusion_dry_run_enabled() and created_ready_proposals:
+            created_seq_ids = [int(proposal.seq_id) for proposal in created_ready_proposals]
+            created_proposal_ids = [int(proposal.proposal_id) for proposal in created_ready_proposals]
+            same_step_normal_draft_seq_ids = sorted(set(created_seq_ids) & actual_draft_home_for_lane)
             applied_excluded_seq_ids = list(plan.lane_excluded_seq_ids)
+            plan.ready_eager_proposal_created_ids = list(created_proposal_ids)
+            plan.ready_eager_proposal_created_seq_ids = list(created_seq_ids)
             trace_record["eager_lane_exclusion_dry_run_enabled"] = True
+            trace_record["ready_eager_proposal_created_ids"] = list(created_proposal_ids)
+            trace_record["ready_eager_proposal_created_seq_ids"] = list(created_seq_ids)
             trace_record["lane_exclusion_decision_available_before_draft"] = bool(
                 plan.lane_exclusion_decision_available_before_draft
             )
-            trace_record["lane_exclusion_deferred_until_next_step"] = True
-            trace_record["lane_exclusion_defer_reason"] = "decision_not_available_before_normal_draft"
-            trace_record["lane_exclusion_decision_late_count"] = len(late_seq_ids)
-            trace_record["eager_lane_exclusion_proposal_ids"] = late_proposal_ids
-            trace_record["eager_lane_exclusion_seq_ids"] = late_seq_ids
-            trace_record["eager_lane_exclusion_reason_by_seq_id"] = {
-                str(seq_id): "decision_not_available_before_normal_draft"
-                for seq_id in late_seq_ids
-            }
-            trace_record["pending_lane_exclusion_decision_ids_after_emit"] = [
-                int(decision.proposal_id) for decision in late_lane_decisions
-            ]
+            trace_record["lane_exclusion_deferred_until_next_step"] = bool(
+                same_step_normal_draft_seq_ids
+            )
+            trace_record["lane_exclusion_defer_reason"] = (
+                "ready_eager_proposal_created_after_plan"
+                if same_step_normal_draft_seq_ids
+                else None
+            )
+            trace_record["lane_exclusion_decision_late_count"] = 0
+            trace_record["pending_lane_exclusion_decision_ids_after_emit"] = []
             trace_record["lane_exclusion_dry_run_done"] = bool(
                 getattr(plan, "lane_exclusion_dry_run_done", False)
             )

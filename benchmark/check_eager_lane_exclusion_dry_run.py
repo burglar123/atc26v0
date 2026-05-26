@@ -17,6 +17,14 @@ ACTUAL_EAGER_COUNTERS = [
     "eager_tokens_invalidated",
 ]
 
+TERMINAL_READY_STATES = {"CONSUMED_APPLIED", "STALE", "EXPIRED", "INVALIDATED"}
+ZERO_ONLY_DRY_RUN_FIELDS = [
+    "eager_tokens_verify_dry_run",
+    "eager_tokens_apply_dry_run",
+    "eager_tokens_result_transfer_dry_run",
+    "eager_tokens_sync_apply_dry_run",
+]
+
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text())
@@ -31,29 +39,32 @@ def load_trace(path: Path) -> list[dict[str, Any]]:
 
 
 def is_dual_record(record: dict[str, Any]) -> bool:
-    return (
-        record.get("execution_mode") == "dual_batch_pearl"
-        and record.get("dual_batch_enabled") is True
-    )
+    return record.get("execution_mode") == "dual_batch_pearl" and record.get("dual_batch_enabled") is True
 
 
 def as_int_list(value: Any) -> list[int]:
     if not isinstance(value, list):
         return []
-    return [int(item) for item in value]
+    result: list[int] = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except Exception:
+            continue
+    return result
 
 
 def as_int_set(value: Any) -> set[int]:
     return set(as_int_list(value))
 
 
-def as_int_map(value: Any) -> dict[int, int]:
+def as_str_map(value: Any) -> dict[int, str]:
     if not isinstance(value, dict):
         return {}
-    result: dict[int, int] = {}
+    result: dict[int, str] = {}
     for key, item in value.items():
         try:
-            result[int(key)] = int(item)
+            result[int(key)] = str(item)
         except Exception:
             continue
     return result
@@ -68,26 +79,34 @@ def int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def _normal_metadata_present(record: dict[str, Any], key: str) -> bool:
+    return key in record and isinstance(record.get(key), list) and bool(record.get(key))
+
+
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     records_with_lane_enabled = 0
-    scheduled_target_eager_count = 0
+    ready_created_count = 0
+    ready_synced_count = 0
+    ready_seen_count = 0
+    ready_in_target_count = 0
+    ready_in_draft_count = 0
+    ready_applied_count = 0
+    ready_stale_count = 0
+    ready_expired_count = 0
+    ready_invalidated_count = 0
+    lane_exclusion_applied_decision_count = 0
     excluded_from_actual_count = 0
-    deferred_count = 0
-    decision_late_count = 0
     sent_received_mismatch_count = 0
     excluded_expected_count = 0
-    missing_after_lane_count = 0
-    fallback_handled_count = 0
     actual_eager_counter_rows = 0
     real_target_eager_nonempty_count = 0
-    scheduler_applied_decision_count = 0
-    synchronized_before_plan_count = 0
+    verify_or_apply_rows = 0
     original_draft_sizes: list[int] = []
     adjusted_draft_sizes: list[int] = []
-    done_proposal_counts: Counter[int] = Counter()
-    defer_reason_counts: Counter[str] = Counter()
-    coverage_candidates = 0
+    applied_proposal_counts: Counter[int] = Counter()
+    skip_reason_counts: Counter[str] = Counter()
+    stale_reason_counts: Counter[str] = Counter()
 
     for idx, record in enumerate(records):
         if not is_dual_record(record):
@@ -95,46 +114,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
 
         lane_enabled = bool(record.get("enable_eager_lane_exclusion_dry_run", False))
         lane_active = bool(record.get("eager_lane_exclusion_dry_run_enabled", False))
-        target_home = as_int_set(record.get("target_home_set"))
-        real_target_eager = as_int_set(record.get("target_eager_set"))
-        original = as_int_set(record.get("original_draft_home_set")) or as_int_set(record.get("draft_home_set"))
-        actual = (
-            as_int_set(record.get("actual_draft_home_set_for_normal_draft"))
-            or as_int_set(record.get("draft_home_set"))
-        )
-        scheduled = as_int_set(record.get("scheduled_target_eager_set_dry_run")) or as_int_set(
-            record.get("target_eager_set_dry_run")
-        )
-        excluded = as_int_set(record.get("excluded_from_actual_draft_home_for_eager")) or as_int_set(
-            record.get("lane_excluded_seq_ids")
-        )
-        excluded_dry_run = as_int_set(record.get("excluded_from_draft_home_for_eager_dry_run"))
-        adjusted_dry_run = as_int_set(record.get("adjusted_draft_home_set_dry_run"))
-        expected_seq_ids = as_int_set(record.get("normal_proposal_expected_seq_ids_after_lane_exclusion")) or actual
-        adjusted_expected = as_int_set(record.get("adjusted_normal_proposal_expected_seq_ids")) or actual
-        sent_seq_ids = as_int_set(record.get("normal_proposal_sent_seq_ids_after_lane_exclusion"))
-        received_seq_ids = as_int_set(record.get("normal_proposal_received_seq_ids_after_lane_exclusion"))
-        decision_available = bool(record.get("lane_exclusion_decision_available_before_draft", False))
-        deferred = bool(record.get("lane_exclusion_deferred_until_next_step", False))
-        defer_reason = record.get("lane_exclusion_defer_reason")
-        done = bool(record.get("lane_exclusion_dry_run_done", False))
-        done_proposal_ids = as_int_list(record.get("lane_exclusion_dry_run_done_proposal_ids"))
-        missing_after_lane = as_int_set(record.get("missing_normal_proposal_after_lane_exclusion"))
-        fallback_handled = as_int_set(record.get("missing_normal_proposal_handled_by_fallback"))
-        lane_tokens = int_value(record.get("eager_tokens_lane_excluded_dry_run"), 0)
-        pending_before = as_int_set(record.get("pending_lane_exclusion_decision_ids_before_plan"))
-        applied_decision_ids = as_int_set(record.get("applied_lane_exclusion_decision_ids"))
-        active_pending_ids = as_int_set(record.get("active_pending_lane_exclusion_decision_ids"))
-        terminal_decision_ids = as_int_set(record.get("terminal_lane_exclusion_decision_ids"))
-        touched_decision_ids = as_int_set(record.get("touched_lane_exclusion_decision_ids"))
-        created_step_by_decision = as_int_map(record.get("lane_exclusion_created_step_by_decision_id"))
-        applied_step_by_decision = as_int_map(record.get("lane_exclusion_applied_step_by_decision_id"))
-        sync_before_plan = bool(record.get("lane_exclusion_decisions_synchronized_before_plan", False))
-        step_id = int_value(record.get("step_id"), -1)
-
-        if real_target_eager:
+        target_eager = as_int_set(record.get("target_eager_set"))
+        if target_eager:
             real_target_eager_nonempty_count += 1
-            errors.append(f"record[{idx}] real target_eager_set must remain empty: {sorted(real_target_eager)}")
+            errors.append(f"record[{idx}] real target_eager_set must remain empty: {sorted(target_eager)}")
 
         nonzero_actual = [
             field for field in ACTUAL_EAGER_COUNTERS if int_value(record.get(field), 0) != 0
@@ -143,166 +126,241 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             actual_eager_counter_rows += 1
             errors.append(f"record[{idx}] actual eager counters must remain zero: {nonzero_actual}")
 
+        forbidden_dry_run = [
+            field
+            for field in (
+                "eager_verify_dry_run_enabled",
+                "eager_apply_dry_run_enabled",
+                "eager_result_transfer_dry_run_enabled",
+                "eager_sync_apply_dry_run_enabled",
+            )
+            if bool(record.get(field, False))
+        ]
+        nonzero_forbidden_tokens = [
+            field for field in ZERO_ONLY_DRY_RUN_FIELDS if int_value(record.get(field), 0) != 0
+        ]
+        if lane_enabled and (forbidden_dry_run or nonzero_forbidden_tokens):
+            verify_or_apply_rows += 1
+            errors.append(
+                f"record[{idx}] Phase 1H-5e3 must not run eager verify/apply/result transfer: "
+                f"flags={forbidden_dry_run}, tokens={nonzero_forbidden_tokens}"
+            )
+
         if not lane_enabled:
-            if lane_active or excluded or lane_tokens:
+            if lane_active or as_int_set(record.get("lane_excluded_seq_ids")):
                 errors.append(f"record[{idx}] lane-exclusion fields populated while lane dry-run disabled")
             continue
 
         records_with_lane_enabled += 1
+        original = as_int_set(record.get("original_draft_home_set")) or as_int_set(record.get("draft_home_set"))
+        actual = as_int_set(record.get("actual_draft_home_set_for_normal_draft")) or as_int_set(
+            record.get("draft_home_set")
+        )
+        excluded = as_int_set(record.get("excluded_from_actual_draft_home_for_eager")) or as_int_set(
+            record.get("lane_excluded_seq_ids")
+        )
+        expected_seq_ids = as_int_set(record.get("normal_proposal_expected_seq_ids_after_lane_exclusion")) or actual
+        adjusted_expected = as_int_set(record.get("adjusted_normal_proposal_expected_seq_ids")) or actual
+        sent_seq_ids = as_int_set(record.get("normal_proposal_sent_seq_ids_after_lane_exclusion"))
+        received_seq_ids = as_int_set(record.get("normal_proposal_received_seq_ids_after_lane_exclusion"))
         original_draft_sizes.append(len(original))
         adjusted_draft_sizes.append(len(actual))
-        scheduled_target_eager_count += len(scheduled)
-        excluded_from_actual_count += len(excluded)
-        missing_after_lane_count += len(missing_after_lane)
-        fallback_handled_count += len(fallback_handled)
-        scheduler_applied_decision_count += len(applied_decision_ids)
-        if sync_before_plan:
-            synchronized_before_plan_count += 1
-        decision_late_count += int_value(record.get("lane_exclusion_decision_late_count"), 0)
-        coverage_candidates += len(scheduled & original) + len(
-            as_int_set(record.get("eager_lane_exclusion_seq_ids")) & original
+
+        pending_decisions = as_int_set(record.get("pending_lane_exclusion_decision_ids_before_plan"))
+        applied_legacy_decisions = as_int_set(record.get("applied_lane_exclusion_decision_ids"))
+        if pending_decisions or applied_legacy_decisions:
+            errors.append(
+                f"record[{idx}] 1H-5e3 must not carry pending LaneExclusionDecision state: "
+                f"pending={sorted(pending_decisions)}, applied={sorted(applied_legacy_decisions)}"
+            )
+
+        created_ids = as_int_set(record.get("ready_eager_proposal_created_ids"))
+        synced_ids = as_int_set(record.get("ready_eager_proposal_synced_ids")) or (
+            as_int_set(record.get("ready_eager_proposal_sent_ids"))
+            | as_int_set(record.get("ready_eager_proposal_received_ids"))
         )
+        registry_ids = as_int_set(record.get("ready_eager_proposal_registry_ids_before_plan"))
+        seen_ids = as_int_set(record.get("ready_eager_proposal_seen_by_scheduler_ids"))
+        in_target_ids = as_int_set(record.get("ready_eager_proposal_in_target_home_ids"))
+        in_draft_ids = as_int_set(record.get("ready_eager_proposal_in_draft_home_ids"))
+        applied_ids = as_int_set(record.get("ready_eager_proposal_applied_ids")) or as_int_set(
+            record.get("lane_exclusion_applied_proposal_ids")
+        )
+        stale_ids = as_int_set(record.get("ready_eager_proposal_stale_ids"))
+        expired_ids = as_int_set(record.get("ready_eager_proposal_expired_ids"))
+        invalidated_ids = as_int_set(record.get("ready_eager_proposal_invalidated_ids"))
+        terminal_ids = applied_ids | stale_ids | expired_ids | invalidated_ids
+        state_by_id = as_str_map(record.get("ready_eager_proposal_state_by_id"))
+        skip_reason_by_id = as_str_map(record.get("ready_eager_proposal_skip_reason_by_id"))
+        stale_reason_by_id = as_str_map(record.get("ready_eager_proposal_stale_reason_by_id"))
+        lane_applied_ids = as_int_set(record.get("lane_exclusion_applied_proposal_ids"))
+        lane_applied_seq_ids = as_int_set(record.get("lane_exclusion_applied_seq_ids"))
+        apply_reason_by_id = as_str_map(record.get("lane_exclusion_apply_reason_by_proposal_id"))
 
-        if active_pending_ids & terminal_decision_ids:
+        ready_created_count += len(created_ids)
+        ready_synced_count += len(synced_ids)
+        ready_seen_count += len(seen_ids)
+        ready_in_target_count += len(in_target_ids)
+        ready_in_draft_count += len(in_draft_ids)
+        ready_applied_count += len(applied_ids)
+        ready_stale_count += len(stale_ids)
+        ready_expired_count += len(expired_ids)
+        ready_invalidated_count += len(invalidated_ids)
+        lane_exclusion_applied_decision_count += len(lane_applied_ids)
+        excluded_from_actual_count += len(excluded)
+        skip_reason_counts.update(skip_reason_by_id.values())
+        stale_reason_counts.update(stale_reason_by_id.values())
+
+        if seen_ids and not bool(record.get("ready_eager_proposals_synchronized_before_plan", False)):
+            errors.append(f"record[{idx}] scheduler saw ready proposals without pre-plan sync")
+        if seen_ids and not seen_ids <= registry_ids:
             errors.append(
-                f"record[{idx}] active pending and terminal decision ids overlap: "
-                f"{sorted(active_pending_ids & terminal_decision_ids)}"
+                f"record[{idx}] seen ready proposals must come from registry ids before plan: "
+                f"seen={sorted(seen_ids)}, registry={sorted(registry_ids)}"
             )
-        if terminal_decision_ids and not terminal_decision_ids <= touched_decision_ids:
-            errors.append(
-                f"record[{idx}] terminal decision ids must be a subset of touched ids: "
-                f"terminal={sorted(terminal_decision_ids)}, touched={sorted(touched_decision_ids)}"
-            )
-        if applied_decision_ids:
-            if not sync_before_plan:
-                errors.append(f"record[{idx}] applied decisions require pre-plan synchronization")
-            if not applied_decision_ids <= pending_before:
+        if in_target_ids - seen_ids:
+            errors.append(f"record[{idx}] in-target ready proposal ids were not seen by scheduler")
+        if in_draft_ids - seen_ids:
+            errors.append(f"record[{idx}] in-draft ready proposal ids were not seen by scheduler")
+        if applied_ids - in_draft_ids:
+            errors.append(f"record[{idx}] applied proposals must be seen in candidate draft home")
+        if applied_ids & (stale_ids | expired_ids | invalidated_ids):
+            errors.append(f"record[{idx}] terminal stale/expired/invalidated proposals were also applied")
+
+        for proposal_id in applied_ids:
+            applied_proposal_counts[proposal_id] += 1
+            if state_by_id.get(proposal_id) != "CONSUMED_APPLIED":
                 errors.append(
-                    f"record[{idx}] applied decisions must have been pending before plan build: "
-                    f"applied={sorted(applied_decision_ids)}, pending_before={sorted(pending_before)}"
+                    f"record[{idx}] applied proposal {proposal_id} must have state CONSUMED_APPLIED, "
+                    f"got {state_by_id.get(proposal_id)!r}"
                 )
-            if not applied_decision_ids <= terminal_decision_ids:
+            if apply_reason_by_id.get(proposal_id) != "ready_eager_proposal_available_for_draft_home":
+                errors.append(f"record[{idx}] applied proposal {proposal_id} has missing/bad apply reason")
+        for proposal_id in terminal_ids:
+            if state_by_id.get(proposal_id) == "READY":
+                errors.append(f"record[{idx}] proposal {proposal_id} is both READY and terminal")
+        for proposal_id in in_target_ids:
+            if proposal_id not in terminal_ids:
+                if state_by_id.get(proposal_id) != "READY":
+                    errors.append(f"record[{idx}] in-target proposal {proposal_id} should stay READY")
+                if skip_reason_by_id.get(proposal_id) != "still_in_target_home":
+                    errors.append(f"record[{idx}] in-target proposal {proposal_id} missing still_in_target_home")
+
+        if lane_applied_ids:
+            if lane_applied_ids != applied_ids:
                 errors.append(
-                    f"record[{idx}] applied decisions must be terminal: "
-                    f"applied={sorted(applied_decision_ids)}, terminal={sorted(terminal_decision_ids)}"
+                    f"record[{idx}] lane applied ids must match ready applied ids: "
+                    f"lane={sorted(lane_applied_ids)}, ready={sorted(applied_ids)}"
                 )
-            for decision_id in applied_decision_ids:
-                created_step = created_step_by_decision.get(decision_id)
-                applied_step = applied_step_by_decision.get(decision_id, step_id)
-                if created_step is not None and applied_step >= 0 and created_step >= applied_step:
-                    errors.append(
-                        f"record[{idx}] lane exclusion decision {decision_id} was applied in the same step "
-                        f"it was created: created={created_step}, applied={applied_step}"
-                    )
-
-        if scheduled & target_home:
-            errors.append(
-                f"record[{idx}] scheduled target eager dry-run intersects target_home_set: "
-                f"{sorted(scheduled & target_home)}"
-            )
-
-        if decision_available:
-            expected_excluded = excluded if applied_decision_ids else (scheduled & original if scheduled else excluded)
-            if excluded != expected_excluded:
+            if excluded != lane_applied_seq_ids:
                 errors.append(
-                    f"record[{idx}] excluded seqs must match scheduled/original intersection: "
-                    f"excluded={sorted(excluded)}, expected={sorted(expected_excluded)}"
+                    f"record[{idx}] excluded seq ids must match lane applied seq ids: "
+                    f"excluded={sorted(excluded)}, applied_seq={sorted(lane_applied_seq_ids)}"
                 )
             expected_actual = original - excluded
             if actual != expected_actual:
                 errors.append(
-                    f"record[{idx}] actual normal draft set must equal original minus excluded: "
+                    f"record[{idx}] actual draft home must equal original minus excluded: "
                     f"actual={sorted(actual)}, expected={sorted(expected_actual)}"
-                )
-            if adjusted_dry_run and not applied_decision_ids and adjusted_dry_run != expected_actual:
-                errors.append(
-                    f"record[{idx}] adjusted_draft_home_set_dry_run must equal actual adjusted set"
-                )
-            if excluded_dry_run and not applied_decision_ids and excluded_dry_run != excluded:
-                errors.append(
-                    f"record[{idx}] excluded_from_draft_home_for_eager_dry_run must match actual excluded seqs"
                 )
             if expected_seq_ids != actual or adjusted_expected != actual:
                 errors.append(f"record[{idx}] normal proposal expected seq ids must use adjusted set")
-            if sent_seq_ids and sent_seq_ids != actual:
+            if not bool(record.get("lane_exclusion_dry_run_done", False)):
+                errors.append(f"record[{idx}] applied lane exclusion must mark lane_exclusion_dry_run_done")
+        else:
+            if excluded:
+                errors.append(f"record[{idx}] excluded seq ids require an applied ready proposal")
+            if actual != original:
+                errors.append(
+                    f"record[{idx}] no applied ready proposal must leave draft home unchanged: "
+                    f"actual={sorted(actual)}, original={sorted(original)}"
+                )
+
+        if _normal_metadata_present(record, "normal_proposal_sent_seq_ids_after_lane_exclusion"):
+            if sent_seq_ids != actual:
                 sent_received_mismatch_count += 1
                 errors.append(
                     f"record[{idx}] sent normal proposal seq ids must match adjusted set: "
                     f"sent={sorted(sent_seq_ids)}, expected={sorted(actual)}"
                 )
-            if received_seq_ids and received_seq_ids != actual:
+        if _normal_metadata_present(record, "normal_proposal_received_seq_ids_after_lane_exclusion"):
+            if received_seq_ids != actual:
                 sent_received_mismatch_count += 1
                 errors.append(
                     f"record[{idx}] received normal proposal seq ids must match adjusted set: "
                     f"received={sorted(received_seq_ids)}, expected={sorted(actual)}"
                 )
-            if excluded & actual:
-                errors.append(f"record[{idx}] excluded seqs still present in actual draft set")
-            if excluded & sent_seq_ids or excluded & received_seq_ids:
-                errors.append(f"record[{idx}] excluded seqs appeared in normal proposal metadata")
-            if not done:
-                errors.append(f"record[{idx}] actual lane exclusion must mark lane_exclusion_dry_run_done")
-            if applied_decision_ids and set(done_proposal_ids) != applied_decision_ids:
-                errors.append(
-                    f"record[{idx}] done proposal ids must match scheduler-applied decisions: "
-                    f"done={sorted(done_proposal_ids)}, applied={sorted(applied_decision_ids)}"
-                )
-            if lane_tokens != len(excluded) * int_value(record.get("normal_gamma"), 0):
-                errors.append(f"record[{idx}] eager_tokens_lane_excluded_dry_run has bad token accounting")
-            for proposal_id in done_proposal_ids:
-                done_proposal_counts[int(proposal_id)] += 1
-        else:
-            if actual != original:
-                errors.append(
-                    f"record[{idx}] late/unavailable decision must not retroactively alter draft set: "
-                    f"actual={sorted(actual)}, original={sorted(original)}"
-                )
-            if excluded:
-                errors.append(f"record[{idx}] unavailable decision must not exclude actual draft seqs")
-            if scheduled & original:
-                if not deferred:
-                    errors.append(f"record[{idx}] late scheduled draft-home candidate must be deferred")
-                if defer_reason != "decision_not_available_before_normal_draft":
-                    errors.append(
-                        f"record[{idx}] bad lane exclusion defer reason={defer_reason!r}"
-                    )
-            if deferred:
-                deferred_count += 1
-                defer_reason_counts[str(defer_reason)] += 1
-
+        if sent_seq_ids and received_seq_ids and sent_seq_ids != received_seq_ids:
+            sent_received_mismatch_count += 1
+            errors.append(
+                f"record[{idx}] sent/received normal proposal metadata mismatch: "
+                f"sent={sorted(sent_seq_ids)}, received={sorted(received_seq_ids)}"
+            )
         if excluded & expected_seq_ids:
             excluded_expected_count += len(excluded & expected_seq_ids)
             errors.append(f"record[{idx}] excluded seqs were still expected by normal proposal receive")
+        if excluded & sent_seq_ids or excluded & received_seq_ids:
+            errors.append(f"record[{idx}] excluded seqs appeared in normal proposal metadata")
 
-    repeated_done = [proposal_id for proposal_id, count in done_proposal_counts.items() if count > 1]
-    if repeated_done:
-        errors.append(f"lane exclusion dry-run done repeated for proposal ids={sorted(repeated_done)}")
+        if in_draft_ids and not applied_ids:
+            accounted = terminal_ids | set(skip_reason_by_id)
+            if not in_draft_ids <= accounted:
+                errors.append(
+                    f"record[{idx}] in-draft ready proposals were neither applied nor explicitly explained: "
+                    f"missing={sorted(in_draft_ids - accounted)}"
+                )
+
+    repeated_applied = [proposal_id for proposal_id, count in applied_proposal_counts.items() if count > 1]
+    if repeated_applied:
+        errors.append(f"ready proposals applied more than once: {sorted(repeated_applied)}")
+
+    if records_with_lane_enabled:
+        if ready_created_count == 0:
+            errors.append("ready_eager_proposal_created_count must be > 0 for lane-exclusion validation")
+        if ready_seen_count == 0:
+            errors.append("ready_eager_proposal_seen_by_scheduler_count must be > 0")
+        if ready_applied_count and not excluded_from_actual_count:
+            errors.append("applied ready proposals must exclude at least one seq from actual draft home")
+        if ready_applied_count and adjusted_draft_sizes and original_draft_sizes:
+            if mean(adjusted_draft_sizes) >= mean(original_draft_sizes):
+                errors.append(
+                    "adjusted_draft_home_size_mean must be smaller than original_draft_home_size_mean "
+                    "when proposals are applied"
+                )
 
     coverage_caveat = ""
-    if records_with_lane_enabled and coverage_candidates and excluded_from_actual_count == 0:
-        if deferred_count or decision_late_count:
-            coverage_caveat = "pass with coverage caveat: no actual lane exclusion exercised"
+    if records_with_lane_enabled and ready_created_count and ready_seen_count and ready_applied_count == 0:
+        explained_count = ready_stale_count + ready_expired_count + ready_invalidated_count + sum(skip_reason_counts.values())
+        if explained_count > 0:
+            coverage_caveat = (
+                "pass with coverage caveat: ready proposals were seen, but none were cleanly applicable"
+            )
         else:
-            errors.append("lane exclusion candidates existed but none were excluded or explicitly deferred")
+            errors.append("ready proposals were seen but none applied and no stale/expired/skip reason was traced")
 
     summary = {
         "total_trace_records": len(records),
         "records_with_lane_exclusion_enabled": records_with_lane_enabled,
-        "scheduled_target_eager_dry_run_count": scheduled_target_eager_count,
+        "ready_eager_proposal_created_count": ready_created_count,
+        "ready_eager_proposal_synced_count": ready_synced_count,
+        "ready_eager_proposal_seen_by_scheduler_count": ready_seen_count,
+        "ready_eager_proposal_in_target_home_count": ready_in_target_count,
+        "ready_eager_proposal_in_draft_home_count": ready_in_draft_count,
+        "ready_eager_proposal_applied_count": ready_applied_count,
+        "ready_eager_proposal_stale_count": ready_stale_count,
+        "ready_eager_proposal_expired_count": ready_expired_count,
+        "ready_eager_proposal_invalidated_count": ready_invalidated_count,
+        "lane_exclusion_applied_decision_count": lane_exclusion_applied_decision_count,
         "excluded_from_actual_draft_home_count": excluded_from_actual_count,
-        "lane_exclusion_deferred_count": deferred_count,
-        "lane_exclusion_decision_late_count": decision_late_count,
         "original_draft_home_size_mean": mean(original_draft_sizes) if original_draft_sizes else 0.0,
         "adjusted_draft_home_size_mean": mean(adjusted_draft_sizes) if adjusted_draft_sizes else 0.0,
         "normal_proposal_sent_received_mismatch_count": sent_received_mismatch_count,
         "excluded_seqs_in_normal_expected_count": excluded_expected_count,
-        "missing_normal_proposal_after_lane_exclusion_count": missing_after_lane_count,
-        "fallback_handled_missing_proposal_count": fallback_handled_count,
         "actual_eager_verified_counter_rows": actual_eager_counter_rows,
         "real_target_eager_nonempty_count": real_target_eager_nonempty_count,
-        "scheduler_applied_lane_exclusion_decision_count": scheduler_applied_decision_count,
-        "records_with_pre_plan_lane_decision_sync": synchronized_before_plan_count,
-        "lane_exclusion_defer_reason_counts": dict(defer_reason_counts),
+        "forbidden_verify_apply_rows": verify_or_apply_rows,
+        "ready_eager_proposal_skip_reason_counts": dict(skip_reason_counts),
+        "ready_eager_proposal_stale_reason_counts": dict(stale_reason_counts),
         "coverage_caveat": coverage_caveat,
     }
     return errors, summary
@@ -313,15 +371,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"{key}={value}")
 
 
-def base_record() -> dict[str, Any]:
+def base_record(*, lane_enabled: bool = True) -> dict[str, Any]:
     record = {
         "execution_mode": "dual_batch_pearl",
         "dual_batch_enabled": True,
         "plan_phase": "steady",
         "step_id": 12,
         "normal_gamma": 4,
-        "enable_eager_lane_exclusion_dry_run": True,
-        "eager_lane_exclusion_dry_run_enabled": True,
+        "enable_eager_lane_exclusion_dry_run": lane_enabled,
+        "eager_lane_exclusion_dry_run_enabled": lane_enabled,
         "target_home_set": [0, 2],
         "draft_home_set": [1, 3],
         "original_draft_home_set": [1, 3],
@@ -339,144 +397,267 @@ def base_record() -> dict[str, Any]:
         "applied_lane_exclusion_decision_ids": [],
         "stale_lane_exclusion_decision_ids": [],
         "expired_lane_exclusion_decision_ids": [],
-        "lane_exclusion_drop_reason_by_decision_id": {},
         "active_pending_lane_exclusion_decision_ids": [],
         "terminal_lane_exclusion_decision_ids": [],
         "touched_lane_exclusion_decision_ids": [],
-        "lane_exclusion_source_step_by_decision_id": {},
-        "lane_exclusion_created_step_by_decision_id": {},
-        "lane_exclusion_applied_step_by_decision_id": {},
-        "lane_exclusion_defer_reason_by_decision_id": {},
-        "lane_exclusion_decisions_synchronized_before_plan": True,
-        "lane_exclusion_decision_transfer_called": True,
-        "lane_exclusion_decision_sent_proposal_ids": [],
-        "lane_exclusion_decision_received_proposal_ids": [],
+        "lane_exclusion_decisions_synchronized_before_plan": lane_enabled,
+        "lane_exclusion_decision_transfer_called": lane_enabled,
         "lane_exclusion_decision_num_decisions": 0,
         "lane_exclusion_decision_payload_len": 0,
         "lane_exclusion_decision_zero_decision": True,
         "lane_exclusion_dry_run_done": False,
         "lane_exclusion_dry_run_done_proposal_ids": [],
+        "lane_exclusion_dry_run_done_seq_ids": [],
         "normal_proposal_expected_seq_ids_after_lane_exclusion": [1, 3],
         "normal_proposal_sent_seq_ids_after_lane_exclusion": [1, 3],
         "normal_proposal_received_seq_ids_after_lane_exclusion": [1, 3],
         "adjusted_normal_proposal_expected_seq_ids": [1, 3],
-        "adjusted_normal_proposal_received_seq_ids": [1, 3],
-        "missing_normal_proposal_after_lane_exclusion": [],
-        "missing_normal_proposal_handled_by_fallback": [],
-        "eager_tokens_lane_excluded_dry_run": 0,
+        "ready_eager_proposal_created_ids": [],
+        "ready_eager_proposal_created_seq_ids": [],
+        "ready_eager_proposal_synced_ids": [],
+        "ready_eager_proposal_registry_ids_before_plan": [],
+        "ready_eager_proposal_seen_by_scheduler_ids": [],
+        "ready_eager_proposal_in_target_home_ids": [],
+        "ready_eager_proposal_in_draft_home_ids": [],
+        "ready_eager_proposal_applied_ids": [],
+        "ready_eager_proposal_stale_ids": [],
+        "ready_eager_proposal_expired_ids": [],
+        "ready_eager_proposal_invalidated_ids": [],
+        "ready_eager_proposal_state_by_id": {},
+        "ready_eager_proposal_skip_reason_by_id": {},
+        "ready_eager_proposal_stale_reason_by_id": {},
+        "ready_eager_proposal_age_by_id": {},
+        "ready_eager_proposal_seq_id_by_id": {},
+        "ready_eager_proposal_base_len_by_id": {},
+        "ready_eager_proposal_current_len_by_id": {},
+        "ready_eager_proposal_current_pre_verify_by_id": {},
+        "ready_eager_proposal_current_status_by_id": {},
+        "ready_eager_proposals_synchronized_before_plan": lane_enabled,
+        "ready_eager_proposal_transfer_called": lane_enabled,
+        "ready_eager_proposal_sent_ids": [],
+        "ready_eager_proposal_received_ids": [],
+        "ready_eager_proposal_num_proposals": 0,
+        "ready_eager_proposal_payload_len": 0,
+        "ready_eager_proposal_zero_proposal": True,
+        "lane_exclusion_applied_proposal_ids": [],
+        "lane_exclusion_applied_seq_ids": [],
+        "lane_exclusion_apply_reason_by_proposal_id": {},
     }
-    for field in ACTUAL_EAGER_COUNTERS:
+    for field in ACTUAL_EAGER_COUNTERS + ZERO_ONLY_DRY_RUN_FIELDS:
         record[field] = 0
+    for field in (
+        "eager_verify_dry_run_enabled",
+        "eager_apply_dry_run_enabled",
+        "eager_result_transfer_dry_run_enabled",
+        "eager_sync_apply_dry_run_enabled",
+    ):
+        record[field] = False
     return record
 
 
-def actual_exclusion_record() -> dict[str, Any]:
+def creation_record(proposal_id: int = 200, seq_id: int = 3) -> dict[str, Any]:
     record = base_record()
     record.update(
         {
-            "actual_draft_home_set_for_normal_draft": [1],
-            "adjusted_draft_home_set_dry_run": [1],
-            "target_eager_set_dry_run": [3],
-            "scheduled_target_eager_set_dry_run": [3],
-            "scheduled_target_eager_proposal_ids_dry_run": [101],
-            "scheduled_target_eager_seq_ids_dry_run": [3],
-            "excluded_from_actual_draft_home_for_eager": [3],
-            "excluded_from_draft_home_for_eager_dry_run": [3],
-            "lane_excluded_seq_ids": [3],
-            "lane_exclusion_decision_available_before_draft": True,
-            "pending_lane_exclusion_decision_ids_before_plan": [101],
-            "applied_lane_exclusion_decision_ids": [101],
-            "active_pending_lane_exclusion_decision_ids": [],
-            "terminal_lane_exclusion_decision_ids": [101],
-            "touched_lane_exclusion_decision_ids": [101],
-            "lane_exclusion_source_step_by_decision_id": {"101": 9},
-            "lane_exclusion_created_step_by_decision_id": {"101": 11},
-            "lane_exclusion_applied_step_by_decision_id": {"101": 12},
-            "lane_exclusion_decision_received_proposal_ids": [101],
-            "lane_exclusion_decision_num_decisions": 1,
-            "lane_exclusion_decision_payload_len": 17,
-            "lane_exclusion_decision_zero_decision": False,
-            "lane_exclusion_dry_run_done": True,
-            "lane_exclusion_dry_run_done_proposal_ids": [101],
-            "lane_exclusion_dry_run_done_seq_ids": [3],
-            "normal_proposal_expected_seq_ids_after_lane_exclusion": [1],
-            "normal_proposal_sent_seq_ids_after_lane_exclusion": [1],
-            "normal_proposal_received_seq_ids_after_lane_exclusion": [1],
-            "adjusted_normal_proposal_expected_seq_ids": [1],
-            "adjusted_normal_proposal_received_seq_ids": [1],
-            "normal_proposal_missing_excluded_seq_ids": [3],
-            "missing_normal_proposal_after_lane_exclusion": [],
-            "missing_normal_proposal_handled_by_fallback": [3],
-            "eager_tokens_lane_excluded_dry_run": 4,
+            "ready_eager_proposal_created_ids": [proposal_id],
+            "ready_eager_proposal_created_seq_ids": [seq_id],
+            "lane_exclusion_deferred_until_next_step": True,
+            "lane_exclusion_defer_reason": "ready_eager_proposal_created_after_plan",
         }
     )
     return record
 
 
-def late_decision_record() -> dict[str, Any]:
+def target_home_record() -> dict[str, Any]:
     record = base_record()
     record.update(
         {
-            "target_eager_set_dry_run": [3],
-            "scheduled_target_eager_set_dry_run": [3],
-            "scheduled_target_eager_proposal_ids_dry_run": [101],
-            "scheduled_target_eager_seq_ids_dry_run": [3],
-            "lane_exclusion_deferred_until_next_step": True,
-            "lane_exclusion_defer_reason": "decision_not_available_before_normal_draft",
-            "lane_exclusion_decision_late_count": 1,
-            "eager_lane_exclusion_proposal_ids": [101],
-            "eager_lane_exclusion_seq_ids": [3],
-            "pending_lane_exclusion_decision_ids_after_emit": [101],
+            "target_home_set": [2],
+            "draft_home_set": [3],
+            "original_draft_home_set": [3],
+            "actual_draft_home_set_for_normal_draft": [3],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [3],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [3],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [3],
+            "adjusted_normal_proposal_expected_seq_ids": [3],
+            "ready_eager_proposal_synced_ids": [201],
+            "ready_eager_proposal_registry_ids_before_plan": [201],
+            "ready_eager_proposal_seen_by_scheduler_ids": [201],
+            "ready_eager_proposal_in_target_home_ids": [201],
+            "ready_eager_proposal_state_by_id": {"201": "READY"},
+            "ready_eager_proposal_skip_reason_by_id": {"201": "still_in_target_home"},
+        }
+    )
+    return record
+
+
+def applied_record() -> dict[str, Any]:
+    record = base_record()
+    record.update(
+        {
+            "target_home_set": [0],
+            "draft_home_set": [5],
+            "original_draft_home_set": [3, 5],
+            "actual_draft_home_set_for_normal_draft": [5],
+            "excluded_from_actual_draft_home_for_eager": [3],
+            "lane_excluded_seq_ids": [3],
+            "lane_exclusion_decision_available_before_draft": True,
+            "lane_exclusion_dry_run_done": True,
+            "lane_exclusion_dry_run_done_proposal_ids": [202],
+            "lane_exclusion_dry_run_done_seq_ids": [3],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [5],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [5],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [5],
+            "adjusted_normal_proposal_expected_seq_ids": [5],
+            "ready_eager_proposal_synced_ids": [202],
+            "ready_eager_proposal_registry_ids_before_plan": [202],
+            "ready_eager_proposal_seen_by_scheduler_ids": [202],
+            "ready_eager_proposal_in_draft_home_ids": [202],
+            "ready_eager_proposal_applied_ids": [202],
+            "ready_eager_proposal_state_by_id": {"202": "CONSUMED_APPLIED"},
+            "ready_eager_proposal_age_by_id": {"202": 1},
+            "ready_eager_proposal_seq_id_by_id": {"202": 3},
+            "ready_eager_proposal_base_len_by_id": {"202": 8},
+            "ready_eager_proposal_current_len_by_id": {"202": 8},
+            "ready_eager_proposal_current_pre_verify_by_id": {"202": False},
+            "ready_eager_proposal_current_status_by_id": {"202": "RUNNING"},
+            "lane_exclusion_applied_proposal_ids": [202],
+            "lane_exclusion_applied_seq_ids": [3],
+            "lane_exclusion_apply_reason_by_proposal_id": {
+                "202": "ready_eager_proposal_available_for_draft_home"
+            },
+        }
+    )
+    return record
+
+
+def stale_pre_verify_record() -> dict[str, Any]:
+    record = base_record()
+    record.update(
+        {
+            "ready_eager_proposal_synced_ids": [203],
+            "ready_eager_proposal_registry_ids_before_plan": [203],
+            "ready_eager_proposal_seen_by_scheduler_ids": [203],
+            "ready_eager_proposal_in_draft_home_ids": [203],
+            "ready_eager_proposal_stale_ids": [203],
+            "ready_eager_proposal_state_by_id": {"203": "STALE"},
+            "ready_eager_proposal_stale_reason_by_id": {"203": "seq_returned_pre_verify"},
+            "ready_eager_proposal_current_pre_verify_by_id": {"203": True},
+        }
+    )
+    return record
+
+
+def stale_base_overshot_record() -> dict[str, Any]:
+    record = stale_pre_verify_record()
+    record.update(
+        {
+            "ready_eager_proposal_synced_ids": [204],
+            "ready_eager_proposal_registry_ids_before_plan": [204],
+            "ready_eager_proposal_seen_by_scheduler_ids": [204],
+            "ready_eager_proposal_in_draft_home_ids": [204],
+            "ready_eager_proposal_stale_ids": [204],
+            "ready_eager_proposal_state_by_id": {"204": "STALE"},
+            "ready_eager_proposal_stale_reason_by_id": {"204": "base_overshot"},
+            "ready_eager_proposal_base_len_by_id": {"204": 8},
+            "ready_eager_proposal_current_len_by_id": {"204": 9},
+            "ready_eager_proposal_current_pre_verify_by_id": {"204": False},
+        }
+    )
+    return record
+
+
+def expired_record() -> dict[str, Any]:
+    record = base_record()
+    record.update(
+        {
+            "ready_eager_proposal_synced_ids": [205],
+            "ready_eager_proposal_registry_ids_before_plan": [205],
+            "ready_eager_proposal_seen_by_scheduler_ids": [205],
+            "ready_eager_proposal_in_draft_home_ids": [205],
+            "ready_eager_proposal_expired_ids": [205],
+            "ready_eager_proposal_state_by_id": {"205": "EXPIRED"},
+            "ready_eager_proposal_stale_reason_by_id": {"205": "expired"},
+            "ready_eager_proposal_age_by_id": {"205": 4},
         }
     )
     return record
 
 
 def run_synthetic_tests() -> None:
-    valid = [actual_exclusion_record(), late_decision_record()]
+    valid = [
+        base_record(lane_enabled=False),
+        creation_record(),
+        target_home_record(),
+        applied_record(),
+        stale_pre_verify_record(),
+        stale_base_overshot_record(),
+        expired_record(),
+    ]
     errors, _ = validate_records(valid)
     assert not errors, f"valid synthetic lane-exclusion records failed: {errors}"
 
-    invalid = [deepcopy(actual_exclusion_record())]
-    invalid[0]["normal_proposal_received_seq_ids_after_lane_exclusion"] = [1, 3]
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["normal_proposal_received_seq_ids_after_lane_exclusion"] = [3, 5]
     errors, _ = validate_records(invalid)
     assert any("received normal proposal seq ids" in error for error in errors), (
         "checker missed target receive using original draft set"
     )
 
-    invalid = [deepcopy(late_decision_record())]
-    invalid[0]["actual_draft_home_set_for_normal_draft"] = [1]
-    errors, _ = validate_records(invalid)
-    assert any("must not retroactively alter draft set" in error for error in errors), (
-        "checker missed retroactive removal after late decision"
-    )
-
-    invalid = [deepcopy(actual_exclusion_record())]
-    invalid[0]["normal_proposal_expected_seq_ids_after_lane_exclusion"] = [1, 3]
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["normal_proposal_expected_seq_ids_after_lane_exclusion"] = [3, 5]
     errors, _ = validate_records(invalid)
     assert any("excluded seqs were still expected" in error for error in errors), (
         "checker missed excluded seq expected by receive"
     )
 
-    invalid = [deepcopy(actual_exclusion_record())]
-    invalid[0]["eager_tokens_verified"] = 4
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["ready_eager_proposal_state_by_id"] = {"202": "READY"}
     errors, _ = validate_records(invalid)
-    assert any("actual eager counters" in error for error in errors), "checker missed actual eager counter"
+    assert any("CONSUMED_APPLIED" in error for error in errors), (
+        "checker missed applied proposal with READY state"
+    )
 
-    invalid = [deepcopy(actual_exclusion_record())]
-    invalid[0]["target_eager_set"] = [3]
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["ready_eager_proposal_stale_ids"] = [202]
+    errors, _ = validate_records(invalid)
+    assert any("were also applied" in error for error in errors), "checker missed stale+applied proposal"
+
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["pending_lane_exclusion_decision_ids_before_plan"] = [202]
+    errors, _ = validate_records(invalid)
+    assert any("must not carry pending LaneExclusionDecision" in error for error in errors), (
+        "checker missed legacy pending decision state"
+    )
+
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["target_eager_set"] = [3]
     errors, _ = validate_records(invalid)
     assert any("real target_eager_set" in error for error in errors), "checker missed real target eager set"
 
-    invalid = [actual_exclusion_record(), actual_exclusion_record()]
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["eager_tokens_verified"] = 4
     errors, _ = validate_records(invalid)
-    assert any("done repeated" in error for error in errors), "checker missed repeated proposal exclusion"
+    assert any("actual eager counters" in error for error in errors), "checker missed actual eager counter"
+
+    invalid = [creation_record(), deepcopy(applied_record())]
+    invalid[1]["eager_verify_dry_run_enabled"] = True
+    errors, _ = validate_records(invalid)
+    assert any("must not run eager verify/apply" in error for error in errors), (
+        "checker missed forbidden eager verify dry-run"
+    )
+
+    invalid = [creation_record(), applied_record(), applied_record()]
+    errors, _ = validate_records(invalid)
+    assert any("applied more than once" in error for error in errors), (
+        "checker missed repeated proposal application"
+    )
 
     print("Synthetic eager lane-exclusion dry-run checks passed.")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Check Phase 1H-5e eager lane-exclusion dry-run traces.")
+    parser = argparse.ArgumentParser(description="Check Phase 1H-5e3 eager lane-exclusion dry-run traces.")
     parser.add_argument("trace", nargs="?", type=Path, help="Optional engine trace JSON to validate.")
     parser.add_argument("--synthetic", action="store_true", help="Run built-in synthetic checker tests.")
     args = parser.parse_args()

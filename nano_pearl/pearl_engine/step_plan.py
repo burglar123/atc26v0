@@ -78,6 +78,40 @@ class StepPlan:
     lane_exclusion_decision_zero_decision: bool = True
     lane_exclusion_decision_sync_plan_id: Optional[int] = None
     lane_exclusion_decision_sync_step_id: Optional[int] = None
+    ready_eager_proposal_created_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_created_seq_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_synced_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_registry_ids_before_plan: List[int] = field(default_factory=list)
+    ready_eager_proposal_seen_by_scheduler_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_in_target_home_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_in_draft_home_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_applied_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_stale_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_expired_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_invalidated_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_state_by_id: Dict[int, str] = field(default_factory=dict)
+    ready_eager_proposal_skip_reason_by_id: Dict[int, str] = field(default_factory=dict)
+    ready_eager_proposal_stale_reason_by_id: Dict[int, str] = field(default_factory=dict)
+    ready_eager_proposal_age_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_seq_id_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_base_len_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_current_len_by_id: Dict[int, int] = field(default_factory=dict)
+    ready_eager_proposal_current_pre_verify_by_id: Dict[int, bool] = field(default_factory=dict)
+    ready_eager_proposal_current_status_by_id: Dict[int, str] = field(default_factory=dict)
+    ready_eager_proposals_synchronized_before_plan: bool = False
+    ready_eager_proposal_transfer_called: bool = False
+    ready_eager_proposal_sent_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_received_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_sent_seq_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_received_seq_ids: List[int] = field(default_factory=list)
+    ready_eager_proposal_num_proposals: int = 0
+    ready_eager_proposal_payload_len: int = 0
+    ready_eager_proposal_zero_proposal: bool = True
+    ready_eager_proposal_sync_plan_id: Optional[int] = None
+    ready_eager_proposal_sync_step_id: Optional[int] = None
+    lane_exclusion_applied_proposal_ids: List[int] = field(default_factory=list)
+    lane_exclusion_applied_seq_ids: List[int] = field(default_factory=list)
+    lane_exclusion_apply_reason_by_proposal_id: Dict[int, str] = field(default_factory=dict)
     normal_proposal_expected_seq_ids_after_lane_exclusion: List[int] = field(default_factory=list)
     adjusted_normal_proposal_expected_seq_ids: List[int] = field(default_factory=list)
     draft_home_set: List[int] = field(default_factory=list)
@@ -400,6 +434,19 @@ class StepPlan:
             self.eager_draft_rollback_seq_ids,
             list(getattr(self, "draft_eager_set_new", [])),
             list(getattr(self, "continuing_eager_set", [])),
+            self.ready_eager_proposal_created_ids,
+            self.ready_eager_proposal_created_seq_ids,
+            self.ready_eager_proposal_synced_ids,
+            self.ready_eager_proposal_registry_ids_before_plan,
+            self.ready_eager_proposal_seen_by_scheduler_ids,
+            self.ready_eager_proposal_in_target_home_ids,
+            self.ready_eager_proposal_in_draft_home_ids,
+            self.ready_eager_proposal_applied_ids,
+            self.ready_eager_proposal_stale_ids,
+            self.ready_eager_proposal_expired_ids,
+            self.ready_eager_proposal_invalidated_ids,
+            self.lane_exclusion_applied_proposal_ids,
+            self.lane_exclusion_applied_seq_ids,
         ]
         eager_mapping_fields = [
             self.eager_proposal_ids_by_seq_id,
@@ -413,6 +460,16 @@ class StepPlan:
             self.eager_draft_proposal_len_by_seq_id,
             self.eager_draft_rollback_ok_by_seq_id,
             self.eager_draft_discard_reason_by_seq_id,
+            self.ready_eager_proposal_state_by_id,
+            self.ready_eager_proposal_skip_reason_by_id,
+            self.ready_eager_proposal_stale_reason_by_id,
+            self.ready_eager_proposal_age_by_id,
+            self.ready_eager_proposal_seq_id_by_id,
+            self.ready_eager_proposal_base_len_by_id,
+            self.ready_eager_proposal_current_len_by_id,
+            self.ready_eager_proposal_current_pre_verify_by_id,
+            self.ready_eager_proposal_current_status_by_id,
+            self.lane_exclusion_apply_reason_by_proposal_id,
         ]
         has_eager_scaffold = any(eager_list_fields) or any(eager_mapping_fields)
         assert (
@@ -614,6 +671,114 @@ class StepPlan:
             ),
             "lane_exclusion_decision_sync_plan_id": self.lane_exclusion_decision_sync_plan_id,
             "lane_exclusion_decision_sync_step_id": self.lane_exclusion_decision_sync_step_id,
+            "ready_eager_proposal_created_ids": _int_list(
+                self.ready_eager_proposal_created_ids
+            ),
+            "ready_eager_proposal_created_seq_ids": _int_list(
+                self.ready_eager_proposal_created_seq_ids
+            ),
+            "ready_eager_proposal_synced_ids": _int_list(
+                self.ready_eager_proposal_synced_ids
+            ),
+            "ready_eager_proposal_registry_ids_before_plan": _int_list(
+                self.ready_eager_proposal_registry_ids_before_plan
+            ),
+            "ready_eager_proposal_seen_by_scheduler_ids": _int_list(
+                self.ready_eager_proposal_seen_by_scheduler_ids
+            ),
+            "ready_eager_proposal_in_target_home_ids": _int_list(
+                self.ready_eager_proposal_in_target_home_ids
+            ),
+            "ready_eager_proposal_in_draft_home_ids": _int_list(
+                self.ready_eager_proposal_in_draft_home_ids
+            ),
+            "ready_eager_proposal_applied_ids": _int_list(
+                self.ready_eager_proposal_applied_ids
+            ),
+            "ready_eager_proposal_stale_ids": _int_list(
+                self.ready_eager_proposal_stale_ids
+            ),
+            "ready_eager_proposal_expired_ids": _int_list(
+                self.ready_eager_proposal_expired_ids
+            ),
+            "ready_eager_proposal_invalidated_ids": _int_list(
+                self.ready_eager_proposal_invalidated_ids
+            ),
+            "ready_eager_proposal_state_by_id": {
+                str(proposal_id): str(state)
+                for proposal_id, state in self.ready_eager_proposal_state_by_id.items()
+            },
+            "ready_eager_proposal_skip_reason_by_id": {
+                str(proposal_id): str(reason)
+                for proposal_id, reason in self.ready_eager_proposal_skip_reason_by_id.items()
+            },
+            "ready_eager_proposal_stale_reason_by_id": {
+                str(proposal_id): str(reason)
+                for proposal_id, reason in self.ready_eager_proposal_stale_reason_by_id.items()
+            },
+            "ready_eager_proposal_age_by_id": _trace_mapping(
+                self.ready_eager_proposal_age_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_seq_id_by_id": _trace_mapping(
+                self.ready_eager_proposal_seq_id_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_base_len_by_id": _trace_mapping(
+                self.ready_eager_proposal_base_len_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_current_len_by_id": _trace_mapping(
+                self.ready_eager_proposal_current_len_by_id,
+                lambda value: int(value),
+            ),
+            "ready_eager_proposal_current_pre_verify_by_id": _trace_mapping(
+                self.ready_eager_proposal_current_pre_verify_by_id,
+                lambda value: bool(value),
+            ),
+            "ready_eager_proposal_current_status_by_id": {
+                str(proposal_id): str(status)
+                for proposal_id, status in self.ready_eager_proposal_current_status_by_id.items()
+            },
+            "ready_eager_proposals_synchronized_before_plan": bool(
+                self.ready_eager_proposals_synchronized_before_plan
+            ),
+            "ready_eager_proposal_transfer_called": bool(
+                self.ready_eager_proposal_transfer_called
+            ),
+            "ready_eager_proposal_sent_ids": _int_list(
+                self.ready_eager_proposal_sent_ids
+            ),
+            "ready_eager_proposal_received_ids": _int_list(
+                self.ready_eager_proposal_received_ids
+            ),
+            "ready_eager_proposal_sent_seq_ids": _int_list(
+                self.ready_eager_proposal_sent_seq_ids
+            ),
+            "ready_eager_proposal_received_seq_ids": _int_list(
+                self.ready_eager_proposal_received_seq_ids
+            ),
+            "ready_eager_proposal_num_proposals": int(
+                self.ready_eager_proposal_num_proposals
+            ),
+            "ready_eager_proposal_payload_len": int(
+                self.ready_eager_proposal_payload_len
+            ),
+            "ready_eager_proposal_zero_proposal": bool(
+                self.ready_eager_proposal_zero_proposal
+            ),
+            "ready_eager_proposal_sync_plan_id": self.ready_eager_proposal_sync_plan_id,
+            "ready_eager_proposal_sync_step_id": self.ready_eager_proposal_sync_step_id,
+            "lane_exclusion_applied_proposal_ids": _int_list(
+                self.lane_exclusion_applied_proposal_ids
+            ),
+            "lane_exclusion_applied_seq_ids": _int_list(
+                self.lane_exclusion_applied_seq_ids
+            ),
+            "lane_exclusion_apply_reason_by_proposal_id": {
+                str(proposal_id): str(reason)
+                for proposal_id, reason in self.lane_exclusion_apply_reason_by_proposal_id.items()
+            },
             "normal_proposal_expected_seq_ids_after_lane_exclusion": _int_list(
                 self.normal_proposal_expected_seq_ids_after_lane_exclusion
             ),

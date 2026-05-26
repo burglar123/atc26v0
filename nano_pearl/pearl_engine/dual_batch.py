@@ -59,6 +59,32 @@ LANE_EXCLUSION_STATE_TO_INT = {
 LANE_EXCLUSION_STATE_FROM_INT = {
     value: key for key, value in LANE_EXCLUSION_STATE_TO_INT.items()
 }
+READY_EAGER_STATE_READY = "READY"
+READY_EAGER_STATE_CONSUMED_APPLIED = "CONSUMED_APPLIED"
+READY_EAGER_STATE_STALE = "STALE"
+READY_EAGER_STATE_EXPIRED = "EXPIRED"
+READY_EAGER_STATE_INVALIDATED = "INVALIDATED"
+READY_EAGER_PROPOSAL_STATES = {
+    READY_EAGER_STATE_READY,
+    READY_EAGER_STATE_CONSUMED_APPLIED,
+    READY_EAGER_STATE_STALE,
+    READY_EAGER_STATE_EXPIRED,
+    READY_EAGER_STATE_INVALIDATED,
+}
+READY_EAGER_STATE_TO_INT = {
+    READY_EAGER_STATE_READY: 0,
+    READY_EAGER_STATE_CONSUMED_APPLIED: 1,
+    READY_EAGER_STATE_STALE: 2,
+    READY_EAGER_STATE_EXPIRED: 3,
+    READY_EAGER_STATE_INVALIDATED: 4,
+}
+READY_EAGER_STATE_FROM_INT = {
+    value: key for key, value in READY_EAGER_STATE_TO_INT.items()
+}
+READY_EAGER_TRANSFER_META_LEN = 5
+READY_EAGER_TRANSFER_HEADER_LEN = 19
+READY_EAGER_DEFAULT_MAX_AGE = 3
+LANE_EXCLUSION_APPLY_REASON_READY_PROPOSAL = "ready_eager_proposal_available_for_draft_home"
 
 
 @dataclass
@@ -143,93 +169,147 @@ class EagerProposal:
 
 
 @dataclass
-class LaneExclusionDecision:
+class ReadyEagerProposal:
     proposal_id: int
     seq_id: int
     request_id: str | int | None = None
-    source_plan_id: int = 0
-    source_step_id: int = 0
-    created_step_id: int = 0
     base_len: int = 0
     base_pre_verify: bool = True
     proposal_len: int = 0
     to_verify_len: int = 0
     proposal_token_ids: list[int] = field(default_factory=list)
-    reason: str = LANE_EXCLUSION_DECISION_REASON_READY_EAGER_SCHEDULED
-    state: str = LANE_EXCLUSION_STATE_PENDING
-    max_age_steps: int = 4
+    created_step_id: int = 0
+    source_plan_id: int = 0
+    source_step_id: int = 0
+    parent_proposal_id: int | None = None
+    parent_ready: bool = True
+    ready: bool = True
+    scheduled: bool = False
+    seq_epoch: int | None = None
+    tokens_digest: int | None = None
+    state: str = READY_EAGER_STATE_READY
+    max_ready_proposal_age: int = READY_EAGER_DEFAULT_MAX_AGE
 
     def __post_init__(self):
         self.proposal_id = int(self.proposal_id)
         self.seq_id = int(self.seq_id)
-        self.source_plan_id = int(self.source_plan_id)
-        self.source_step_id = int(self.source_step_id)
-        self.created_step_id = int(self.created_step_id)
         self.base_len = int(self.base_len)
         self.base_pre_verify = bool(self.base_pre_verify)
         self.proposal_len = int(self.proposal_len)
         self.to_verify_len = int(self.to_verify_len)
         self.proposal_token_ids = [int(token_id) for token_id in self.proposal_token_ids]
+        self.created_step_id = int(self.created_step_id)
+        self.source_plan_id = int(self.source_plan_id)
+        self.source_step_id = int(self.source_step_id)
+        if self.parent_proposal_id is not None:
+            self.parent_proposal_id = int(self.parent_proposal_id)
+        self.parent_ready = bool(self.parent_ready)
+        self.ready = bool(self.ready)
+        self.scheduled = bool(self.scheduled)
+        if self.seq_epoch is not None:
+            self.seq_epoch = int(self.seq_epoch)
+        if self.tokens_digest is not None:
+            self.tokens_digest = int(self.tokens_digest)
+        if self.state not in READY_EAGER_PROPOSAL_STATES:
+            raise ValueError(f"invalid ready eager proposal state={self.state!r}")
+        self.max_ready_proposal_age = int(self.max_ready_proposal_age)
+        if self.max_ready_proposal_age < 0:
+            raise ValueError(
+                "max_ready_proposal_age must be non-negative, "
+                f"got {self.max_ready_proposal_age}"
+            )
+
+
+@dataclass
+class LaneExclusionApplyRecord:
+    """StepPlan-local lane exclusion record; never pending across steps."""
+
+    proposal_id: int
+    seq_id: int
+    apply_step_id: int
+    apply_plan_id: int
+    reason: str = LANE_EXCLUSION_APPLY_REASON_READY_PROPOSAL
+
+    def __post_init__(self):
+        self.proposal_id = int(self.proposal_id)
+        self.seq_id = int(self.seq_id)
+        self.apply_step_id = int(self.apply_step_id)
+        self.apply_plan_id = int(self.apply_plan_id)
         self.reason = str(self.reason)
-        if self.state not in LANE_EXCLUSION_STATES:
-            raise ValueError(f"invalid lane exclusion decision state={self.state!r}")
-        self.max_age_steps = int(self.max_age_steps)
-        if self.max_age_steps < 0:
-            raise ValueError(f"max_age_steps must be non-negative, got {self.max_age_steps}")
 
 
-class LaneExclusionDecisionBuffer:
-    """Scheduler-visible pending lane-exclusion decisions keyed by proposal id."""
+class ReadyEagerProposalRegistry:
+    """Scheduler-owned ready eager proposal opportunities keyed by proposal id."""
 
     def __init__(self):
-        self._decisions: Dict[int, LaneExclusionDecision] = {}
-        self._outbox: Dict[int, LaneExclusionDecision] = {}
+        self._proposals: Dict[int, ReadyEagerProposal] = {}
+        self._outbox: Dict[int, ReadyEagerProposal] = {}
 
     def clear(self) -> None:
-        self._decisions.clear()
+        self._proposals.clear()
         self._outbox.clear()
 
     def size(self) -> int:
-        return len(self._decisions)
+        return len(self._proposals)
 
-    def pending(self) -> list[LaneExclusionDecision]:
+    def proposals(self) -> list[ReadyEagerProposal]:
         return sorted(
-            [
-                decision
-                for decision in self._decisions.values()
-                if decision.state == LANE_EXCLUSION_STATE_PENDING
-            ],
-            key=lambda decision: (int(decision.proposal_id), int(decision.seq_id)),
+            self._proposals.values(),
+            key=lambda proposal: (int(proposal.proposal_id), int(proposal.seq_id)),
         )
 
-    def pending_ids(self) -> list[int]:
-        return [int(decision.proposal_id) for decision in self.pending()]
+    def ready(self) -> list[ReadyEagerProposal]:
+        return [
+            proposal
+            for proposal in self.proposals()
+            if proposal.state == READY_EAGER_STATE_READY
+        ]
 
-    def upsert(self, decision: LaneExclusionDecision, *, enqueue_for_sync: bool = False) -> bool:
-        if not isinstance(decision, LaneExclusionDecision):
+    def ready_ids(self) -> list[int]:
+        return [int(proposal.proposal_id) for proposal in self.ready()]
+
+    def get_ready_for_seq(self, seq_id: int) -> list[ReadyEagerProposal]:
+        seq_id = int(seq_id)
+        return [
+            proposal
+            for proposal in self.ready()
+            if int(proposal.seq_id) == seq_id
+        ]
+
+    def upsert(self, proposal: ReadyEagerProposal, *, enqueue_for_sync: bool = False) -> bool:
+        if not isinstance(proposal, ReadyEagerProposal):
             raise TypeError(
-                "LaneExclusionDecisionBuffer.upsert expected LaneExclusionDecision, "
-                f"got {type(decision).__name__}"
+                "ReadyEagerProposalRegistry.upsert expected ReadyEagerProposal, "
+                f"got {type(proposal).__name__}"
             )
-        if decision.state != LANE_EXCLUSION_STATE_PENDING:
+        if proposal.state != READY_EAGER_STATE_READY:
             return False
-        proposal_id = int(decision.proposal_id)
-        existed = proposal_id in self._decisions
-        self._decisions[proposal_id] = decision
+        proposal_id = int(proposal.proposal_id)
+        existing = self._proposals.get(proposal_id)
+        if existing is not None and existing.state != READY_EAGER_STATE_READY:
+            return False
+        existed = existing is not None
+        self._proposals[proposal_id] = proposal
         if enqueue_for_sync:
-            self._outbox[proposal_id] = decision
+            self._outbox[proposal_id] = proposal
         return not existed
 
-    def remove(self, proposal_id: int) -> LaneExclusionDecision | None:
-        return self._decisions.pop(int(proposal_id), None)
+    def mark_state(self, proposal_id: int, state: str) -> ReadyEagerProposal | None:
+        if state not in READY_EAGER_PROPOSAL_STATES:
+            raise ValueError(f"invalid ready eager proposal state={state!r}")
+        proposal = self._proposals.get(int(proposal_id))
+        if proposal is not None:
+            proposal.state = state
+        self._outbox.pop(int(proposal_id), None)
+        return proposal
 
-    def pop_outbox(self) -> list[LaneExclusionDecision]:
-        decisions = sorted(
+    def pop_outbox(self) -> list[ReadyEagerProposal]:
+        proposals = sorted(
             self._outbox.values(),
-            key=lambda decision: (int(decision.proposal_id), int(decision.seq_id)),
+            key=lambda proposal: (int(proposal.proposal_id), int(proposal.seq_id)),
         )
         self._outbox.clear()
-        return decisions
+        return proposals
 
 
 class ProposalBuffer:
@@ -712,109 +792,129 @@ def _numeric_request_id(request_id: str | int | None) -> int:
         return -1
 
 
-def _encode_lane_exclusion_state(state: str) -> int:
-    if state not in LANE_EXCLUSION_STATE_TO_INT:
-        raise ValueError(f"unknown lane exclusion state={state!r}")
-    return LANE_EXCLUSION_STATE_TO_INT[state]
+def _proposal_tokens_digest(token_ids: Iterable[int]) -> int:
+    digest = 0
+    for token_id in token_ids:
+        digest = (digest * 1315423911 + int(token_id) + 0x9E3779B9) & 0x7FFFFFFFFFFFFFFF
+    return int(digest)
 
 
-def _decode_lane_exclusion_state(value: int) -> str:
+def _encode_ready_eager_state(state: str) -> int:
+    if state not in READY_EAGER_STATE_TO_INT:
+        raise ValueError(f"unknown ready eager proposal state={state!r}")
+    return READY_EAGER_STATE_TO_INT[state]
+
+
+def _decode_ready_eager_state(value: int) -> str:
     value = int(value)
-    if value not in LANE_EXCLUSION_STATE_FROM_INT:
-        raise ValueError(f"unknown encoded lane exclusion state={value}")
-    return LANE_EXCLUSION_STATE_FROM_INT[value]
+    if value not in READY_EAGER_STATE_FROM_INT:
+        raise ValueError(f"unknown encoded ready eager proposal state={value}")
+    return READY_EAGER_STATE_FROM_INT[value]
 
 
-def lane_exclusion_decision_from_eager_proposal(
+def ready_eager_proposal_from_eager_proposal(
     proposal: EagerProposal,
     created_step_id: int,
-    max_age_steps: int = 4,
-) -> LaneExclusionDecision:
-    return LaneExclusionDecision(
+    max_ready_proposal_age: int = READY_EAGER_DEFAULT_MAX_AGE,
+    scheduled: bool = False,
+) -> ReadyEagerProposal:
+    proposal_token_ids = [int(token_id) for token_id in proposal.proposal_token_ids]
+    return ReadyEagerProposal(
         proposal_id=int(proposal.proposal_id),
         seq_id=int(proposal.seq_id),
         request_id=proposal.request_id,
-        source_plan_id=int(proposal.source_plan_id),
-        source_step_id=int(proposal.source_step_id),
-        created_step_id=int(created_step_id),
         base_len=int(proposal.base_len),
         base_pre_verify=bool(proposal.base_pre_verify),
         proposal_len=int(proposal.proposal_len),
         to_verify_len=len(proposal.to_be_verified_token_ids),
-        proposal_token_ids=[int(token_id) for token_id in proposal.proposal_token_ids],
-        reason=LANE_EXCLUSION_DECISION_REASON_READY_EAGER_SCHEDULED,
-        state=LANE_EXCLUSION_STATE_PENDING,
-        max_age_steps=int(max_age_steps),
+        proposal_token_ids=proposal_token_ids,
+        created_step_id=int(created_step_id),
+        source_plan_id=int(proposal.source_plan_id),
+        source_step_id=int(proposal.source_step_id),
+        parent_proposal_id=proposal.parent_proposal_id,
+        parent_ready=True,
+        ready=True,
+        scheduled=bool(scheduled),
+        seq_epoch=None,
+        tokens_digest=_proposal_tokens_digest(proposal_token_ids),
+        state=READY_EAGER_STATE_READY,
+        max_ready_proposal_age=int(max_ready_proposal_age),
     )
 
 
-def serialize_lane_exclusion_decisions(
-    decisions: Iterable[LaneExclusionDecision],
+def serialize_ready_eager_proposals(
+    proposals: Iterable[ReadyEagerProposal],
     plan_id: int,
     step_id: int | None,
 ) -> tuple[list[int], list[int]]:
-    decisions = list(decisions)
+    proposals = list(proposals)
     payload: list[int] = []
-    for decision in decisions:
-        proposal_token_ids = [int(token_id) for token_id in decision.proposal_token_ids]
+    for proposal in proposals:
+        proposal_token_ids = [int(token_id) for token_id in proposal.proposal_token_ids]
         payload.extend(
             [
-                int(decision.proposal_id),
-                int(decision.seq_id),
-                _numeric_request_id(decision.request_id),
-                int(decision.source_plan_id),
-                int(decision.source_step_id),
-                int(decision.created_step_id),
-                int(decision.base_len),
-                int(bool(decision.base_pre_verify)),
-                int(decision.proposal_len),
-                int(decision.to_verify_len),
+                int(proposal.proposal_id),
+                int(proposal.seq_id),
+                _numeric_request_id(proposal.request_id),
+                int(proposal.source_plan_id),
+                int(proposal.source_step_id),
+                int(proposal.created_step_id),
+                int(proposal.base_len),
+                int(bool(proposal.base_pre_verify)),
+                int(proposal.proposal_len),
+                int(proposal.to_verify_len),
                 len(proposal_token_ids),
-                _encode_lane_exclusion_state(decision.state),
-                int(decision.max_age_steps),
+                _encode_ready_eager_state(proposal.state),
+                int(proposal.max_ready_proposal_age),
+                -1 if proposal.parent_proposal_id is None else int(proposal.parent_proposal_id),
+                int(bool(proposal.parent_ready)),
+                int(bool(proposal.ready)),
+                int(bool(proposal.scheduled)),
+                -1 if proposal.seq_epoch is None else int(proposal.seq_epoch),
+                -1 if proposal.tokens_digest is None else int(proposal.tokens_digest),
             ]
         )
         payload.extend(proposal_token_ids)
     meta = [
-        len(decisions),
+        len(proposals),
         len(payload),
         int(plan_id),
         -1 if step_id is None else int(step_id),
-        LANE_EXCLUSION_TRANSFER_HEADER_LEN,
+        READY_EAGER_TRANSFER_HEADER_LEN,
     ]
     return meta, payload
 
 
-def deserialize_lane_exclusion_decisions(
+def deserialize_ready_eager_proposals(
     meta: Iterable[int],
     payload: Iterable[int],
-) -> list[LaneExclusionDecision]:
+) -> list[ReadyEagerProposal]:
     meta_values = [int(value) for value in meta]
-    if len(meta_values) != LANE_EXCLUSION_TRANSFER_META_LEN:
+    if len(meta_values) != READY_EAGER_TRANSFER_META_LEN:
         raise ValueError(
-            "lane exclusion transfer meta must have "
-            f"{LANE_EXCLUSION_TRANSFER_META_LEN} values, got {len(meta_values)}"
+            "ready eager proposal transfer meta must have "
+            f"{READY_EAGER_TRANSFER_META_LEN} values, got {len(meta_values)}"
         )
-    num_decisions, payload_len, _plan_id, _step_id, header_len = meta_values
-    if int(header_len) != LANE_EXCLUSION_TRANSFER_HEADER_LEN:
+    num_proposals, payload_len, _plan_id, _step_id, header_len = meta_values
+    if int(header_len) != READY_EAGER_TRANSFER_HEADER_LEN:
         raise ValueError(
-            f"lane exclusion transfer header length mismatch: expected="
-            f"{LANE_EXCLUSION_TRANSFER_HEADER_LEN}, got {header_len}"
+            f"ready eager proposal transfer header length mismatch: expected="
+            f"{READY_EAGER_TRANSFER_HEADER_LEN}, got {header_len}"
         )
     payload_values = [int(value) for value in payload]
     if int(payload_len) != len(payload_values):
         raise ValueError(
-            f"lane exclusion transfer payload length mismatch: "
+            f"ready eager proposal transfer payload length mismatch: "
             f"meta={payload_len}, payload={len(payload_values)}"
         )
 
-    decisions: list[LaneExclusionDecision] = []
+    proposals: list[ReadyEagerProposal] = []
     offset = 0
-    for idx in range(int(num_decisions)):
-        header = payload_values[offset:offset + LANE_EXCLUSION_TRANSFER_HEADER_LEN]
-        if len(header) != LANE_EXCLUSION_TRANSFER_HEADER_LEN:
-            raise ValueError(f"lane exclusion payload ended while reading header index={idx}")
-        offset += LANE_EXCLUSION_TRANSFER_HEADER_LEN
+    for idx in range(int(num_proposals)):
+        header = payload_values[offset:offset + READY_EAGER_TRANSFER_HEADER_LEN]
+        if len(header) != READY_EAGER_TRANSFER_HEADER_LEN:
+            raise ValueError(f"ready eager proposal payload ended while reading header index={idx}")
+        offset += READY_EAGER_TRANSFER_HEADER_LEN
         (
             proposal_id,
             seq_id,
@@ -828,36 +928,47 @@ def deserialize_lane_exclusion_decisions(
             to_verify_len,
             proposal_token_len,
             state_value,
-            max_age_steps,
+            max_ready_proposal_age,
+            parent_proposal_id,
+            parent_ready,
+            ready,
+            scheduled,
+            seq_epoch,
+            tokens_digest,
         ) = header
         proposal_token_ids = payload_values[offset:offset + proposal_token_len]
         offset += proposal_token_len
         if len(proposal_token_ids) != proposal_token_len:
-            raise ValueError(f"lane exclusion payload ended while reading tokens index={idx}")
-        decisions.append(
-            LaneExclusionDecision(
+            raise ValueError(f"ready eager proposal payload ended while reading tokens index={idx}")
+        proposals.append(
+            ReadyEagerProposal(
                 proposal_id=proposal_id,
                 seq_id=seq_id,
                 request_id=None if request_id < 0 else request_id,
-                source_plan_id=source_plan_id,
-                source_step_id=source_step_id,
-                created_step_id=created_step_id,
                 base_len=base_len,
                 base_pre_verify=bool(base_pre_verify),
                 proposal_len=proposal_len,
                 to_verify_len=to_verify_len,
                 proposal_token_ids=proposal_token_ids,
-                reason=LANE_EXCLUSION_DECISION_REASON_READY_EAGER_SCHEDULED,
-                state=_decode_lane_exclusion_state(state_value),
-                max_age_steps=max_age_steps,
+                created_step_id=created_step_id,
+                source_plan_id=source_plan_id,
+                source_step_id=source_step_id,
+                parent_proposal_id=None if parent_proposal_id < 0 else parent_proposal_id,
+                parent_ready=bool(parent_ready),
+                ready=bool(ready),
+                scheduled=bool(scheduled),
+                seq_epoch=None if seq_epoch < 0 else seq_epoch,
+                tokens_digest=None if tokens_digest < 0 else tokens_digest,
+                state=_decode_ready_eager_state(state_value),
+                max_ready_proposal_age=max_ready_proposal_age,
             )
         )
     if offset != len(payload_values):
         raise ValueError(
-            f"lane exclusion transfer payload has trailing values: "
+            f"ready eager proposal transfer payload has trailing values: "
             f"consumed={offset}, payload={len(payload_values)}"
         )
-    return decisions
+    return proposals
 
 
 class DualBatchManager:
@@ -867,13 +978,13 @@ class DualBatchManager:
         self.gamma = int(gamma)
         self.batches = {0: BatchState(0), 1: BatchState(1)}
         self.step_id = 0
-        self.lane_exclusion_decisions = LaneExclusionDecisionBuffer()
+        self.ready_eager_proposals = ReadyEagerProposalRegistry()
 
     def reset(self) -> None:
         for batch in self.batches.values():
             batch.seq_ids.clear()
         self.step_id = 0
-        self.lane_exclusion_decisions.clear()
+        self.ready_eager_proposals.clear()
 
     def update_running(self, running_seqs: Iterable[Sequence]) -> None:
         running = list(running_seqs)
@@ -924,60 +1035,38 @@ class DualBatchManager:
                 mapping[int(seq_id)] = int(batch_id)
         return mapping
 
-    def emit_lane_exclusion_decision(self, decision: LaneExclusionDecision) -> bool:
-        return self.lane_exclusion_decisions.upsert(decision, enqueue_for_sync=True)
+    def emit_ready_eager_proposal(self, proposal: ReadyEagerProposal) -> bool:
+        return self.ready_eager_proposals.upsert(proposal, enqueue_for_sync=True)
 
-    def receive_lane_exclusion_decisions(self, decisions: Iterable[LaneExclusionDecision]) -> list[int]:
+    def receive_ready_eager_proposals(self, proposals: Iterable[ReadyEagerProposal]) -> list[int]:
         stored = []
-        for decision in decisions:
-            if self.lane_exclusion_decisions.upsert(decision):
-                stored.append(int(decision.proposal_id))
+        for proposal in proposals:
+            if self.ready_eager_proposals.upsert(proposal):
+                stored.append(int(proposal.proposal_id))
         return sorted(stored)
 
-    def pop_lane_exclusion_decisions_for_sync(self) -> list[LaneExclusionDecision]:
-        return self.lane_exclusion_decisions.pop_outbox()
+    def pop_ready_eager_proposals_for_sync(self) -> list[ReadyEagerProposal]:
+        return self.ready_eager_proposals.pop_outbox()
 
-    def _lane_exclusion_keep_pending_reason(
-        self,
-        decision: LaneExclusionDecision,
-        plan: StepPlan,
-        seq: Sequence | None,
-        current_step_id: int,
-    ) -> str | None:
-        seq_id = int(decision.seq_id)
-        target_home = {int(value) for value in plan.target_home_set}
-        draft_home = {int(value) for value in plan.draft_home_set}
-        age = max(0, int(current_step_id) - int(decision.created_step_id))
-        if age > int(decision.max_age_steps):
-            return LANE_EXCLUSION_STATE_EXPIRED
-        if plan.execution_mode != "dual_batch_pearl" or plan.plan_phase != "steady":
-            return "non_steady_plan_before_lane_exclusion"
-        if seq_id in target_home:
-            return "still_in_target_home"
-        if seq_id not in draft_home:
-            return "seq_not_in_draft_home_before_lane_exclusion"
+    def _sequence_status_name(self, seq: Sequence | None) -> str:
         if seq is None:
-            return "seq_not_found_before_lane_exclusion"
-        if getattr(seq, "status", None) != SequenceStatus.RUNNING:
-            return "seq_not_running_before_lane_exclusion"
-        if bool(getattr(seq, "is_finished", False)):
-            return "seq_finished_before_lane_exclusion"
-        if bool(getattr(seq, "pre_verify", True)):
-            return "seq_returned_pre_verify_before_lane_exclusion"
-        if bool(decision.base_pre_verify):
-            return "invalid_base_pre_verify_before_lane_exclusion"
-        if int(decision.proposal_len) != int(self.gamma):
-            return "invalid_proposal_len_before_lane_exclusion"
-        if int(decision.to_verify_len) != int(self.gamma):
-            return "invalid_to_verify_len_before_lane_exclusion"
-        current_len = int(len(seq))
-        if current_len < int(decision.base_len):
-            return "base_not_reached_before_lane_exclusion"
-        if current_len > int(decision.base_len):
-            return "draft_base_overshot_before_lane_exclusion"
-        return None
+            return "MISSING"
+        status = getattr(seq, "status", None)
+        return status.name if isinstance(status, SequenceStatus) else str(status)
 
-    def _apply_lane_exclusion_decisions_to_plan(
+    def _mark_ready_proposal_terminal(
+        self,
+        proposal_id: int,
+        state: str,
+        ids: list[int],
+        reason_by_id: dict[int, str],
+        reason: str,
+    ) -> None:
+        self.ready_eager_proposals.mark_state(proposal_id, state)
+        ids.append(int(proposal_id))
+        reason_by_id[int(proposal_id)] = str(reason)
+
+    def _apply_ready_eager_proposals_to_plan(
         self,
         plan: StepPlan,
         running_seqs: Iterable[Sequence] | None,
@@ -988,9 +1077,11 @@ class DualBatchManager:
 
         current_step_id = int(plan.step_id if plan.step_id is not None else self.step_id)
         original_draft_home = [int(seq_id) for seq_id in plan.draft_home_set]
+        target_home_set = {int(seq_id) for seq_id in plan.target_home_set}
+        draft_home_set = set(original_draft_home)
         seq_by_id = {int(seq.seq_id): seq for seq in (running_seqs or [])}
-        pending = self.lane_exclusion_decisions.pending()
-        pending_ids = [int(decision.proposal_id) for decision in pending]
+        ready_proposals = self.ready_eager_proposals.ready()
+        ready_proposal_ids = [int(proposal.proposal_id) for proposal in ready_proposals]
 
         plan.enable_eager_lane_exclusion_dry_run = True
         plan.eager_lane_exclusion_dry_run_enabled = True
@@ -999,114 +1090,217 @@ class DualBatchManager:
         plan.adjusted_draft_home_set_dry_run = list(original_draft_home)
         plan.excluded_from_draft_home_for_eager_dry_run = []
         plan.lane_excluded_seq_ids = []
-        plan.pending_lane_exclusion_decision_ids_before_plan = list(pending_ids)
+        plan.pending_lane_exclusion_decision_ids_before_plan = []
         plan.applied_lane_exclusion_decision_ids = []
         plan.stale_lane_exclusion_decision_ids = []
         plan.expired_lane_exclusion_decision_ids = []
         plan.lane_exclusion_drop_reason_by_decision_id = {}
-        plan.active_pending_lane_exclusion_decision_ids = list(pending_ids)
+        plan.active_pending_lane_exclusion_decision_ids = []
         plan.terminal_lane_exclusion_decision_ids = []
-        plan.touched_lane_exclusion_decision_ids = list(pending_ids)
+        plan.touched_lane_exclusion_decision_ids = []
         plan.normal_proposal_expected_seq_ids_after_lane_exclusion = list(original_draft_home)
         plan.adjusted_normal_proposal_expected_seq_ids = list(original_draft_home)
         plan.lane_exclusion_decision_available_before_draft = False
         plan.lane_exclusion_deferred_until_next_step = False
         plan.lane_exclusion_defer_reason = None
-        plan.lane_exclusion_source_step_by_decision_id = {
-            int(decision.proposal_id): int(decision.source_step_id)
-            for decision in pending
-        }
-        plan.lane_exclusion_created_step_by_decision_id = {
-            int(decision.proposal_id): int(decision.created_step_id)
-            for decision in pending
-        }
+        plan.lane_exclusion_source_step_by_decision_id = {}
+        plan.lane_exclusion_created_step_by_decision_id = {}
         plan.lane_exclusion_applied_step_by_decision_id = {}
+        plan.lane_exclusion_applied_proposal_ids = []
+        plan.lane_exclusion_applied_seq_ids = []
+        plan.lane_exclusion_apply_reason_by_proposal_id = {}
+        plan.ready_eager_proposal_registry_ids_before_plan = list(ready_proposal_ids)
+        plan.ready_eager_proposal_seen_by_scheduler_ids = list(ready_proposal_ids)
+        plan.ready_eager_proposal_in_target_home_ids = []
+        plan.ready_eager_proposal_in_draft_home_ids = []
+        plan.ready_eager_proposal_applied_ids = []
+        plan.ready_eager_proposal_stale_ids = []
+        plan.ready_eager_proposal_expired_ids = []
+        plan.ready_eager_proposal_invalidated_ids = []
+        plan.ready_eager_proposal_state_by_id = {}
+        plan.ready_eager_proposal_skip_reason_by_id = {}
+        plan.ready_eager_proposal_stale_reason_by_id = {}
+        plan.ready_eager_proposal_age_by_id = {}
+        plan.ready_eager_proposal_seq_id_by_id = {}
+        plan.ready_eager_proposal_base_len_by_id = {}
+        plan.ready_eager_proposal_current_len_by_id = {}
+        plan.ready_eager_proposal_current_pre_verify_by_id = {}
+        plan.ready_eager_proposal_current_status_by_id = {}
 
-        if not pending:
+        if not ready_proposals:
             return
 
-        draft_home_set = set(original_draft_home)
-        applied_decisions: list[LaneExclusionDecision] = []
+        applied_records: list[LaneExclusionApplyRecord] = []
         applied_seq_ids: set[int] = set()
-        dropped_ids: list[int] = []
+        stale_ids: list[int] = []
         expired_ids: list[int] = []
-        drop_reasons: dict[int, str] = {}
-        deferred_reasons: dict[int, str] = {}
+        invalidated_ids: list[int] = []
+        skip_reasons: dict[int, str] = {}
+        stale_reasons: dict[int, str] = {}
 
-        for decision in pending:
-            proposal_id = int(decision.proposal_id)
-            seq_id = int(decision.seq_id)
-            reason = self._lane_exclusion_keep_pending_reason(
-                decision,
-                plan,
-                seq_by_id.get(seq_id),
-                current_step_id,
-            )
-            if reason == LANE_EXCLUSION_STATE_EXPIRED:
-                decision.state = LANE_EXCLUSION_STATE_EXPIRED
-                self.lane_exclusion_decisions.remove(proposal_id)
-                expired_ids.append(proposal_id)
-                drop_reasons[proposal_id] = "expired_before_lane_exclusion"
+        for proposal in ready_proposals:
+            proposal_id = int(proposal.proposal_id)
+            seq_id = int(proposal.seq_id)
+            seq = seq_by_id.get(seq_id)
+            age = max(0, int(current_step_id) - int(proposal.created_step_id))
+            current_len = -1 if seq is None else int(len(seq))
+            current_pre_verify = True if seq is None else bool(getattr(seq, "pre_verify", True))
+            current_status = self._sequence_status_name(seq)
+            plan.ready_eager_proposal_age_by_id[proposal_id] = age
+            plan.ready_eager_proposal_seq_id_by_id[proposal_id] = seq_id
+            plan.ready_eager_proposal_base_len_by_id[proposal_id] = int(proposal.base_len)
+            plan.ready_eager_proposal_current_len_by_id[proposal_id] = current_len
+            plan.ready_eager_proposal_current_pre_verify_by_id[proposal_id] = current_pre_verify
+            plan.ready_eager_proposal_current_status_by_id[proposal_id] = current_status
+            if seq_id in target_home_set:
+                plan.ready_eager_proposal_in_target_home_ids.append(proposal_id)
+            if seq_id in draft_home_set:
+                plan.ready_eager_proposal_in_draft_home_ids.append(proposal_id)
+
+            if age > int(proposal.max_ready_proposal_age):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_EXPIRED,
+                    expired_ids,
+                    stale_reasons,
+                    "expired",
+                )
                 continue
-            if reason in {
-                "non_steady_plan_before_lane_exclusion",
-                "still_in_target_home",
-                "seq_not_in_draft_home_before_lane_exclusion",
-                "base_not_reached_before_lane_exclusion",
-            }:
-                deferred_reasons[proposal_id] = reason
+            if plan.execution_mode != "dual_batch_pearl" or plan.plan_phase != "steady":
+                skip_reasons[proposal_id] = "non_steady_plan"
                 continue
-            if reason is not None:
-                decision.state = LANE_EXCLUSION_STATE_STALE_DROPPED
-                self.lane_exclusion_decisions.remove(proposal_id)
-                dropped_ids.append(proposal_id)
-                drop_reasons[proposal_id] = reason
-                continue
-            if seq_id in applied_seq_ids:
-                decision.state = LANE_EXCLUSION_STATE_STALE_DROPPED
-                self.lane_exclusion_decisions.remove(proposal_id)
-                dropped_ids.append(proposal_id)
-                drop_reasons[proposal_id] = "duplicate_lane_exclusion_decision_for_seq"
+            if seq_id in target_home_set:
+                skip_reasons[proposal_id] = "still_in_target_home"
                 continue
             if seq_id not in draft_home_set:
-                deferred_reasons[proposal_id] = "seq_not_in_draft_home_before_lane_exclusion"
+                skip_reasons[proposal_id] = "not_in_candidate_draft_home"
+                continue
+            if seq is None:
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "seq_not_found",
+                )
+                continue
+            if getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "seq_not_running",
+                )
+                continue
+            if bool(getattr(seq, "is_finished", False)):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "seq_finished",
+                )
+                continue
+            if bool(getattr(seq, "pre_verify", True)):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "seq_returned_pre_verify",
+                )
+                continue
+            if bool(proposal.base_pre_verify):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "invalid_base_pre_verify",
+                )
+                continue
+            if int(proposal.proposal_len) != int(self.gamma):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "invalid_proposal_len",
+                )
+                continue
+            if int(proposal.to_verify_len) != int(self.gamma):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "invalid_to_verify_len",
+                )
+                continue
+            if current_len < int(proposal.base_len):
+                skip_reasons[proposal_id] = "wait_base_not_reached"
+                continue
+            if current_len > int(proposal.base_len):
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "base_overshot",
+                )
+                continue
+            if seq_id in applied_seq_ids:
+                self._mark_ready_proposal_terminal(
+                    proposal_id,
+                    READY_EAGER_STATE_STALE,
+                    stale_ids,
+                    stale_reasons,
+                    "duplicate_ready_eager_proposal_for_seq",
+                )
                 continue
 
-            decision.state = LANE_EXCLUSION_STATE_APPLIED
-            self.lane_exclusion_decisions.remove(proposal_id)
-            applied_decisions.append(decision)
+            self.ready_eager_proposals.mark_state(proposal_id, READY_EAGER_STATE_CONSUMED_APPLIED)
+            applied_records.append(
+                LaneExclusionApplyRecord(
+                    proposal_id=proposal_id,
+                    seq_id=seq_id,
+                    apply_step_id=current_step_id,
+                    apply_plan_id=int(plan.plan_id),
+                )
+            )
             applied_seq_ids.add(seq_id)
 
-        if deferred_reasons and not applied_decisions:
+        if skip_reasons and not applied_records:
             plan.lane_exclusion_deferred_until_next_step = True
-            plan.lane_exclusion_defer_reason = next(iter(deferred_reasons.values()))
-        if deferred_reasons:
-            plan.lane_exclusion_defer_reason_by_decision_id = {
-                int(proposal_id): reason for proposal_id, reason in deferred_reasons.items()
-            }
+            plan.lane_exclusion_defer_reason = next(iter(skip_reasons.values()))
 
-        stale_ids = sorted(dropped_ids + expired_ids)
-        plan.stale_lane_exclusion_decision_ids = list(stale_ids)
-        plan.expired_lane_exclusion_decision_ids = sorted(expired_ids)
-        plan.lane_exclusion_drop_reason_by_decision_id = {
-            int(proposal_id): reason for proposal_id, reason in sorted(drop_reasons.items())
+        plan.ready_eager_proposal_stale_ids = sorted(stale_ids)
+        plan.ready_eager_proposal_expired_ids = sorted(expired_ids)
+        plan.ready_eager_proposal_invalidated_ids = sorted(invalidated_ids)
+        plan.ready_eager_proposal_skip_reason_by_id = {
+            int(proposal_id): reason for proposal_id, reason in sorted(skip_reasons.items())
         }
-        plan.terminal_lane_exclusion_decision_ids = sorted(
-            [int(decision.proposal_id) for decision in applied_decisions] + stale_ids
-        )
-        plan.active_pending_lane_exclusion_decision_ids = self.lane_exclusion_decisions.pending_ids()
+        plan.ready_eager_proposal_stale_reason_by_id = {
+            int(proposal_id): reason for proposal_id, reason in sorted(stale_reasons.items())
+        }
+        plan.ready_eager_proposal_state_by_id = {
+            int(proposal_id): self.ready_eager_proposals._proposals[int(proposal_id)].state
+            for proposal_id in ready_proposal_ids
+            if int(proposal_id) in self.ready_eager_proposals._proposals
+        }
 
-        if not applied_decisions:
+        if not applied_records:
             return
 
-        applied_decisions = sorted(
-            applied_decisions,
-            key=lambda decision: original_draft_home.index(int(decision.seq_id))
-            if int(decision.seq_id) in draft_home_set
+        applied_records = sorted(
+            applied_records,
+            key=lambda record: original_draft_home.index(int(record.seq_id))
+            if int(record.seq_id) in draft_home_set
             else len(original_draft_home),
         )
-        excluded_seq_ids = [int(decision.seq_id) for decision in applied_decisions]
-        proposal_ids = [int(decision.proposal_id) for decision in applied_decisions]
+        excluded_seq_ids = [int(record.seq_id) for record in applied_records]
+        proposal_ids = [int(record.proposal_id) for record in applied_records]
         adjusted_draft_home = [
             int(seq_id) for seq_id in original_draft_home if int(seq_id) not in set(excluded_seq_ids)
         ]
@@ -1121,20 +1315,26 @@ class DualBatchManager:
         plan.lane_exclusion_decision_available_before_draft = True
         plan.lane_exclusion_deferred_until_next_step = False
         plan.lane_exclusion_defer_reason = None
-        plan.applied_lane_exclusion_decision_ids = list(proposal_ids)
-        plan.lane_exclusion_applied_step_by_decision_id = {
-            int(decision.proposal_id): current_step_id for decision in applied_decisions
+        plan.ready_eager_proposal_applied_ids = list(proposal_ids)
+        plan.lane_exclusion_applied_proposal_ids = list(proposal_ids)
+        plan.lane_exclusion_applied_seq_ids = list(excluded_seq_ids)
+        plan.lane_exclusion_apply_reason_by_proposal_id = {
+            int(record.proposal_id): record.reason for record in applied_records
         }
         plan.eager_schedule_dry_run_enabled = True
         plan.eager_lane_exclusion_proposal_ids = list(proposal_ids)
         plan.eager_lane_exclusion_seq_ids = list(excluded_seq_ids)
         plan.eager_lane_exclusion_reason_by_seq_id = {
-            int(seq_id): "scheduler_owned_lane_exclusion_applied"
-            for seq_id in excluded_seq_ids
+            int(record.seq_id): record.reason for record in applied_records
         }
         plan.lane_exclusion_dry_run_done = True
         plan.lane_exclusion_dry_run_done_proposal_ids = list(proposal_ids)
         plan.lane_exclusion_dry_run_done_seq_ids = list(excluded_seq_ids)
+        plan.ready_eager_proposal_state_by_id = {
+            int(proposal_id): self.ready_eager_proposals._proposals[int(proposal_id)].state
+            for proposal_id in ready_proposal_ids
+            if int(proposal_id) in self.ready_eager_proposals._proposals
+        }
 
     def build_step_plan(
         self,
@@ -1252,7 +1452,7 @@ class DualBatchManager:
             phase=phase,
             fallback_reason=fallback_reason,
         )
-        self._apply_lane_exclusion_decisions_to_plan(
+        self._apply_ready_eager_proposals_to_plan(
             plan,
             running_seqs=running_seqs,
             enable_eager_lane_exclusion_dry_run=enable_eager_lane_exclusion_dry_run,

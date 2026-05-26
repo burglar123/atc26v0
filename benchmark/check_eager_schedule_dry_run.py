@@ -298,7 +298,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             )
         if target_eager_dry_run and not adjusted_draft_home:
             errors.append(f"record[{idx}] scheduled dry-run must trace adjusted_draft_home_set_dry_run")
-        if as_int_set(record.get("applied_lane_exclusion_decision_ids")):
+        if (
+            as_int_set(record.get("applied_lane_exclusion_decision_ids"))
+            or as_int_set(record.get("lane_exclusion_applied_proposal_ids"))
+        ):
             adjustment_parent_home = draft_home
         else:
             adjustment_parent_home = original_draft_home if original_draft_home else draft_home
