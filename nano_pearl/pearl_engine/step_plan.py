@@ -42,6 +42,17 @@ class StepPlan:
     execution_mode: str
 
     target_home_set: List[int] = field(default_factory=list)
+    target_normal_verify_seq_ids: List[int] = field(default_factory=list)
+    target_eager_verify_seq_ids_dry_run: List[int] = field(default_factory=list)
+    target_eager_verify_proposal_ids_dry_run: List[int] = field(default_factory=list)
+    target_eager_verify_reason_by_seq_id_dry_run: Dict[int, str] = field(default_factory=dict)
+    excluded_from_target_normal_verify_for_eager_dry_run: List[int] = field(default_factory=list)
+    missing_normal_proposal_allowed_by_eager_dry_run: bool = False
+    missing_normal_proposal_allowed_seq_ids_dry_run: List[int] = field(default_factory=list)
+    raw_target_home_set_for_normal_verify: List[int] = field(default_factory=list)
+    missing_buffered_proposal_seq_ids: List[int] = field(default_factory=list)
+    missing_buffered_proposal_allowed_by_eager_seq_ids: List[int] = field(default_factory=list)
+    missing_buffered_proposal_unexpected_seq_ids: List[int] = field(default_factory=list)
     target_eager_set: List[int] = field(default_factory=list)
     target_eager_set_dry_run: List[int] = field(default_factory=list)
     scheduled_target_eager_set_dry_run: List[int] = field(default_factory=list)
@@ -228,6 +239,16 @@ class StepPlan:
             return list(self.draft_home_set) + list(self.draft_eager_set)
         return list(self.target_home_set) + list(self.target_eager_set)
 
+    def target_normal_verify_ids(self) -> List[int]:
+        if (
+            self.target_normal_verify_seq_ids
+            or self.raw_target_home_set_for_normal_verify
+            or self.target_eager_verify_seq_ids_dry_run
+            or self.excluded_from_target_normal_verify_for_eager_dry_run
+        ):
+            return list(self.target_normal_verify_seq_ids)
+        return list(self.target_home_set)
+
     def is_eager_empty(self) -> bool:
         return not self.target_eager_set and not self.draft_eager_set
 
@@ -302,6 +323,8 @@ class StepPlan:
         global_gamma: int | None = None,
     ):
         target_home = set(int(seq_id) for seq_id in self.target_home_set)
+        target_normal_verify = set(int(seq_id) for seq_id in self.target_normal_verify_ids())
+        target_eager_verify = set(int(seq_id) for seq_id in self.target_eager_verify_seq_ids_dry_run)
         draft_home = set(int(seq_id) for seq_id in self.draft_home_set)
         target_eager = set(int(seq_id) for seq_id in self.target_eager_set)
         target_eager_dry_run = set(int(seq_id) for seq_id in self.target_eager_set_dry_run)
@@ -321,6 +344,18 @@ class StepPlan:
         actual_draft_home = set(int(seq_id) for seq_id in self.actual_draft_home_set_for_normal_draft)
         lane_excluded = set(int(seq_id) for seq_id in self.lane_excluded_seq_ids)
         draft_eager = set(int(seq_id) for seq_id in self.draft_eager_set)
+        assert target_normal_verify <= target_home, (
+            "target_normal_verify_seq_ids must be a subset of target_home_set: "
+            f"extra={sorted(target_normal_verify - target_home)}"
+        )
+        assert not (target_normal_verify & target_eager_verify), (
+            "target_normal_verify_seq_ids cannot overlap target_eager_verify_seq_ids_dry_run: "
+            f"{sorted(target_normal_verify & target_eager_verify)}"
+        )
+        assert not (draft_eager & target_eager_verify), (
+            "draft_eager_set is a current target-home candidate set and must not overlap "
+            f"one-shot target_eager_verify_seq_ids_dry_run: {sorted(draft_eager & target_eager_verify)}"
+        )
 
         assert not (target_eager & target_home), (
             f"target_eager_set cannot overlap target_home_set: "
@@ -445,6 +480,12 @@ class StepPlan:
             self.ready_eager_proposal_stale_ids,
             self.ready_eager_proposal_expired_ids,
             self.ready_eager_proposal_invalidated_ids,
+            self.target_eager_verify_seq_ids_dry_run,
+            self.target_eager_verify_proposal_ids_dry_run,
+            self.excluded_from_target_normal_verify_for_eager_dry_run,
+            self.missing_normal_proposal_allowed_seq_ids_dry_run,
+            self.missing_buffered_proposal_allowed_by_eager_seq_ids,
+            self.missing_buffered_proposal_unexpected_seq_ids,
             self.lane_exclusion_applied_proposal_ids,
             self.lane_exclusion_applied_seq_ids,
         ]
@@ -469,6 +510,7 @@ class StepPlan:
             self.ready_eager_proposal_current_len_by_id,
             self.ready_eager_proposal_current_pre_verify_by_id,
             self.ready_eager_proposal_current_status_by_id,
+            self.target_eager_verify_reason_by_seq_id_dry_run,
             self.lane_exclusion_apply_reason_by_proposal_id,
         ]
         has_eager_scaffold = any(eager_list_fields) or any(eager_mapping_fields)
@@ -576,6 +618,40 @@ class StepPlan:
             "iteration_id": int(self.iteration_id),
             "execution_mode": self.execution_mode,
             "target_home_set": _int_list(self.target_home_set),
+            "target_normal_verify_seq_ids": _int_list(
+                self.target_normal_verify_ids()
+            ),
+            "target_eager_verify_seq_ids_dry_run": _int_list(
+                self.target_eager_verify_seq_ids_dry_run
+            ),
+            "target_eager_verify_proposal_ids_dry_run": _int_list(
+                self.target_eager_verify_proposal_ids_dry_run
+            ),
+            "target_eager_verify_reason_by_seq_id_dry_run": {
+                str(seq_id): str(reason)
+                for seq_id, reason in self.target_eager_verify_reason_by_seq_id_dry_run.items()
+            },
+            "excluded_from_target_normal_verify_for_eager_dry_run": _int_list(
+                self.excluded_from_target_normal_verify_for_eager_dry_run
+            ),
+            "missing_normal_proposal_allowed_by_eager_dry_run": bool(
+                self.missing_normal_proposal_allowed_by_eager_dry_run
+            ),
+            "missing_normal_proposal_allowed_seq_ids_dry_run": _int_list(
+                self.missing_normal_proposal_allowed_seq_ids_dry_run
+            ),
+            "raw_target_home_set_for_normal_verify": _int_list(
+                self.raw_target_home_set_for_normal_verify or self.target_home_set
+            ),
+            "missing_buffered_proposal_seq_ids": _int_list(
+                self.missing_buffered_proposal_seq_ids
+            ),
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": _int_list(
+                self.missing_buffered_proposal_allowed_by_eager_seq_ids
+            ),
+            "missing_buffered_proposal_unexpected_seq_ids": _int_list(
+                self.missing_buffered_proposal_unexpected_seq_ids
+            ),
             "target_eager_set": _int_list(self.target_eager_set),
             "target_eager_set_dry_run": _int_list(self.target_eager_set_dry_run),
             "scheduled_target_eager_set_dry_run": _int_list(self.scheduled_target_eager_set_dry_run),

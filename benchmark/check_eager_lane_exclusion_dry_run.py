@@ -58,6 +58,12 @@ def as_int_set(value: Any) -> set[int]:
     return set(as_int_list(value))
 
 
+def record_int_set(record: dict[str, Any], key: str, default: set[int] | None = None) -> set[int]:
+    if key in record and isinstance(record.get(key), list):
+        return as_int_set(record.get(key))
+    return set() if default is None else set(default)
+
+
 def as_str_map(value: Any) -> dict[int, str]:
     if not isinstance(value, dict):
         return {}
@@ -97,6 +103,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     ready_invalidated_count = 0
     lane_exclusion_applied_decision_count = 0
     excluded_from_actual_count = 0
+    target_eager_verify_count = 0
+    missing_buffered_allowed_count = 0
+    missing_buffered_unexpected_count = 0
     sent_received_mismatch_count = 0
     excluded_expected_count = 0
     actual_eager_counter_rows = 0
@@ -153,6 +162,20 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
 
         records_with_lane_enabled += 1
         original = as_int_set(record.get("original_draft_home_set")) or as_int_set(record.get("draft_home_set"))
+        target_home = as_int_set(record.get("target_home_set"))
+        target_normal_verify = record_int_set(record, "target_normal_verify_seq_ids", target_home)
+        target_eager_verify = as_int_set(record.get("target_eager_verify_seq_ids_dry_run"))
+        target_eager_verify_proposal_ids = as_int_set(record.get("target_eager_verify_proposal_ids_dry_run"))
+        target_eager_reason_by_seq = as_str_map(record.get("target_eager_verify_reason_by_seq_id_dry_run"))
+        excluded_from_target_normal = as_int_set(
+            record.get("excluded_from_target_normal_verify_for_eager_dry_run")
+        )
+        missing_allowed = as_int_set(record.get("missing_normal_proposal_allowed_seq_ids_dry_run")) or as_int_set(
+            record.get("missing_buffered_proposal_allowed_by_eager_seq_ids")
+        )
+        missing_unexpected = as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids"))
+        missing_buffered = as_int_set(record.get("missing_buffered_proposal_seq_ids"))
+        draft_eager = as_int_set(record.get("draft_eager_set"))
         actual = as_int_set(record.get("actual_draft_home_set_for_normal_draft")) or as_int_set(
             record.get("draft_home_set")
         )
@@ -208,8 +231,60 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         ready_invalidated_count += len(invalidated_ids)
         lane_exclusion_applied_decision_count += len(lane_applied_ids)
         excluded_from_actual_count += len(excluded)
+        target_eager_verify_count += len(target_eager_verify)
+        missing_buffered_allowed_count += len(missing_allowed)
+        missing_buffered_unexpected_count += len(missing_unexpected)
         skip_reason_counts.update(skip_reason_by_id.values())
         stale_reason_counts.update(stale_reason_by_id.values())
+
+        if target_normal_verify - target_home:
+            errors.append(
+                f"record[{idx}] target_normal_verify_seq_ids must be a subset of target_home_set: "
+                f"extra={sorted(target_normal_verify - target_home)}"
+            )
+        if target_normal_verify & target_eager_verify:
+            errors.append(
+                f"record[{idx}] target normal verify overlaps eager takeover seqs: "
+                f"{sorted(target_normal_verify & target_eager_verify)}"
+            )
+        expected_target_normal = target_home - (target_eager_verify & target_home)
+        if target_normal_verify != expected_target_normal:
+            errors.append(
+                f"record[{idx}] target_normal_verify_seq_ids must equal target_home minus eager takeover: "
+                f"target_normal={sorted(target_normal_verify)}, expected={sorted(expected_target_normal)}"
+            )
+        if target_eager_verify and len(target_eager_verify_proposal_ids) != len(target_eager_verify):
+            errors.append(
+                f"record[{idx}] target eager verify seqs need matching proposal ids: "
+                f"seqs={sorted(target_eager_verify)}, proposals={sorted(target_eager_verify_proposal_ids)}"
+            )
+        if target_eager_verify and not target_eager_verify <= set(target_eager_reason_by_seq):
+            errors.append(
+                f"record[{idx}] target eager verify seqs missing reason mapping: "
+                f"missing={sorted(target_eager_verify - set(target_eager_reason_by_seq))}"
+            )
+        if draft_eager & target_eager_verify:
+            errors.append(
+                f"record[{idx}] target_eager_verify_seq_ids_dry_run must not be treated as draft_eager_set: "
+                f"overlap={sorted(draft_eager & target_eager_verify)}"
+            )
+        if missing_allowed - target_eager_verify:
+            errors.append(
+                f"record[{idx}] allowed missing normal proposals must be eager takeover seqs: "
+                f"extra={sorted(missing_allowed - target_eager_verify)}"
+            )
+        if missing_unexpected:
+            errors.append(
+                f"record[{idx}] unexpected missing buffered normal proposals: {sorted(missing_unexpected)}"
+            )
+        if missing_buffered and missing_buffered != missing_allowed | missing_unexpected:
+            errors.append(
+                f"record[{idx}] missing buffered proposal split is inconsistent: "
+                f"missing={sorted(missing_buffered)}, allowed={sorted(missing_allowed)}, "
+                f"unexpected={sorted(missing_unexpected)}"
+            )
+        if missing_allowed and not bool(record.get("missing_normal_proposal_allowed_by_eager_dry_run", False)):
+            errors.append(f"record[{idx}] allowed eager-takeover missing proposals must set allow flag")
 
         if seen_ids and not bool(record.get("ready_eager_proposals_synchronized_before_plan", False)):
             errors.append(f"record[{idx}] scheduler saw ready proposals without pre-plan sync")
@@ -267,6 +342,16 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] normal proposal expected seq ids must use adjusted set")
             if not bool(record.get("lane_exclusion_dry_run_done", False)):
                 errors.append(f"record[{idx}] applied lane exclusion must mark lane_exclusion_dry_run_done")
+            if not excluded <= target_eager_verify:
+                errors.append(
+                    f"record[{idx}] every excluded normal-draft seq must be routed to target eager verify: "
+                    f"excluded={sorted(excluded)}, target_eager_verify={sorted(target_eager_verify)}"
+                )
+            if not excluded <= excluded_from_target_normal:
+                errors.append(
+                    f"record[{idx}] excluded seqs must be traced as excluded from target normal verify: "
+                    f"excluded={sorted(excluded)}, traced={sorted(excluded_from_target_normal)}"
+                )
         else:
             if excluded:
                 errors.append(f"record[{idx}] excluded seq ids require an applied ready proposal")
@@ -352,6 +437,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "ready_eager_proposal_invalidated_count": ready_invalidated_count,
         "lane_exclusion_applied_decision_count": lane_exclusion_applied_decision_count,
         "excluded_from_actual_draft_home_count": excluded_from_actual_count,
+        "target_eager_verify_seq_ids_dry_run_count": target_eager_verify_count,
+        "missing_buffered_proposal_allowed_by_eager_count": missing_buffered_allowed_count,
+        "missing_buffered_proposal_unexpected_count": missing_buffered_unexpected_count,
         "original_draft_home_size_mean": mean(original_draft_sizes) if original_draft_sizes else 0.0,
         "adjusted_draft_home_size_mean": mean(adjusted_draft_sizes) if adjusted_draft_sizes else 0.0,
         "normal_proposal_sent_received_mismatch_count": sent_received_mismatch_count,
@@ -381,6 +469,18 @@ def base_record(*, lane_enabled: bool = True) -> dict[str, Any]:
         "enable_eager_lane_exclusion_dry_run": lane_enabled,
         "eager_lane_exclusion_dry_run_enabled": lane_enabled,
         "target_home_set": [0, 2],
+        "target_normal_verify_seq_ids": [0, 2],
+        "target_eager_verify_seq_ids_dry_run": [],
+        "target_eager_verify_proposal_ids_dry_run": [],
+        "target_eager_verify_reason_by_seq_id_dry_run": {},
+        "excluded_from_target_normal_verify_for_eager_dry_run": [],
+        "missing_normal_proposal_allowed_by_eager_dry_run": False,
+        "missing_normal_proposal_allowed_seq_ids_dry_run": [],
+        "raw_target_home_set_for_normal_verify": [0, 2],
+        "missing_buffered_proposal_seq_ids": [],
+        "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
+        "missing_buffered_proposal_unexpected_seq_ids": [],
+        "draft_eager_set": [],
         "draft_home_set": [1, 3],
         "original_draft_home_set": [1, 3],
         "actual_draft_home_set_for_normal_draft": [1, 3],
@@ -473,6 +573,8 @@ def target_home_record() -> dict[str, Any]:
     record.update(
         {
             "target_home_set": [2],
+            "target_normal_verify_seq_ids": [2],
+            "raw_target_home_set_for_normal_verify": [2],
             "draft_home_set": [3],
             "original_draft_home_set": [3],
             "actual_draft_home_set_for_normal_draft": [3],
@@ -496,6 +598,14 @@ def applied_record() -> dict[str, Any]:
     record.update(
         {
             "target_home_set": [0],
+            "target_normal_verify_seq_ids": [0],
+            "raw_target_home_set_for_normal_verify": [0],
+            "target_eager_verify_seq_ids_dry_run": [3],
+            "target_eager_verify_proposal_ids_dry_run": [202],
+            "target_eager_verify_reason_by_seq_id_dry_run": {
+                "3": "ready_eager_proposal_available_for_draft_home"
+            },
+            "excluded_from_target_normal_verify_for_eager_dry_run": [3],
             "draft_home_set": [5],
             "original_draft_home_set": [3, 5],
             "actual_draft_home_set_for_normal_draft": [5],
@@ -526,6 +636,37 @@ def applied_record() -> dict[str, Any]:
             "lane_exclusion_apply_reason_by_proposal_id": {
                 "202": "ready_eager_proposal_available_for_draft_home"
             },
+        }
+    )
+    return record
+
+
+def takeover_target_verify_record() -> dict[str, Any]:
+    record = base_record()
+    record.update(
+        {
+            "target_home_set": [3, 5],
+            "target_normal_verify_seq_ids": [5],
+            "raw_target_home_set_for_normal_verify": [3, 5],
+            "target_eager_verify_seq_ids_dry_run": [3],
+            "target_eager_verify_proposal_ids_dry_run": [202],
+            "target_eager_verify_reason_by_seq_id_dry_run": {
+                "3": "ready_eager_takeover_for_target_normal_verify"
+            },
+            "excluded_from_target_normal_verify_for_eager_dry_run": [3],
+            "missing_normal_proposal_allowed_by_eager_dry_run": True,
+            "missing_normal_proposal_allowed_seq_ids_dry_run": [3],
+            "missing_buffered_proposal_seq_ids": [3],
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": [3],
+            "missing_buffered_proposal_unexpected_seq_ids": [],
+            "draft_home_set": [4, 6],
+            "original_draft_home_set": [4, 6],
+            "actual_draft_home_set_for_normal_draft": [4, 6],
+            "normal_proposal_expected_seq_ids_after_lane_exclusion": [4, 6],
+            "normal_proposal_sent_seq_ids_after_lane_exclusion": [4, 6],
+            "normal_proposal_received_seq_ids_after_lane_exclusion": [4, 6],
+            "adjusted_normal_proposal_expected_seq_ids": [4, 6],
+            "ready_eager_proposal_state_by_id": {"202": "CONSUMED_APPLIED"},
         }
     )
     return record
@@ -590,6 +731,7 @@ def run_synthetic_tests() -> None:
         creation_record(),
         target_home_record(),
         applied_record(),
+        takeover_target_verify_record(),
         stale_pre_verify_record(),
         stale_base_overshot_record(),
         expired_record(),
@@ -645,6 +787,21 @@ def run_synthetic_tests() -> None:
     errors, _ = validate_records(invalid)
     assert any("must not run eager verify/apply" in error for error in errors), (
         "checker missed forbidden eager verify dry-run"
+    )
+
+    invalid = [creation_record(), deepcopy(takeover_target_verify_record())]
+    invalid[1]["missing_buffered_proposal_unexpected_seq_ids"] = [5]
+    invalid[1]["missing_buffered_proposal_seq_ids"] = [3, 5]
+    errors, _ = validate_records(invalid)
+    assert any("unexpected missing buffered normal proposals" in error for error in errors), (
+        "checker missed unexpected missing normal proposal"
+    )
+
+    invalid = [creation_record(), deepcopy(takeover_target_verify_record())]
+    invalid[1]["draft_eager_set"] = [3]
+    errors, _ = validate_records(invalid)
+    assert any("must not be treated as draft_eager_set" in error for error in errors), (
+        "checker missed target eager takeover mixed with draft eager candidates"
     )
 
     invalid = [creation_record(), applied_record(), applied_record()]

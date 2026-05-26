@@ -814,6 +814,37 @@ class ModelRunnerBase:
             "lane_exclusion_apply_reason_by_proposal_id": dict(
                 step_plan.lane_exclusion_apply_reason_by_proposal_id
             ),
+            "raw_target_home_set_for_normal_verify": list(
+                step_plan.raw_target_home_set_for_normal_verify or step_plan.target_home_set
+            ),
+            "target_normal_verify_seq_ids": list(
+                step_plan.target_normal_verify_ids()
+                if hasattr(step_plan, "target_normal_verify_ids")
+                else (step_plan.target_normal_verify_seq_ids or step_plan.target_home_set)
+            ),
+            "target_eager_verify_seq_ids_dry_run": list(step_plan.target_eager_verify_seq_ids_dry_run),
+            "target_eager_verify_proposal_ids_dry_run": list(
+                step_plan.target_eager_verify_proposal_ids_dry_run
+            ),
+            "target_eager_verify_reason_by_seq_id_dry_run": dict(
+                step_plan.target_eager_verify_reason_by_seq_id_dry_run
+            ),
+            "excluded_from_target_normal_verify_for_eager_dry_run": list(
+                step_plan.excluded_from_target_normal_verify_for_eager_dry_run
+            ),
+            "missing_normal_proposal_allowed_by_eager_dry_run": bool(
+                step_plan.missing_normal_proposal_allowed_by_eager_dry_run
+            ),
+            "missing_normal_proposal_allowed_seq_ids_dry_run": list(
+                step_plan.missing_normal_proposal_allowed_seq_ids_dry_run
+            ),
+            "missing_buffered_proposal_seq_ids": list(step_plan.missing_buffered_proposal_seq_ids),
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": list(
+                step_plan.missing_buffered_proposal_allowed_by_eager_seq_ids
+            ),
+            "missing_buffered_proposal_unexpected_seq_ids": list(
+                step_plan.missing_buffered_proposal_unexpected_seq_ids
+            ),
             "eager_schedule_step_id": None,
             "eager_schedule_plan_id": None,
             "target_eager_set_dry_run": list(step_plan.target_eager_set_dry_run),
@@ -1112,6 +1143,11 @@ class ModelRunnerBase:
             for seq_id in (plan.actual_draft_home_set_for_normal_draft or plan.draft_home_set)
         ]
 
+    def _target_normal_verify_seq_ids(self, plan: StepPlan) -> list[int]:
+        if hasattr(plan, "target_normal_verify_ids"):
+            return [int(seq_id) for seq_id in plan.target_normal_verify_ids()]
+        return [int(seq_id) for seq_id in (plan.target_normal_verify_seq_ids or plan.target_home_set)]
+
     def _lane_exclusion_step_id_before_plan(self) -> int:
         return int(self.dual_batch_manager.step_id)
 
@@ -1325,6 +1361,9 @@ class ModelRunnerBase:
         seq_by_id = {int(seq.seq_id): seq for seq in target_seqs}
         running_seq_ids = {int(seq.seq_id) for seq in self.scheduler.running}
         pending_eager_seq_ids = self._pending_eager_seq_ids()
+        target_eager_takeover_seq_ids = {
+            int(seq_id) for seq_id in getattr(plan, "target_eager_verify_seq_ids_dry_run", [])
+        }
 
         plan.eager_candidate_seq_ids = list(target_seq_ids)
         plan.eager_skipped_not_in_target_home_set_seq_ids = []
@@ -1348,6 +1387,8 @@ class ModelRunnerBase:
                 reason = "finished"
             elif seq_id in plan.eager_active_seq_ids:
                 reason = "already_eager_active"
+            elif seq_id in target_eager_takeover_seq_ids:
+                reason = "target_eager_verify_takeover"
             elif seq_id in pending_eager_seq_ids:
                 reason = "pending_eager_proposal"
             elif bool(seq.pre_verify):
@@ -1431,7 +1472,20 @@ class ModelRunnerBase:
         self._apply_eager_plan_dry_run(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
-        buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
+        allowed_missing = sorted(
+            set(raw_buffer_inspect["miss_seq_ids"])
+            & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
+        )
+        unexpected_missing = sorted(set(raw_buffer_inspect["miss_seq_ids"]) - set(allowed_missing))
+        plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
+        plan.missing_buffered_proposal_seq_ids = [int(seq_id) for seq_id in raw_buffer_inspect["miss_seq_ids"]]
+        plan.missing_buffered_proposal_allowed_by_eager_seq_ids = [int(seq_id) for seq_id in allowed_missing]
+        plan.missing_buffered_proposal_unexpected_seq_ids = [int(seq_id) for seq_id in unexpected_missing]
+        plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(allowed_missing)
+        plan.missing_normal_proposal_allowed_seq_ids_dry_run = [int(seq_id) for seq_id in allowed_missing]
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
         plan.proposal_buffer_requested_seq_ids = buffer_inspect["requested_seq_ids"]
@@ -1531,7 +1585,13 @@ class ModelRunnerBase:
             f"draft_home_set={plan.draft_home_set}, original_draft_home_set="
             f"{plan.original_draft_home_set}, actual_draft_home_set_for_normal_draft="
             f"{self._actual_normal_draft_seq_ids(plan)}, buffered_proposal_seq_ids="
-            f"{self.dual_proposal_buffer.pending_seq_ids()}"
+            f"{self.dual_proposal_buffer.pending_seq_ids()}, target_normal_verify_seq_ids="
+            f"{self._target_normal_verify_seq_ids(plan)}, target_eager_verify_seq_ids_dry_run="
+            f"{getattr(plan, 'target_eager_verify_seq_ids_dry_run', [])}, "
+            f"missing_buffered_proposal_allowed_by_eager_seq_ids="
+            f"{getattr(plan, 'missing_buffered_proposal_allowed_by_eager_seq_ids', [])}, "
+            f"missing_buffered_proposal_unexpected_seq_ids="
+            f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}"
         )
 
     def _update_lane_exclusion_proposal_trace(
@@ -1570,6 +1630,35 @@ class ModelRunnerBase:
             )
         trace_record["excluded_from_actual_draft_home_for_eager"] = list(excluded_seq_ids)
         trace_record["lane_excluded_seq_ids"] = list(excluded_seq_ids)
+        trace_record["raw_target_home_set_for_normal_verify"] = list(
+            plan.raw_target_home_set_for_normal_verify or plan.target_home_set
+        )
+        trace_record["target_normal_verify_seq_ids"] = self._target_normal_verify_seq_ids(plan)
+        trace_record["target_eager_verify_seq_ids_dry_run"] = list(
+            plan.target_eager_verify_seq_ids_dry_run
+        )
+        trace_record["target_eager_verify_proposal_ids_dry_run"] = list(
+            plan.target_eager_verify_proposal_ids_dry_run
+        )
+        trace_record["target_eager_verify_reason_by_seq_id_dry_run"] = dict(
+            plan.target_eager_verify_reason_by_seq_id_dry_run
+        )
+        trace_record["excluded_from_target_normal_verify_for_eager_dry_run"] = list(
+            plan.excluded_from_target_normal_verify_for_eager_dry_run
+        )
+        trace_record["missing_normal_proposal_allowed_by_eager_dry_run"] = bool(
+            plan.missing_normal_proposal_allowed_by_eager_dry_run
+        )
+        trace_record["missing_normal_proposal_allowed_seq_ids_dry_run"] = list(
+            plan.missing_normal_proposal_allowed_seq_ids_dry_run
+        )
+        trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
+        trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
+            plan.missing_buffered_proposal_allowed_by_eager_seq_ids
+        )
+        trace_record["missing_buffered_proposal_unexpected_seq_ids"] = list(
+            plan.missing_buffered_proposal_unexpected_seq_ids
+        )
         trace_record["normal_proposal_expected_seq_ids_after_lane_exclusion"] = list(expected_seq_ids)
         trace_record["adjusted_normal_proposal_expected_seq_ids"] = list(expected_seq_ids)
         trace_record["normal_proposal_sent_seq_ids_after_lane_exclusion"] = list(sent_seq_ids)
@@ -4788,7 +4877,11 @@ class DraftModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
-        target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "draft_apply_verify")
+        target_seqs = self._resolve_dual_seq_ids(
+            self._target_normal_verify_seq_ids(plan),
+            plan,
+            "draft_apply_verify",
+        )
         normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         draft_seqs = self._resolve_dual_seq_ids(normal_draft_seq_ids, plan, "dual_draft")
         eager_draft_seqs = self._resolve_dual_seq_ids(
@@ -5009,7 +5102,8 @@ class TargetModelRunner(ModelRunnerBase):
 
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
-        target_seqs = self._resolve_dual_seq_ids(plan.target_home_set, plan, "dual_verify")
+        target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
+        target_seqs = self._resolve_dual_seq_ids(target_normal_seq_ids, plan, "dual_verify")
         draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         target_seq_ids = [seq.seq_id for seq in target_seqs]
         fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"

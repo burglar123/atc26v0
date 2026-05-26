@@ -189,6 +189,7 @@ class ReadyEagerProposal:
     tokens_digest: int | None = None
     state: str = READY_EAGER_STATE_READY
     max_ready_proposal_age: int = READY_EAGER_DEFAULT_MAX_AGE
+    takeover_routed_step_id: int | None = None
 
     def __post_init__(self):
         self.proposal_id = int(self.proposal_id)
@@ -210,6 +211,8 @@ class ReadyEagerProposal:
             self.seq_epoch = int(self.seq_epoch)
         if self.tokens_digest is not None:
             self.tokens_digest = int(self.tokens_digest)
+        if self.takeover_routed_step_id is not None:
+            self.takeover_routed_step_id = int(self.takeover_routed_step_id)
         if self.state not in READY_EAGER_PROPOSAL_STATES:
             raise ValueError(f"invalid ready eager proposal state={self.state!r}")
         self.max_ready_proposal_age = int(self.max_ready_proposal_age)
@@ -268,6 +271,19 @@ class ReadyEagerProposalRegistry:
     def ready_ids(self) -> list[int]:
         return [int(proposal.proposal_id) for proposal in self.ready()]
 
+    def pending_takeover_for_target(self, target_seq_ids: Iterable[int]) -> list[ReadyEagerProposal]:
+        target_seq_id_set = {int(seq_id) for seq_id in target_seq_ids}
+        return sorted(
+            [
+                proposal
+                for proposal in self._proposals.values()
+                if proposal.state == READY_EAGER_STATE_CONSUMED_APPLIED
+                and proposal.takeover_routed_step_id is None
+                and int(proposal.seq_id) in target_seq_id_set
+            ],
+            key=lambda proposal: (int(proposal.seq_id), int(proposal.proposal_id)),
+        )
+
     def get_ready_for_seq(self, seq_id: int) -> list[ReadyEagerProposal]:
         seq_id = int(seq_id)
         return [
@@ -301,6 +317,12 @@ class ReadyEagerProposalRegistry:
         if proposal is not None:
             proposal.state = state
         self._outbox.pop(int(proposal_id), None)
+        return proposal
+
+    def mark_takeover_routed(self, proposal_id: int, step_id: int) -> ReadyEagerProposal | None:
+        proposal = self._proposals.get(int(proposal_id))
+        if proposal is not None:
+            proposal.takeover_routed_step_id = int(step_id)
         return proposal
 
     def pop_outbox(self) -> list[ReadyEagerProposal]:
@@ -1082,9 +1104,27 @@ class DualBatchManager:
         seq_by_id = {int(seq.seq_id): seq for seq in (running_seqs or [])}
         ready_proposals = self.ready_eager_proposals.ready()
         ready_proposal_ids = [int(proposal.proposal_id) for proposal in ready_proposals]
+        takeover_proposals = self.ready_eager_proposals.pending_takeover_for_target(plan.target_home_set)
+        takeover_seq_ids = [int(proposal.seq_id) for proposal in takeover_proposals]
+        takeover_proposal_ids = [int(proposal.proposal_id) for proposal in takeover_proposals]
 
         plan.enable_eager_lane_exclusion_dry_run = True
         plan.eager_lane_exclusion_dry_run_enabled = True
+        plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
+        plan.target_eager_verify_seq_ids_dry_run = list(takeover_seq_ids)
+        plan.target_eager_verify_proposal_ids_dry_run = list(takeover_proposal_ids)
+        plan.target_eager_verify_reason_by_seq_id_dry_run = {
+            int(proposal.seq_id): "ready_eager_takeover_for_target_normal_verify"
+            for proposal in takeover_proposals
+        }
+        plan.excluded_from_target_normal_verify_for_eager_dry_run = list(takeover_seq_ids)
+        plan.target_normal_verify_seq_ids = [
+            int(seq_id) for seq_id in plan.target_home_set if int(seq_id) not in set(takeover_seq_ids)
+        ]
+        plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(takeover_seq_ids)
+        plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(takeover_seq_ids)
+        for proposal in takeover_proposals:
+            self.ready_eager_proposals.mark_takeover_routed(proposal.proposal_id, current_step_id)
         plan.original_draft_home_set = list(original_draft_home)
         plan.actual_draft_home_set_for_normal_draft = list(original_draft_home)
         plan.adjusted_draft_home_set_dry_run = list(original_draft_home)
@@ -1128,6 +1168,11 @@ class DualBatchManager:
         plan.ready_eager_proposal_current_status_by_id = {}
 
         if not ready_proposals:
+            if takeover_proposals:
+                plan.ready_eager_proposal_state_by_id = {
+                    int(proposal.proposal_id): proposal.state
+                    for proposal in takeover_proposals
+                }
             return
 
         applied_records: list[LaneExclusionApplyRecord] = []
@@ -1286,7 +1331,7 @@ class DualBatchManager:
         }
         plan.ready_eager_proposal_state_by_id = {
             int(proposal_id): self.ready_eager_proposals._proposals[int(proposal_id)].state
-            for proposal_id in ready_proposal_ids
+            for proposal_id in ready_proposal_ids + takeover_proposal_ids
             if int(proposal_id) in self.ready_eager_proposals._proposals
         }
 
@@ -1321,6 +1366,24 @@ class DualBatchManager:
         plan.lane_exclusion_apply_reason_by_proposal_id = {
             int(record.proposal_id): record.reason for record in applied_records
         }
+        existing_takeover_seq_ids = list(plan.target_eager_verify_seq_ids_dry_run)
+        existing_takeover_proposal_ids = list(plan.target_eager_verify_proposal_ids_dry_run)
+        for record in applied_records:
+            if int(record.seq_id) not in set(existing_takeover_seq_ids):
+                existing_takeover_seq_ids.append(int(record.seq_id))
+            if int(record.proposal_id) not in set(existing_takeover_proposal_ids):
+                existing_takeover_proposal_ids.append(int(record.proposal_id))
+            plan.target_eager_verify_reason_by_seq_id_dry_run[int(record.seq_id)] = record.reason
+        plan.target_eager_verify_seq_ids_dry_run = list(existing_takeover_seq_ids)
+        plan.target_eager_verify_proposal_ids_dry_run = list(existing_takeover_proposal_ids)
+        plan.excluded_from_target_normal_verify_for_eager_dry_run = list(existing_takeover_seq_ids)
+        plan.target_normal_verify_seq_ids = [
+            int(seq_id)
+            for seq_id in plan.raw_target_home_set_for_normal_verify or plan.target_home_set
+            if int(seq_id) not in set(existing_takeover_seq_ids)
+        ]
+        plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(existing_takeover_seq_ids)
+        plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(existing_takeover_seq_ids)
         plan.eager_schedule_dry_run_enabled = True
         plan.eager_lane_exclusion_proposal_ids = list(proposal_ids)
         plan.eager_lane_exclusion_seq_ids = list(excluded_seq_ids)
@@ -1332,7 +1395,7 @@ class DualBatchManager:
         plan.lane_exclusion_dry_run_done_seq_ids = list(excluded_seq_ids)
         plan.ready_eager_proposal_state_by_id = {
             int(proposal_id): self.ready_eager_proposals._proposals[int(proposal_id)].state
-            for proposal_id in ready_proposal_ids
+            for proposal_id in ready_proposal_ids + takeover_proposal_ids
             if int(proposal_id) in self.ready_eager_proposals._proposals
         }
 
@@ -1412,6 +1475,8 @@ class DualBatchManager:
             iteration_id=iteration_id,
             execution_mode=execution_mode,
             target_home_set=target_home_set,
+            target_normal_verify_seq_ids=list(target_home_set),
+            raw_target_home_set_for_normal_verify=list(target_home_set),
             target_eager_set=[],
             draft_home_set=draft_home_set,
             draft_eager_set=[],
