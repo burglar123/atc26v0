@@ -166,20 +166,27 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         verify_dry_run_allowed = (
             record.get("eager_verify_dry_run_source") == "phase1h5e3_takeover_lane"
         )
+        apply_dry_run_allowed = (
+            record.get("eager_apply_dry_run_source") == "phase1h5e3_takeover_lane"
+        )
         forbidden_dry_run_fields = [
-            "eager_apply_dry_run_enabled",
             "eager_result_transfer_dry_run_enabled",
             "eager_sync_apply_dry_run_enabled",
         ]
         if not verify_dry_run_allowed:
             forbidden_dry_run_fields.append("eager_verify_dry_run_enabled")
+        if not apply_dry_run_allowed:
+            forbidden_dry_run_fields.append("eager_apply_dry_run_enabled")
         forbidden_dry_run = [
             field for field in forbidden_dry_run_fields if bool(record.get(field, False))
         ]
         zero_only_fields = [
             field
             for field in ZERO_ONLY_DRY_RUN_FIELDS
-            if field != "eager_tokens_verify_dry_run" or not verify_dry_run_allowed
+            if (
+                (field != "eager_tokens_verify_dry_run" or not verify_dry_run_allowed)
+                and (field != "eager_tokens_apply_dry_run" or not apply_dry_run_allowed)
+            )
         ]
         nonzero_forbidden_tokens = [
             field for field in zero_only_fields if int_value(record.get(field), 0) != 0
