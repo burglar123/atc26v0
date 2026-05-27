@@ -111,6 +111,7 @@ class ModelRunnerBase:
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
+        self._decode_iteration_group = 0
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
         self.cached_kv_store = {}
@@ -453,8 +454,10 @@ class ModelRunnerBase:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
         record = {
+            "trace_type": "prefill" if is_prefill else "decode_iteration",
             "execution_mode": self.active_execution_mode,
             "decode_ready_mode": self.active_decode_ready_mode,
+            "decode_iteration_group": self._decode_iteration_group,
             "iteration_id": iteration_id,
             "batch_id": batch_id,
             "runner_role": runner_role,
@@ -475,6 +478,16 @@ class ModelRunnerBase:
             "accepted_tokens_per_seq": dict(per_seq_zeros),
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
+            "drafted_tokens_total": 0,
+            "rejected_tokens_by_request": {},
+            "slo_class_by_request": {
+                seq.request_id: getattr(seq, "slo_class", None)
+                for seq in seqs
+            },
+            "slo_tpot_ms_by_request": {
+                seq.request_id: getattr(seq, "slo_tpot_ms", None)
+                for seq in seqs
+            },
         }
         self.trace_records.append(record)
         return record
@@ -494,11 +507,21 @@ class ModelRunnerBase:
             record["per_seq_accepted_len"].update(accepted_lens)
             record["accepted_tokens_per_seq"].update(accepted_lens)
             record["total_accepted_tokens"] = sum(record["accepted_tokens_per_seq"].values())
+            # Compute rejected tokens: for PEARL, gamma tokens were drafted per seq;
+            # rejected = gamma - accepted for each seq that was verified.
+            gamma = getattr(self, "gamma", 4)
+            rejected = {}
+            for seq_id in accepted_lens:
+                # Only compute rejection for seq_ids in the current batch
+                if seq_id in record["scheduled_seq_ids"]:
+                    rejected[seq_id] = max(gamma - accepted_lens[seq_id], 0)
+            if rejected:
+                record["rejected_tokens_by_request"].update(rejected)
         if invalidated_lens:
             invalidated_lens = {seq_id: int(invalidated_len) for seq_id, invalidated_len in invalidated_lens.items()}
             record["per_seq_invalidated_predraft_len"].update(invalidated_lens)
 
-    def _mark_trace_end(self, record: dict, accepted_lens: dict[int, int] | None = None, invalidated_lens: dict[int, int] | None = None):
+    def _mark_trace_end(self, record: dict, accepted_lens: dict[int, int] | None = None, invalidated_lens: dict[int, int] | None = None, drafted_tokens: int = 0):
         if self.tp_params.local_rank == 0:
             now = time.time()
             key = "draft_end_ts" if self.is_draft else "verify_end_ts"
@@ -510,6 +533,8 @@ class ModelRunnerBase:
                 record["verify_time_ms"] = (record["verify_end_ts"] - record["verify_start_ts"]) * 1000
             if record["total_iteration_start_ts"] is not None:
                 record["total_iteration_time_ms"] = (now - record["total_iteration_start_ts"]) * 1000
+        if drafted_tokens:
+            record["drafted_tokens_total"] = record.get("drafted_tokens_total", 0) + drafted_tokens
         self._update_trace_token_stats(record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     def _service_metadata(self):
@@ -581,6 +606,7 @@ class ModelRunnerBase:
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
 
     def step(self):
+        self._decode_iteration_group += 1
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, self._runner_role())
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -1024,6 +1050,7 @@ class DraftModelRunner(ModelRunnerBase):
         return super().prepare_decode(seqs)
     
     def pearl_step(self):
+        self._decode_iteration_group += 1
         trace_record = None
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
@@ -1044,7 +1071,7 @@ class DraftModelRunner(ModelRunnerBase):
             # append the sample tokens to the seqs. Do not use postprocess to avoid early exiting when the draft tokens contain EOS.
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
-            self._mark_trace_end(trace_record)
+            self._mark_trace_end(trace_record, drafted_tokens=len(seqs))
 
         accepted_lens, invalidated_lens = self.verify(seqs)
         if trace_record is not None:
@@ -1058,6 +1085,7 @@ class DraftModelRunner(ModelRunnerBase):
         This disables draft/verify overlap without claiming vanilla serial
         speculative decoding equivalence.
         """
+        self._decode_iteration_group += 1
         trace_record = None
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
@@ -1075,7 +1103,7 @@ class DraftModelRunner(ModelRunnerBase):
 
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
-            self._mark_trace_end(trace_record)
+            self._mark_trace_end(trace_record, drafted_tokens=len(seqs))
 
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
@@ -1177,6 +1205,7 @@ class TargetModelRunner(ModelRunnerBase):
         return input_ids, positions, temp_seqs
 
     def pearl_step(self):
+        self._decode_iteration_group += 1
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, "verify")
         assert not is_prefill, "wrong match. current stage is prefill."
@@ -1199,6 +1228,7 @@ class TargetModelRunner(ModelRunnerBase):
         """
         # Global barrier pairs with DraftModelRunner.serialized_pearl_step().
         # Do not move this below target compute, or draft/verify will overlap.
+        self._decode_iteration_group += 1
         dist.barrier()
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")

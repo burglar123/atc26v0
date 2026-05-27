@@ -73,6 +73,127 @@ class Controller:
     def read_output(self):
         return self.read_payload(self.target_shm)
 
+    @staticmethod
+    def _merge_decode_iterations(traces):
+        """Merge per-step draft/verify records into consolidated decode-iteration records.
+
+        Groups records by ``decode_iteration_group`` and merges draft-phase timing
+        with verify-phase token statistics into a single record per logical iteration.
+        """
+        groups: dict = {}
+        for rec in traces:
+            if rec.get("is_prefill"):
+                continue
+            gid = rec.get("decode_iteration_group", -1)
+            if gid not in groups:
+                groups[gid] = {"draft": [], "verify": []}
+            role = rec.get("runner_role", "")
+            if "draft" in role:
+                groups[gid]["draft"].append(rec)
+            elif "verify" in role:
+                groups[gid]["verify"].append(rec)
+
+        merged = []
+        for gid in sorted(groups.keys()):
+            drafts = groups[gid]["draft"]
+            verifies = groups[gid]["verify"]
+            if not drafts and not verifies:
+                continue
+
+            # Use the verify record as the primary source for token stats.
+            primary = verifies[0] if verifies else drafts[-1]
+            mode = primary.get("execution_mode", "")
+
+            # Draft timing: span across all draft sub-records.
+            draft_starts = [r["draft_start_ts"] for r in drafts if r.get("draft_start_ts") is not None]
+            draft_ends = [r["draft_end_ts"] for r in drafts if r.get("draft_end_ts") is not None]
+            draft_start_ts = min(draft_starts) if draft_starts else None
+            draft_end_ts = max(draft_ends) if draft_ends else None
+            draft_time_ms = (draft_end_ts - draft_start_ts) * 1000.0 if (draft_start_ts is not None and draft_end_ts is not None) else 0.0
+
+            # Verify timing: from the verify record.
+            verify_start_ts = primary.get("verify_start_ts")
+            verify_end_ts = primary.get("verify_end_ts")
+            verify_time_ms = primary.get("verify_time_ms")
+            if verify_time_ms is None and verify_start_ts is not None and verify_end_ts is not None:
+                verify_time_ms = (verify_end_ts - verify_start_ts) * 1000.0
+            elif verify_time_ms is None:
+                verify_time_ms = 0.0
+
+            # Iteration span.
+            all_starts = [t for t in [draft_start_ts, verify_start_ts] if t is not None]
+            all_ends = [t for t in [draft_end_ts, verify_end_ts] if t is not None]
+            iter_start_ts = min(all_starts) if all_starts else None
+            iter_end_ts = max(all_ends) if all_ends else None
+            iter_time_ms = (iter_end_ts - iter_start_ts) * 1000.0 if (iter_start_ts is not None and iter_end_ts is not None) else 0.0
+
+            # Overlap (parallel_pearl only).
+            overlap_time_ms = 0.0
+            if "parallel_pearl" in mode and draft_start_ts is not None and verify_end_ts is not None:
+                overlap_start = max(draft_start_ts, verify_start_ts or 0)
+                overlap_end = min(draft_end_ts or float("inf"), verify_end_ts or float("inf"))
+                if overlap_end > overlap_start:
+                    overlap_time_ms = (overlap_end - overlap_start) * 1000.0
+
+            # Token stats: aggregate across all draft records + use verify record's stats.
+            drafted_tokens_total = sum(r.get("drafted_tokens_total", 0) for r in drafts)
+            accepted_tokens_total = primary.get("total_accepted_tokens", 0)
+            verified_tokens_total = drafted_tokens_total if drafted_tokens_total > 0 else (
+                primary.get("num_seqs_in_batch", 0) * 4  # fallback: gamma * batch
+            )
+
+            # Per-request maps: prefer verify side (has accepted + rejected),
+            # fall back to draft side for slo info.
+            accepted_by_req = primary.get("accepted_tokens_per_seq", {})
+            rejected_by_req = primary.get("rejected_tokens_by_request", {})
+            invalidated_by_req = primary.get("per_seq_invalidated_predraft_len", {})
+            slo_class_by_req = primary.get("slo_class_by_request", {})
+            slo_tpot_by_req = primary.get("slo_tpot_ms_by_request", {})
+            # Fill SLO info from draft records if verify side is missing them.
+            if not slo_class_by_req and drafts:
+                slo_class_by_req = drafts[-1].get("slo_class_by_request", {})
+            if not slo_tpot_by_req and drafts:
+                slo_tpot_by_req = drafts[-1].get("slo_tpot_ms_by_request", {})
+
+            # Map seq_ids to request_ids.
+            seq_to_req = {}
+            for r in drafts + verifies:
+                for sid, rid in zip(r.get("scheduled_seq_ids", []), r.get("request_ids", [])):
+                    seq_to_req[str(sid)] = rid
+
+            def _seq_to_req(d):
+                return {seq_to_req.get(str(k), str(k)): v for k, v in d.items()}
+
+            merged.append({
+                "trace_type": "decode_iteration",
+                "execution_mode": mode,
+                "decode_ready_mode": primary.get("decode_ready_mode", False),
+                "decode_iteration_group": gid,
+                "iteration_id": primary.get("iteration_id"),
+                "active_batch_size": primary.get("num_seqs_in_batch", 0),
+                "active_request_ids": primary.get("request_ids", []),
+                "draft_start_ts": draft_start_ts,
+                "draft_end_ts": draft_end_ts,
+                "draft_time_ms": draft_time_ms,
+                "verify_start_ts": verify_start_ts,
+                "verify_end_ts": verify_end_ts,
+                "verify_time_ms": verify_time_ms,
+                "iter_start_ts": iter_start_ts,
+                "iter_end_ts": iter_end_ts,
+                "iter_time_ms": iter_time_ms,
+                "draft_verify_overlap_ms": overlap_time_ms,
+                "drafted_tokens_total": drafted_tokens_total,
+                "verified_tokens_total": verified_tokens_total,
+                "accepted_tokens_total": accepted_tokens_total,
+                "accepted_tokens_by_request": _seq_to_req(accepted_by_req),
+                "rejected_tokens_by_request": _seq_to_req(rejected_by_req),
+                "invalidated_predraft_tokens_by_request": _seq_to_req(invalidated_by_req),
+                "slo_class_by_request": _seq_to_req(slo_class_by_req),
+                "slo_tpot_ms_by_request": _seq_to_req(slo_tpot_by_req),
+            })
+
+        return merged
+
     def read_all_traces(self):
         _, _, draft_traces, draft_requests = self.read_payload(self.draft_shm)
         _, _, target_traces, target_requests = self.read_payload(self.target_shm)
@@ -86,6 +207,10 @@ class Controller:
                 record.get("iteration_id", -1),
             )
         )
+        # Merge per-step records into consolidated decode-iteration records.
+        merged = self._merge_decode_iterations(traces)
+        if merged:
+            traces = traces + merged
         requests = {req["seq_id"]: req for req in draft_requests + target_requests}.values()
         return traces, list(requests)
 
