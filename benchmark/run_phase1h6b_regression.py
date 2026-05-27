@@ -16,7 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark.check_eager_commit_ready_only import load_trace, validate_records  # noqa: E402
+from benchmark.check_eager_commit_ready_only import load_trace  # noqa: E402
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -103,8 +104,9 @@ CASE_PRESETS: dict[str, RegressionCase] = {
 
 
 REAL_COMMIT_CHECKERS = [
-    "benchmark/check_eager_commit_ready_only.py",
-    "benchmark/check_multislo_result.py",
+    ("benchmark/check_eager_commit_ready_only.py", "trace"),
+    ("benchmark/check_multislo_result.py", "result"),
+    ("benchmark/check_eager_performance_accounting.py", "trace_result"),
 ]
 
 DRY_RUN_CHECKERS = [
@@ -215,26 +217,51 @@ def eval_command(
     return command
 
 
-def checker_command(args: argparse.Namespace, checker: str, path: Path) -> list[str]:
-    return [args.python, checker, str(path)]
+def checker_command(args: argparse.Namespace, checker: str, *paths: Path) -> list[str]:
+    return [args.python, checker, *(str(path) for path in paths)]
 
 
-def load_commit_summary(engine_trace: Path) -> dict[str, Any]:
+def load_accounting_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
     records = load_trace(engine_trace)
-    errors, summary = validate_records(records)
-    selected_keys = [
-        "committed_proposal_count",
-        "committed_token_count",
-        "target_actual_eager_verified_token_increment_sum",
-        "target_actual_eager_accepted_token_increment_sum",
-        "skipped_proposal_count",
-        "skip_reason_counts",
-        "repeated_commit_proposal_ids",
-        "missing_buffered_proposal_unexpected_count",
-    ]
-    compact = {key: summary.get(key) for key in selected_keys}
-    compact["checker_error_count"] = len(errors)
-    return compact
+    result_payload = load_json(result_json) if result_json.exists() else {}
+    accounting = aggregate_performance_accounting(records, result_payload)
+    return {
+        "committed_proposal_count": accounting.get("eager_committed_proposal_count"),
+        "committed_token_count": accounting.get("eager_committed_token_count"),
+        "candidate_proposal_count": accounting.get("eager_candidate_proposal_count"),
+        "candidate_token_count": accounting.get("eager_candidate_token_count"),
+        "commit_rate_by_proposal": accounting.get("eager_commit_rate_by_proposal"),
+        "commit_rate_by_token": accounting.get("eager_commit_rate_by_token"),
+        "target_actual_eager_verified_token_increment_sum": accounting.get(
+            "target_actual_eager_verified_token_increment_sum"
+        ),
+        "target_actual_eager_accepted_token_increment_sum": accounting.get(
+            "target_actual_eager_accepted_token_increment_sum"
+        ),
+        "skipped_proposal_count": accounting.get("eager_skipped_proposal_count"),
+        "skip_reason_counts": accounting.get("eager_skip_reason_counts"),
+        "repeated_commit_proposal_ids": accounting.get("repeated_commit_proposal_ids"),
+        "missing_buffered_proposal_unexpected_count": accounting.get(
+            "missing_buffered_proposal_unexpected_count"
+        ),
+        "engine_elapsed_s": accounting.get("engine_elapsed_s"),
+        "goodput_tokens_per_s": accounting.get("goodput_tokens_per_s"),
+        "mean_tpot_ms": accounting.get("mean_tpot_ms"),
+        "normal_draft_token_slots_suppressed": accounting.get("normal_draft_token_slots_suppressed"),
+        "target_normal_verify_token_slots_replaced_by_eager": accounting.get(
+            "target_normal_verify_token_slots_replaced_by_eager"
+        ),
+        "eager_proposal_transfer_payload_bytes": accounting.get("eager_proposal_transfer_payload_bytes"),
+        "eager_result_transfer_payload_bytes": accounting.get("eager_result_transfer_payload_bytes"),
+        "eager_proposal_transfer_payload_len_units": accounting.get(
+            "eager_proposal_transfer_payload_len_units"
+        ),
+        "eager_result_transfer_payload_len_units": accounting.get(
+            "eager_result_transfer_payload_len_units"
+        ),
+        "timing_available": accounting.get("timing_available"),
+        "total_eager_overhead_time_ms": accounting.get("total_eager_overhead_time_ms"),
+    }
 
 
 def run_real_case(
@@ -255,9 +282,13 @@ def run_real_case(
     )
     check_status = "eval_failed" if status else "pass"
     if status == 0:
-        for checker in REAL_COMMIT_CHECKERS:
-            path = result_json if checker.endswith("check_multislo_result.py") else engine_trace
-            checker_status = run_command(checker_command(args, checker, path), env, args.print_only)
+        for checker, input_kind in REAL_COMMIT_CHECKERS:
+            if input_kind == "result":
+                checker_status = run_command(checker_command(args, checker, result_json), env, args.print_only)
+            elif input_kind == "trace_result":
+                checker_status = run_command(checker_command(args, checker, engine_trace, result_json), env, args.print_only)
+            else:
+                checker_status = run_command(checker_command(args, checker, engine_trace), env, args.print_only)
             if checker_status != 0:
                 status = checker_status
                 check_status = f"failed:{checker}"
@@ -271,7 +302,7 @@ def run_real_case(
         "check_status": check_status,
     }
     if status == 0 and not args.print_only and engine_trace.exists():
-        row.update(load_commit_summary(engine_trace))
+        row.update(load_accounting_summary(engine_trace, result_json))
     return status, row
 
 
@@ -343,7 +374,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-model")
     parser.add_argument("--target-model")
     parser.add_argument("--workload-in")
-    parser.add_argument("--out-root", default="results/multislo/phase1h6b")
+    parser.add_argument("--out-root", default="results/multislo/phase1h6b_regression")
     parser.add_argument("--cases", default="baseline", help="Comma-separated preset names, or all.")
     parser.add_argument("--list-cases", action="store_true")
     parser.add_argument("--python", default=sys.executable)
@@ -431,7 +462,9 @@ def main() -> int:
             f"- {row['case_name']}: {row['check_status']} "
             f"committed={row.get('committed_proposal_count', 'n/a')} "
             f"tokens={row.get('committed_token_count', 'n/a')} "
-            f"target_verified={row.get('target_actual_eager_verified_token_increment_sum', 'n/a')}"
+            f"target_verified={row.get('target_actual_eager_verified_token_increment_sum', 'n/a')} "
+            f"rate_token={row.get('commit_rate_by_token', 'n/a')} "
+            f"goodput={row.get('goodput_tokens_per_s', 'n/a')}"
         )
     return status
 

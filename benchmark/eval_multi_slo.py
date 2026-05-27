@@ -1285,6 +1285,35 @@ def maybe_dump_engine_trace(engine: PEARLEngine, path: Optional[str]) -> None:
         print(f"[WARN] engine.dump_traces_json({path}) failed: {exc}")
 
 
+def build_eager_performance_accounting(
+    engine: PEARLEngine,
+    result_args: Dict[str, Any],
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        from benchmark.check_eager_performance_accounting import (
+            aggregate_performance_accounting,
+            trace_payload_to_records,
+        )
+
+        trace_payload = try_get_traces(engine)
+        records = trace_payload_to_records(trace_payload)
+        return aggregate_performance_accounting(
+            records,
+            {
+                "args": result_args,
+                "metrics": metrics,
+            },
+        )
+    except Exception as exc:
+        return {
+            "accounting_available": False,
+            "accounting_error": str(exc),
+            "timing_available": False,
+            "missing_timing_reason": "not_instrumented",
+        }
+
+
 def run_generation(
     engine: PEARLEngine,
     execution_mode: str,
@@ -1769,11 +1798,17 @@ def main() -> None:
         write_trace_export(args.trace_out, evaluated_rows, args)
 
         result_args = {key: value for key, value in vars(args).items() if not key.startswith("_")}
+        eager_performance_accounting = build_eager_performance_accounting(
+            engine=engine,
+            result_args=result_args,
+            metrics=metrics,
+        )
 
         result: Dict[str, Any] = {
             "args": result_args,
             "workload_meta": workload_meta,
             "metrics": metrics,
+            "eager_performance_accounting": eager_performance_accounting,
             "num_tokens": num_tokens,
             "num_acc_tokens": num_acc_tokens,
             "traces": evaluated_rows,
