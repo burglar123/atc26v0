@@ -232,6 +232,20 @@ def load_accounting_summary(engine_trace: Path, result_json: Path) -> dict[str, 
         "candidate_token_count": accounting.get("eager_candidate_token_count"),
         "commit_rate_by_proposal": accounting.get("eager_commit_rate_by_proposal"),
         "commit_rate_by_token": accounting.get("eager_commit_rate_by_token"),
+        "committed_token_share_of_output": accounting.get("committed_token_share_of_output"),
+        "candidate_token_share_of_output": accounting.get("candidate_token_share_of_output"),
+        "suppressed_slots_per_committed_token": accounting.get(
+            "suppressed_slots_per_committed_token"
+        ),
+        "replaced_slots_per_committed_token": accounting.get(
+            "replaced_slots_per_committed_token"
+        ),
+        "proposal_payload_len_units_per_committed_token": accounting.get(
+            "proposal_payload_len_units_per_committed_token"
+        ),
+        "result_payload_len_units_per_committed_token": accounting.get(
+            "result_payload_len_units_per_committed_token"
+        ),
         "target_actual_eager_verified_token_increment_sum": accounting.get(
             "target_actual_eager_verified_token_increment_sum"
         ),
@@ -261,6 +275,7 @@ def load_accounting_summary(engine_trace: Path, result_json: Path) -> dict[str, 
         ),
         "timing_available": accounting.get("timing_available"),
         "total_eager_overhead_time_ms": accounting.get("total_eager_overhead_time_ms"),
+        "performance_warnings": accounting.get("performance_warnings", []),
     }
 
 

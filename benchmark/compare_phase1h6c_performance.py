@@ -23,14 +23,21 @@ TABLE_COLUMNS = [
     "engine_elapsed_s",
     "total_output_tokens",
     "goodput_tokens_per_s",
+    "goodput_ratio_eager_vs_baseline",
     "mean_tpot_ms",
+    "mean_tpot_ratio_eager_vs_baseline",
     "committed_tokens",
     "committed_proposals",
+    "committed_token_share_of_output",
     "commit_rate_token",
     "commit_rate_proposal",
     "normal_draft_slots_suppressed",
     "target_verify_slots_replaced",
+    "suppressed_slots_per_committed_token",
+    "replaced_slots_per_committed_token",
     "transfer_payload_bytes",
+    "proposal_payload_len_units_per_committed_token",
+    "result_payload_len_units_per_committed_token",
     "overhead_time_ms",
     "notes",
 ]
@@ -56,9 +63,31 @@ def accounting_from_inputs(
     return {**accounting, "accounting_source": "result_metrics_only"}
 
 
-def compact_row(case_name: str, accounting: dict[str, Any]) -> dict[str, Any]:
+def safe_ratio(numerator: Any, denominator: Any) -> float:
+    try:
+        numerator = float(numerator or 0.0)
+        denominator = float(denominator or 0.0)
+    except Exception:
+        return 0.0
+    return numerator / denominator if denominator else 0.0
+
+
+def compact_row(
+    case_name: str,
+    accounting: dict[str, Any],
+    baseline_accounting: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     transfer_payload_bytes = int(accounting.get("eager_proposal_transfer_payload_bytes") or 0) + int(
         accounting.get("eager_result_transfer_payload_bytes") or 0
+    )
+    baseline_accounting = baseline_accounting or accounting
+    goodput_ratio = safe_ratio(
+        accounting.get("goodput_tokens_per_s"),
+        baseline_accounting.get("goodput_tokens_per_s"),
+    )
+    tpot_ratio = safe_ratio(
+        accounting.get("mean_tpot_ms"),
+        baseline_accounting.get("mean_tpot_ms"),
     )
     notes: list[str] = []
     if not accounting.get("payload_bytes_available", False):
@@ -74,14 +103,27 @@ def compact_row(case_name: str, accounting: dict[str, Any]) -> dict[str, Any]:
         "engine_elapsed_s": accounting.get("engine_elapsed_s", 0.0),
         "total_output_tokens": accounting.get("total_output_tokens", 0),
         "goodput_tokens_per_s": accounting.get("goodput_tokens_per_s", 0.0),
+        "goodput_ratio_eager_vs_baseline": goodput_ratio,
         "mean_tpot_ms": accounting.get("mean_tpot_ms", 0.0),
+        "mean_tpot_ratio_eager_vs_baseline": tpot_ratio,
         "committed_tokens": accounting.get("eager_committed_token_count", 0),
         "committed_proposals": accounting.get("eager_committed_proposal_count", 0),
+        "committed_token_share_of_output": accounting.get("committed_token_share_of_output", 0.0),
         "commit_rate_token": accounting.get("eager_commit_rate_by_token", 0.0),
         "commit_rate_proposal": accounting.get("eager_commit_rate_by_proposal", 0.0),
         "normal_draft_slots_suppressed": accounting.get("normal_draft_token_slots_suppressed", 0),
         "target_verify_slots_replaced": accounting.get("target_normal_verify_token_slots_replaced_by_eager", 0),
+        "suppressed_slots_per_committed_token": accounting.get("suppressed_slots_per_committed_token", 0.0),
+        "replaced_slots_per_committed_token": accounting.get("replaced_slots_per_committed_token", 0.0),
         "transfer_payload_bytes": transfer_payload_bytes,
+        "proposal_payload_len_units_per_committed_token": accounting.get(
+            "proposal_payload_len_units_per_committed_token",
+            0.0,
+        ),
+        "result_payload_len_units_per_committed_token": accounting.get(
+            "result_payload_len_units_per_committed_token",
+            0.0,
+        ),
         "overhead_time_ms": accounting.get("total_eager_overhead_time_ms", 0.0),
         "notes": ",".join(notes) if notes else "ok",
     }
@@ -123,9 +165,14 @@ def main() -> int:
     if args.dryrun_json:
         cases.append(("dryrun", args.dryrun_json, args.dryrun_trace))
 
-    rows = [
-        compact_row(case_name, accounting_from_inputs(result_path, trace_path))
+    accountings = [
+        (case_name, accounting_from_inputs(result_path, trace_path))
         for case_name, result_path, trace_path in cases
+    ]
+    baseline_accounting = accountings[0][1]
+    rows = [
+        compact_row(case_name, accounting, baseline_accounting)
+        for case_name, accounting in accountings
     ]
     print_table(rows)
     if args.out:

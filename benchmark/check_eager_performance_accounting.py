@@ -37,6 +37,12 @@ PROPOSAL_LEN_MAP_KEYS = [
     "eager_transfer_proposal_len_by_proposal_id",
     "eager_schedule_proposal_len_by_proposal_id",
 ]
+DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
+DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
+
+
+def safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
@@ -152,6 +158,77 @@ def result_metrics(result_payload: dict[str, Any]) -> dict[str, Any]:
         "goodput_tokens_per_s": float_value(overall.get("goodput_tokens_per_s"), 0.0),
         "mean_tpot_ms": float_value(overall.get("mean_tpot_ms"), 0.0),
     }
+
+
+def add_derived_metrics(accounting: dict[str, Any]) -> dict[str, Any]:
+    total_output_tokens = int_value(accounting.get("total_output_tokens"), 0)
+    candidate_tokens = int_value(accounting.get("eager_candidate_token_count"), 0)
+    ready_tokens = int_value(accounting.get("eager_ready_token_count"), 0)
+    committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    suppressed_slots = int_value(accounting.get("normal_draft_token_slots_suppressed"), 0)
+    replaced_slots = int_value(accounting.get("target_normal_verify_token_slots_replaced_by_eager"), 0)
+    proposal_payload_units = int_value(accounting.get("eager_proposal_transfer_payload_len_units"), 0)
+    result_payload_units = int_value(accounting.get("eager_result_transfer_payload_len_units"), 0)
+    accounting.update(
+        {
+            "committed_token_share_of_output": safe_div(committed_tokens, total_output_tokens),
+            "candidate_token_share_of_output": safe_div(candidate_tokens, total_output_tokens),
+            "suppressed_slots_per_committed_token": safe_div(suppressed_slots, committed_tokens),
+            "replaced_slots_per_committed_token": safe_div(replaced_slots, committed_tokens),
+            "proposal_payload_len_units_per_committed_token": safe_div(
+                proposal_payload_units,
+                committed_tokens,
+            ),
+            "result_payload_len_units_per_committed_token": safe_div(
+                result_payload_units,
+                committed_tokens,
+            ),
+            "committed_tokens_per_candidate_token": safe_div(committed_tokens, candidate_tokens),
+            "ready_tokens_per_candidate_token": safe_div(ready_tokens, candidate_tokens),
+            "committed_tokens_per_ready_token": safe_div(committed_tokens, ready_tokens),
+        }
+    )
+    return accounting
+
+
+def performance_warnings(
+    accounting: dict[str, Any],
+    *,
+    low_committed_share_threshold: float = DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD,
+    high_payload_len_per_committed_token_threshold: float = (
+        DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD
+    ),
+    baseline_goodput_tokens_per_s: float | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    committed_share = float_value(accounting.get("committed_token_share_of_output"), 0.0)
+    if committed_tokens <= 0:
+        warnings.append("no_committed_tokens")
+    elif committed_share < low_committed_share_threshold:
+        warnings.append(
+            f"committed_token_share_below_{low_committed_share_threshold:g}"
+        )
+    if baseline_goodput_tokens_per_s is not None and baseline_goodput_tokens_per_s > 0:
+        eager_goodput = float_value(accounting.get("goodput_tokens_per_s"), 0.0)
+        if eager_goodput < baseline_goodput_tokens_per_s:
+            warnings.append("eager_goodput_below_baseline")
+    if not bool(accounting.get("timing_available", False)):
+        warnings.append("timing_unavailable")
+    if not bool(accounting.get("payload_bytes_available", False)):
+        warnings.append("payload_bytes_unavailable")
+    if (
+        committed_tokens > 0
+        and float_value(accounting.get("proposal_payload_len_units_per_committed_token"), 0.0)
+        > high_payload_len_per_committed_token_threshold
+    ):
+        warnings.append("proposal_payload_len_units_high_per_committed_token")
+    if (
+        committed_tokens > 0
+        and int_value(accounting.get("normal_draft_token_slots_suppressed"), 0) > committed_tokens
+    ):
+        warnings.append("suppressed_slots_exceed_committed_tokens")
+    return warnings
 
 
 def validate_result_sanity(result_payload: dict[str, Any]) -> list[str]:
@@ -424,12 +501,20 @@ def aggregate_performance_accounting(
         "commit_checker_error_count": 0,
         **timing_summary,
     }
+    accounting = add_derived_metrics(accounting)
+    accounting["performance_warnings"] = performance_warnings(accounting)
     return accounting
 
 
 def validate_accounting(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
+    *,
+    strict_performance: bool = False,
+    low_committed_share_threshold: float = DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD,
+    high_payload_len_per_committed_token_threshold: float = (
+        DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD
+    ),
 ) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     commit_errors, _commit_summary = validate_commit_records(records)
@@ -485,6 +570,14 @@ def validate_accounting(
         errors.append(f"duplicate commit proposal ids present: {accounting['repeated_commit_proposal_ids']}")
     if result_payload:
         errors.extend(validate_result_sanity(result_payload))
+    warnings = performance_warnings(
+        accounting,
+        low_committed_share_threshold=low_committed_share_threshold,
+        high_payload_len_per_committed_token_threshold=high_payload_len_per_committed_token_threshold,
+    )
+    accounting["performance_warnings"] = warnings
+    if strict_performance and warnings:
+        errors.append(f"strict performance warnings present: {warnings}")
     return errors, accounting
 
 
@@ -508,6 +601,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         "eager_commit_rate_by_token",
         "eager_full_accept_rate",
         "eager_partial_reject_rate",
+        "committed_token_share_of_output",
+        "candidate_token_share_of_output",
+        "suppressed_slots_per_committed_token",
+        "replaced_slots_per_committed_token",
+        "proposal_payload_len_units_per_committed_token",
+        "result_payload_len_units_per_committed_token",
+        "committed_tokens_per_candidate_token",
+        "ready_tokens_per_candidate_token",
+        "committed_tokens_per_ready_token",
         "normal_draft_seq_excluded_count",
         "normal_draft_token_slots_suppressed",
         "normal_proposal_missing_allowed_by_eager_count",
@@ -522,6 +624,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "timing_available",
         "missing_timing_reason",
         "total_eager_overhead_time_ms",
+        "performance_warnings",
         "repeated_commit_proposal_ids",
         "missing_buffered_proposal_unexpected_count",
     ]
@@ -622,6 +725,9 @@ def run_synthetic_tests() -> None:
     assert summary["eager_committed_token_count"] == 4
     assert summary["normal_draft_token_slots_suppressed"] == 8
     assert summary["target_normal_verify_token_slots_replaced_by_eager"] == 8
+    assert summary["committed_token_share_of_output"] == 4 / 64
+    assert summary["suppressed_slots_per_committed_token"] == 2.0
+    assert summary["proposal_payload_len_units_per_committed_token"] == 3.0
     assert summary["timing_available"] is False
     assert summary["missing_timing_reason"] == "not_instrumented"
 
@@ -648,6 +754,15 @@ def run_synthetic_tests() -> None:
     errors, _ = validate_accounting(records, invalid_result)
     assert any("observed_tpot" in error for error in errors), "missed result JSON sanity error"
 
+    errors, summary = validate_accounting(
+        records,
+        synthetic_result_payload(),
+        strict_performance=True,
+        low_committed_share_threshold=0.5,
+    )
+    assert any("strict performance warnings" in error for error in errors), "missed strict performance warning"
+    assert "committed_token_share_below_0.5" in summary["performance_warnings"]
+
     print("Synthetic eager performance accounting checks passed.")
 
 
@@ -656,6 +771,13 @@ def main() -> int:
     parser.add_argument("trace", nargs="?", type=Path, help="Engine trace JSON.")
     parser.add_argument("result", nargs="?", type=Path, help="Optional eval result JSON.")
     parser.add_argument("--synthetic", action="store_true", help="Run built-in synthetic checks.")
+    parser.add_argument("--strict-performance", action="store_true", help="Fail when diagnostic performance warnings fire.")
+    parser.add_argument("--low-committed-share-threshold", type=float, default=DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD)
+    parser.add_argument(
+        "--high-payload-len-per-committed-token-threshold",
+        type=float,
+        default=DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD,
+    )
     args = parser.parse_args()
 
     if args.synthetic or args.trace is None:
@@ -664,7 +786,13 @@ def main() -> int:
 
     records = load_trace(args.trace)
     result_payload = load_json(args.result) if args.result else {}
-    errors, summary = validate_accounting(records, result_payload)
+    errors, summary = validate_accounting(
+        records,
+        result_payload,
+        strict_performance=args.strict_performance,
+        low_committed_share_threshold=args.low_committed_share_threshold,
+        high_payload_len_per_committed_token_threshold=args.high_payload_len_per_committed_token_threshold,
+    )
     print_summary(summary)
     if errors:
         print("Errors:")
