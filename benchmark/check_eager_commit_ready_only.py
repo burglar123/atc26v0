@@ -82,10 +82,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     committed_ids_seen: set[int] = set()
     skipped_ids_seen: set[int] = set()
     candidate_ids_seen: set[int] = set()
+    readiness_ready_ids_seen: set[int] = set()
     committed_token_by_id_seen: dict[int, int] = {}
     committed_sides_by_id: dict[int, set[str]] = defaultdict(set)
     repeated_steps_by_side: dict[tuple[str, int], set[tuple[int, int]]] = defaultdict(set)
     skip_reason_by_id_seen: dict[int, str] = {}
+    committed_but_not_readiness_ready_ids: set[int] = set()
+    committed_non_full_accept_ids: set[int] = set()
     missing_unexpected_count = 0
     real_target_eager_nonempty_count = 0
     max_actual_verified_per_record = 0
@@ -143,12 +146,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         candidate_ids_seen.update(candidate_ids)
         committed_ids_seen.update(committed_ids)
         skipped_ids_seen.update(skipped_ids)
+        readiness_ready_ids_seen.update(readiness_ids)
         if committed_ids & skipped_ids:
             errors.append(f"record[{idx}] proposals both committed and skipped: {sorted(committed_ids & skipped_ids)}")
         if candidate_ids and not committed_ids <= candidate_ids:
             errors.append(f"record[{idx}] committed proposal outside commit candidates: {sorted(committed_ids - candidate_ids)}")
         if readiness_ids and not committed_ids <= readiness_ids:
-            errors.append(f"record[{idx}] committed proposal outside readiness-ready ids: {sorted(committed_ids - readiness_ids)}")
+            outside_readiness = committed_ids - readiness_ids
+            committed_but_not_readiness_ready_ids.update(outside_readiness)
+            errors.append(
+                f"record[{idx}] committed proposal outside readiness-ready ids: {sorted(outside_readiness)}"
+            )
         if not_ready_ids & committed_ids:
             errors.append(f"record[{idx}] not-ready proposals committed: {sorted(not_ready_ids & committed_ids)}")
         if record.get("eager_commit_duplicate_proposal_ids"):
@@ -188,6 +196,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             if action != FULL_ACCEPT_ACTION:
                 errors.append(f"record[{idx}] committed proposal_id={proposal_id} bad action={action!r}")
             if verify_result != "full_accept":
+                committed_non_full_accept_ids.add(proposal_id)
                 errors.append(f"record[{idx}] committed proposal_id={proposal_id} is not full_accept")
             if gamma > 0 and token_count != gamma:
                 errors.append(f"record[{idx}] committed proposal_id={proposal_id} token_count != gamma")
@@ -277,15 +286,25 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 continue
             counted_commit_events.add(event_key)
 
-    repeated_commit_proposal_ids = sorted(
+    repeated_commit_proposal_ids = sorted({
         proposal_id
         for (_side, proposal_id), step_keys in repeated_steps_by_side.items()
         if len(step_keys) > 1
-    )
+    })
     if repeated_commit_proposal_ids:
         errors.append(f"proposal committed more than once on one side: {repeated_commit_proposal_ids}")
-    if records_with_commit_enabled and not committed_ids_seen:
-        errors.append("eager commit-ready-only enabled but no proposals were committed")
+    if readiness_ready_ids_seen and not committed_ids_seen:
+        errors.append(
+            "eager commit-ready-only enabled and commit-ready proposals exist, "
+            f"but no proposals were committed: ready_ids={sorted(readiness_ready_ids_seen)}"
+        )
+    if readiness_ready_ids_seen and not committed_ids_seen <= readiness_ready_ids_seen:
+        outside_readiness = committed_ids_seen - readiness_ready_ids_seen
+        committed_but_not_readiness_ready_ids.update(outside_readiness)
+        errors.append(
+            "committed proposals were not found in any readiness-ready source: "
+            f"{sorted(outside_readiness)}"
+        )
     committed_token_count = sum(int(value) for value in committed_token_by_id_seen.values())
     missing_target_side = sorted(
         proposal_id for proposal_id, sides in committed_sides_by_id.items() if "target" not in sides
@@ -324,6 +343,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "records_with_eager_commit_enabled": records_with_commit_enabled,
         "commit_active_records": commit_active_records,
         "commit_candidate_proposal_count": len(candidate_ids_seen),
+        "commit_readiness_ready_proposal_count": len(readiness_ready_ids_seen),
         "committed_proposal_count": len(committed_ids_seen),
         "skipped_proposal_count": len(skipped_ids_seen),
         "committed_token_count": committed_token_count,
@@ -340,6 +360,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "max_eager_tokens_committed_per_record": max_committed_tokens_per_record,
         "skip_reason_counts": dict(skip_reason_counts),
         "repeated_commit_proposal_ids": repeated_commit_proposal_ids,
+        "committed_but_not_readiness_ready_proposal_ids": sorted(committed_but_not_readiness_ready_ids),
+        "committed_non_full_accept_proposal_ids": sorted(committed_non_full_accept_ids),
+        "missing_target_side_commit_proposal_ids": missing_target_side,
+        "missing_draft_side_commit_proposal_ids": missing_draft_side,
         "real_target_eager_non_empty_count": real_target_eager_nonempty_count,
         "missing_buffered_proposal_unexpected_count": missing_unexpected_count,
     }
@@ -352,6 +376,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "records_with_eager_commit_enabled",
         "commit_active_records",
         "commit_candidate_proposal_count",
+        "commit_readiness_ready_proposal_count",
         "committed_proposal_count",
         "skipped_proposal_count",
         "committed_token_count",
@@ -368,6 +393,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "max_eager_tokens_committed_per_record",
         "skip_reason_counts",
         "repeated_commit_proposal_ids",
+        "committed_but_not_readiness_ready_proposal_ids",
+        "committed_non_full_accept_proposal_ids",
+        "missing_target_side_commit_proposal_ids",
+        "missing_draft_side_commit_proposal_ids",
         "real_target_eager_non_empty_count",
         "missing_buffered_proposal_unexpected_count",
     ):
