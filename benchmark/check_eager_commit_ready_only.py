@@ -83,13 +83,24 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     skipped_ids_seen: set[int] = set()
     candidate_ids_seen: set[int] = set()
     committed_token_by_id_seen: dict[int, int] = {}
+    committed_sides_by_id: dict[int, set[str]] = defaultdict(set)
     repeated_steps_by_side: dict[tuple[str, int], set[tuple[int, int]]] = defaultdict(set)
-    skip_reason_counts: Counter[str] = Counter()
+    skip_reason_by_id_seen: dict[int, str] = {}
     missing_unexpected_count = 0
     real_target_eager_nonempty_count = 0
-    max_actual_verified = 0
-    max_actual_accepted = 0
-    max_committed_tokens = 0
+    max_actual_verified_per_record = 0
+    max_actual_accepted_per_record = 0
+    max_committed_tokens_per_record = 0
+    counted_commit_events: set[tuple[str, int, int, int]] = set()
+    counted_counter_records: set[tuple[str, int, int, tuple[int, ...]]] = set()
+    target_actual_verified_sum = 0
+    target_actual_accepted_sum = 0
+    target_actual_rejected_sum = 0
+    target_actual_invalidated_sum = 0
+    draft_actual_verified_sum = 0
+    draft_actual_accepted_sum = 0
+    draft_actual_rejected_sum = 0
+    draft_actual_invalidated_sum = 0
 
     for idx, record in enumerate(records):
         if not is_dual_record(record):
@@ -161,6 +172,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         seq_ids = as_int_list(record.get("eager_committed_seq_ids"))
         pid_to_seq = dict(zip(as_int_list(record.get("eager_committed_proposal_ids")), seq_ids))
         gamma = int_value(record.get("normal_gamma"), 0)
+        side = str(record.get("eager_commit_side", "unknown"))
+        step = int_value(record.get("eager_commit_step_id"), int_value(record.get("step_id"), -1))
+        plan = int_value(record.get("eager_commit_plan_id"), int_value(record.get("plan_id"), -1))
 
         for proposal_id in sorted(committed_ids):
             token_count = int_value(dict_get(token_by_id, proposal_id), -1)
@@ -193,17 +207,27 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                     errors.append(f"record[{idx}] target/draft length mismatch for seq_id={seq_id}")
                 if dict_get(token_match_by_seq, seq_id) is False:
                     errors.append(f"record[{idx}] target/draft token mismatch for seq_id={seq_id}")
+            previous_token_count = committed_token_by_id_seen.get(proposal_id)
+            if previous_token_count is not None and previous_token_count != token_count:
+                errors.append(
+                    f"record[{idx}] committed token count changed for proposal_id={proposal_id}: "
+                    f"old={previous_token_count}, new={token_count}"
+                )
             committed_token_by_id_seen[proposal_id] = token_count
-            side = str(record.get("eager_commit_side", "unknown"))
-            step = int_value(record.get("eager_commit_step_id"), int_value(record.get("step_id"), -1))
-            plan = int_value(record.get("eager_commit_plan_id"), int_value(record.get("plan_id"), -1))
+            committed_sides_by_id[proposal_id].add(side)
             repeated_steps_by_side[(side, proposal_id)].add((step, plan))
 
         for proposal_id in sorted(skipped_ids):
             reason = str(dict_get(reason_by_id, proposal_id, ""))
             if not reason:
                 errors.append(f"record[{idx}] skipped proposal_id={proposal_id} missing reason")
-            skip_reason_counts[reason] += 1
+            previous_reason = skip_reason_by_id_seen.get(proposal_id)
+            if previous_reason is not None and previous_reason != reason:
+                errors.append(
+                    f"record[{idx}] skipped reason changed for proposal_id={proposal_id}: "
+                    f"old={previous_reason!r}, new={reason!r}"
+                )
+            skip_reason_by_id_seen[proposal_id] = reason
 
         committed_token_sum = sum(int_value(dict_get(token_by_id, proposal_id), 0) for proposal_id in committed_ids)
         if int_value(record.get("eager_tokens_committed"), 0) != committed_token_sum:
@@ -222,9 +246,36 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] actual eager rejected counter must remain zero")
         if int_value(record.get("eager_tokens_invalidated"), 0) != 0:
             errors.append(f"record[{idx}] actual eager invalidated counter must remain zero")
-        max_actual_verified = max(max_actual_verified, int_value(record.get("eager_tokens_verified"), 0))
-        max_actual_accepted = max(max_actual_accepted, int_value(record.get("eager_tokens_accepted"), 0))
-        max_committed_tokens = max(max_committed_tokens, int_value(record.get("eager_tokens_committed"), 0))
+        max_actual_verified_per_record = max(
+            max_actual_verified_per_record,
+            int_value(record.get("eager_tokens_verified"), 0),
+        )
+        max_actual_accepted_per_record = max(
+            max_actual_accepted_per_record,
+            int_value(record.get("eager_tokens_accepted"), 0),
+        )
+        max_committed_tokens_per_record = max(
+            max_committed_tokens_per_record,
+            int_value(record.get("eager_tokens_committed"), 0),
+        )
+        counter_key = (side, step, plan, tuple(sorted(committed_ids)))
+        if committed_ids and counter_key not in counted_counter_records:
+            counted_counter_records.add(counter_key)
+            if side == "target":
+                target_actual_verified_sum += int_value(record.get("eager_tokens_verified"), 0)
+                target_actual_accepted_sum += int_value(record.get("eager_tokens_accepted"), 0)
+                target_actual_rejected_sum += int_value(record.get("eager_tokens_rejected"), 0)
+                target_actual_invalidated_sum += int_value(record.get("eager_tokens_invalidated"), 0)
+            elif side == "draft":
+                draft_actual_verified_sum += int_value(record.get("eager_tokens_verified"), 0)
+                draft_actual_accepted_sum += int_value(record.get("eager_tokens_accepted"), 0)
+                draft_actual_rejected_sum += int_value(record.get("eager_tokens_rejected"), 0)
+                draft_actual_invalidated_sum += int_value(record.get("eager_tokens_invalidated"), 0)
+        for proposal_id in sorted(committed_ids):
+            event_key = (side, proposal_id, step, plan)
+            if event_key in counted_commit_events:
+                continue
+            counted_commit_events.add(event_key)
 
     repeated_commit_proposal_ids = sorted(
         proposal_id
@@ -236,8 +287,37 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     if records_with_commit_enabled and not committed_ids_seen:
         errors.append("eager commit-ready-only enabled but no proposals were committed")
     committed_token_count = sum(int(value) for value in committed_token_by_id_seen.values())
-    if max_actual_verified != max_committed_tokens or max_actual_accepted != max_committed_tokens:
-        errors.append("max actual eager counters do not match committed token count")
+    missing_target_side = sorted(
+        proposal_id for proposal_id, sides in committed_sides_by_id.items() if "target" not in sides
+    )
+    missing_draft_side = sorted(
+        proposal_id for proposal_id, sides in committed_sides_by_id.items() if "draft" not in sides
+    )
+    if missing_target_side:
+        errors.append(f"committed proposals missing target-side commit event: {missing_target_side}")
+    if missing_draft_side:
+        errors.append(f"committed proposals missing draft-side commit event: {missing_draft_side}")
+    if committed_token_count and target_actual_verified_sum != committed_token_count:
+        errors.append(
+            "target actual eager verified aggregate does not match committed_token_count: "
+            f"target={target_actual_verified_sum}, committed={committed_token_count}"
+        )
+    if committed_token_count and target_actual_accepted_sum != committed_token_count:
+        errors.append(
+            "target actual eager accepted aggregate does not match committed_token_count: "
+            f"target={target_actual_accepted_sum}, committed={committed_token_count}"
+        )
+    if committed_token_count and draft_actual_verified_sum != committed_token_count:
+        errors.append(
+            "draft actual eager verified aggregate does not match committed_token_count: "
+            f"draft={draft_actual_verified_sum}, committed={committed_token_count}"
+        )
+    if committed_token_count and draft_actual_accepted_sum != committed_token_count:
+        errors.append(
+            "draft actual eager accepted aggregate does not match committed_token_count: "
+            f"draft={draft_actual_accepted_sum}, committed={committed_token_count}"
+        )
+    skip_reason_counts = Counter(skip_reason_by_id_seen.values())
 
     summary = {
         "total_trace_records": len(records),
@@ -247,10 +327,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "committed_proposal_count": len(committed_ids_seen),
         "skipped_proposal_count": len(skipped_ids_seen),
         "committed_token_count": committed_token_count,
-        "actual_eager_verified_tokens": max_actual_verified,
-        "actual_eager_accepted_tokens": max_actual_accepted,
-        "actual_eager_rejected_tokens": 0,
-        "actual_eager_invalidated_tokens": 0,
+        "target_actual_eager_verified_token_increment_sum": target_actual_verified_sum,
+        "target_actual_eager_accepted_token_increment_sum": target_actual_accepted_sum,
+        "target_actual_eager_rejected_token_increment_sum": target_actual_rejected_sum,
+        "target_actual_eager_invalidated_token_increment_sum": target_actual_invalidated_sum,
+        "draft_actual_eager_verified_token_increment_sum": draft_actual_verified_sum,
+        "draft_actual_eager_accepted_token_increment_sum": draft_actual_accepted_sum,
+        "draft_actual_eager_rejected_token_increment_sum": draft_actual_rejected_sum,
+        "draft_actual_eager_invalidated_token_increment_sum": draft_actual_invalidated_sum,
+        "max_actual_eager_verified_tokens_per_record": max_actual_verified_per_record,
+        "max_actual_eager_accepted_tokens_per_record": max_actual_accepted_per_record,
+        "max_eager_tokens_committed_per_record": max_committed_tokens_per_record,
         "skip_reason_counts": dict(skip_reason_counts),
         "repeated_commit_proposal_ids": repeated_commit_proposal_ids,
         "real_target_eager_non_empty_count": real_target_eager_nonempty_count,
@@ -268,10 +355,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "committed_proposal_count",
         "skipped_proposal_count",
         "committed_token_count",
-        "actual_eager_verified_tokens",
-        "actual_eager_accepted_tokens",
-        "actual_eager_rejected_tokens",
-        "actual_eager_invalidated_tokens",
+        "target_actual_eager_verified_token_increment_sum",
+        "target_actual_eager_accepted_token_increment_sum",
+        "target_actual_eager_rejected_token_increment_sum",
+        "target_actual_eager_invalidated_token_increment_sum",
+        "draft_actual_eager_verified_token_increment_sum",
+        "draft_actual_eager_accepted_token_increment_sum",
+        "draft_actual_eager_rejected_token_increment_sum",
+        "draft_actual_eager_invalidated_token_increment_sum",
+        "max_actual_eager_verified_tokens_per_record",
+        "max_actual_eager_accepted_tokens_per_record",
+        "max_eager_tokens_committed_per_record",
         "skip_reason_counts",
         "repeated_commit_proposal_ids",
         "real_target_eager_non_empty_count",
@@ -297,7 +391,13 @@ def synthetic_base_record() -> dict[str, Any]:
     }
 
 
-def synthetic_commit_record() -> dict[str, Any]:
+def synthetic_commit_record(
+    proposal_id: int,
+    seq_id: int,
+    side: str,
+    step: int,
+    plan: int,
+) -> dict[str, Any]:
     record = synthetic_base_record()
     record.update(
         {
@@ -305,39 +405,39 @@ def synthetic_commit_record() -> dict[str, Any]:
             "enable_eager_commit_ready_only": True,
             "eager_commit_enabled": True,
             "eager_commit_source": TAKEOVER_SOURCE,
-            "eager_commit_side": "draft",
-            "eager_commit_step_id": 9,
-            "eager_commit_plan_id": 11,
-            "eager_commit_ready_proposal_ids": [101],
-            "eager_commit_ready_seq_ids": [7],
-            "eager_commit_not_ready_proposal_ids": [102],
-            "eager_commit_not_ready_seq_ids": [8],
-            "eager_commit_not_ready_reason_by_proposal_id": {"102": "not_full_accept"},
-            "eager_commit_candidate_proposal_ids": [101, 102],
-            "eager_commit_candidate_seq_ids": [7, 8],
-            "eager_commit_from_readiness_proposal_ids": [101],
-            "eager_committed_proposal_ids": [101],
-            "eager_committed_seq_ids": [7],
-            "eager_committed_token_count_by_proposal_id": {"101": 4},
-            "eager_committed_accept_len_by_proposal_id": {"101": 4},
-            "eager_committed_action_by_proposal_id": {"101": FULL_ACCEPT_ACTION},
-            "eager_committed_verify_result_by_proposal_id": {"101": "full_accept"},
-            "eager_commit_skipped_proposal_ids": [102],
-            "eager_commit_skip_reason_by_proposal_id": {"102": "not_full_accept"},
-            "eager_commit_precondition_ok_by_proposal_id": {"101": True, "102": False},
-            "eager_commit_precondition_failed_by_proposal_id": {"101": False, "102": True},
-            "eager_commit_precondition_failure_reason_by_proposal_id": {"102": "not_full_accept"},
-            "eager_commit_target_seq_len_before_by_seq_id": {"7": 20},
-            "eager_commit_target_seq_len_after_by_seq_id": {"7": 24},
-            "eager_commit_draft_seq_len_before_by_seq_id": {"7": 20},
-            "eager_commit_draft_seq_len_after_by_seq_id": {"7": 24},
-            "eager_commit_target_draft_len_match_by_seq_id": {"7": True},
-            "eager_commit_target_draft_token_match_by_seq_id": {"7": True},
+            "eager_commit_side": side,
+            "eager_commit_step_id": step,
+            "eager_commit_plan_id": plan,
+            "eager_commit_ready_proposal_ids": [proposal_id],
+            "eager_commit_ready_seq_ids": [seq_id],
+            "eager_commit_not_ready_proposal_ids": [],
+            "eager_commit_not_ready_seq_ids": [],
+            "eager_commit_not_ready_reason_by_proposal_id": {},
+            "eager_commit_candidate_proposal_ids": [proposal_id],
+            "eager_commit_candidate_seq_ids": [seq_id],
+            "eager_commit_from_readiness_proposal_ids": [proposal_id],
+            "eager_committed_proposal_ids": [proposal_id],
+            "eager_committed_seq_ids": [seq_id],
+            "eager_committed_token_count_by_proposal_id": {str(proposal_id): 4},
+            "eager_committed_accept_len_by_proposal_id": {str(proposal_id): 4},
+            "eager_committed_action_by_proposal_id": {str(proposal_id): FULL_ACCEPT_ACTION},
+            "eager_committed_verify_result_by_proposal_id": {str(proposal_id): "full_accept"},
+            "eager_commit_skipped_proposal_ids": [],
+            "eager_commit_skip_reason_by_proposal_id": {},
+            "eager_commit_precondition_ok_by_proposal_id": {str(proposal_id): True},
+            "eager_commit_precondition_failed_by_proposal_id": {str(proposal_id): False},
+            "eager_commit_precondition_failure_reason_by_proposal_id": {},
+            "eager_commit_target_seq_len_before_by_seq_id": {str(seq_id): 20},
+            "eager_commit_target_seq_len_after_by_seq_id": {str(seq_id): 24},
+            "eager_commit_draft_seq_len_before_by_seq_id": {str(seq_id): 20},
+            "eager_commit_draft_seq_len_after_by_seq_id": {str(seq_id): 24},
+            "eager_commit_target_draft_len_match_by_seq_id": {str(seq_id): True},
+            "eager_commit_target_draft_token_match_by_seq_id": {str(seq_id): True},
             "eager_tokens_committed": 4,
             "eager_tokens_committed_full_accept": 4,
-            "eager_commit_candidate_count": 2,
+            "eager_commit_candidate_count": 1,
             "eager_commit_committed_count": 1,
-            "eager_commit_skipped_count": 1,
+            "eager_commit_skipped_count": 0,
             "eager_tokens_verified": 4,
             "eager_tokens_accepted": 4,
             "eager_tokens_rejected": 0,
@@ -347,10 +447,75 @@ def synthetic_commit_record() -> dict[str, Any]:
     return record
 
 
+def synthetic_skip_record() -> dict[str, Any]:
+    record = synthetic_base_record()
+    proposal_ids = [201, 202, 203]
+    seq_ids = [301, 302, 303]
+    record.update(
+        {
+            "enable_eager_commit_readiness_dry_run": True,
+            "enable_eager_commit_ready_only": True,
+            "eager_commit_enabled": True,
+            "eager_commit_source": TAKEOVER_SOURCE,
+            "eager_commit_side": "draft",
+            "eager_commit_step_id": 30,
+            "eager_commit_plan_id": 40,
+            "eager_commit_ready_proposal_ids": [],
+            "eager_commit_ready_seq_ids": [],
+            "eager_commit_not_ready_proposal_ids": proposal_ids,
+            "eager_commit_not_ready_seq_ids": seq_ids,
+            "eager_commit_not_ready_reason_by_proposal_id": {
+                str(proposal_id): "not_full_accept" for proposal_id in proposal_ids
+            },
+            "eager_commit_candidate_proposal_ids": proposal_ids,
+            "eager_commit_candidate_seq_ids": seq_ids,
+            "eager_commit_from_readiness_proposal_ids": [],
+            "eager_committed_proposal_ids": [],
+            "eager_committed_seq_ids": [],
+            "eager_commit_skipped_proposal_ids": proposal_ids,
+            "eager_commit_skip_reason_by_proposal_id": {
+                str(proposal_id): "not_full_accept" for proposal_id in proposal_ids
+            },
+            "eager_commit_precondition_ok_by_proposal_id": {
+                str(proposal_id): False for proposal_id in proposal_ids
+            },
+            "eager_commit_precondition_failed_by_proposal_id": {
+                str(proposal_id): True for proposal_id in proposal_ids
+            },
+            "eager_commit_precondition_failure_reason_by_proposal_id": {
+                str(proposal_id): "not_full_accept" for proposal_id in proposal_ids
+            },
+            "eager_tokens_committed": 0,
+            "eager_tokens_committed_full_accept": 0,
+            "eager_commit_candidate_count": 3,
+            "eager_commit_committed_count": 0,
+            "eager_commit_skipped_count": 3,
+        }
+    )
+    return record
+
+
+def synthetic_mirrored_records() -> list[dict[str, Any]]:
+    records = [synthetic_base_record()]
+    for offset, proposal_id in enumerate([101, 102, 103, 104, 105]):
+        seq_id = 7 + offset
+        step = 10 + offset
+        plan = 20 + offset
+        records.append(synthetic_commit_record(proposal_id, seq_id, "target", step, plan))
+        records.append(synthetic_commit_record(proposal_id, seq_id, "draft", step, plan))
+    records.append(synthetic_skip_record())
+    return records
+
+
 def run_synthetic_tests() -> None:
-    valid_records = [synthetic_base_record(), synthetic_commit_record()]
+    valid_records = synthetic_mirrored_records()
     errors, _ = validate_records(valid_records)
-    assert not errors, f"valid synthetic commit-ready-only records failed: {errors}"
+    assert not errors, f"valid mirrored synthetic commit-ready-only records failed: {errors}"
+    _, summary = validate_records(valid_records)
+    assert summary["committed_proposal_count"] == 5, "synthetic committed proposal count mismatch"
+    assert summary["committed_token_count"] == 20, "synthetic committed token aggregate mismatch"
+    assert summary["target_actual_eager_verified_token_increment_sum"] == 20, "synthetic target aggregate mismatch"
+    assert summary["draft_actual_eager_verified_token_increment_sum"] == 20, "synthetic draft aggregate mismatch"
 
     invalid = deepcopy(valid_records)
     invalid[1]["enable_eager_commit_ready_only"] = False
@@ -358,7 +523,11 @@ def run_synthetic_tests() -> None:
     assert any("flag disabled" in error for error in errors), "checker missed disabled commit fields"
 
     invalid = deepcopy(valid_records)
-    invalid[1]["eager_committed_proposal_ids"] = [101, 102]
+    invalid[1]["eager_commit_not_ready_proposal_ids"] = [201]
+    invalid[1]["eager_commit_not_ready_reason_by_proposal_id"] = {"201": "not_full_accept"}
+    invalid[1]["eager_commit_candidate_proposal_ids"] = [101, 201]
+    invalid[1]["eager_commit_candidate_count"] = 2
+    invalid[1]["eager_committed_proposal_ids"] = [101, 201]
     errors, _ = validate_records(invalid)
     assert any("not-ready proposals committed" in error for error in errors), "checker missed not-ready commit"
 
@@ -368,9 +537,11 @@ def run_synthetic_tests() -> None:
     assert any("not full_accept" in error for error in errors), "checker missed partial commit"
 
     invalid = deepcopy(valid_records)
-    invalid[1]["eager_tokens_verified"] = 3
+    invalid[1]["eager_tokens_verified"] = 0
     errors, _ = validate_records(invalid)
-    assert any("verified counter mismatch" in error for error in errors), "checker missed counter mismatch"
+    assert any("target actual eager verified aggregate" in error for error in errors), (
+        "checker missed target aggregate mismatch"
+    )
 
     invalid = deepcopy(valid_records)
     invalid[1]["eager_commit_target_seq_len_after_by_seq_id"] = {"7": 23}
@@ -381,6 +552,29 @@ def run_synthetic_tests() -> None:
     invalid[1]["eager_commit_duplicate_proposal_ids"] = [101]
     errors, _ = validate_records(invalid)
     assert any("duplicate committed proposal" in error for error in errors), "checker missed duplicate proposal"
+
+    duplicate_passive = deepcopy(valid_records)
+    duplicate_passive.append(deepcopy(valid_records[1]))
+    errors, summary = validate_records(duplicate_passive)
+    assert not errors, f"checker double-counted duplicate passive row: {errors}"
+    assert summary["target_actual_eager_verified_token_increment_sum"] == 20, (
+        "duplicate passive row changed target aggregate"
+    )
+
+    true_duplicate = deepcopy(valid_records)
+    extra = deepcopy(valid_records[1])
+    extra["eager_commit_step_id"] = 99
+    extra["eager_commit_plan_id"] = 199
+    true_duplicate.append(extra)
+    errors, _ = validate_records(true_duplicate)
+    assert any("more than once" in error for error in errors), "checker missed true duplicate commit"
+
+    invalid = deepcopy(valid_records)
+    invalid[2]["eager_tokens_verified"] = 0
+    errors, _ = validate_records(invalid)
+    assert any("draft actual eager verified aggregate" in error for error in errors), (
+        "checker missed draft aggregate mismatch"
+    )
 
     print("Synthetic eager commit-ready-only checks passed.")
 
