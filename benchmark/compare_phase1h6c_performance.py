@@ -41,6 +41,9 @@ TABLE_COLUMNS = [
     "proposal_payload_len_units_per_committed_token",
     "result_payload_len_units_per_committed_token",
     "overhead_time_ms",
+    "eager_transfer_time_ms",
+    "eager_result_transfer_time_ms",
+    "eager_commit_time_ms",
     "notes",
 ]
 
@@ -127,6 +130,9 @@ def compact_row(
             0.0,
         ),
         "overhead_time_ms": accounting.get("total_eager_overhead_time_ms", 0.0),
+        "eager_transfer_time_ms": accounting.get("eager_transfer_time_ms", 0.0),
+        "eager_result_transfer_time_ms": accounting.get("eager_result_transfer_time_ms", 0.0),
+        "eager_commit_time_ms": accounting.get("eager_commit_time_ms", 0.0),
         "notes": ",".join(notes) if notes else "ok",
     }
 

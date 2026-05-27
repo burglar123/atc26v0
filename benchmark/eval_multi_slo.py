@@ -215,6 +215,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_eager_requests_per_step": args.max_eager_requests_per_step,
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
         "max_eager_tokens_per_request": args.max_eager_tokens_per_request,
+        "eager_trace_level": args.eager_trace_level,
     }
 
     # Try new named-path style with gamma.
@@ -249,6 +250,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_eager_requests_per_step",
         "max_eager_tokens_per_step",
         "max_eager_tokens_per_request",
+        "eager_trace_level",
     ):
         legacy_kwargs.pop(key, None)
 
@@ -1290,6 +1292,7 @@ def build_eager_performance_accounting(
     result_args: Dict[str, Any],
     metrics: Dict[str, Any],
 ) -> Dict[str, Any]:
+    accounting_start = time.perf_counter()
     try:
         from benchmark.check_eager_performance_accounting import (
             aggregate_performance_accounting,
@@ -1298,19 +1301,28 @@ def build_eager_performance_accounting(
 
         trace_payload = try_get_traces(engine)
         records = trace_payload_to_records(trace_payload)
-        return aggregate_performance_accounting(
+        accounting = aggregate_performance_accounting(
             records,
             {
                 "args": result_args,
                 "metrics": metrics,
             },
         )
+        accounting["eager_accounting_summary_time_ms"] = max(
+            0.0,
+            (time.perf_counter() - accounting_start) * 1000.0,
+        )
+        return accounting
     except Exception as exc:
         return {
             "accounting_available": False,
             "accounting_error": str(exc),
             "timing_available": False,
             "missing_timing_reason": "not_instrumented",
+            "eager_accounting_summary_time_ms": max(
+                0.0,
+                (time.perf_counter() - accounting_start) * 1000.0,
+            ),
         }
 
 
@@ -1607,6 +1619,15 @@ def main() -> None:
     parser.add_argument("--max-eager-requests-per-step", type=int, default=0)
     parser.add_argument("--max-eager-tokens-per-step", type=int, default=0)
     parser.add_argument("--max-eager-tokens-per-request", type=int, default=0)
+    parser.add_argument(
+        "--eager-trace-level",
+        choices=["full", "summary", "minimal"],
+        default="full",
+        help=(
+            "Eager trace verbosity. full preserves current debug traces; summary/minimal "
+            "drop empty eager debug defaults and some passive diagnostics for performance runs."
+        ),
+    )
     parser.add_argument(
         "--decode-ready",
         "--prefill-elided",

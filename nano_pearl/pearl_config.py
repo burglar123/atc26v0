@@ -12,6 +12,7 @@ PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
     "Phase 1H-0 only adds eager scaffolding; eager execution is not implemented yet."
 )
 EAGER_POLICIES = {"none", "tight_only"}
+EAGER_TRACE_LEVELS = {"full", "summary", "minimal"}
 
 
 def validate_eager_gamma(config, gamma: int) -> bool:
@@ -145,6 +146,7 @@ class PEARLConfig:
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
+    eager_trace_level: str = "full"
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -194,6 +196,12 @@ class PEARLConfig:
             raise ValueError(
                 f"Invalid eager_policy={self.eager_policy!r}. "
                 f"Expected one of {sorted(EAGER_POLICIES)}."
+            )
+        self.eager_trace_level = str(self.eager_trace_level)
+        if self.eager_trace_level not in EAGER_TRACE_LEVELS:
+            raise ValueError(
+                f"Invalid eager_trace_level={self.eager_trace_level!r}. "
+                f"Expected one of {sorted(EAGER_TRACE_LEVELS)}."
             )
         for field_name in (
             "max_eager_requests_per_step",
@@ -250,6 +258,7 @@ class PEARLConfig:
         logger.info(f"Enable_Eager_Commit_Ready_Only={self.enable_eager_commit_ready_only}")
         logger.info(f"Enable_Eager_Lane_Exclusion_Dry_Run={self.enable_eager_lane_exclusion_dry_run}")
         logger.info(f"Eager_Policy={self.eager_policy}")
+        logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Request={self.max_eager_tokens_per_request}")

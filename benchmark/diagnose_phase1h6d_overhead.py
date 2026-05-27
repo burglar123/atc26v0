@@ -122,6 +122,24 @@ def build_diagnosis(
                 0,
             ),
             "timing_available": eager_accounting.get("timing_available", False),
+            "eager_transfer_time_ms": eager_accounting.get("eager_transfer_time_ms", 0.0),
+            "eager_result_transfer_time_ms": eager_accounting.get(
+                "eager_result_transfer_time_ms",
+                0.0,
+            ),
+            "eager_commit_readiness_time_ms": eager_accounting.get(
+                "eager_commit_readiness_time_ms",
+                0.0,
+            ),
+            "eager_commit_time_ms": eager_accounting.get("eager_commit_time_ms", 0.0),
+            "eager_accounting_summary_time_ms": eager_accounting.get(
+                "eager_accounting_summary_time_ms",
+                0.0,
+            ),
+            "total_eager_overhead_time_ms": eager_accounting.get(
+                "total_eager_overhead_time_ms",
+                0.0,
+            ),
             "payload_bytes_available": eager_accounting.get("payload_bytes_available", False),
         },
         "derived": {

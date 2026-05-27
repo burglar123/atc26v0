@@ -1278,6 +1278,7 @@ class ModelRunnerBase:
         verified = int(record.get("proposal_tokens_verified") or 0)
         record["draft_waste_rate"] = wasted_tokens / max(1, generated) if generated else None
         record["acceptance_rate"] = accepted_tokens / max(1, verified) if verified else None
+        self._prune_trace_record_for_level(record)
 
     def _proposal_verify_token_count(self, seqs: list[Sequence]) -> int:
         return sum(1 if seq.pre_verify else self.gamma for seq in seqs)
@@ -1360,6 +1361,71 @@ class ModelRunnerBase:
 
     def _eager_lane_exclusion_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False))
+
+    def _eager_trace_level(self) -> str:
+        level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
+        return level if level in {"full", "summary", "minimal"} else "full"
+
+    def _record_elapsed_ms(self, trace_record: dict | None, field_name: str, start_time: float) -> None:
+        if trace_record is None:
+            return
+        elapsed_ms = max(0.0, (time.perf_counter() - start_time) * 1000.0)
+        trace_record[field_name] = float(trace_record.get(field_name) or 0.0) + elapsed_ms
+
+    def _trace_value_is_empty_debug_default(self, value) -> bool:
+        return value is None or value == [] or value == {}
+
+    def _prune_trace_record_for_level(self, record: dict) -> None:
+        level = self._eager_trace_level()
+        record["eager_trace_level"] = level
+        if level == "full":
+            record["eager_trace_pruned_key_count"] = 0
+            return
+
+        eager_prefixes = (
+            "eager_",
+            "ready_eager_",
+            "lane_exclusion_",
+            "target_eager_",
+            "scheduled_target_eager_",
+            "adjusted_draft_home_set_dry_run",
+            "excluded_from_draft_home_for_eager_dry_run",
+            "missing_buffered_proposal_",
+            "missing_normal_proposal_",
+            "fallback_",
+        )
+        pruned = 0
+        for key in list(record.keys()):
+            if key in {"eager_trace_level", "eager_trace_pruned_key_count"}:
+                continue
+            if key.startswith(eager_prefixes) and self._trace_value_is_empty_debug_default(record.get(key)):
+                del record[key]
+                pruned += 1
+
+        if level == "minimal":
+            # These are high-cardinality debug diagnostics that are useful when
+            # chasing stale spans, but they are not needed by the 6a/6c commit
+            # and accounting checkers. Keep proposal-id token/action maps.
+            minimal_drop_prefixes = (
+                "eager_transfer_base_",
+                "eager_transfer_current_",
+                "eager_transfer_seq_",
+                "eager_pending_current_",
+                "eager_pending_base_",
+                "eager_verify_base_len_by_seq_id",
+                "eager_verify_current_len_by_seq_id",
+                "eager_verify_seq_",
+                "eager_apply_current_len_",
+                "eager_apply_pre_verify_",
+                "eager_apply_status_",
+                "eager_result_draft_",
+                "ready_eager_proposal_current_",
+            )
+            for key in list(record.keys()):
+                if key.startswith(minimal_drop_prefixes):
+                    del record[key]
+                    pruned += 1
+        record["eager_trace_pruned_key_count"] = pruned
 
     def _pending_eager_seq_ids(self) -> set[int]:
         return {
@@ -2113,6 +2179,7 @@ class ModelRunnerBase:
         plan: StepPlan,
         trace_record: dict,
     ) -> None:
+        timer_start = time.perf_counter()
         buffer_size_before = self.eager_proposal_buffer.size()
         ready_proposals = [
             proposal for proposal in proposals
@@ -2138,12 +2205,14 @@ class ModelRunnerBase:
             buffer_size_before,
         )
         if self.tp_params.local_rank != 0:
+            self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
             return
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[1]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
 
     def _result_action_code(self, action: str) -> int:
         return {
@@ -2560,6 +2629,7 @@ class ModelRunnerBase:
         trace_record: dict,
         scheduled_proposals: list[EagerProposal],
     ) -> None:
+        timer_start = time.perf_counter()
         results = self._build_eager_result_transfer_results(plan, trace_record, scheduled_proposals)
         meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
         result_source = (
@@ -2662,6 +2732,7 @@ class ModelRunnerBase:
             else:
                 payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
 
     def _validate_eager_result_on_draft(
         self,
@@ -2764,6 +2835,7 @@ class ModelRunnerBase:
         trace_record: dict,
         known_proposals: list[EagerProposal],
     ) -> None:
+        timer_start = time.perf_counter()
         known_by_id = dict(self._draft_sent_eager_proposals_by_id)
         known_by_id.update({int(proposal.proposal_id): proposal for proposal in known_proposals})
         known_by_id.update(
@@ -2773,6 +2845,7 @@ class ModelRunnerBase:
             }
         )
         if self.tp_params.local_rank != 0:
+            self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
             return
         meta = torch.zeros(EAGER_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
@@ -3012,6 +3085,7 @@ class ModelRunnerBase:
         trace_record["eager_result_zero_result_step"] = len(results) == 0
         trace_record["result_transfer_called"] = True
         trace_record["result_transfer_zero_result"] = len(results) == 0
+        self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
         if self._eager_sync_apply_dry_run_enabled():
             plan.eager_sync_apply_dry_run_enabled = True
             self._run_draft_sync_apply_dry_run(
@@ -5056,6 +5130,7 @@ class ModelRunnerBase:
         seq_by_id: dict[int, Sequence],
         plan_context: dict[str, set[int]],
     ) -> None:
+        timer_start = time.perf_counter()
         gamma = int(self.gamma)
         result_by_id = {int(result["proposal_id"]): result for result in validated_results}
         sync_executed_ids = {
@@ -5430,6 +5505,7 @@ class ModelRunnerBase:
         trace_record["eager_commit_not_ready_reason_counts"] = dict(sorted(reason_counts.items()))
         trace_record["eager_commit_readiness_full_accept_count"] = int(full_accept_count)
         trace_record["eager_commit_readiness_partial_reject_count"] = int(partial_reject_count)
+        self._record_elapsed_ms(trace_record, "eager_commit_readiness_time_ms", timer_start)
 
     def _commit_ready_only_decisions_from_trace(self, trace_record: dict) -> list[dict]:
         ready_ids = [int(proposal_id) for proposal_id in trace_record.get("eager_commit_ready_proposal_ids", [])]
@@ -5596,6 +5672,7 @@ class ModelRunnerBase:
         plan_context: dict[str, set[int]],
         side: str,
     ) -> None:
+        timer_start = time.perf_counter()
         gamma = int(self.gamma)
         readiness_ids = {int(proposal_id) for proposal_id in trace_record.get("eager_commit_ready_proposal_ids", [])}
         decision_ids = {int(decision["proposal_id"]) for decision in decisions}
@@ -5848,6 +5925,7 @@ class ModelRunnerBase:
         trace_record["eager_tokens_accepted"] = int(committed_tokens)
         trace_record["eager_tokens_rejected"] = 0
         trace_record["eager_tokens_invalidated"] = 0
+        self._record_elapsed_ms(trace_record, "eager_commit_time_ms", timer_start)
 
     def _schedule_ready_eager_dry_run(
         self,
@@ -6129,6 +6207,7 @@ class ModelRunnerBase:
         return scheduled
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
+        timer_start = time.perf_counter()
         seq_by_id = self._local_sequence_by_id()
         plan_context = self._eager_transfer_plan_context(plan, trace_record)
         buffer_size_before_update = self.eager_proposal_buffer.size()
@@ -6382,6 +6461,7 @@ class ModelRunnerBase:
         )
         trace_record["eager_buffer_size_after"] = int(buffer_size_after_clear)
         trace_record["eager_proposal_transfer_called"] = True
+        self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
         return scheduled_for_result_transfer
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):

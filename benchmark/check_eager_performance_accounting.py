@@ -25,6 +25,7 @@ TIMING_FIELDS = [
     "eager_apply_dry_run_time_ms",
     "eager_result_transfer_time_ms",
     "eager_sync_apply_dry_run_time_ms",
+    "eager_commit_readiness_time_ms",
     "eager_commit_time_ms",
 ]
 PROPOSAL_LEN_MAP_KEYS = [
@@ -434,6 +435,16 @@ def aggregate_performance_accounting(
 
     timing_summary = dict(timing_sums)
     timing_summary["total_eager_overhead_time_ms"] = sum(timing_sums.values()) if timing_available else 0.0
+    embedded_accounting = (
+        result_payload.get("eager_performance_accounting", {})
+        if isinstance(result_payload, dict)
+        else {}
+    )
+    accounting_summary_time_ms = (
+        float_value(embedded_accounting.get("eager_accounting_summary_time_ms"), 0.0)
+        if isinstance(embedded_accounting, dict)
+        else 0.0
+    )
 
     accounting = {
         "accounting_available": True,
@@ -493,6 +504,7 @@ def aggregate_performance_accounting(
         "eager_commit_metadata_bytes": 0,
         "extra_collective_count_by_type": {},
         "zero_result_transfer_steps": len(zero_result_transfer_steps),
+        "eager_accounting_summary_time_ms": accounting_summary_time_ms,
         "repeated_commit_proposal_ids": commit_summary.get("repeated_commit_proposal_ids", []),
         "missing_buffered_proposal_unexpected_count": commit_summary.get(
             "missing_buffered_proposal_unexpected_count", 0
@@ -564,6 +576,8 @@ def validate_accounting(
                 errors.append(f"{field} must be nonnegative")
     elif accounting.get("missing_timing_reason") != "not_instrumented":
         errors.append("missing timing must be explicitly marked not_instrumented")
+    if float_value(accounting.get("eager_accounting_summary_time_ms"), 0.0) < 0.0:
+        errors.append("eager_accounting_summary_time_ms must be nonnegative")
     if int_value(accounting.get("missing_buffered_proposal_unexpected_count"), 0) != 0:
         errors.append("unexpected missing normal proposal count must be zero")
     if accounting.get("repeated_commit_proposal_ids"):
@@ -621,8 +635,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "eager_proposal_transfer_payload_len_units",
         "eager_result_transfer_payload_bytes",
         "eager_result_transfer_payload_len_units",
+        "eager_accounting_summary_time_ms",
         "timing_available",
         "missing_timing_reason",
+        *TIMING_FIELDS,
         "total_eager_overhead_time_ms",
         "performance_warnings",
         "repeated_commit_proposal_ids",
