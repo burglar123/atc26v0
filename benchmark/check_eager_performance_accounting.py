@@ -27,6 +27,7 @@ TIMING_FIELDS = [
     "eager_sync_apply_dry_run_time_ms",
     "eager_commit_readiness_time_ms",
     "eager_commit_time_ms",
+    "continuous_eager_overhead_time_ms",
 ]
 PROPOSAL_LEN_MAP_KEYS = [
     "eager_commit_ready_token_count_by_proposal_id",
@@ -299,6 +300,15 @@ def aggregate_performance_accounting(
     committed_ids: set[int] = set()
     skipped_ids: set[int] = set()
     skip_reason_by_id: dict[int, str] = {}
+    continuous_candidate_ids: set[int] = set()
+    continuous_ready_shadow_ids: set[int] = set()
+    continuous_token_by_id: dict[int, int] = {}
+    continuous_ready_token_by_id: dict[int, int] = {}
+    continuous_drop_reason_by_id: dict[int, str] = {}
+    continuous_chain_depth_by_id: dict[int, int] = {}
+    continuous_duplicate_ids: set[int] = set()
+    continuous_frontier_mismatch_ids: set[int] = set()
+    continuous_real_commit_count = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -336,6 +346,42 @@ def aggregate_performance_accounting(
         committed_ids.update(as_int_set(record.get("eager_committed_proposal_ids")))
         skipped_ids.update(as_int_set(record.get("eager_commit_skipped_proposal_ids")))
         skipped_ids.update(as_int_set(record.get("eager_commit_not_ready_proposal_ids")))
+
+        continuous_candidate_ids.update(
+            as_int_set(record.get("continuous_eager_candidate_proposal_ids"))
+        )
+        continuous_ready_shadow_ids.update(
+            as_int_set(record.get("continuous_eager_commit_ready_shadow_proposal_ids"))
+        )
+        for proposal_id, token_count in as_int_map(
+            record.get("continuous_eager_candidate_token_count_by_proposal_id")
+        ).items():
+            if token_count > 0:
+                continuous_token_by_id.setdefault(proposal_id, token_count)
+        for proposal_id, token_count in as_int_map(
+            record.get("continuous_eager_commit_ready_shadow_token_count_by_proposal_id")
+        ).items():
+            if token_count > 0:
+                continuous_ready_token_by_id.setdefault(proposal_id, token_count)
+        for proposal_id, depth in as_int_map(
+            record.get("continuous_eager_chain_depth_by_proposal_id")
+        ).items():
+            if depth > 0:
+                continuous_chain_depth_by_id.setdefault(proposal_id, depth)
+        reason_map = record.get("continuous_eager_not_ready_shadow_reason_by_proposal_id")
+        if isinstance(reason_map, dict):
+            for raw_proposal_id, reason in reason_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                if reason:
+                    continuous_drop_reason_by_id.setdefault(proposal_id, str(reason))
+        continuous_duplicate_ids.update(as_int_set(record.get("continuous_eager_duplicate_proposal_ids")))
+        continuous_frontier_mismatch_ids.update(
+            as_int_set(record.get("continuous_eager_frontier_mismatch_proposal_ids"))
+        )
+        continuous_real_commit_count += int_value(record.get("continuous_eager_real_commit_count"), 0)
 
         reason_map = record.get("eager_commit_skip_reason_by_proposal_id")
         if not isinstance(reason_map, dict):
@@ -418,6 +464,19 @@ def aggregate_performance_accounting(
     committed_proposal_count = int_value(commit_summary.get("committed_proposal_count"), len(committed_ids))
     candidate_token_count = sum_proposal_lens(candidate_ids, proposal_len_by_id, gamma)
     ready_token_count = sum_proposal_lens(ready_ids, proposal_len_by_id, gamma)
+    continuous_candidate_token_count = sum(
+        int(continuous_token_by_id.get(proposal_id, max(0, gamma)))
+        for proposal_id in continuous_candidate_ids
+    )
+    continuous_ready_shadow_token_count = sum(
+        int(continuous_ready_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+        for proposal_id in continuous_ready_shadow_ids
+    )
+    continuous_chain_distribution = Counter(
+        str(depth)
+        for proposal_id, depth in continuous_chain_depth_by_id.items()
+        if proposal_id in continuous_candidate_ids
+    )
     lane_token_slots = sum_proposal_lens(lane_applied_ids, proposal_len_by_id, gamma)
     if not lane_applied_ids:
         lane_token_slots = len(lane_applied_seq_fallback_events) * max(0, gamma)
@@ -465,6 +524,27 @@ def aggregate_performance_accounting(
         "eager_commit_rate_by_token": commit_rate_by_token,
         "eager_full_accept_rate": eager_full_accept_rate,
         "eager_partial_reject_rate": eager_partial_reject_rate,
+        "continuous_eager_candidate_proposal_count": len(continuous_candidate_ids),
+        "continuous_eager_candidate_token_count": continuous_candidate_token_count,
+        "continuous_eager_commit_ready_shadow_proposal_count": len(continuous_ready_shadow_ids),
+        "continuous_eager_commit_ready_shadow_token_count": continuous_ready_shadow_token_count,
+        "continuous_eager_estimated_committed_token_share_of_output": safe_div(
+            continuous_ready_shadow_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
+        "combined_one_shot_plus_continuous_shadow_token_count": (
+            committed_token_count + continuous_ready_shadow_token_count
+        ),
+        "combined_estimated_token_share_of_output": safe_div(
+            committed_token_count + continuous_ready_shadow_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
+        "continuous_eager_chain_length_distribution": dict(continuous_chain_distribution),
+        "continuous_eager_drop_reason_counts": dict(Counter(continuous_drop_reason_by_id.values())),
+        "continuous_eager_duplicate_count": len(continuous_duplicate_ids),
+        "continuous_eager_frontier_mismatch_count": len(continuous_frontier_mismatch_ids),
+        "continuous_eager_real_commit_count": continuous_real_commit_count,
+        "continuous_eager_payload_len_units_per_ready_token": 0.0,
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
         "normal_draft_token_slots_suppressed": lane_token_slots,
         "normal_proposal_missing_allowed_by_eager_count": len(missing_allowed_events),
@@ -556,6 +636,13 @@ def validate_accounting(
         errors.append("skipped plus committed proposals exceeds candidate proposal count")
     if skipped_proposals and not accounting.get("eager_skip_reason_counts"):
         errors.append("skipped proposals require skip reason counts")
+    if int_value(accounting.get("continuous_eager_real_commit_count"), 0) != 0:
+        errors.append("continuous eager shadow dry-run must not real-commit proposals")
+    if int_value(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0) > int_value(
+        accounting.get("continuous_eager_candidate_token_count"),
+        0,
+    ):
+        errors.append("continuous shadow ready tokens exceed continuous candidate tokens")
     if committed_tokens and int_value(accounting.get("normal_draft_token_slots_suppressed"), 0) < committed_tokens:
         errors.append("normal draft token slots suppressed must cover committed tokens")
     if committed_tokens and int_value(accounting.get("target_normal_verify_token_slots_replaced_by_eager"), 0) < committed_tokens:
@@ -615,6 +702,18 @@ def print_summary(summary: dict[str, Any]) -> None:
         "eager_commit_rate_by_token",
         "eager_full_accept_rate",
         "eager_partial_reject_rate",
+        "continuous_eager_candidate_proposal_count",
+        "continuous_eager_candidate_token_count",
+        "continuous_eager_commit_ready_shadow_proposal_count",
+        "continuous_eager_commit_ready_shadow_token_count",
+        "continuous_eager_estimated_committed_token_share_of_output",
+        "combined_one_shot_plus_continuous_shadow_token_count",
+        "combined_estimated_token_share_of_output",
+        "continuous_eager_chain_length_distribution",
+        "continuous_eager_drop_reason_counts",
+        "continuous_eager_duplicate_count",
+        "continuous_eager_frontier_mismatch_count",
+        "continuous_eager_real_commit_count",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",
         "suppressed_slots_per_committed_token",

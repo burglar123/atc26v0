@@ -142,11 +142,16 @@ class PEARLConfig:
     enable_eager_commit_readiness_dry_run: bool = False
     enable_eager_commit_ready_only: bool = False
     enable_eager_lane_exclusion_dry_run: bool = False
+    enable_continuous_eager_dry_run: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
     max_eager_tokens_per_request: int = 0
     eager_trace_level: str = "full"
+    max_continuous_eager_chain_depth: int = 1
+    max_continuous_eager_requests_per_step: int = 2
+    max_continuous_eager_tokens_per_step: int = 0
+    max_continuous_eager_tokens_per_request: int = 0
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -167,6 +172,7 @@ class PEARLConfig:
         self.enable_eager_commit_readiness_dry_run = bool(self.enable_eager_commit_readiness_dry_run)
         self.enable_eager_commit_ready_only = bool(self.enable_eager_commit_ready_only)
         self.enable_eager_lane_exclusion_dry_run = bool(self.enable_eager_lane_exclusion_dry_run)
+        self.enable_continuous_eager_dry_run = bool(self.enable_continuous_eager_dry_run)
         if self.enable_eager_commit_ready_only:
             self.enable_eager_commit_readiness_dry_run = True
         if self.enable_eager_commit_readiness_dry_run:
@@ -207,11 +213,29 @@ class PEARLConfig:
             "max_eager_requests_per_step",
             "max_eager_tokens_per_step",
             "max_eager_tokens_per_request",
+            "max_continuous_eager_chain_depth",
+            "max_continuous_eager_requests_per_step",
+            "max_continuous_eager_tokens_per_step",
+            "max_continuous_eager_tokens_per_request",
         ):
             value = int(getattr(self, field_name))
             if value < 0:
                 raise ValueError(f"{field_name} must be non-negative, got {value}")
             setattr(self, field_name, value)
+        if self.max_continuous_eager_tokens_per_request <= 0 and int(self.gamma) > 0:
+            self.max_continuous_eager_tokens_per_request = int(self.gamma)
+        if self.max_continuous_eager_tokens_per_step <= 0:
+            if self.max_eager_tokens_per_step > 0:
+                self.max_continuous_eager_tokens_per_step = int(self.max_eager_tokens_per_step)
+            else:
+                self.max_continuous_eager_tokens_per_step = (
+                    int(self.max_continuous_eager_requests_per_step)
+                    * int(self.max_continuous_eager_tokens_per_request)
+                )
+        if self.enable_continuous_eager_dry_run and self.max_continuous_eager_chain_depth <= 0:
+            raise ValueError("enable_continuous_eager_dry_run requires max_continuous_eager_chain_depth > 0")
+        if self.enable_continuous_eager_dry_run and self.max_continuous_eager_requests_per_step <= 0:
+            raise ValueError("enable_continuous_eager_dry_run requires max_continuous_eager_requests_per_step > 0")
         if self.enable_eager_execution:
             raise NotImplementedError(PHASE_1H0_EAGER_NOT_IMPLEMENTED)
         if self.enable_eager_draft_dry_run:
@@ -257,11 +281,16 @@ class PEARLConfig:
         logger.info(f"Enable_Eager_Commit_Readiness_Dry_Run={self.enable_eager_commit_readiness_dry_run}")
         logger.info(f"Enable_Eager_Commit_Ready_Only={self.enable_eager_commit_ready_only}")
         logger.info(f"Enable_Eager_Lane_Exclusion_Dry_Run={self.enable_eager_lane_exclusion_dry_run}")
+        logger.info(f"Enable_Continuous_Eager_Dry_Run={self.enable_continuous_eager_dry_run}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Step={self.max_eager_tokens_per_step}")
         logger.info(f"Max_Eager_Tokens_Per_Request={self.max_eager_tokens_per_request}")
+        logger.info(f"Max_Continuous_Eager_Chain_Depth={self.max_continuous_eager_chain_depth}")
+        logger.info(f"Max_Continuous_Eager_Requests_Per_Step={self.max_continuous_eager_requests_per_step}")
+        logger.info(f"Max_Continuous_Eager_Tokens_Per_Step={self.max_continuous_eager_tokens_per_step}")
+        logger.info(f"Max_Continuous_Eager_Tokens_Per_Request={self.max_continuous_eager_tokens_per_request}")
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len

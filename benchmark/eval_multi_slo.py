@@ -216,6 +216,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_eager_tokens_per_step": args.max_eager_tokens_per_step,
         "max_eager_tokens_per_request": args.max_eager_tokens_per_request,
         "eager_trace_level": args.eager_trace_level,
+        "enable_continuous_eager_dry_run": args.enable_continuous_eager_dry_run,
+        "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
+        "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
+        "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
+        "max_continuous_eager_tokens_per_request": args.max_continuous_eager_tokens_per_request,
     }
 
     # Try new named-path style with gamma.
@@ -251,6 +256,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_eager_tokens_per_step",
         "max_eager_tokens_per_request",
         "eager_trace_level",
+        "enable_continuous_eager_dry_run",
+        "max_continuous_eager_chain_depth",
+        "max_continuous_eager_requests_per_step",
+        "max_continuous_eager_tokens_per_step",
+        "max_continuous_eager_tokens_per_request",
     ):
         legacy_kwargs.pop(key, None)
 
@@ -1619,6 +1629,15 @@ def main() -> None:
     parser.add_argument("--max-eager-requests-per-step", type=int, default=0)
     parser.add_argument("--max-eager-tokens-per-step", type=int, default=0)
     parser.add_argument("--max-eager-tokens-per-request", type=int, default=0)
+    parser.add_argument(
+        "--enable-continuous-eager-dry-run",
+        action="store_true",
+        help="Enable Phase 1H-7a continuous eager shadow dry-run without real continuous commit.",
+    )
+    parser.add_argument("--max-continuous-eager-chain-depth", type=int, default=1)
+    parser.add_argument("--max-continuous-eager-requests-per-step", type=int, default=2)
+    parser.add_argument("--max-continuous-eager-tokens-per-step", type=int, default=0)
+    parser.add_argument("--max-continuous-eager-tokens-per-request", type=int, default=0)
     parser.add_argument(
         "--eager-trace-level",
         choices=["full", "summary", "minimal"],

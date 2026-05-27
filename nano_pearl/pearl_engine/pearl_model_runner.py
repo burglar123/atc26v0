@@ -56,6 +56,8 @@ from tqdm import trange
 
 
 EAGER_TAKEOVER_DRY_RUN_SOURCE = "phase1h5e3_takeover_lane"
+CONTINUOUS_EAGER_DRY_RUN_SOURCE = "continuous_shadow"
+CONTINUOUS_EAGER_PARENT_SOURCE = "phase1h6a_one_shot_commit"
 EAGER_LEGACY_RESULT_TRANSFER_SOURCE = "scheduled_target_eager_lane"
 EAGER_RESULT_TRANSFER_MAGIC = 0x1A5E3
 EAGER_RESULT_TRANSFER_OP_DRY_RUN = 0x1A5E35
@@ -883,6 +885,61 @@ class ModelRunnerBase:
             "eager_commit_target_draft_token_match_by_seq_id": {},
             "eager_commit_frontier_ok_by_proposal_id": {},
             "eager_commit_token_payload_ok_by_proposal_id": {},
+            "enable_continuous_eager_dry_run": bool(
+                getattr(self.global_config, "enable_continuous_eager_dry_run", False)
+            ),
+            "continuous_eager_dry_run_enabled": False,
+            "continuous_eager_source": None,
+            "continuous_eager_parent_source": None,
+            "max_continuous_eager_chain_depth": int(
+                getattr(self.global_config, "max_continuous_eager_chain_depth", 0) or 0
+            ),
+            "max_continuous_eager_requests_per_step": int(
+                getattr(self.global_config, "max_continuous_eager_requests_per_step", 0) or 0
+            ),
+            "max_continuous_eager_tokens_per_step": int(
+                getattr(self.global_config, "max_continuous_eager_tokens_per_step", 0) or 0
+            ),
+            "max_continuous_eager_tokens_per_request": int(
+                getattr(self.global_config, "max_continuous_eager_tokens_per_request", 0) or 0
+            ),
+            "continuous_eager_candidate_proposal_ids": [],
+            "continuous_eager_candidate_seq_ids": [],
+            "continuous_eager_candidate_token_count_by_proposal_id": {},
+            "continuous_eager_parent_proposal_id_by_proposal_id": {},
+            "continuous_eager_chain_depth_by_proposal_id": {},
+            "continuous_eager_chain_index_by_proposal_id": {},
+            "continuous_eager_root_proposal_id_by_proposal_id": {},
+            "continuous_eager_parent_source_by_proposal_id": {},
+            "continuous_eager_verified_proposal_ids": [],
+            "continuous_eager_full_accept_proposal_ids": [],
+            "continuous_eager_partial_reject_proposal_ids": [],
+            "continuous_eager_accept_len_by_proposal_id": {},
+            "continuous_eager_verify_result_by_proposal_id": {},
+            "continuous_eager_commit_ready_shadow_proposal_ids": [],
+            "continuous_eager_commit_ready_shadow_seq_ids": [],
+            "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {},
+            "continuous_eager_not_ready_shadow_proposal_ids": [],
+            "continuous_eager_not_ready_shadow_reason_by_proposal_id": {},
+            "continuous_eager_stale_proposal_ids": [],
+            "continuous_eager_duplicate_proposal_ids": [],
+            "continuous_eager_frontier_mismatch_proposal_ids": [],
+            "continuous_eager_seq_finished_proposal_ids": [],
+            "continuous_eager_overshot_proposal_ids": [],
+            "continuous_eager_invalidated_proposal_ids": [],
+            "continuous_eager_mutation_detected_count": 0,
+            "continuous_eager_real_commit_count": 0,
+            "continuous_eager_candidate_proposal_count": 0,
+            "continuous_eager_candidate_token_count": 0,
+            "continuous_eager_verified_proposal_count": 0,
+            "continuous_eager_full_accept_proposal_count": 0,
+            "continuous_eager_commit_ready_shadow_proposal_count": 0,
+            "continuous_eager_commit_ready_shadow_token_count": 0,
+            "continuous_eager_chain_length_distribution": {},
+            "continuous_eager_drop_reason_counts": {},
+            "continuous_eager_estimated_committed_token_share_of_output": 0.0,
+            "continuous_eager_payload_len_units_per_ready_token": 0.0,
+            "continuous_eager_overhead_time_ms": 0.0,
             "target_sync_apply_checkpoint_ok_by_seq_id": {},
             "target_sync_apply_rollback_ok_by_seq_id": {},
             "target_sync_apply_mutation_remaining_by_seq_id": {},
@@ -1362,6 +1419,9 @@ class ModelRunnerBase:
     def _eager_lane_exclusion_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False))
 
+    def _continuous_eager_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_continuous_eager_dry_run", False))
+
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
         return level if level in {"full", "summary", "minimal"} else "full"
@@ -1393,6 +1453,7 @@ class ModelRunnerBase:
             "missing_buffered_proposal_",
             "missing_normal_proposal_",
             "fallback_",
+            "continuous_eager_",
         )
         pruned = 0
         for key in list(record.keys()):
@@ -5662,6 +5723,195 @@ class ModelRunnerBase:
             self.scheduler.finished.append(seq)
         seq.mark_finished()
 
+    def _continuous_shadow_proposal_id(self, root_proposal_id: int, chain_depth: int) -> int:
+        return 900_000_000 + int(root_proposal_id) * 100 + int(chain_depth)
+
+    def _run_continuous_eager_shadow_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        committed_ids: list[int],
+        committed_seq_ids: list[int],
+        known_by_id: dict[int, EagerProposal | ReadyEagerProposal],
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+    ) -> None:
+        timer_start = time.perf_counter()
+        gamma = int(self.gamma)
+        max_depth = int(getattr(self.global_config, "max_continuous_eager_chain_depth", 1) or 1)
+        max_requests = int(getattr(self.global_config, "max_continuous_eager_requests_per_step", 1) or 1)
+        token_per_request = int(
+            getattr(self.global_config, "max_continuous_eager_tokens_per_request", gamma) or gamma
+        )
+        token_per_request = max(1, min(token_per_request, gamma))
+        max_tokens_per_step = int(
+            getattr(
+                self.global_config,
+                "max_continuous_eager_tokens_per_step",
+                max_requests * token_per_request,
+            )
+            or (max_requests * token_per_request)
+        )
+
+        parent_by_id: dict[int, int] = {}
+        root_by_id: dict[int, int] = {}
+        depth_by_id: dict[int, int] = {}
+        chain_index_by_id: dict[int, int] = {}
+        token_count_by_id: dict[int, int] = {}
+        parent_source_by_id: dict[int, str] = {}
+        candidate_ids: list[int] = []
+        candidate_seq_ids: list[int] = []
+        not_ready_ids: list[int] = []
+        not_ready_reason_by_id: dict[int, str] = {}
+        stale_ids: list[int] = []
+        duplicate_ids: list[int] = []
+        frontier_mismatch_ids: list[int] = []
+        seq_finished_ids: list[int] = []
+        overshot_ids: list[int] = []
+        invalidated_ids: list[int] = []
+        chain_distribution: dict[int, int] = {}
+        reason_counts: dict[str, int] = {}
+        seen_seq_depth: set[tuple[int, int]] = set()
+        token_budget = 0
+
+        def add_not_ready(proposal_id: int, reason: str) -> None:
+            not_ready_ids.append(proposal_id)
+            not_ready_reason_by_id[proposal_id] = reason
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+            if reason in {"seq_not_running", "seq_finished"}:
+                seq_finished_ids.append(proposal_id)
+            elif reason in {"frontier_mismatch", "parent_shadow_not_committed"}:
+                frontier_mismatch_ids.append(proposal_id)
+            elif reason == "duplicate_continuous_candidate":
+                duplicate_ids.append(proposal_id)
+            elif reason == "base_overshot":
+                overshot_ids.append(proposal_id)
+            elif reason == "span_invalidated":
+                invalidated_ids.append(proposal_id)
+            elif reason in {"missing_parent_proposal", "seq_pre_verify"}:
+                stale_ids.append(proposal_id)
+
+        parent_pairs = list(dict.fromkeys(zip(committed_ids, committed_seq_ids)))[:max_requests]
+        for chain_index, (root_proposal_id, seq_id) in enumerate(parent_pairs):
+            root_proposal_id = int(root_proposal_id)
+            seq_id = int(seq_id)
+            parent_id = root_proposal_id
+            parent = known_by_id.get(root_proposal_id) or self.dual_batch_manager.ready_eager_proposals.by_id(root_proposal_id)
+            seq = seq_by_id.get(seq_id)
+
+            for depth in range(1, max_depth + 1):
+                proposal_id = self._continuous_shadow_proposal_id(root_proposal_id, depth)
+                parent_by_id[proposal_id] = int(parent_id)
+                root_by_id[proposal_id] = root_proposal_id
+                depth_by_id[proposal_id] = int(depth)
+                chain_index_by_id[proposal_id] = int(chain_index)
+                token_count_by_id[proposal_id] = int(token_per_request)
+                parent_source_by_id[proposal_id] = (
+                    CONTINUOUS_EAGER_PARENT_SOURCE if depth == 1 else CONTINUOUS_EAGER_DRY_RUN_SOURCE
+                )
+
+                reason = None
+                current_len = -1 if seq is None else int(len(seq))
+                if (seq_id, depth) in seen_seq_depth:
+                    reason = "duplicate_continuous_candidate"
+                elif depth > 1:
+                    reason = "parent_shadow_not_committed"
+                elif token_budget + token_per_request > max_tokens_per_step:
+                    reason = "token_budget_exhausted"
+                elif parent is None:
+                    reason = "missing_parent_proposal"
+                elif seq is None:
+                    reason = "seq_not_found"
+                elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                    reason = "seq_not_running"
+                elif self.is_request_level_finished(seq, plan_context):
+                    reason = "seq_finished"
+                elif self.is_speculative_span_invalidated(seq, plan_context):
+                    reason = "span_invalidated"
+                elif bool(getattr(seq, "pre_verify", True)):
+                    reason = "seq_pre_verify"
+                elif getattr(parent, "real_commit_step_id", None) is None:
+                    reason = "parent_not_committed"
+                elif current_len < int(getattr(parent, "base_len", 0)) + int(getattr(parent, "proposal_len", 0)):
+                    reason = "frontier_mismatch"
+
+                seen_seq_depth.add((seq_id, depth))
+                if reason is not None:
+                    add_not_ready(proposal_id, reason)
+                    parent_id = proposal_id
+                    continue
+
+                candidate_ids.append(proposal_id)
+                candidate_seq_ids.append(seq_id)
+                chain_distribution[depth] = int(chain_distribution.get(depth, 0)) + 1
+                token_budget += token_per_request
+                add_not_ready(proposal_id, "shadow_verify_not_executed")
+                parent_id = proposal_id
+
+        trace_record["enable_continuous_eager_dry_run"] = True
+        trace_record["continuous_eager_dry_run_enabled"] = True
+        trace_record["continuous_eager_source"] = CONTINUOUS_EAGER_DRY_RUN_SOURCE
+        trace_record["continuous_eager_parent_source"] = CONTINUOUS_EAGER_PARENT_SOURCE
+        trace_record["max_continuous_eager_chain_depth"] = max_depth
+        trace_record["max_continuous_eager_requests_per_step"] = max_requests
+        trace_record["max_continuous_eager_tokens_per_step"] = max_tokens_per_step
+        trace_record["max_continuous_eager_tokens_per_request"] = token_per_request
+        trace_record["continuous_eager_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["continuous_eager_candidate_seq_ids"] = list(candidate_seq_ids)
+        trace_record["continuous_eager_candidate_token_count_by_proposal_id"] = {
+            str(proposal_id): int(token_count_by_id[proposal_id]) for proposal_id in sorted(candidate_ids)
+        }
+        trace_record["continuous_eager_parent_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(parent_by_id.items())
+        }
+        trace_record["continuous_eager_chain_depth_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(depth_by_id.items())
+        }
+        trace_record["continuous_eager_chain_index_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(chain_index_by_id.items())
+        }
+        trace_record["continuous_eager_root_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(root_by_id.items())
+        }
+        trace_record["continuous_eager_parent_source_by_proposal_id"] = {
+            str(proposal_id): str(value) for proposal_id, value in sorted(parent_source_by_id.items())
+        }
+        trace_record["continuous_eager_verified_proposal_ids"] = []
+        trace_record["continuous_eager_full_accept_proposal_ids"] = []
+        trace_record["continuous_eager_partial_reject_proposal_ids"] = []
+        trace_record["continuous_eager_accept_len_by_proposal_id"] = {}
+        trace_record["continuous_eager_verify_result_by_proposal_id"] = {}
+        trace_record["continuous_eager_commit_ready_shadow_proposal_ids"] = []
+        trace_record["continuous_eager_commit_ready_shadow_seq_ids"] = []
+        trace_record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {}
+        trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = sorted(set(not_ready_ids))
+        trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(not_ready_reason_by_id.items())
+        }
+        trace_record["continuous_eager_stale_proposal_ids"] = sorted(set(stale_ids))
+        trace_record["continuous_eager_duplicate_proposal_ids"] = sorted(set(duplicate_ids))
+        trace_record["continuous_eager_frontier_mismatch_proposal_ids"] = sorted(set(frontier_mismatch_ids))
+        trace_record["continuous_eager_seq_finished_proposal_ids"] = sorted(set(seq_finished_ids))
+        trace_record["continuous_eager_overshot_proposal_ids"] = sorted(set(overshot_ids))
+        trace_record["continuous_eager_invalidated_proposal_ids"] = sorted(set(invalidated_ids))
+        trace_record["continuous_eager_mutation_detected_count"] = 0
+        trace_record["continuous_eager_real_commit_count"] = 0
+        trace_record["continuous_eager_candidate_proposal_count"] = len(candidate_ids)
+        trace_record["continuous_eager_candidate_token_count"] = sum(
+            int(token_count_by_id[proposal_id]) for proposal_id in candidate_ids
+        )
+        trace_record["continuous_eager_verified_proposal_count"] = 0
+        trace_record["continuous_eager_full_accept_proposal_count"] = 0
+        trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = 0
+        trace_record["continuous_eager_commit_ready_shadow_token_count"] = 0
+        trace_record["continuous_eager_chain_length_distribution"] = {
+            str(depth): count for depth, count in sorted(chain_distribution.items())
+        }
+        trace_record["continuous_eager_drop_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["continuous_eager_estimated_committed_token_share_of_output"] = 0.0
+        trace_record["continuous_eager_payload_len_units_per_ready_token"] = 0.0
+        self._record_elapsed_ms(trace_record, "continuous_eager_overhead_time_ms", timer_start)
+
     def _run_eager_commit_ready_only(
         self,
         plan: StepPlan,
@@ -5925,6 +6175,16 @@ class ModelRunnerBase:
         trace_record["eager_tokens_accepted"] = int(committed_tokens)
         trace_record["eager_tokens_rejected"] = 0
         trace_record["eager_tokens_invalidated"] = 0
+        if self._continuous_eager_dry_run_enabled() and side == "target":
+            self._run_continuous_eager_shadow_dry_run(
+                plan,
+                trace_record,
+                committed_ids,
+                committed_seq_ids,
+                known_by_id,
+                seq_by_id,
+                plan_context,
+            )
         self._record_elapsed_ms(trace_record, "eager_commit_time_ms", timer_start)
 
     def _schedule_ready_eager_dry_run(
