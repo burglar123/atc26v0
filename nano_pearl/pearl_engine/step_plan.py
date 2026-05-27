@@ -244,6 +244,8 @@ class StepPlan:
     eager_sync_apply_dry_run_enabled: bool = False
     enable_eager_commit_readiness_dry_run: bool = False
     eager_commit_readiness_dry_run_enabled: bool = False
+    enable_eager_commit_ready_only: bool = False
+    eager_commit_enabled: bool = False
     enable_eager_lane_exclusion_dry_run: bool = False
     eager_lane_exclusion_dry_run_enabled: bool = False
 
@@ -336,6 +338,7 @@ class StepPlan:
         enable_eager_result_transfer_dry_run: bool = False,
         enable_eager_sync_apply_dry_run: bool = False,
         enable_eager_commit_readiness_dry_run: bool = False,
+        enable_eager_commit_ready_only: bool = False,
         enable_eager_lane_exclusion_dry_run: bool = False,
         global_gamma: int | None = None,
     ):
@@ -557,11 +560,16 @@ class StepPlan:
             or bool(enable_eager_result_transfer_dry_run)
             or bool(enable_eager_sync_apply_dry_run)
             or bool(enable_eager_commit_readiness_dry_run)
+            or bool(enable_eager_commit_ready_only)
             or bool(enable_eager_lane_exclusion_dry_run)
             or not has_eager_scaffold
         ), (
             "non-empty eager scaffold fields require eager trace/execution to be enabled"
         )
+        if enable_eager_commit_ready_only:
+            assert enable_eager_commit_readiness_dry_run, (
+                "Phase 1H-6a eager commit-ready-only requires commit-readiness dry-run"
+            )
         if enable_eager_commit_readiness_dry_run:
             assert enable_eager_sync_apply_dry_run, (
                 "Phase 1H-5j commit-readiness dry-run requires eager sync apply dry-run"
@@ -1079,6 +1087,8 @@ class StepPlan:
             "eager_sync_apply_dry_run_enabled": bool(self.eager_sync_apply_dry_run_enabled),
             "enable_eager_commit_readiness_dry_run": bool(self.enable_eager_commit_readiness_dry_run),
             "eager_commit_readiness_dry_run_enabled": bool(self.eager_commit_readiness_dry_run_enabled),
+            "enable_eager_commit_ready_only": bool(self.enable_eager_commit_ready_only),
+            "eager_commit_enabled": bool(self.eager_commit_enabled),
             "enable_eager_lane_exclusion_dry_run": bool(self.enable_eager_lane_exclusion_dry_run),
             "eager_lane_exclusion_dry_run_enabled": bool(self.eager_lane_exclusion_dry_run_enabled),
         }
