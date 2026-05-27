@@ -813,6 +813,42 @@ class ModelRunnerBase:
             "eager_sync_apply_dry_run_inconsistent_proposal_ids": [],
             "eager_sync_apply_dry_run_missing_local_proposal_ids": [],
             "eager_sync_apply_dry_run_duplicate_proposal_ids": [],
+            "enable_eager_commit_readiness_dry_run": bool(
+                getattr(self.global_config, "enable_eager_commit_readiness_dry_run", False)
+            ),
+            "eager_commit_readiness_dry_run_enabled": False,
+            "eager_commit_readiness_dry_run_source": None,
+            "eager_commit_readiness_candidate_proposal_ids": [],
+            "eager_commit_readiness_candidate_seq_ids": [],
+            "eager_commit_readiness_from_sync_apply_proposal_ids": [],
+            "eager_commit_readiness_from_result_transfer_proposal_ids": [],
+            "eager_commit_readiness_from_apply_proposal_ids": [],
+            "eager_commit_readiness_from_verify_proposal_ids": [],
+            "eager_commit_ready_proposal_ids": [],
+            "eager_commit_ready_seq_ids": [],
+            "eager_commit_ready_token_count_by_proposal_id": {},
+            "eager_commit_ready_action_by_proposal_id": {},
+            "eager_commit_ready_accept_len_by_proposal_id": {},
+            "eager_commit_ready_verify_result_by_proposal_id": {},
+            "eager_commit_not_ready_proposal_ids": [],
+            "eager_commit_not_ready_seq_ids": [],
+            "eager_commit_not_ready_reason_by_proposal_id": {},
+            "eager_commit_readiness_verify_ok_by_proposal_id": {},
+            "eager_commit_readiness_apply_ok_by_proposal_id": {},
+            "eager_commit_readiness_result_transfer_ok_by_proposal_id": {},
+            "eager_commit_readiness_sync_apply_ok_by_proposal_id": {},
+            "eager_commit_readiness_frontier_ok_by_proposal_id": {},
+            "eager_commit_readiness_token_payload_ok_by_proposal_id": {},
+            "eager_commit_readiness_no_mutation_by_proposal_id": {},
+            "eager_commit_readiness_actual_counters_zero": True,
+            "eager_commit_readiness_real_target_eager_empty": True,
+            "eager_commit_readiness_candidate_count": 0,
+            "eager_commit_ready_count": 0,
+            "eager_commit_not_ready_count": 0,
+            "eager_commit_ready_token_count": 0,
+            "eager_commit_not_ready_reason_counts": {},
+            "eager_commit_readiness_full_accept_count": 0,
+            "eager_commit_readiness_partial_reject_count": 0,
             "target_sync_apply_checkpoint_ok_by_seq_id": {},
             "target_sync_apply_rollback_ok_by_seq_id": {},
             "target_sync_apply_mutation_remaining_by_seq_id": {},
@@ -1276,6 +1312,9 @@ class ModelRunnerBase:
     def _eager_sync_apply_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_sync_apply_dry_run", False))
 
+    def _eager_commit_readiness_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_eager_commit_readiness_dry_run", False))
+
     def _eager_lane_exclusion_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_lane_exclusion_dry_run", False))
 
@@ -1300,6 +1339,7 @@ class ModelRunnerBase:
             enable_eager_apply_dry_run=bool(plan.enable_eager_apply_dry_run),
             enable_eager_result_transfer_dry_run=bool(plan.enable_eager_result_transfer_dry_run),
             enable_eager_sync_apply_dry_run=bool(plan.enable_eager_sync_apply_dry_run),
+            enable_eager_commit_readiness_dry_run=bool(plan.enable_eager_commit_readiness_dry_run),
             enable_eager_lane_exclusion_dry_run=bool(plan.enable_eager_lane_exclusion_dry_run),
             global_gamma=int(self.gamma),
         )
@@ -1456,7 +1496,8 @@ class ModelRunnerBase:
         plan.lane_exclusion_decision_sync_step_id = sync_info.get("step_id")
 
     def _apply_eager_plan_dry_run(self, plan: StepPlan) -> None:
-        sync_apply_dry_run_enabled = self._eager_sync_apply_dry_run_enabled()
+        commit_readiness_dry_run_enabled = self._eager_commit_readiness_dry_run_enabled()
+        sync_apply_dry_run_enabled = self._eager_sync_apply_dry_run_enabled() or commit_readiness_dry_run_enabled
         lane_exclusion_dry_run_enabled = self._eager_lane_exclusion_dry_run_enabled()
         result_transfer_dry_run_enabled = self._eager_result_transfer_dry_run_enabled() or sync_apply_dry_run_enabled
         apply_dry_run_enabled = self._eager_apply_dry_run_enabled() or result_transfer_dry_run_enabled
@@ -1477,6 +1518,7 @@ class ModelRunnerBase:
         plan.enable_eager_apply_dry_run = apply_dry_run_enabled
         plan.enable_eager_result_transfer_dry_run = result_transfer_dry_run_enabled
         plan.enable_eager_sync_apply_dry_run = sync_apply_dry_run_enabled
+        plan.enable_eager_commit_readiness_dry_run = commit_readiness_dry_run_enabled
         plan.enable_eager_lane_exclusion_dry_run = lane_exclusion_dry_run_enabled
         plan.eager_policy = policy
         plan.eager_post_verify_only = True
@@ -1517,6 +1559,7 @@ class ModelRunnerBase:
                 enable_eager_apply_dry_run=apply_dry_run_enabled,
                 enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
                 enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
+                enable_eager_commit_readiness_dry_run=commit_readiness_dry_run_enabled,
                 enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
                 global_gamma=gamma,
             )
@@ -1613,6 +1656,7 @@ class ModelRunnerBase:
             enable_eager_apply_dry_run=apply_dry_run_enabled,
             enable_eager_result_transfer_dry_run=result_transfer_dry_run_enabled,
             enable_eager_sync_apply_dry_run=sync_apply_dry_run_enabled,
+            enable_eager_commit_readiness_dry_run=commit_readiness_dry_run_enabled,
             enable_eager_lane_exclusion_dry_run=lane_exclusion_dry_run_enabled,
             global_gamma=gamma,
         )
@@ -4934,6 +4978,400 @@ class ModelRunnerBase:
         trace_record["eager_sync_apply_draft_mutation_remaining_count"] = sum(
             1 for value in mutation_remaining_by_seq_id.values() if bool(value)
         )
+        if self._eager_commit_readiness_dry_run_enabled():
+            plan.eager_commit_readiness_dry_run_enabled = True
+            self._run_eager_commit_readiness_dry_run(
+                plan,
+                trace_record,
+                validated_results,
+                known_by_id,
+                seq_by_id,
+                plan_context,
+            )
+
+    def _run_eager_commit_readiness_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        validated_results: list[dict],
+        known_by_id: dict[int, EagerProposal | ReadyEagerProposal],
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+    ) -> None:
+        gamma = int(self.gamma)
+        result_by_id = {int(result["proposal_id"]): result for result in validated_results}
+        sync_executed_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_sync_apply_dry_run_executed_proposal_ids", [])
+        }
+        sync_consistent_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_sync_apply_dry_run_consistent_proposal_ids", [])
+        }
+        transfer_validated_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_result_transfer_validated_proposal_ids", [])
+        }
+        apply_executed_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_apply_dry_run_executed_proposal_ids", [])
+        } or set(transfer_validated_ids)
+        verify_executed_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_verify_dry_run_executed_proposal_ids", [])
+        } or set(transfer_validated_ids)
+        candidate_ids = sorted(sync_executed_ids & sync_consistent_ids & transfer_validated_ids)
+
+        actual_counters_zero = all(
+            int(trace_record.get(field, 0) or 0) == 0
+            for field in (
+                "eager_tokens_verified",
+                "eager_tokens_accepted",
+                "eager_tokens_rejected",
+                "eager_tokens_invalidated",
+            )
+        )
+        real_target_eager_empty = not bool(trace_record.get("target_eager_set") or [])
+        unexpected_missing = bool(trace_record.get("missing_buffered_proposal_unexpected_seq_ids") or [])
+        invalid_result_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_result_transfer_invalid_proposal_ids", [])
+        }
+        duplicate_result_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("eager_result_transfer_duplicate_proposal_ids", [])
+        }
+        validation_reason_by_id = trace_record.get("eager_result_transfer_validation_reason_by_proposal_id", {})
+        result_action_by_id = trace_record.get("eager_result_transfer_action_by_proposal_id", {})
+        result_verify_by_id = trace_record.get("eager_result_transfer_verify_result_by_proposal_id", {})
+        result_accept_by_id = trace_record.get("eager_result_transfer_accept_len_by_proposal_id", {})
+        result_append_by_id = trace_record.get("eager_result_transfer_append_tokens_by_proposal_id", {})
+        result_discard_by_id = trace_record.get("eager_result_transfer_discarded_tokens_by_proposal_id", {})
+        result_rollback_by_id = trace_record.get("eager_result_transfer_rollback_ok_by_proposal_id", {})
+        result_mutation_by_id = trace_record.get("eager_result_transfer_mutation_detected_by_proposal_id", {})
+        result_checkpoint_by_id = trace_record.get("eager_result_transfer_checkpoint_failed_by_proposal_id", {})
+        sync_action_match_by_id = trace_record.get("eager_sync_apply_dry_run_action_match_by_proposal_id", {})
+        sync_accept_match_by_id = trace_record.get("eager_sync_apply_dry_run_accept_len_match_by_proposal_id", {})
+        sync_result_match_by_id = trace_record.get("eager_sync_apply_dry_run_result_match_by_proposal_id", {})
+        sync_action_by_id = trace_record.get("eager_sync_apply_dry_run_draft_action_by_proposal_id", {})
+        sync_result_by_id = trace_record.get("eager_sync_apply_dry_run_draft_verify_result_by_proposal_id", {})
+        sync_accept_by_id = trace_record.get("eager_sync_apply_dry_run_draft_accept_len_by_proposal_id", {})
+        sync_append_by_id = trace_record.get("eager_sync_apply_dry_run_append_tokens_by_proposal_id", {})
+        sync_rollback_by_id = trace_record.get("eager_sync_apply_dry_run_rollback_ok_by_proposal_id", {})
+        sync_mutation_by_id = trace_record.get("eager_sync_apply_dry_run_mutation_detected_by_proposal_id", {})
+        sync_checkpoint_by_id = trace_record.get("eager_sync_apply_dry_run_checkpoint_failed_by_proposal_id", {})
+        sync_len_before_by_seq = trace_record.get("eager_sync_apply_dry_run_sequence_len_before_by_seq_id", {})
+
+        candidate_seq_ids: list[int] = []
+        ready_ids: list[int] = []
+        ready_seq_ids: list[int] = []
+        not_ready_ids: list[int] = []
+        not_ready_seq_ids: list[int] = []
+        not_ready_reason_by_id: dict[int, str] = {}
+        ready_token_count_by_id: dict[int, int] = {}
+        ready_action_by_id: dict[int, str] = {}
+        ready_accept_by_id: dict[int, int] = {}
+        ready_verify_by_id: dict[int, str] = {}
+        verify_ok_by_id: dict[int, bool] = {}
+        apply_ok_by_id: dict[int, bool] = {}
+        result_ok_by_id: dict[int, bool] = {}
+        sync_ok_by_id: dict[int, bool] = {}
+        frontier_ok_by_id: dict[int, bool] = {}
+        token_payload_ok_by_id: dict[int, bool] = {}
+        no_mutation_by_id: dict[int, bool] = {}
+        reason_counts: dict[str, int] = {}
+        full_accept_count = 0
+        partial_reject_count = 0
+
+        def add_reason(reason: str) -> None:
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+        for proposal_id in candidate_ids:
+            result = result_by_id.get(proposal_id, {})
+            proposal = known_by_id.get(proposal_id) or self.dual_batch_manager.ready_eager_proposals.by_id(proposal_id)
+            seq_id = int(
+                result.get(
+                    "seq_id",
+                    getattr(proposal, "seq_id", -1),
+                )
+            )
+            seq = seq_by_id.get(seq_id)
+            candidate_seq_ids.append(seq_id)
+            proposal_len = int(result.get("proposal_len", gamma))
+            base_len = int(result.get("base_len", getattr(proposal, "base_len", -1)))
+            verify_result = str(
+                self._trace_map_get(
+                    result_verify_by_id,
+                    proposal_id,
+                    result.get("verify_result", "unknown"),
+                )
+            )
+            action = str(
+                self._trace_map_get(
+                    result_action_by_id,
+                    proposal_id,
+                    result.get("apply_action", "unknown"),
+                )
+            )
+            accept_len = int(
+                self._trace_map_get(
+                    result_accept_by_id,
+                    proposal_id,
+                    result.get("accepted_len", -1),
+                )
+            )
+            append_tokens = int(
+                self._trace_map_get(
+                    result_append_by_id,
+                    proposal_id,
+                    result.get("append_token_count", 0),
+                )
+            )
+            result_discarded = int(
+                self._trace_map_get(
+                    result_discard_by_id,
+                    proposal_id,
+                    result.get("discarded_token_count", 0),
+                )
+            )
+            result_rollback_ok = bool(
+                self._trace_map_get(result_rollback_by_id, proposal_id, result.get("rollback_ok", False))
+            )
+            result_mutation = bool(
+                self._trace_map_get(result_mutation_by_id, proposal_id, result.get("mutation_detected", True))
+            )
+            result_checkpoint_failed = bool(
+                self._trace_map_get(result_checkpoint_by_id, proposal_id, result.get("checkpoint_failed", True))
+            )
+            sync_action = str(self._trace_map_get(sync_action_by_id, proposal_id, action))
+            sync_result = str(self._trace_map_get(sync_result_by_id, proposal_id, verify_result))
+            sync_accept = int(self._trace_map_get(sync_accept_by_id, proposal_id, accept_len))
+            sync_append_tokens = int(self._trace_map_get(sync_append_by_id, proposal_id, append_tokens))
+            sync_rollback_ok = bool(self._trace_map_get(sync_rollback_by_id, proposal_id, False))
+            sync_mutation = bool(self._trace_map_get(sync_mutation_by_id, proposal_id, True))
+            sync_checkpoint_failed = bool(self._trace_map_get(sync_checkpoint_by_id, proposal_id, True))
+            current_len = -1 if seq is None else int(len(seq))
+            sync_len_before = int(self._trace_map_get(sync_len_before_by_seq, seq_id, current_len))
+            proposal_state = str(getattr(proposal, "state", "")) if proposal is not None else ""
+
+            verify_ok = (
+                proposal_id in verify_executed_ids
+                and verify_result == "full_accept"
+                and accept_len == proposal_len == gamma
+                and not bool(trace_record.get("eager_verify_dry_run_mutation_detected", False))
+                and not bool(trace_record.get("eager_verify_dry_run_checkpoint_failed", False))
+            )
+            apply_ok = (
+                proposal_id in apply_executed_ids
+                and action == "append_full_accept_then_rollback"
+                and append_tokens == proposal_len == gamma
+                and result_rollback_ok
+                and not result_mutation
+                and not result_checkpoint_failed
+            )
+            result_token_accounting_ok = (
+                (
+                    verify_result == "full_accept"
+                    and append_tokens == proposal_len == gamma
+                    and result_discarded == 0
+                )
+                or (
+                    verify_result != "full_accept"
+                    and append_tokens == 0
+                    and result_discarded == proposal_len == gamma
+                )
+            )
+            result_ok = (
+                proposal_id in transfer_validated_ids
+                and proposal_id not in invalid_result_ids
+                and proposal_id not in duplicate_result_ids
+                and str(self._trace_map_get(validation_reason_by_id, proposal_id, "ok")) == "ok"
+                and result_token_accounting_ok
+            )
+            sync_ok = (
+                proposal_id in sync_executed_ids
+                and proposal_id in sync_consistent_ids
+                and sync_action == action
+                and sync_result == verify_result
+                and sync_accept == accept_len
+                and bool(self._trace_map_get(sync_action_match_by_id, proposal_id, False))
+                and bool(self._trace_map_get(sync_accept_match_by_id, proposal_id, False))
+                and bool(self._trace_map_get(sync_result_match_by_id, proposal_id, False))
+                and sync_append_tokens == append_tokens
+                and sync_rollback_ok
+                and not sync_mutation
+                and not sync_checkpoint_failed
+            )
+            frontier_ok = (
+                seq is not None
+                and getattr(seq, "status", None) == SequenceStatus.RUNNING
+                and not self.is_request_level_finished(seq, plan_context)
+                and not self.is_speculative_span_invalidated(seq, plan_context)
+                and not bool(getattr(seq, "pre_verify", True))
+                and sync_len_before >= base_len >= 0
+            )
+            token_payload_ok = (
+                proposal is not None
+                and len(getattr(proposal, "proposal_token_ids", [])) == proposal_len == gamma
+            )
+            no_mutation = (
+                actual_counters_zero
+                and real_target_eager_empty
+                and not result_mutation
+                and not result_checkpoint_failed
+                and not sync_mutation
+                and not sync_checkpoint_failed
+            )
+            verify_ok_by_id[proposal_id] = bool(verify_ok)
+            apply_ok_by_id[proposal_id] = bool(apply_ok)
+            result_ok_by_id[proposal_id] = bool(result_ok)
+            sync_ok_by_id[proposal_id] = bool(sync_ok)
+            frontier_ok_by_id[proposal_id] = bool(frontier_ok)
+            token_payload_ok_by_id[proposal_id] = bool(token_payload_ok)
+            no_mutation_by_id[proposal_id] = bool(no_mutation)
+
+            reason = None
+            if proposal is None:
+                reason = "missing_local_proposal"
+            elif int(getattr(proposal, "seq_id", -1)) != seq_id:
+                reason = "result_metadata_mismatch"
+            elif proposal_state == "STALE":
+                reason = "proposal_stale"
+            elif proposal_state == "EXPIRED":
+                reason = "proposal_expired"
+            elif proposal_state == "INVALIDATED":
+                reason = "proposal_invalidated"
+            elif proposal_state and proposal_state != READY_EAGER_STATE_CONSUMED_APPLIED:
+                reason = "proposal_stale"
+            elif getattr(proposal, "takeover_routed_step_id", None) is None:
+                reason = "result_metadata_mismatch"
+            elif unexpected_missing:
+                reason = "unexpected_missing_normal_proposal"
+            elif not actual_counters_zero:
+                reason = "actual_eager_counter_nonzero"
+            elif not real_target_eager_empty:
+                reason = "real_target_eager_nonempty"
+            elif proposal_id not in verify_executed_ids:
+                reason = "verify_not_executed"
+            elif verify_result != "full_accept":
+                reason = "not_full_accept"
+            elif result_mutation:
+                reason = "apply_mutation_detected"
+            elif result_checkpoint_failed:
+                reason = "apply_checkpoint_failed"
+            elif not result_rollback_ok:
+                reason = "apply_rollback_failed"
+            elif proposal_id not in apply_executed_ids:
+                reason = "apply_not_executed"
+            elif action != "append_full_accept_then_rollback":
+                reason = "apply_action_not_full_accept"
+            elif proposal_id not in transfer_validated_ids:
+                reason = "result_not_validated"
+            elif proposal_id in invalid_result_ids:
+                reason = "result_invalid"
+            elif proposal_id in duplicate_result_ids:
+                reason = "result_duplicate"
+            elif not result_ok:
+                reason = "result_metadata_mismatch"
+            elif proposal_id not in sync_executed_ids:
+                reason = "sync_apply_not_executed"
+            elif not sync_ok:
+                reason = "sync_apply_inconsistent"
+            elif sync_mutation:
+                reason = "sync_apply_mutation_detected"
+            elif not sync_rollback_ok:
+                reason = "sync_apply_rollback_failed"
+            elif seq is None:
+                reason = "missing_local_proposal"
+            elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                reason = "seq_not_running"
+            elif self.is_request_level_finished(seq, plan_context):
+                reason = "seq_finished"
+            elif bool(getattr(seq, "pre_verify", True)):
+                reason = "seq_pre_verify"
+            elif sync_len_before < base_len:
+                reason = "base_len_mismatch"
+            elif not frontier_ok:
+                reason = "frontier_mismatch"
+            elif not token_payload_ok:
+                reason = "token_payload_missing"
+
+            if verify_result == "full_accept":
+                full_accept_count += 1
+            else:
+                partial_reject_count += 1
+
+            if reason is None:
+                ready_ids.append(proposal_id)
+                ready_seq_ids.append(seq_id)
+                ready_token_count_by_id[proposal_id] = proposal_len
+                ready_action_by_id[proposal_id] = action
+                ready_accept_by_id[proposal_id] = accept_len
+                ready_verify_by_id[proposal_id] = verify_result
+            else:
+                not_ready_ids.append(proposal_id)
+                not_ready_seq_ids.append(seq_id)
+                not_ready_reason_by_id[proposal_id] = reason
+                add_reason(reason)
+
+        trace_record["enable_eager_commit_readiness_dry_run"] = True
+        trace_record["eager_commit_readiness_dry_run_enabled"] = True
+        trace_record["eager_commit_readiness_dry_run_source"] = EAGER_TAKEOVER_DRY_RUN_SOURCE
+        trace_record["eager_commit_readiness_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["eager_commit_readiness_candidate_seq_ids"] = list(candidate_seq_ids)
+        trace_record["eager_commit_readiness_from_sync_apply_proposal_ids"] = sorted(sync_executed_ids)
+        trace_record["eager_commit_readiness_from_result_transfer_proposal_ids"] = sorted(transfer_validated_ids)
+        trace_record["eager_commit_readiness_from_apply_proposal_ids"] = sorted(apply_executed_ids)
+        trace_record["eager_commit_readiness_from_verify_proposal_ids"] = sorted(verify_executed_ids)
+        trace_record["eager_commit_ready_proposal_ids"] = list(ready_ids)
+        trace_record["eager_commit_ready_seq_ids"] = list(ready_seq_ids)
+        trace_record["eager_commit_ready_token_count_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(ready_token_count_by_id.items())
+        }
+        trace_record["eager_commit_ready_action_by_proposal_id"] = {
+            str(proposal_id): action for proposal_id, action in sorted(ready_action_by_id.items())
+        }
+        trace_record["eager_commit_ready_accept_len_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(ready_accept_by_id.items())
+        }
+        trace_record["eager_commit_ready_verify_result_by_proposal_id"] = {
+            str(proposal_id): result for proposal_id, result in sorted(ready_verify_by_id.items())
+        }
+        trace_record["eager_commit_not_ready_proposal_ids"] = list(not_ready_ids)
+        trace_record["eager_commit_not_ready_seq_ids"] = list(not_ready_seq_ids)
+        trace_record["eager_commit_not_ready_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(not_ready_reason_by_id.items())
+        }
+        trace_record["eager_commit_readiness_verify_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(verify_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_apply_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(apply_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_result_transfer_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(result_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_sync_apply_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(sync_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_frontier_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(frontier_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_token_payload_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(token_payload_ok_by_id.items())
+        }
+        trace_record["eager_commit_readiness_no_mutation_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(no_mutation_by_id.items())
+        }
+        trace_record["eager_commit_readiness_actual_counters_zero"] = bool(actual_counters_zero)
+        trace_record["eager_commit_readiness_real_target_eager_empty"] = bool(real_target_eager_empty)
+        trace_record["eager_commit_readiness_candidate_count"] = len(candidate_ids)
+        trace_record["eager_commit_ready_count"] = len(ready_ids)
+        trace_record["eager_commit_not_ready_count"] = len(not_ready_ids)
+        trace_record["eager_commit_ready_token_count"] = sum(int(value) for value in ready_token_count_by_id.values())
+        trace_record["eager_commit_not_ready_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["eager_commit_readiness_full_accept_count"] = int(full_accept_count)
+        trace_record["eager_commit_readiness_partial_reject_count"] = int(partial_reject_count)
 
     def _schedule_ready_eager_dry_run(
         self,
