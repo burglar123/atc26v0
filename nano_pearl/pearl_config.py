@@ -143,6 +143,7 @@ class PEARLConfig:
     enable_eager_commit_ready_only: bool = False
     enable_eager_lane_exclusion_dry_run: bool = False
     enable_continuous_eager_dry_run: bool = False
+    enable_continuous_eager_verify_apply_dry_run: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -173,6 +174,9 @@ class PEARLConfig:
         self.enable_eager_commit_ready_only = bool(self.enable_eager_commit_ready_only)
         self.enable_eager_lane_exclusion_dry_run = bool(self.enable_eager_lane_exclusion_dry_run)
         self.enable_continuous_eager_dry_run = bool(self.enable_continuous_eager_dry_run)
+        self.enable_continuous_eager_verify_apply_dry_run = bool(self.enable_continuous_eager_verify_apply_dry_run)
+        if self.enable_continuous_eager_verify_apply_dry_run:
+            self.enable_continuous_eager_dry_run = True
         if self.enable_eager_commit_ready_only:
             self.enable_eager_commit_readiness_dry_run = True
         if self.enable_eager_commit_readiness_dry_run:
@@ -282,6 +286,9 @@ class PEARLConfig:
         logger.info(f"Enable_Eager_Commit_Ready_Only={self.enable_eager_commit_ready_only}")
         logger.info(f"Enable_Eager_Lane_Exclusion_Dry_Run={self.enable_eager_lane_exclusion_dry_run}")
         logger.info(f"Enable_Continuous_Eager_Dry_Run={self.enable_continuous_eager_dry_run}")
+        logger.info(
+            f"Enable_Continuous_Eager_Verify_Apply_Dry_Run={self.enable_continuous_eager_verify_apply_dry_run}"
+        )
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")

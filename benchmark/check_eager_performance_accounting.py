@@ -302,13 +302,21 @@ def aggregate_performance_accounting(
     skip_reason_by_id: dict[int, str] = {}
     continuous_candidate_ids: set[int] = set()
     continuous_ready_shadow_ids: set[int] = set()
+    continuous_verified_ids: set[int] = set()
+    continuous_full_accept_ids: set[int] = set()
     continuous_token_by_id: dict[int, int] = {}
     continuous_ready_token_by_id: dict[int, int] = {}
+    continuous_verified_token_by_id: dict[int, int] = {}
+    continuous_full_accept_token_by_id: dict[int, int] = {}
     continuous_drop_reason_by_id: dict[int, str] = {}
     continuous_chain_depth_by_id: dict[int, int] = {}
     continuous_duplicate_ids: set[int] = set()
     continuous_frontier_mismatch_ids: set[int] = set()
+    continuous_true_frontier_mismatch_ids: set[int] = set()
+    continuous_parent_shadow_not_committed_ids: set[int] = set()
+    continuous_parent_not_ready_ids: set[int] = set()
     continuous_real_commit_count = 0
+    continuous_result_transfer_payload_len_units = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -353,6 +361,11 @@ def aggregate_performance_accounting(
         continuous_ready_shadow_ids.update(
             as_int_set(record.get("continuous_eager_commit_ready_shadow_proposal_ids"))
         )
+        continuous_verified_ids.update(as_int_set(record.get("continuous_eager_verified_proposal_ids")))
+        continuous_verified_ids.update(
+            as_int_set(record.get("continuous_eager_verify_dry_run_executed_proposal_ids"))
+        )
+        continuous_full_accept_ids.update(as_int_set(record.get("continuous_eager_full_accept_proposal_ids")))
         for proposal_id, token_count in as_int_map(
             record.get("continuous_eager_candidate_token_count_by_proposal_id")
         ).items():
@@ -363,6 +376,16 @@ def aggregate_performance_accounting(
         ).items():
             if token_count > 0:
                 continuous_ready_token_by_id.setdefault(proposal_id, token_count)
+        for proposal_id in as_int_set(record.get("continuous_eager_verified_proposal_ids")):
+            continuous_verified_token_by_id.setdefault(
+                proposal_id,
+                continuous_token_by_id.get(proposal_id, max(0, gamma)),
+            )
+        for proposal_id in as_int_set(record.get("continuous_eager_full_accept_proposal_ids")):
+            continuous_full_accept_token_by_id.setdefault(
+                proposal_id,
+                continuous_token_by_id.get(proposal_id, max(0, gamma)),
+            )
         for proposal_id, depth in as_int_map(
             record.get("continuous_eager_chain_depth_by_proposal_id")
         ).items():
@@ -381,7 +404,20 @@ def aggregate_performance_accounting(
         continuous_frontier_mismatch_ids.update(
             as_int_set(record.get("continuous_eager_frontier_mismatch_proposal_ids"))
         )
+        continuous_true_frontier_mismatch_ids.update(
+            as_int_set(record.get("continuous_eager_true_frontier_mismatch_proposal_ids"))
+        )
+        continuous_parent_shadow_not_committed_ids.update(
+            as_int_set(record.get("continuous_eager_parent_shadow_not_committed_proposal_ids"))
+        )
+        continuous_parent_not_ready_ids.update(
+            as_int_set(record.get("continuous_eager_parent_not_ready_proposal_ids"))
+        )
         continuous_real_commit_count += int_value(record.get("continuous_eager_real_commit_count"), 0)
+        continuous_result_transfer_payload_len_units += max(
+            0,
+            int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0),
+        )
 
         reason_map = record.get("eager_commit_skip_reason_by_proposal_id")
         if not isinstance(reason_map, dict):
@@ -472,6 +508,14 @@ def aggregate_performance_accounting(
         int(continuous_ready_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
         for proposal_id in continuous_ready_shadow_ids
     )
+    continuous_verified_token_count = sum(
+        int(continuous_verified_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+        for proposal_id in continuous_verified_ids
+    )
+    continuous_full_accept_token_count = sum(
+        int(continuous_full_accept_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+        for proposal_id in continuous_full_accept_ids
+    )
     continuous_chain_distribution = Counter(
         str(depth)
         for proposal_id, depth in continuous_chain_depth_by_id.items()
@@ -526,6 +570,10 @@ def aggregate_performance_accounting(
         "eager_partial_reject_rate": eager_partial_reject_rate,
         "continuous_eager_candidate_proposal_count": len(continuous_candidate_ids),
         "continuous_eager_candidate_token_count": continuous_candidate_token_count,
+        "continuous_eager_verified_proposal_count": len(continuous_verified_ids),
+        "continuous_eager_verified_token_count": continuous_verified_token_count,
+        "continuous_eager_full_accept_proposal_count": len(continuous_full_accept_ids),
+        "continuous_eager_full_accept_token_count": continuous_full_accept_token_count,
         "continuous_eager_commit_ready_shadow_proposal_count": len(continuous_ready_shadow_ids),
         "continuous_eager_commit_ready_shadow_token_count": continuous_ready_shadow_token_count,
         "continuous_eager_estimated_committed_token_share_of_output": safe_div(
@@ -543,8 +591,12 @@ def aggregate_performance_accounting(
         "continuous_eager_drop_reason_counts": dict(Counter(continuous_drop_reason_by_id.values())),
         "continuous_eager_duplicate_count": len(continuous_duplicate_ids),
         "continuous_eager_frontier_mismatch_count": len(continuous_frontier_mismatch_ids),
+        "continuous_true_frontier_mismatch_count": len(continuous_true_frontier_mismatch_ids),
+        "continuous_parent_shadow_not_committed_count": len(continuous_parent_shadow_not_committed_ids),
+        "continuous_parent_shadow_not_ready_count": len(continuous_parent_not_ready_ids),
         "continuous_eager_real_commit_count": continuous_real_commit_count,
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
+        "continuous_eager_result_transfer_payload_len_units": continuous_result_transfer_payload_len_units,
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
         "normal_draft_token_slots_suppressed": lane_token_slots,
         "normal_proposal_missing_allowed_by_eager_count": len(missing_allowed_events),
@@ -643,6 +695,16 @@ def validate_accounting(
         0,
     ):
         errors.append("continuous shadow ready tokens exceed continuous candidate tokens")
+    if int_value(accounting.get("continuous_eager_verified_token_count"), 0) > int_value(
+        accounting.get("continuous_eager_candidate_token_count"),
+        0,
+    ):
+        errors.append("continuous verified tokens exceed continuous candidate tokens")
+    if int_value(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0) > int_value(
+        accounting.get("continuous_eager_verified_token_count"),
+        0,
+    ):
+        errors.append("continuous shadow ready tokens exceed continuous verified tokens")
     if committed_tokens and int_value(accounting.get("normal_draft_token_slots_suppressed"), 0) < committed_tokens:
         errors.append("normal draft token slots suppressed must cover committed tokens")
     if committed_tokens and int_value(accounting.get("target_normal_verify_token_slots_replaced_by_eager"), 0) < committed_tokens:
@@ -704,6 +766,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "eager_partial_reject_rate",
         "continuous_eager_candidate_proposal_count",
         "continuous_eager_candidate_token_count",
+        "continuous_eager_verified_proposal_count",
+        "continuous_eager_verified_token_count",
+        "continuous_eager_full_accept_proposal_count",
+        "continuous_eager_full_accept_token_count",
         "continuous_eager_commit_ready_shadow_proposal_count",
         "continuous_eager_commit_ready_shadow_token_count",
         "continuous_eager_estimated_committed_token_share_of_output",
@@ -713,7 +779,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_eager_drop_reason_counts",
         "continuous_eager_duplicate_count",
         "continuous_eager_frontier_mismatch_count",
+        "continuous_true_frontier_mismatch_count",
+        "continuous_parent_shadow_not_committed_count",
+        "continuous_parent_shadow_not_ready_count",
         "continuous_eager_real_commit_count",
+        "continuous_eager_result_transfer_payload_len_units",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",
         "suppressed_slots_per_committed_token",

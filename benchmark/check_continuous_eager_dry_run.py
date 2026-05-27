@@ -118,26 +118,38 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         one_shot_committed_ids_by_record[idx] = committed
 
     records_with_enabled = 0
+    records_with_verify_apply_enabled = 0
     active_records = 0
     candidate_ids_seen: set[int] = set()
     candidate_token_by_id: dict[int, int] = {}
     ready_shadow_ids_seen: set[int] = set()
     not_ready_ids_seen: set[int] = set()
     verified_ids_seen: set[int] = set()
+    verify_skipped_ids_seen: set[int] = set()
     full_accept_ids_seen: set[int] = set()
     duplicate_ids_seen: set[int] = set()
     frontier_mismatch_ids_seen: set[int] = set()
+    true_frontier_mismatch_ids_seen: set[int] = set()
+    parent_shadow_not_committed_ids_seen: set[int] = set()
     real_commit_count = 0
     mutation_detected_count = 0
     missing_unexpected_count = 0
+    sent_result_ids_seen: set[int] = set()
+    received_result_ids_seen: set[int] = set()
+    validated_result_ids_seen: set[int] = set()
+    invalid_result_ids_seen: set[int] = set()
+    sync_executed_ids_seen: set[int] = set()
     chain_depths: dict[int, int] = {}
     drop_reason_by_id: dict[int, str] = {}
     step_seq_depth_seen: dict[tuple[int, int, int], set[int]] = defaultdict(set)
 
     for idx, record in enumerate(records):
         enabled = bool(record.get("enable_continuous_eager_dry_run", False))
+        verify_apply_enabled = bool(record.get("enable_continuous_eager_verify_apply_dry_run", False))
         if enabled:
             records_with_enabled += 1
+        if verify_apply_enabled:
+            records_with_verify_apply_enabled += 1
         if not continuous_row(record):
             continue
         if not enabled:
@@ -147,6 +159,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             active_records += 1
         if active and record.get("continuous_eager_source") != CONTINUOUS_SOURCE:
             errors.append(f"record[{idx}] continuous source is not {CONTINUOUS_SOURCE!r}")
+        stage = record.get("continuous_eager_execution_stage") or record.get("continuous_shadow_stage")
+        if verify_apply_enabled and active and stage != "verify_apply_dry_run":
+            errors.append(f"record[{idx}] continuous verify/apply enabled but stage is {stage!r}")
 
         candidate_ids = as_int_list(record.get("continuous_eager_candidate_proposal_ids"))
         candidate_seq_ids = as_int_list(record.get("continuous_eager_candidate_seq_ids"))
@@ -154,14 +169,32 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         not_ready_ids = as_int_set(record.get("continuous_eager_not_ready_shadow_proposal_ids"))
         ready_shadow_ids = as_int_set(record.get("continuous_eager_commit_ready_shadow_proposal_ids"))
         verified_ids = as_int_set(record.get("continuous_eager_verified_proposal_ids"))
+        verify_candidates = as_int_set(record.get("continuous_eager_verify_dry_run_candidate_proposal_ids"))
+        verify_executed = as_int_set(record.get("continuous_eager_verify_dry_run_executed_proposal_ids"))
+        verify_skipped = as_int_set(record.get("continuous_eager_verify_dry_run_skipped_proposal_ids"))
         full_accept_ids = as_int_set(record.get("continuous_eager_full_accept_proposal_ids"))
+        apply_candidates = as_int_set(record.get("continuous_eager_apply_dry_run_candidate_proposal_ids"))
+        apply_executed = as_int_set(record.get("continuous_eager_apply_dry_run_executed_proposal_ids"))
         token_by_id = as_int_map(record.get("continuous_eager_candidate_token_count_by_proposal_id"))
         parent_by_id = as_int_map(record.get("continuous_eager_parent_proposal_id_by_proposal_id"))
         root_by_id = as_int_map(record.get("continuous_eager_root_proposal_id_by_proposal_id"))
         depth_by_id = as_int_map(record.get("continuous_eager_chain_depth_by_proposal_id"))
         reason_by_id = as_str_map(record.get("continuous_eager_not_ready_shadow_reason_by_proposal_id"))
         parent_source_by_id = as_str_map(record.get("continuous_eager_parent_source_by_proposal_id"))
+        verify_result_by_id = as_str_map(record.get("continuous_eager_verify_result_by_proposal_id"))
+        accept_len_by_id = as_int_map(record.get("continuous_eager_accept_len_by_proposal_id"))
+        apply_action_by_id = as_str_map(record.get("continuous_eager_apply_action_by_proposal_id"))
+        apply_rollback_by_id = record.get("continuous_eager_apply_rollback_ok_by_proposal_id") or {}
+        apply_mutation_by_id = record.get("continuous_eager_apply_mutation_detected_by_proposal_id") or {}
+        apply_checkpoint_by_id = record.get("continuous_eager_apply_checkpoint_failed_by_proposal_id") or {}
+        sync_action_match_by_id = record.get("continuous_eager_sync_apply_action_match_by_proposal_id") or {}
+        sync_result_match_by_id = record.get("continuous_eager_sync_apply_result_match_by_proposal_id") or {}
+        sync_accept_match_by_id = record.get("continuous_eager_sync_apply_accept_len_match_by_proposal_id") or {}
+        sync_rollback_by_id = record.get("continuous_eager_sync_apply_rollback_ok_by_proposal_id") or {}
+        sync_mutation_by_id = record.get("continuous_eager_sync_apply_mutation_detected_by_proposal_id") or {}
+        sync_checkpoint_by_id = record.get("continuous_eager_sync_apply_checkpoint_failed_by_proposal_id") or {}
         max_depth = int_value(record.get("max_continuous_eager_chain_depth"), 0)
+        observed_depth = int_value(record.get("max_continuous_depth_observed"), 0)
         step, _plan = step_plan_key(record)
 
         if len(candidate_ids) != len(candidate_seq_ids):
@@ -183,6 +216,18 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(
                     f"record[{idx}] candidate {proposal_id} parent {parent_id} is not one-shot committed/ready"
                 )
+            if (
+                verify_apply_enabled
+                and verify_candidates
+                and depth == 1
+                and proposal_id in verify_candidates
+                and proposal_id not in (verify_executed | verify_skipped)
+            ):
+                errors.append(f"record[{idx}] depth-1 candidate {proposal_id} was not verified or skipped")
+        if max_depth > 0 and observed_depth > max_depth:
+            errors.append(f"record[{idx}] observed depth {observed_depth} exceeds configured max {max_depth}")
+        if verify_apply_enabled and "shadow_verify_not_executed" in reason_by_id.values():
+            errors.append(f"record[{idx}] verify/apply stage still reports shadow_verify_not_executed")
 
         for proposal_id, seq_id in zip(candidate_ids, candidate_seq_ids):
             depth = int(depth_by_id.get(proposal_id, 0))
@@ -200,10 +245,32 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(
                 f"record[{idx}] full-accept ids are not verified: {sorted(full_accept_ids - verified_ids)}"
             )
-        if full_accept_ids - ready_shadow_ids:
-            errors.append(
-                f"record[{idx}] full-accept ids are not shadow-ready: {sorted(full_accept_ids - ready_shadow_ids)}"
-            )
+        if verify_apply_enabled and apply_executed - full_accept_ids:
+            errors.append(f"record[{idx}] non-full-accept ids were apply-executed: {sorted(apply_executed - full_accept_ids)}")
+        for proposal_id in full_accept_ids:
+            if int(accept_len_by_id.get(proposal_id, -1)) != int(token_by_id.get(proposal_id, 0)):
+                errors.append(f"record[{idx}] full-accept {proposal_id} accept_len/token_count mismatch")
+            if apply_action_by_id.get(proposal_id) not in {None, "append_full_accept_then_rollback"}:
+                errors.append(f"record[{idx}] full-accept {proposal_id} has bad apply action")
+            if str(apply_rollback_by_id.get(str(proposal_id), apply_rollback_by_id.get(proposal_id, True))) == "False":
+                errors.append(f"record[{idx}] full-accept {proposal_id} apply rollback failed")
+            if bool(apply_mutation_by_id.get(str(proposal_id), apply_mutation_by_id.get(proposal_id, False))):
+                errors.append(f"record[{idx}] full-accept {proposal_id} apply mutation detected")
+            if bool(apply_checkpoint_by_id.get(str(proposal_id), apply_checkpoint_by_id.get(proposal_id, False))):
+                errors.append(f"record[{idx}] full-accept {proposal_id} apply checkpoint failed")
+        for proposal_id in ready_shadow_ids:
+            for mapping, name in (
+                (sync_action_match_by_id, "sync action"),
+                (sync_result_match_by_id, "sync result"),
+                (sync_accept_match_by_id, "sync accept_len"),
+                (sync_rollback_by_id, "sync rollback"),
+            ):
+                if mapping and not bool(mapping.get(str(proposal_id), mapping.get(proposal_id, False))):
+                    errors.append(f"record[{idx}] shadow-ready {proposal_id} failed {name} guard")
+            if bool(sync_mutation_by_id.get(str(proposal_id), sync_mutation_by_id.get(proposal_id, False))):
+                errors.append(f"record[{idx}] shadow-ready {proposal_id} sync mutation detected")
+            if bool(sync_checkpoint_by_id.get(str(proposal_id), sync_checkpoint_by_id.get(proposal_id, False))):
+                errors.append(f"record[{idx}] shadow-ready {proposal_id} sync checkpoint failed")
         continuous_ids = (
             candidate_id_set
             | not_ready_ids
@@ -228,10 +295,23 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         ready_shadow_ids_seen.update(ready_shadow_ids)
         not_ready_ids_seen.update(not_ready_ids)
         verified_ids_seen.update(verified_ids)
+        verified_ids_seen.update(verify_executed)
+        verify_skipped_ids_seen.update(verify_skipped)
         full_accept_ids_seen.update(full_accept_ids)
+        sent_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_sent_proposal_ids")))
+        received_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_received_proposal_ids")))
+        validated_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_validated_proposal_ids")))
+        invalid_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_invalid_proposal_ids")))
+        sync_executed_ids_seen.update(as_int_set(record.get("continuous_eager_sync_apply_executed_proposal_ids")))
         duplicate_ids_seen.update(as_int_set(record.get("continuous_eager_duplicate_proposal_ids")))
         frontier_mismatch_ids_seen.update(
             as_int_set(record.get("continuous_eager_frontier_mismatch_proposal_ids"))
+        )
+        true_frontier_mismatch_ids_seen.update(
+            as_int_set(record.get("continuous_eager_true_frontier_mismatch_proposal_ids"))
+        )
+        parent_shadow_not_committed_ids_seen.update(
+            as_int_set(record.get("continuous_eager_parent_shadow_not_committed_proposal_ids"))
         )
         real_commit_count += int_value(record.get("continuous_eager_real_commit_count"), 0)
         mutation_detected_count += int_value(record.get("continuous_eager_mutation_detected_count"), 0)
@@ -258,6 +338,31 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     }
     if repeated_seq_depth:
         errors.append(f"duplicate continuous candidates for same step/seq/depth: {repeated_seq_depth}")
+    ready_without_full_accept = ready_shadow_ids_seen - full_accept_ids_seen
+    if ready_without_full_accept:
+        errors.append(f"continuous shadow-ready ids were not full-accept: {sorted(ready_without_full_accept)}")
+    if records_with_verify_apply_enabled:
+        depth1_candidates = {
+            proposal_id for proposal_id, depth in chain_depths.items() if int(depth) == 1
+        }
+        missing_verify_or_skip = depth1_candidates - verified_ids_seen - verify_skipped_ids_seen
+        if missing_verify_or_skip:
+            errors.append(
+                f"continuous depth-1 candidates not verified or skipped: {sorted(missing_verify_or_skip)}"
+            )
+        missing_result_receive = sent_result_ids_seen - received_result_ids_seen
+        if missing_result_receive:
+            errors.append(f"continuous result transfer sent but not received: {sorted(missing_result_receive)}")
+        missing_result_validation = received_result_ids_seen - validated_result_ids_seen - invalid_result_ids_seen
+        if missing_result_validation:
+            errors.append(f"continuous result transfer missing validation: {sorted(missing_result_validation)}")
+        if invalid_result_ids_seen:
+            errors.append(f"continuous result transfer invalid ids: {sorted(invalid_result_ids_seen)}")
+        missing_sync = validated_result_ids_seen - sync_executed_ids_seen
+        if missing_sync:
+            errors.append(f"continuous validated results not sync-applied: {sorted(missing_sync)}")
+        if parent_shadow_not_committed_ids_seen & true_frontier_mismatch_ids_seen:
+            errors.append("parent_shadow_not_committed counted as true frontier mismatch")
 
     accounting = aggregate_performance_accounting(records, {})
     candidate_tokens = sum(candidate_token_by_id.values())
@@ -266,6 +371,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     summary = {
         "total_trace_records": len(records),
         "records_with_continuous_eager_enabled": records_with_enabled,
+        "records_with_continuous_verify_apply_enabled": records_with_verify_apply_enabled,
         "continuous_active_records": active_records,
         "one_shot_committed_proposal_count": int_value(commit_summary.get("committed_proposal_count"), 0),
         "one_shot_committed_token_count": int_value(commit_summary.get("committed_token_count"), 0),
@@ -280,9 +386,15 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "continuous_drop_reason_counts": dict(Counter(drop_reason_by_id.values())),
         "continuous_duplicate_count": len(duplicate_ids_seen),
         "continuous_frontier_mismatch_count": len(frontier_mismatch_ids_seen),
+        "continuous_true_frontier_mismatch_count": len(true_frontier_mismatch_ids_seen),
+        "continuous_parent_shadow_not_committed_count": len(parent_shadow_not_committed_ids_seen),
         "continuous_mutation_detected_count": mutation_detected_count,
         "continuous_real_commit_count": real_commit_count,
         "missing_buffered_proposal_unexpected_count": missing_unexpected_count,
+        "continuous_result_transfer_sent_count": len(sent_result_ids_seen),
+        "continuous_result_transfer_received_count": len(received_result_ids_seen),
+        "continuous_result_transfer_validated_count": len(validated_result_ids_seen),
+        "continuous_sync_apply_executed_count": len(sync_executed_ids_seen),
         "combined_one_shot_plus_continuous_shadow_token_count": accounting.get(
             "combined_one_shot_plus_continuous_shadow_token_count",
             0,
@@ -299,6 +411,7 @@ def print_summary(summary: dict[str, Any]) -> None:
     for key in (
         "total_trace_records",
         "records_with_continuous_eager_enabled",
+        "records_with_continuous_verify_apply_enabled",
         "continuous_active_records",
         "one_shot_committed_proposal_count",
         "one_shot_committed_token_count",
@@ -313,9 +426,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_drop_reason_counts",
         "continuous_duplicate_count",
         "continuous_frontier_mismatch_count",
+        "continuous_true_frontier_mismatch_count",
+        "continuous_parent_shadow_not_committed_count",
         "continuous_mutation_detected_count",
         "continuous_real_commit_count",
         "missing_buffered_proposal_unexpected_count",
+        "continuous_result_transfer_sent_count",
+        "continuous_result_transfer_received_count",
+        "continuous_result_transfer_validated_count",
+        "continuous_sync_apply_executed_count",
         "combined_one_shot_plus_continuous_shadow_token_count",
         "combined_estimated_token_share_of_output",
     ):
@@ -399,7 +518,9 @@ def synthetic_continuous_record() -> dict[str, Any]:
                 "900000601": "shadow_verify_not_executed",
                 "900000602": "parent_shadow_not_committed",
             },
-            "continuous_eager_frontier_mismatch_proposal_ids": [900000602],
+            "continuous_eager_parent_shadow_not_committed_proposal_ids": [900000602],
+            "continuous_eager_true_frontier_mismatch_proposal_ids": [],
+            "continuous_eager_frontier_mismatch_proposal_ids": [],
             "continuous_eager_candidate_proposal_count": 1,
             "continuous_eager_candidate_token_count": 4,
             "continuous_eager_commit_ready_shadow_proposal_count": 0,
@@ -411,6 +532,80 @@ def synthetic_continuous_record() -> dict[str, Any]:
     return record
 
 
+def synthetic_verify_apply_records() -> list[dict[str, Any]]:
+    target = synthetic_base_record()
+    target.update(
+        {
+            "enable_continuous_eager_dry_run": True,
+            "enable_continuous_eager_verify_apply_dry_run": True,
+            "continuous_eager_dry_run_enabled": True,
+            "continuous_eager_source": CONTINUOUS_SOURCE,
+            "continuous_eager_execution_stage": "verify_apply_dry_run",
+            "continuous_shadow_stage": "verify_apply_dry_run",
+            "max_continuous_eager_chain_depth": 1,
+            "max_continuous_depth_configured": 1,
+            "max_continuous_depth_observed": 1,
+            "continuous_eager_candidate_proposal_ids": [900000601],
+            "continuous_eager_candidate_seq_ids": [12],
+            "continuous_eager_candidate_token_count_by_proposal_id": {"900000601": 4},
+            "continuous_eager_parent_proposal_id_by_proposal_id": {"900000601": 6},
+            "continuous_eager_chain_depth_by_proposal_id": {"900000601": 1},
+            "continuous_eager_root_proposal_id_by_proposal_id": {"900000601": 6},
+            "continuous_eager_parent_source_by_proposal_id": {"900000601": ONE_SHOT_PARENT_SOURCE},
+            "continuous_eager_verify_dry_run_candidate_proposal_ids": [900000601],
+            "continuous_eager_verify_dry_run_executed_proposal_ids": [900000601],
+            "continuous_eager_verified_proposal_ids": [900000601],
+            "continuous_eager_verify_result_by_proposal_id": {"900000601": "full_accept"},
+            "continuous_eager_accept_len_by_proposal_id": {"900000601": 4},
+            "continuous_eager_full_accept_proposal_ids": [900000601],
+            "continuous_eager_apply_dry_run_candidate_proposal_ids": [900000601],
+            "continuous_eager_apply_dry_run_executed_proposal_ids": [900000601],
+            "continuous_eager_apply_action_by_proposal_id": {"900000601": "append_full_accept_then_rollback"},
+            "continuous_eager_apply_rollback_ok_by_proposal_id": {"900000601": True},
+            "continuous_eager_apply_mutation_detected_by_proposal_id": {"900000601": False},
+            "continuous_eager_apply_checkpoint_failed_by_proposal_id": {"900000601": False},
+            "continuous_eager_result_transfer_sent_proposal_ids": [900000601],
+            "continuous_eager_real_commit_count": 0,
+        }
+    )
+    draft = synthetic_base_record()
+    draft["eager_commit_side"] = "draft"
+    draft.update(
+        {
+            "enable_continuous_eager_dry_run": True,
+            "enable_continuous_eager_verify_apply_dry_run": True,
+            "continuous_eager_dry_run_enabled": True,
+            "continuous_eager_source": CONTINUOUS_SOURCE,
+            "continuous_eager_execution_stage": "verify_apply_dry_run",
+            "continuous_shadow_stage": "verify_apply_dry_run",
+            "max_continuous_eager_chain_depth": 1,
+            "max_continuous_depth_configured": 1,
+            "max_continuous_depth_observed": 1,
+            "continuous_eager_candidate_proposal_ids": [900000601],
+            "continuous_eager_candidate_seq_ids": [12],
+            "continuous_eager_candidate_token_count_by_proposal_id": {"900000601": 4},
+            "continuous_eager_parent_proposal_id_by_proposal_id": {"900000601": 6},
+            "continuous_eager_chain_depth_by_proposal_id": {"900000601": 1},
+            "continuous_eager_root_proposal_id_by_proposal_id": {"900000601": 6},
+            "continuous_eager_parent_source_by_proposal_id": {"900000601": ONE_SHOT_PARENT_SOURCE},
+            "continuous_eager_result_transfer_received_proposal_ids": [900000601],
+            "continuous_eager_result_transfer_validated_proposal_ids": [900000601],
+            "continuous_eager_sync_apply_executed_proposal_ids": [900000601],
+            "continuous_eager_sync_apply_action_match_by_proposal_id": {"900000601": True},
+            "continuous_eager_sync_apply_result_match_by_proposal_id": {"900000601": True},
+            "continuous_eager_sync_apply_accept_len_match_by_proposal_id": {"900000601": True},
+            "continuous_eager_sync_apply_rollback_ok_by_proposal_id": {"900000601": True},
+            "continuous_eager_sync_apply_mutation_detected_by_proposal_id": {"900000601": False},
+            "continuous_eager_sync_apply_checkpoint_failed_by_proposal_id": {"900000601": False},
+            "continuous_eager_commit_ready_shadow_proposal_ids": [900000601],
+            "continuous_eager_commit_ready_shadow_seq_ids": [12],
+            "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {"900000601": 4},
+            "continuous_eager_real_commit_count": 0,
+        }
+    )
+    return [target, draft]
+
+
 def run_synthetic_tests() -> None:
     draft_record = synthetic_base_record()
     draft_record["eager_commit_side"] = "draft"
@@ -420,6 +615,12 @@ def run_synthetic_tests() -> None:
     assert summary["continuous_candidate_token_count"] == 4
     assert summary["continuous_real_commit_count"] == 0
     assert summary["continuous_drop_reason_counts"]["shadow_verify_not_executed"] == 1
+
+    verify_valid = synthetic_verify_apply_records()
+    errors, summary = validate_records(verify_valid)
+    assert not errors, f"valid verify/apply synthetic failed: {errors}"
+    assert summary["continuous_verified_proposal_count"] == 1
+    assert summary["continuous_commit_ready_shadow_token_count"] == 4
 
     invalid = deepcopy(valid)
     invalid[0]["enable_continuous_eager_dry_run"] = False
@@ -451,6 +652,30 @@ def run_synthetic_tests() -> None:
     invalid[0]["continuous_eager_chain_depth_by_proposal_id"]["900000601"] = 3
     errors, _summary = validate_records(invalid)
     assert any("exceeds max chain depth" in error for error in errors), "missed excessive chain depth"
+
+    invalid = deepcopy(verify_valid)
+    invalid[0]["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = {
+        "900000601": "shadow_verify_not_executed"
+    }
+    invalid[0]["continuous_eager_not_ready_shadow_proposal_ids"] = [900000601]
+    errors, _summary = validate_records(invalid)
+    assert any("shadow_verify_not_executed" in error for error in errors), "missed stale 7a not-executed reason"
+
+    invalid = deepcopy(verify_valid)
+    invalid[1]["continuous_eager_sync_apply_rollback_ok_by_proposal_id"] = {"900000601": False}
+    errors, _summary = validate_records(invalid)
+    assert any("sync rollback" in error for error in errors), "missed sync rollback failure"
+
+    invalid = deepcopy(verify_valid)
+    invalid[0]["continuous_eager_verify_dry_run_executed_proposal_ids"] = []
+    invalid[0]["continuous_eager_verify_dry_run_skipped_proposal_ids"] = []
+    invalid[0]["continuous_eager_verified_proposal_ids"] = []
+    invalid[0]["continuous_eager_full_accept_proposal_ids"] = []
+    invalid[1]["continuous_eager_commit_ready_shadow_proposal_ids"] = []
+    invalid[1]["continuous_eager_commit_ready_shadow_seq_ids"] = []
+    invalid[1]["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {}
+    errors, _summary = validate_records(invalid)
+    assert any("not verified or skipped" in error for error in errors), "missed unexecuted depth-1 7b candidate"
 
     print("Synthetic continuous eager dry-run checks passed.")
 

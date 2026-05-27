@@ -58,6 +58,9 @@ from tqdm import trange
 EAGER_TAKEOVER_DRY_RUN_SOURCE = "phase1h5e3_takeover_lane"
 CONTINUOUS_EAGER_DRY_RUN_SOURCE = "continuous_shadow"
 CONTINUOUS_EAGER_PARENT_SOURCE = "phase1h6a_one_shot_commit"
+CONTINUOUS_EAGER_TRANSFER_MAGIC = 0x1A70B
+CONTINUOUS_EAGER_TRANSFER_OP_DRY_RUN = 0x1A70B1
+CONTINUOUS_EAGER_TRANSFER_META_LEN = 7
 EAGER_LEGACY_RESULT_TRANSFER_SOURCE = "scheduled_target_eager_lane"
 EAGER_RESULT_TRANSFER_MAGIC = 0x1A5E3
 EAGER_RESULT_TRANSFER_OP_DRY_RUN = 0x1A5E35
@@ -888,12 +891,21 @@ class ModelRunnerBase:
             "enable_continuous_eager_dry_run": bool(
                 getattr(self.global_config, "enable_continuous_eager_dry_run", False)
             ),
+            "enable_continuous_eager_verify_apply_dry_run": bool(
+                getattr(self.global_config, "enable_continuous_eager_verify_apply_dry_run", False)
+            ),
             "continuous_eager_dry_run_enabled": False,
             "continuous_eager_source": None,
             "continuous_eager_parent_source": None,
+            "continuous_eager_execution_stage": None,
+            "continuous_shadow_stage": None,
             "max_continuous_eager_chain_depth": int(
                 getattr(self.global_config, "max_continuous_eager_chain_depth", 0) or 0
             ),
+            "max_continuous_depth_configured": int(
+                getattr(self.global_config, "max_continuous_eager_chain_depth", 0) or 0
+            ),
+            "max_continuous_depth_observed": 0,
             "max_continuous_eager_requests_per_step": int(
                 getattr(self.global_config, "max_continuous_eager_requests_per_step", 0) or 0
             ),
@@ -916,6 +928,36 @@ class ModelRunnerBase:
             "continuous_eager_partial_reject_proposal_ids": [],
             "continuous_eager_accept_len_by_proposal_id": {},
             "continuous_eager_verify_result_by_proposal_id": {},
+            "continuous_eager_verify_dry_run_candidate_proposal_ids": [],
+            "continuous_eager_verify_dry_run_executed_proposal_ids": [],
+            "continuous_eager_verify_dry_run_skipped_proposal_ids": [],
+            "continuous_eager_verify_skip_reason_by_proposal_id": {},
+            "continuous_eager_verified_token_count": 0,
+            "continuous_eager_full_accept_token_count": 0,
+            "continuous_eager_partial_reject_token_count": 0,
+            "continuous_eager_apply_dry_run_candidate_proposal_ids": [],
+            "continuous_eager_apply_dry_run_executed_proposal_ids": [],
+            "continuous_eager_apply_action_by_proposal_id": {},
+            "continuous_eager_apply_append_tokens_by_proposal_id": {},
+            "continuous_eager_apply_discarded_tokens_by_proposal_id": {},
+            "continuous_eager_apply_rollback_ok_by_proposal_id": {},
+            "continuous_eager_apply_mutation_detected_by_proposal_id": {},
+            "continuous_eager_apply_checkpoint_failed_by_proposal_id": {},
+            "continuous_eager_result_transfer_sent_proposal_ids": [],
+            "continuous_eager_result_transfer_received_proposal_ids": [],
+            "continuous_eager_result_transfer_validated_proposal_ids": [],
+            "continuous_eager_result_transfer_invalid_proposal_ids": [],
+            "continuous_eager_result_transfer_validation_reason_by_proposal_id": {},
+            "continuous_eager_result_transfer_payload_len_units": 0,
+            "continuous_eager_result_transfer_zero_steps": 0,
+            "continuous_eager_sync_apply_candidate_proposal_ids": [],
+            "continuous_eager_sync_apply_executed_proposal_ids": [],
+            "continuous_eager_sync_apply_action_match_by_proposal_id": {},
+            "continuous_eager_sync_apply_result_match_by_proposal_id": {},
+            "continuous_eager_sync_apply_accept_len_match_by_proposal_id": {},
+            "continuous_eager_sync_apply_rollback_ok_by_proposal_id": {},
+            "continuous_eager_sync_apply_mutation_detected_by_proposal_id": {},
+            "continuous_eager_sync_apply_checkpoint_failed_by_proposal_id": {},
             "continuous_eager_commit_ready_shadow_proposal_ids": [],
             "continuous_eager_commit_ready_shadow_seq_ids": [],
             "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {},
@@ -923,20 +965,29 @@ class ModelRunnerBase:
             "continuous_eager_not_ready_shadow_reason_by_proposal_id": {},
             "continuous_eager_stale_proposal_ids": [],
             "continuous_eager_duplicate_proposal_ids": [],
+            "continuous_eager_parent_not_ready_proposal_ids": [],
+            "continuous_eager_parent_shadow_not_committed_proposal_ids": [],
+            "continuous_eager_true_frontier_mismatch_proposal_ids": [],
             "continuous_eager_frontier_mismatch_proposal_ids": [],
             "continuous_eager_seq_finished_proposal_ids": [],
             "continuous_eager_overshot_proposal_ids": [],
             "continuous_eager_invalidated_proposal_ids": [],
             "continuous_eager_mutation_detected_count": 0,
             "continuous_eager_real_commit_count": 0,
+            "continuous_eager_unexpected_lane_overlap_count": 0,
+            "continuous_eager_unexpected_takeover_overlap_count": 0,
             "continuous_eager_candidate_proposal_count": 0,
             "continuous_eager_candidate_token_count": 0,
             "continuous_eager_verified_proposal_count": 0,
             "continuous_eager_full_accept_proposal_count": 0,
             "continuous_eager_commit_ready_shadow_proposal_count": 0,
             "continuous_eager_commit_ready_shadow_token_count": 0,
+            "continuous_eager_not_ready_shadow_proposal_count": 0,
             "continuous_eager_chain_length_distribution": {},
             "continuous_eager_drop_reason_counts": {},
+            "continuous_parent_shadow_not_committed_count": 0,
+            "continuous_parent_shadow_not_ready_count": 0,
+            "continuous_true_frontier_mismatch_count": 0,
             "continuous_eager_estimated_committed_token_share_of_output": 0.0,
             "continuous_eager_payload_len_units_per_ready_token": 0.0,
             "continuous_eager_overhead_time_ms": 0.0,
@@ -1421,6 +1472,9 @@ class ModelRunnerBase:
 
     def _continuous_eager_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_continuous_eager_dry_run", False))
+
+    def _continuous_eager_verify_apply_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_continuous_eager_verify_apply_dry_run", False))
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -2884,7 +2938,10 @@ class ModelRunnerBase:
             "apply_plan_id",
             "apply_step_id",
         ):
-            if result_source == EAGER_LEGACY_RESULT_TRANSFER_SOURCE and field_name == "takeover_step_id":
+            if (
+                result_source in {EAGER_LEGACY_RESULT_TRANSFER_SOURCE, CONTINUOUS_EAGER_DRY_RUN_SOURCE}
+                and field_name == "takeover_step_id"
+            ):
                 continue
             if int(result[field_name]) < 0:
                 return "missing_plan_or_step_id"
@@ -5679,6 +5736,22 @@ class ModelRunnerBase:
             self._eager_transfer_plan_context(plan, trace_record),
             side="draft",
         )
+        if self._continuous_eager_verify_apply_dry_run_enabled():
+            plan_context = self._eager_transfer_plan_context(plan, trace_record)
+            committed_ids = [int(proposal_id) for proposal_id in trace_record.get("eager_committed_proposal_ids", [])]
+            committed_seq_ids = [int(seq_id) for seq_id in trace_record.get("eager_committed_seq_ids", [])]
+            continuous_proposals = self._run_continuous_eager_draft_shadow_dry_run(
+                plan,
+                trace_record,
+                committed_ids,
+                committed_seq_ids,
+                known_by_id,
+                seq_by_id,
+                plan_context,
+            )
+            self._send_continuous_eager_transfer_dry_run(continuous_proposals, plan, trace_record)
+            validated_results = self._receive_continuous_eager_result_transfer_dry_run(plan, trace_record)
+            self._run_continuous_eager_sync_apply_dry_run(plan, trace_record, validated_results)
 
     def _receive_eager_commit_ready_only_decision(
         self,
@@ -5708,6 +5781,16 @@ class ModelRunnerBase:
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
+        if self._continuous_eager_verify_apply_dry_run_enabled():
+            plan_context = self._eager_transfer_plan_context(plan, trace_record)
+            continuous_proposals = self._receive_continuous_eager_transfer_dry_run(plan, trace_record)
+            continuous_results = self._run_continuous_eager_target_verify_apply_dry_run(
+                plan,
+                trace_record,
+                continuous_proposals,
+                plan_context,
+            )
+            self._send_continuous_eager_result_transfer_dry_run(plan, trace_record, continuous_results)
 
     def _mark_eager_commit_finished_if_needed(self, seq: Sequence, proposal_tokens: list[int]) -> None:
         if not proposal_tokens:
@@ -5766,6 +5849,9 @@ class ModelRunnerBase:
         stale_ids: list[int] = []
         duplicate_ids: list[int] = []
         frontier_mismatch_ids: list[int] = []
+        true_frontier_mismatch_ids: list[int] = []
+        parent_shadow_not_committed_ids: list[int] = []
+        parent_not_ready_ids: list[int] = []
         seq_finished_ids: list[int] = []
         overshot_ids: list[int] = []
         invalidated_ids: list[int] = []
@@ -5780,8 +5866,13 @@ class ModelRunnerBase:
             reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
             if reason in {"seq_not_running", "seq_finished"}:
                 seq_finished_ids.append(proposal_id)
-            elif reason in {"frontier_mismatch", "parent_shadow_not_committed"}:
+            elif reason == "frontier_mismatch":
                 frontier_mismatch_ids.append(proposal_id)
+                true_frontier_mismatch_ids.append(proposal_id)
+            elif reason == "parent_shadow_not_committed":
+                parent_shadow_not_committed_ids.append(proposal_id)
+            elif reason in {"parent_not_committed", "parent_shadow_not_ready"}:
+                parent_not_ready_ids.append(proposal_id)
             elif reason == "duplicate_continuous_candidate":
                 duplicate_ids.append(proposal_id)
             elif reason == "base_overshot":
@@ -5852,7 +5943,11 @@ class ModelRunnerBase:
         trace_record["continuous_eager_dry_run_enabled"] = True
         trace_record["continuous_eager_source"] = CONTINUOUS_EAGER_DRY_RUN_SOURCE
         trace_record["continuous_eager_parent_source"] = CONTINUOUS_EAGER_PARENT_SOURCE
+        trace_record["continuous_eager_execution_stage"] = "candidate_shadow"
+        trace_record["continuous_shadow_stage"] = "candidate_shadow"
         trace_record["max_continuous_eager_chain_depth"] = max_depth
+        trace_record["max_continuous_depth_configured"] = max_depth
+        trace_record["max_continuous_depth_observed"] = max(depth_by_id.values(), default=0)
         trace_record["max_continuous_eager_requests_per_step"] = max_requests
         trace_record["max_continuous_eager_tokens_per_step"] = max_tokens_per_step
         trace_record["max_continuous_eager_tokens_per_request"] = token_per_request
@@ -5890,6 +5985,13 @@ class ModelRunnerBase:
         }
         trace_record["continuous_eager_stale_proposal_ids"] = sorted(set(stale_ids))
         trace_record["continuous_eager_duplicate_proposal_ids"] = sorted(set(duplicate_ids))
+        trace_record["continuous_eager_parent_not_ready_proposal_ids"] = sorted(set(parent_not_ready_ids))
+        trace_record["continuous_eager_parent_shadow_not_committed_proposal_ids"] = sorted(
+            set(parent_shadow_not_committed_ids)
+        )
+        trace_record["continuous_eager_true_frontier_mismatch_proposal_ids"] = sorted(
+            set(true_frontier_mismatch_ids)
+        )
         trace_record["continuous_eager_frontier_mismatch_proposal_ids"] = sorted(set(frontier_mismatch_ids))
         trace_record["continuous_eager_seq_finished_proposal_ids"] = sorted(set(seq_finished_ids))
         trace_record["continuous_eager_overshot_proposal_ids"] = sorted(set(overshot_ids))
@@ -5904,13 +6006,904 @@ class ModelRunnerBase:
         trace_record["continuous_eager_full_accept_proposal_count"] = 0
         trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = 0
         trace_record["continuous_eager_commit_ready_shadow_token_count"] = 0
+        trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(set(not_ready_ids))
         trace_record["continuous_eager_chain_length_distribution"] = {
             str(depth): count for depth, count in sorted(chain_distribution.items())
         }
         trace_record["continuous_eager_drop_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["continuous_parent_shadow_not_committed_count"] = len(set(parent_shadow_not_committed_ids))
+        trace_record["continuous_parent_shadow_not_ready_count"] = len(set(parent_not_ready_ids))
+        trace_record["continuous_true_frontier_mismatch_count"] = len(set(true_frontier_mismatch_ids))
         trace_record["continuous_eager_estimated_committed_token_share_of_output"] = 0.0
         trace_record["continuous_eager_payload_len_units_per_ready_token"] = 0.0
         self._record_elapsed_ms(trace_record, "continuous_eager_overhead_time_ms", timer_start)
+
+    def _continuous_eager_limits(self) -> tuple[int, int, int, int]:
+        gamma = int(self.gamma)
+        max_depth = int(getattr(self.global_config, "max_continuous_eager_chain_depth", 1) or 1)
+        max_requests = int(getattr(self.global_config, "max_continuous_eager_requests_per_step", 1) or 1)
+        token_per_request = int(
+            getattr(self.global_config, "max_continuous_eager_tokens_per_request", gamma) or gamma
+        )
+        token_per_request = max(1, min(token_per_request, gamma))
+        max_tokens_per_step = int(
+            getattr(
+                self.global_config,
+                "max_continuous_eager_tokens_per_step",
+                max_requests * token_per_request,
+            )
+            or (max_requests * token_per_request)
+        )
+        return max_depth, max_requests, token_per_request, max_tokens_per_step
+
+    def _continuous_proposal_seq_id_by_id(self, trace_record: dict) -> dict[int, int]:
+        proposal_ids = [int(proposal_id) for proposal_id in trace_record.get("continuous_eager_candidate_proposal_ids", [])]
+        seq_ids = [int(seq_id) for seq_id in trace_record.get("continuous_eager_candidate_seq_ids", [])]
+        return {proposal_id: seq_id for proposal_id, seq_id in zip(proposal_ids, seq_ids)}
+
+    def _continuous_set_common_trace(
+        self,
+        trace_record: dict,
+        max_depth: int,
+        max_requests: int,
+        token_per_request: int,
+        max_tokens_per_step: int,
+        depth_by_id: dict[int, int],
+    ) -> None:
+        trace_record["enable_continuous_eager_dry_run"] = True
+        trace_record["enable_continuous_eager_verify_apply_dry_run"] = bool(
+            self._continuous_eager_verify_apply_dry_run_enabled()
+        )
+        trace_record["continuous_eager_dry_run_enabled"] = True
+        trace_record["continuous_eager_source"] = CONTINUOUS_EAGER_DRY_RUN_SOURCE
+        trace_record["continuous_eager_parent_source"] = CONTINUOUS_EAGER_PARENT_SOURCE
+        trace_record["continuous_eager_execution_stage"] = "verify_apply_dry_run"
+        trace_record["continuous_shadow_stage"] = "verify_apply_dry_run"
+        trace_record["max_continuous_eager_chain_depth"] = int(max_depth)
+        trace_record["max_continuous_depth_configured"] = int(max_depth)
+        trace_record["max_continuous_depth_observed"] = max(depth_by_id.values(), default=0)
+        trace_record["max_continuous_eager_requests_per_step"] = int(max_requests)
+        trace_record["max_continuous_eager_tokens_per_step"] = int(max_tokens_per_step)
+        trace_record["max_continuous_eager_tokens_per_request"] = int(token_per_request)
+
+    def _run_continuous_eager_draft_shadow_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        committed_ids: list[int],
+        committed_seq_ids: list[int],
+        known_by_id: dict[int, EagerProposal | ReadyEagerProposal],
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+    ) -> list[EagerProposal]:
+        timer_start = time.perf_counter()
+        gamma = int(self.gamma)
+        max_depth, max_requests, token_per_request, max_tokens_per_step = self._continuous_eager_limits()
+        proposals: list[EagerProposal] = []
+        parent_by_id: dict[int, int] = {}
+        root_by_id: dict[int, int] = {}
+        depth_by_id: dict[int, int] = {}
+        chain_index_by_id: dict[int, int] = {}
+        token_count_by_id: dict[int, int] = {}
+        parent_source_by_id: dict[int, str] = {}
+        candidate_ids: list[int] = []
+        candidate_seq_ids: list[int] = []
+        not_ready_ids: list[int] = []
+        not_ready_reason_by_id: dict[int, str] = {}
+        duplicate_ids: list[int] = []
+        parent_not_ready_ids: list[int] = []
+        parent_shadow_not_committed_ids: list[int] = []
+        true_frontier_mismatch_ids: list[int] = []
+        frontier_mismatch_ids: list[int] = []
+        seq_finished_ids: list[int] = []
+        stale_ids: list[int] = []
+        invalidated_ids: list[int] = []
+        chain_distribution: dict[int, int] = {}
+        reason_counts: dict[str, int] = {}
+        seen_seq_depth: set[tuple[int, int]] = set()
+        token_budget = 0
+
+        def add_not_ready(proposal_id: int, reason: str) -> None:
+            not_ready_ids.append(int(proposal_id))
+            not_ready_reason_by_id[int(proposal_id)] = str(reason)
+            reason_counts[str(reason)] = int(reason_counts.get(str(reason), 0)) + 1
+            if reason == "duplicate_continuous_candidate":
+                duplicate_ids.append(int(proposal_id))
+            elif reason == "parent_shadow_not_committed":
+                parent_shadow_not_committed_ids.append(int(proposal_id))
+            elif reason in {"parent_not_committed", "parent_shadow_not_ready"}:
+                parent_not_ready_ids.append(int(proposal_id))
+            elif reason == "frontier_mismatch":
+                true_frontier_mismatch_ids.append(int(proposal_id))
+                frontier_mismatch_ids.append(int(proposal_id))
+            elif reason in {"seq_not_running", "seq_finished"}:
+                seq_finished_ids.append(int(proposal_id))
+            elif reason in {"span_invalidated"}:
+                invalidated_ids.append(int(proposal_id))
+            elif reason in {"seq_pre_verify", "missing_parent_proposal", "seq_not_found"}:
+                stale_ids.append(int(proposal_id))
+
+        valid_depth1: list[tuple[int, int, int, Sequence, ReadyEagerProposal | EagerProposal]] = []
+        parent_pairs = list(dict.fromkeys(zip(committed_ids, committed_seq_ids)))[:max_requests]
+        for chain_index, (root_proposal_id, seq_id) in enumerate(parent_pairs):
+            root_proposal_id = int(root_proposal_id)
+            seq_id = int(seq_id)
+            parent = known_by_id.get(root_proposal_id) or self.dual_batch_manager.ready_eager_proposals.by_id(root_proposal_id)
+            seq = seq_by_id.get(seq_id)
+            for depth in range(1, max_depth + 1):
+                proposal_id = self._continuous_shadow_proposal_id(root_proposal_id, depth)
+                parent_id = root_proposal_id if depth == 1 else self._continuous_shadow_proposal_id(root_proposal_id, depth - 1)
+                parent_by_id[proposal_id] = int(parent_id)
+                root_by_id[proposal_id] = int(root_proposal_id)
+                depth_by_id[proposal_id] = int(depth)
+                chain_index_by_id[proposal_id] = int(chain_index)
+                token_count_by_id[proposal_id] = int(token_per_request)
+                parent_source_by_id[proposal_id] = (
+                    CONTINUOUS_EAGER_PARENT_SOURCE if depth == 1 else CONTINUOUS_EAGER_DRY_RUN_SOURCE
+                )
+
+                current_len = -1 if seq is None else int(len(seq))
+                reason = None
+                if (seq_id, depth) in seen_seq_depth:
+                    reason = "duplicate_continuous_candidate"
+                elif depth > 1:
+                    reason = "parent_shadow_not_committed"
+                elif token_per_request != gamma:
+                    reason = "continuous_token_limit_not_gamma"
+                elif token_budget + token_per_request > max_tokens_per_step:
+                    reason = "token_budget_exhausted"
+                elif parent is None:
+                    reason = "missing_parent_proposal"
+                elif seq is None:
+                    reason = "seq_not_found"
+                elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                    reason = "seq_not_running"
+                elif self.is_request_level_finished(seq, plan_context):
+                    reason = "seq_finished"
+                elif self.is_speculative_span_invalidated(seq, plan_context):
+                    reason = "span_invalidated"
+                elif bool(getattr(seq, "pre_verify", True)):
+                    reason = "seq_pre_verify"
+                elif getattr(parent, "real_commit_step_id", None) is None:
+                    reason = "parent_not_committed"
+                elif current_len != int(getattr(parent, "base_len", 0)) + int(getattr(parent, "proposal_len", 0)):
+                    reason = "frontier_mismatch"
+
+                seen_seq_depth.add((seq_id, depth))
+                if reason is not None:
+                    add_not_ready(proposal_id, reason)
+                    continue
+                valid_depth1.append((proposal_id, root_proposal_id, chain_index, seq, parent))
+                token_budget += token_per_request
+
+        checkpoints = {
+            int(seq.seq_id): self._make_eager_apply_checkpoint(seq)
+            for _pid, _root, _idx, seq, _parent in valid_depth1
+        }
+        generated_by_seq_id: dict[int, list[int]] = {int(seq.seq_id): [] for _pid, _root, _idx, seq, _parent in valid_depth1}
+        draft_error: BaseException | None = None
+        valid_seqs = [seq for _pid, _root, _idx, seq, _parent in valid_depth1]
+        try:
+            for _ in range(gamma):
+                if not valid_seqs:
+                    break
+                self._allocate_decode_slots_for_dual(valid_seqs, plan, "continuous_eager_draft_shadow")
+                input_ids, positions = self.prepare_pearl_decode(valid_seqs)
+                torch.cuda.synchronize()
+                logits = self.run_model(input_ids, positions, False)
+                if self.tp_params.local_rank == 0:
+                    sample_tokens = logits.argmax(dim=-1)
+                else:
+                    sample_tokens = torch.zeros(
+                        len(valid_seqs),
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    ).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                torch.cuda.synchronize()
+                reset_context(self.tp_params)
+                for seq, token_id in zip(valid_seqs, sample_tokens.tolist()):
+                    int_token_id = int(token_id)
+                    seq.append_token(int_token_id)
+                    generated_by_seq_id[int(seq.seq_id)].append(int_token_id)
+
+            for proposal_id, root_proposal_id, chain_index, seq, parent in valid_depth1:
+                seq_id = int(seq.seq_id)
+                checkpoint = checkpoints[seq_id]
+                proposal_tokens = [int(token_id) for token_id in generated_by_seq_id[seq_id]]
+                to_be_verified = [int(token_id) for token_id in seq.token_ids[-2 * gamma + 1:-gamma + 1]]
+                if len(proposal_tokens) != gamma or len(to_be_verified) != gamma:
+                    add_not_ready(proposal_id, "invalid_continuous_token_span")
+                    continue
+                candidate_ids.append(int(proposal_id))
+                candidate_seq_ids.append(seq_id)
+                chain_distribution[1] = int(chain_distribution.get(1, 0)) + 1
+                proposal = EagerProposal(
+                    proposal_id=int(proposal_id),
+                    seq_id=seq_id,
+                    request_id=seq.request_id,
+                    lane=LANE_EAGER,
+                    parent_proposal_id=int(root_proposal_id),
+                    parent_kind=LANE_EAGER,
+                    parent_step_id=getattr(parent, "real_commit_step_id", None),
+                    source_step_id=0 if plan.step_id is None else int(plan.step_id),
+                    source_plan_id=int(plan.plan_id),
+                    home_batch_id=-1 if seq.home_batch_id is None else int(seq.home_batch_id),
+                    base_len=int(checkpoint["len"]),
+                    base_pre_verify=bool(checkpoint["pre_verify"]),
+                    base_num_completion_tokens=int(checkpoint["num_completion_tokens"]),
+                    proposal_token_ids=proposal_tokens,
+                    to_be_verified_token_ids=to_be_verified,
+                    proposal_len=gamma,
+                    state=EAGER_STATE_READY_TO_VERIFY,
+                    valid=True,
+                )
+                proposals.append(proposal)
+                self._draft_sent_eager_proposals_by_id[int(proposal.proposal_id)] = proposal
+        except BaseException as exc:
+            draft_error = exc
+        finally:
+            for seq in valid_seqs:
+                seq_id = int(seq.seq_id)
+                checkpoint = checkpoints[seq_id]
+                rollback_len = int(len(seq)) - int(checkpoint["len"])
+                if rollback_len > 0:
+                    self.scheduler.rollback(seq, rollback_len)
+                if not self._sequence_matches_eager_apply_checkpoint(seq, checkpoint):
+                    self._restore_eager_apply_checkpoint(seq, checkpoint)
+
+        self._continuous_set_common_trace(trace_record, max_depth, max_requests, token_per_request, max_tokens_per_step, depth_by_id)
+        trace_record["continuous_eager_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["continuous_eager_candidate_seq_ids"] = list(candidate_seq_ids)
+        trace_record["continuous_eager_candidate_token_count_by_proposal_id"] = {
+            str(proposal_id): int(token_count_by_id[proposal_id]) for proposal_id in sorted(candidate_ids)
+        }
+        trace_record["continuous_eager_parent_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(parent_by_id.items())
+        }
+        trace_record["continuous_eager_chain_depth_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(depth_by_id.items())
+        }
+        trace_record["continuous_eager_chain_index_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(chain_index_by_id.items())
+        }
+        trace_record["continuous_eager_root_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(root_by_id.items())
+        }
+        trace_record["continuous_eager_parent_source_by_proposal_id"] = {
+            str(proposal_id): str(value) for proposal_id, value in sorted(parent_source_by_id.items())
+        }
+        trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = sorted(set(not_ready_ids))
+        trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(not_ready_reason_by_id.items())
+        }
+        trace_record["continuous_eager_duplicate_proposal_ids"] = sorted(set(duplicate_ids))
+        trace_record["continuous_eager_parent_not_ready_proposal_ids"] = sorted(set(parent_not_ready_ids))
+        trace_record["continuous_eager_parent_shadow_not_committed_proposal_ids"] = sorted(
+            set(parent_shadow_not_committed_ids)
+        )
+        trace_record["continuous_eager_true_frontier_mismatch_proposal_ids"] = sorted(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_frontier_mismatch_proposal_ids"] = sorted(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_seq_finished_proposal_ids"] = sorted(set(seq_finished_ids))
+        trace_record["continuous_eager_invalidated_proposal_ids"] = sorted(set(invalidated_ids))
+        trace_record["continuous_eager_stale_proposal_ids"] = sorted(set(stale_ids))
+        trace_record["continuous_eager_candidate_proposal_count"] = len(candidate_ids)
+        trace_record["continuous_eager_candidate_token_count"] = sum(
+            int(token_count_by_id[proposal_id]) for proposal_id in candidate_ids
+        )
+        trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(set(not_ready_ids))
+        trace_record["continuous_eager_chain_length_distribution"] = {
+            str(depth): count for depth, count in sorted(chain_distribution.items())
+        }
+        trace_record["continuous_eager_drop_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["continuous_parent_shadow_not_committed_count"] = len(set(parent_shadow_not_committed_ids))
+        trace_record["continuous_parent_shadow_not_ready_count"] = len(set(parent_not_ready_ids))
+        trace_record["continuous_true_frontier_mismatch_count"] = len(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_real_commit_count"] = 0
+        self._record_elapsed_ms(trace_record, "continuous_eager_overhead_time_ms", timer_start)
+        if draft_error is not None:
+            raise draft_error
+        return proposals
+
+    def _serialize_continuous_eager_transfer_payload(
+        self,
+        proposals: list[EagerProposal],
+        plan: StepPlan,
+    ) -> tuple[list[int], list[int]]:
+        base_meta, payload_values = serialize_eager_transfer_payload(
+            proposals,
+            gamma=int(self.gamma),
+            plan_id=int(plan.plan_id),
+            step_id=plan.step_id,
+        )
+        return [
+            int(CONTINUOUS_EAGER_TRANSFER_MAGIC),
+            int(CONTINUOUS_EAGER_TRANSFER_OP_DRY_RUN),
+            *[int(value) for value in base_meta],
+        ], payload_values
+
+    def _deserialize_continuous_eager_transfer_payload(
+        self,
+        meta_values: list[int],
+        payload_values: list[int],
+    ) -> list[EagerProposal]:
+        if len(meta_values) != CONTINUOUS_EAGER_TRANSFER_META_LEN:
+            raise ValueError(f"continuous eager transfer meta length mismatch: {len(meta_values)}")
+        if int(meta_values[0]) != int(CONTINUOUS_EAGER_TRANSFER_MAGIC):
+            raise ValueError(f"continuous eager transfer magic mismatch: got={meta_values[0]}")
+        if int(meta_values[1]) != int(CONTINUOUS_EAGER_TRANSFER_OP_DRY_RUN):
+            raise ValueError(f"continuous eager transfer op mismatch: got={meta_values[1]}")
+        return deserialize_eager_transfer_payload(meta_values[2:], payload_values)
+
+    def _send_continuous_eager_transfer_dry_run(
+        self,
+        proposals: list[EagerProposal],
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> None:
+        meta_values, payload_values = self._serialize_continuous_eager_transfer_payload(proposals, plan)
+        trace_record["continuous_eager_result_transfer_zero_steps"] = int(len(proposals) == 0)
+        trace_record["continuous_eager_proposal_transfer_payload_len_units"] = int(meta_values[3])
+        if self.tp_params.local_rank != 0:
+            return
+        meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        if int(meta_values[3]) > 0:
+            payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _receive_continuous_eager_transfer_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> list[EagerProposal]:
+        meta = torch.zeros(CONTINUOUS_EAGER_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        payload_len = int(meta_values[3])
+        payload_values: list[int] = []
+        if payload_len > 0:
+            payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            payload_values = [int(value) for value in payload.tolist()]
+        proposals = self._deserialize_continuous_eager_transfer_payload(meta_values, payload_values)
+        trace_record["continuous_eager_proposal_transfer_payload_len_units"] = payload_len
+        return proposals
+
+    def _validate_continuous_target_proposal(
+        self,
+        proposal: EagerProposal,
+        seq: Sequence | None,
+        plan_context: dict[str, set[int]],
+    ) -> str | None:
+        gamma = int(self.gamma)
+        parent_id = -1 if proposal.parent_proposal_id is None else int(proposal.parent_proposal_id)
+        parent = self.dual_batch_manager.ready_eager_proposals.by_id(parent_id)
+        if proposal.parent_kind != LANE_EAGER:
+            return "invalid_parent_kind"
+        if parent is None:
+            return "missing_parent_proposal"
+        if getattr(parent, "real_commit_step_id", None) is None:
+            return "parent_not_committed"
+        if int(parent.seq_id) != int(proposal.seq_id):
+            return "parent_seq_mismatch"
+        if int(proposal.proposal_len) != gamma or len(proposal.proposal_token_ids) != gamma:
+            return "invalid_proposal_len"
+        if len(proposal.to_be_verified_token_ids) != gamma:
+            return "invalid_to_verify_len"
+        if bool(proposal.base_pre_verify):
+            return "invalid_base_pre_verify"
+        if seq is None:
+            return "seq_not_found"
+        if getattr(seq, "status", None) != SequenceStatus.RUNNING:
+            return "seq_not_running"
+        if self.is_request_level_finished(seq, plan_context):
+            return "seq_finished"
+        if self.is_speculative_span_invalidated(seq, plan_context):
+            return "span_invalidated"
+        if bool(getattr(seq, "pre_verify", True)):
+            return "seq_pre_verify"
+        if int(len(seq)) != int(proposal.base_len):
+            return "frontier_mismatch"
+        return None
+
+    def _run_continuous_eager_target_verify_apply_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        proposals: list[EagerProposal],
+        plan_context: dict[str, set[int]],
+    ) -> list[dict]:
+        timer_start = time.perf_counter()
+        gamma = int(self.gamma)
+        max_depth, max_requests, token_per_request, max_tokens_per_step = self._continuous_eager_limits()
+        seq_by_id = self._local_sequence_by_id()
+        candidate_ids = [int(proposal.proposal_id) for proposal in proposals]
+        candidate_seq_ids = [int(proposal.seq_id) for proposal in proposals]
+        parent_by_id = {
+            int(proposal.proposal_id): (-1 if proposal.parent_proposal_id is None else int(proposal.parent_proposal_id))
+            for proposal in proposals
+        }
+        root_by_id = dict(parent_by_id)
+        depth_by_id = {int(proposal.proposal_id): 1 for proposal in proposals}
+        token_by_id = {int(proposal.proposal_id): int(proposal.proposal_len) for proposal in proposals}
+        parent_source_by_id = {int(proposal.proposal_id): CONTINUOUS_EAGER_PARENT_SOURCE for proposal in proposals}
+
+        executed_proposals: list[EagerProposal] = []
+        executed_seqs: list[Sequence] = []
+        skipped_ids: list[int] = []
+        skip_reason_by_id: dict[int, str] = {}
+        not_ready_ids: list[int] = []
+        not_ready_reason_by_id: dict[int, str] = {}
+        true_frontier_mismatch_ids: list[int] = []
+        seq_finished_ids: list[int] = []
+        invalidated_ids: list[int] = []
+        stale_ids: list[int] = []
+        parent_not_ready_ids: list[int] = []
+        reason_counts: dict[str, int] = {}
+
+        for proposal in proposals:
+            proposal_id = int(proposal.proposal_id)
+            seq = seq_by_id.get(int(proposal.seq_id))
+            reason = self._validate_continuous_target_proposal(proposal, seq, plan_context)
+            if reason is None:
+                executed_proposals.append(proposal)
+                executed_seqs.append(seq)
+            else:
+                skipped_ids.append(proposal_id)
+                skip_reason_by_id[proposal_id] = reason
+                not_ready_ids.append(proposal_id)
+                not_ready_reason_by_id[proposal_id] = reason
+                reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+                if reason == "frontier_mismatch":
+                    true_frontier_mismatch_ids.append(proposal_id)
+                elif reason in {"seq_finished", "seq_not_running"}:
+                    seq_finished_ids.append(proposal_id)
+                elif reason == "span_invalidated":
+                    invalidated_ids.append(proposal_id)
+                elif reason in {"parent_not_committed", "missing_parent_proposal"}:
+                    parent_not_ready_ids.append(proposal_id)
+                else:
+                    stale_ids.append(proposal_id)
+
+        checkpoints = {int(seq.seq_id): self._make_eager_apply_checkpoint(seq) for seq in executed_seqs}
+        results: dict[str, dict[int, int | bool]] = {
+            "accepted_len_by_seq_id": {},
+            "invalidated_len_by_seq_id": {},
+            "reject_position_by_seq_id": {},
+            "revised_token_by_seq_id": {},
+            "full_accept_by_seq_id": {},
+        }
+        if executed_seqs:
+            self._allocate_decode_slots_for_dual(executed_seqs, plan, "continuous_eager_verify_dry_run")
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode(executed_seqs)
+            temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+            torch.cuda.synchronize()
+            logits = self.run_model(input_ids, positions, False)
+            results = self.compute_pearl_verify_result_no_apply(
+                logits,
+                executed_seqs,
+                temperatures,
+                executed_proposals,
+                gamma=gamma,
+                lane=LANE_EAGER,
+            )
+            torch.cuda.synchronize()
+
+        accept_len_by_id: dict[int, int] = {}
+        verify_result_by_id: dict[int, str] = {}
+        full_accept_ids: list[int] = []
+        partial_reject_ids: list[int] = []
+        apply_candidate_ids: list[int] = []
+        apply_executed_ids: list[int] = []
+        action_by_id: dict[int, str] = {}
+        append_by_id: dict[int, int] = {}
+        discard_by_id: dict[int, int] = {}
+        rollback_ok_by_id: dict[int, bool] = {}
+        mutation_by_id: dict[int, bool] = {}
+        checkpoint_failed_by_id: dict[int, bool] = {}
+        result_items: list[dict] = []
+
+        for proposal, seq in zip(executed_proposals, executed_seqs):
+            proposal_id = int(proposal.proposal_id)
+            seq_id = int(seq.seq_id)
+            accept_len = int(results["accepted_len_by_seq_id"].get(seq_id, 0))
+            verify_result = self._verify_result_from_accept_len(accept_len, gamma)
+            accept_len_by_id[proposal_id] = accept_len
+            verify_result_by_id[proposal_id] = verify_result
+            apply_candidate_ids.append(proposal_id)
+            if verify_result == "full_accept":
+                full_accept_ids.append(proposal_id)
+            else:
+                partial_reject_ids.append(proposal_id)
+                not_ready_ids.append(proposal_id)
+                not_ready_reason_by_id[proposal_id] = "continuous_not_full_accept"
+                reason_counts["continuous_not_full_accept"] = int(reason_counts.get("continuous_not_full_accept", 0)) + 1
+
+            checkpoint = checkpoints[seq_id]
+            checkpoint_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+            appended_count = 0
+            if verify_result == "full_accept":
+                for token_id in proposal.proposal_token_ids:
+                    seq.append_token(int(token_id))
+                seq.pre_verify = False
+                appended_count = len(proposal.proposal_token_ids)
+                action = "append_full_accept_then_rollback"
+                apply_executed_ids.append(proposal_id)
+            elif verify_result == "partial_accept":
+                action = "discard_partial_no_mutation"
+            else:
+                action = "discard_reject_no_mutation"
+            rollback_ok, mutation_remaining = self._rollback_eager_apply_dry_run(seq, checkpoint, appended_count)
+            action_by_id[proposal_id] = action
+            append_by_id[proposal_id] = int(appended_count)
+            discard_by_id[proposal_id] = 0 if appended_count else gamma
+            rollback_ok_by_id[proposal_id] = bool(rollback_ok)
+            mutation_by_id[proposal_id] = bool(mutation_remaining)
+            checkpoint_failed_by_id[proposal_id] = not bool(checkpoint_ok)
+            if verify_result == "full_accept" and (not rollback_ok or mutation_remaining or not checkpoint_ok):
+                not_ready_ids.append(proposal_id)
+                not_ready_reason_by_id[proposal_id] = "continuous_apply_guard_failed"
+                reason_counts["continuous_apply_guard_failed"] = int(reason_counts.get("continuous_apply_guard_failed", 0)) + 1
+
+            result_items.append(
+                {
+                    "proposal_id": proposal_id,
+                    "seq_id": seq_id,
+                    "request_id": self._numeric_request_id(proposal.request_id),
+                    "source_plan_id": int(proposal.source_plan_id),
+                    "source_step_id": int(proposal.source_step_id),
+                    "schedule_plan_id": int(plan.plan_id),
+                    "schedule_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "takeover_step_id": -1,
+                    "verify_plan_id": int(plan.plan_id),
+                    "verify_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "apply_plan_id": int(plan.plan_id),
+                    "apply_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "verify_result": verify_result,
+                    "accepted_len": accept_len,
+                    "full_accept": verify_result == "full_accept",
+                    "reject_position": -1 if verify_result == "full_accept" else accept_len,
+                    "invalidated_len": max(0, gamma - accept_len),
+                    "revised_token": -1,
+                    "proposal_len": gamma,
+                    "to_verify_len": gamma,
+                    "gamma": gamma,
+                    "base_len": int(proposal.base_len),
+                    "base_pre_verify": bool(proposal.base_pre_verify),
+                    "target_seq_len_at_verify": int(checkpoint["len"]),
+                    "target_seq_pre_verify_at_verify": bool(checkpoint["pre_verify"]),
+                    "apply_action": action,
+                    "append_token_count": int(appended_count),
+                    "discarded_token_count": 0 if appended_count else gamma,
+                    "rollback_ok": bool(rollback_ok),
+                    "mutation_detected": bool(mutation_remaining),
+                    "checkpoint_failed": not bool(checkpoint_ok),
+                    "source": CONTINUOUS_EAGER_DRY_RUN_SOURCE,
+                }
+            )
+
+        # Target-side full accepts are only shadow-ready after result transfer
+        # and draft sync-apply validation complete. Keep this target record at
+        # the verify/apply stage so accounting does not count a pre-sync result.
+        ready_ids: list[int] = []
+        seq_by_proposal_id = {int(proposal.proposal_id): int(proposal.seq_id) for proposal in proposals}
+        ready_seq_ids = [int(seq_by_proposal_id.get(proposal_id, -1)) for proposal_id in ready_ids]
+        ready_token_by_id = {proposal_id: gamma for proposal_id in ready_ids}
+        self._continuous_set_common_trace(trace_record, max_depth, max_requests, token_per_request, max_tokens_per_step, depth_by_id)
+        trace_record["continuous_eager_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["continuous_eager_candidate_seq_ids"] = list(candidate_seq_ids)
+        trace_record["continuous_eager_candidate_token_count_by_proposal_id"] = {
+            str(proposal_id): int(token_by_id.get(proposal_id, gamma)) for proposal_id in sorted(candidate_ids)
+        }
+        trace_record["continuous_eager_parent_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(parent_by_id.items())
+        }
+        trace_record["continuous_eager_chain_depth_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(depth_by_id.items())
+        }
+        trace_record["continuous_eager_root_proposal_id_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(root_by_id.items())
+        }
+        trace_record["continuous_eager_parent_source_by_proposal_id"] = {
+            str(proposal_id): value for proposal_id, value in sorted(parent_source_by_id.items())
+        }
+        trace_record["continuous_eager_verify_dry_run_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["continuous_eager_verify_dry_run_executed_proposal_ids"] = [
+            int(proposal.proposal_id) for proposal in executed_proposals
+        ]
+        trace_record["continuous_eager_verify_dry_run_skipped_proposal_ids"] = list(skipped_ids)
+        trace_record["continuous_eager_verify_skip_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(skip_reason_by_id.items())
+        }
+        trace_record["continuous_eager_verified_proposal_ids"] = [
+            int(proposal.proposal_id) for proposal in executed_proposals
+        ]
+        trace_record["continuous_eager_verify_result_by_proposal_id"] = {
+            str(proposal_id): result for proposal_id, result in sorted(verify_result_by_id.items())
+        }
+        trace_record["continuous_eager_accept_len_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(accept_len_by_id.items())
+        }
+        trace_record["continuous_eager_full_accept_proposal_ids"] = list(full_accept_ids)
+        trace_record["continuous_eager_partial_reject_proposal_ids"] = list(partial_reject_ids)
+        trace_record["continuous_eager_verified_token_count"] = len(executed_proposals) * gamma
+        trace_record["continuous_eager_full_accept_token_count"] = len(full_accept_ids) * gamma
+        trace_record["continuous_eager_partial_reject_token_count"] = len(partial_reject_ids) * gamma
+        trace_record["continuous_eager_apply_dry_run_candidate_proposal_ids"] = list(apply_candidate_ids)
+        trace_record["continuous_eager_apply_dry_run_executed_proposal_ids"] = list(apply_executed_ids)
+        trace_record["continuous_eager_apply_action_by_proposal_id"] = {
+            str(proposal_id): action for proposal_id, action in sorted(action_by_id.items())
+        }
+        trace_record["continuous_eager_apply_append_tokens_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(append_by_id.items())
+        }
+        trace_record["continuous_eager_apply_discarded_tokens_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(discard_by_id.items())
+        }
+        trace_record["continuous_eager_apply_rollback_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(rollback_ok_by_id.items())
+        }
+        trace_record["continuous_eager_apply_mutation_detected_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(mutation_by_id.items())
+        }
+        trace_record["continuous_eager_apply_checkpoint_failed_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(checkpoint_failed_by_id.items())
+        }
+        trace_record["continuous_eager_commit_ready_shadow_proposal_ids"] = list(ready_ids)
+        trace_record["continuous_eager_commit_ready_shadow_seq_ids"] = list(ready_seq_ids)
+        trace_record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(ready_token_by_id.items())
+        }
+        trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = sorted(set(not_ready_ids))
+        trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(not_ready_reason_by_id.items())
+        }
+        trace_record["continuous_eager_parent_not_ready_proposal_ids"] = sorted(set(parent_not_ready_ids))
+        trace_record["continuous_eager_true_frontier_mismatch_proposal_ids"] = sorted(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_frontier_mismatch_proposal_ids"] = sorted(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_seq_finished_proposal_ids"] = sorted(set(seq_finished_ids))
+        trace_record["continuous_eager_invalidated_proposal_ids"] = sorted(set(invalidated_ids))
+        trace_record["continuous_eager_stale_proposal_ids"] = sorted(set(stale_ids))
+        trace_record["continuous_eager_candidate_proposal_count"] = len(candidate_ids)
+        trace_record["continuous_eager_candidate_token_count"] = len(candidate_ids) * gamma
+        trace_record["continuous_eager_verified_proposal_count"] = len(executed_proposals)
+        trace_record["continuous_eager_full_accept_proposal_count"] = len(full_accept_ids)
+        trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = len(ready_ids)
+        trace_record["continuous_eager_commit_ready_shadow_token_count"] = len(ready_ids) * gamma
+        trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(set(not_ready_ids))
+        trace_record["continuous_eager_chain_length_distribution"] = {"1": len(candidate_ids)} if candidate_ids else {}
+        trace_record["continuous_eager_drop_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["continuous_parent_shadow_not_committed_count"] = 0
+        trace_record["continuous_parent_shadow_not_ready_count"] = len(set(parent_not_ready_ids))
+        trace_record["continuous_true_frontier_mismatch_count"] = len(set(true_frontier_mismatch_ids))
+        trace_record["continuous_eager_mutation_detected_count"] = sum(1 for value in mutation_by_id.values() if bool(value))
+        trace_record["continuous_eager_real_commit_count"] = 0
+        self._record_elapsed_ms(trace_record, "continuous_eager_overhead_time_ms", timer_start)
+        return result_items
+
+    def _send_continuous_eager_result_transfer_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        results: list[dict],
+    ) -> None:
+        meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
+        num_results = int(meta_values[2])
+        payload_len = int(meta_values[3])
+        trace_record["continuous_eager_result_transfer_sent_proposal_ids"] = [
+            int(result["proposal_id"]) for result in results
+        ]
+        trace_record["continuous_eager_result_transfer_payload_len_units"] = payload_len
+        trace_record["continuous_eager_result_transfer_zero_steps"] = int(num_results == 0)
+        trace_record["continuous_eager_result_transfer_sent_count"] = num_results
+        meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        if payload_len > 0:
+            if self.rank == self.global_config.target_config.master_rank:
+                payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            else:
+                payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+
+    def _receive_continuous_eager_result_transfer_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> list[dict]:
+        meta = torch.zeros(EAGER_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        payload_len = int(meta_values[3])
+        payload_values: list[int] = []
+        if payload_len > 0:
+            payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+            payload_values = [int(value) for value in payload.tolist()]
+        results = self._deserialize_eager_result_transfer_payload(meta_values, payload_values)
+        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
+        seq_by_id = self._local_sequence_by_id()
+        validated: list[dict] = []
+        invalid: list[dict] = []
+        validation_reason_by_id: dict[int, str] = {}
+        for result in results:
+            proposal_id = int(result["proposal_id"])
+            reason = self._validate_eager_result_on_draft(
+                result,
+                known_by_id,
+                seq_by_id.get(int(result["seq_id"])),
+                int(meta_values[4]),
+                CONTINUOUS_EAGER_DRY_RUN_SOURCE,
+            )
+            validation_reason_by_id[proposal_id] = reason
+            if reason == "ok":
+                validated.append(result)
+            else:
+                invalid.append(result)
+        trace_record["continuous_eager_result_transfer_received_proposal_ids"] = [
+            int(result["proposal_id"]) for result in results
+        ]
+        trace_record["continuous_eager_result_transfer_validated_proposal_ids"] = [
+            int(result["proposal_id"]) for result in validated
+        ]
+        trace_record["continuous_eager_result_transfer_invalid_proposal_ids"] = [
+            int(result["proposal_id"]) for result in invalid
+        ]
+        trace_record["continuous_eager_result_transfer_validation_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(validation_reason_by_id.items())
+        }
+        trace_record["continuous_eager_result_transfer_payload_len_units"] = payload_len
+        trace_record["continuous_eager_result_transfer_zero_steps"] = int(len(results) == 0)
+        return validated
+
+    def _run_continuous_eager_sync_apply_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        validated_results: list[dict],
+    ) -> None:
+        gamma = int(self.gamma)
+        seq_by_id = self._local_sequence_by_id()
+        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
+        candidate_ids = [int(result["proposal_id"]) for result in validated_results]
+        candidate_seq_ids = [int(result["seq_id"]) for result in validated_results]
+        executed_ids: list[int] = []
+        ready_ids: list[int] = []
+        ready_seq_ids: list[int] = []
+        not_ready_ids: list[int] = []
+        not_ready_reason_by_id: dict[int, str] = {}
+        target_action_by_id: dict[int, str] = {}
+        draft_action_by_id: dict[int, str] = {}
+        target_result_by_id: dict[int, str] = {}
+        draft_result_by_id: dict[int, str] = {}
+        target_accept_by_id: dict[int, int] = {}
+        draft_accept_by_id: dict[int, int] = {}
+        action_match_by_id: dict[int, bool] = {}
+        result_match_by_id: dict[int, bool] = {}
+        accept_match_by_id: dict[int, bool] = {}
+        rollback_ok_by_id: dict[int, bool] = {}
+        mutation_by_id: dict[int, bool] = {}
+        checkpoint_failed_by_id: dict[int, bool] = {}
+        append_by_id: dict[int, int] = {}
+        discard_by_id: dict[int, int] = {}
+        reason_counts: dict[str, int] = {}
+
+        for result in validated_results:
+            proposal_id = int(result["proposal_id"])
+            seq_id = int(result["seq_id"])
+            proposal = known_by_id.get(proposal_id)
+            seq = seq_by_id.get(seq_id)
+            verify_result = str(result.get("verify_result", "unknown"))
+            accept_len = int(result.get("accepted_len", -1))
+            target_action = str(result.get("apply_action", "unknown"))
+            draft_action = target_action
+            target_action_by_id[proposal_id] = target_action
+            draft_action_by_id[proposal_id] = draft_action
+            target_result_by_id[proposal_id] = verify_result
+            draft_result_by_id[proposal_id] = verify_result
+            target_accept_by_id[proposal_id] = accept_len
+            draft_accept_by_id[proposal_id] = accept_len
+            action_match_by_id[proposal_id] = True
+            result_match_by_id[proposal_id] = True
+            accept_match_by_id[proposal_id] = True
+            append_by_id[proposal_id] = 0
+            discard_by_id[proposal_id] = int(result.get("discarded_token_count", 0))
+            rollback_ok_by_id[proposal_id] = True
+            mutation_by_id[proposal_id] = False
+            checkpoint_failed_by_id[proposal_id] = False
+
+            reason = None
+            if proposal is None:
+                reason = "missing_local_proposal"
+            elif seq is None:
+                reason = "seq_not_found"
+            elif int(getattr(proposal, "seq_id", -1)) != seq_id:
+                reason = "seq_id_mismatch"
+            elif verify_result == "full_accept" and target_action != "append_full_accept_then_rollback":
+                reason = "action_mismatch"
+            elif verify_result != "full_accept":
+                reason = "continuous_not_full_accept"
+            elif not bool(result.get("rollback_ok", False)):
+                reason = "target_rollback_failed"
+            elif bool(result.get("mutation_detected", True)):
+                reason = "target_mutation_detected"
+            elif bool(result.get("checkpoint_failed", True)):
+                reason = "target_checkpoint_failed"
+            elif int(result.get("proposal_len", -1)) != gamma or accept_len != gamma:
+                reason = "invalid_accept_len"
+
+            if reason is None:
+                checkpoint = self._make_eager_apply_checkpoint(seq)
+                checkpoint_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                for token_id in proposal.proposal_token_ids:
+                    seq.append_token(int(token_id))
+                seq.pre_verify = False
+                appended_count = len(proposal.proposal_token_ids)
+                self._restore_eager_apply_checkpoint(seq, checkpoint)
+                rollback_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                mutation_remaining = not rollback_ok
+                append_by_id[proposal_id] = appended_count
+                discard_by_id[proposal_id] = 0
+                rollback_ok_by_id[proposal_id] = rollback_ok
+                mutation_by_id[proposal_id] = mutation_remaining
+                checkpoint_failed_by_id[proposal_id] = not checkpoint_ok
+                if checkpoint_ok and rollback_ok and not mutation_remaining:
+                    ready_ids.append(proposal_id)
+                    ready_seq_ids.append(seq_id)
+                    executed_ids.append(proposal_id)
+                else:
+                    reason = "continuous_sync_apply_guard_failed"
+
+            if reason is not None:
+                not_ready_ids.append(proposal_id)
+                not_ready_reason_by_id[proposal_id] = reason
+                reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+                if proposal_id not in executed_ids and proposal is not None:
+                    executed_ids.append(proposal_id)
+
+        trace_record["continuous_eager_sync_apply_candidate_proposal_ids"] = list(candidate_ids)
+        trace_record["continuous_eager_sync_apply_executed_proposal_ids"] = list(executed_ids)
+        trace_record["continuous_eager_sync_apply_action_match_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(action_match_by_id.items())
+        }
+        trace_record["continuous_eager_sync_apply_result_match_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(result_match_by_id.items())
+        }
+        trace_record["continuous_eager_sync_apply_accept_len_match_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(accept_match_by_id.items())
+        }
+        trace_record["continuous_eager_sync_apply_rollback_ok_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(rollback_ok_by_id.items())
+        }
+        trace_record["continuous_eager_sync_apply_mutation_detected_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(mutation_by_id.items())
+        }
+        trace_record["continuous_eager_sync_apply_checkpoint_failed_by_proposal_id"] = {
+            str(proposal_id): bool(value) for proposal_id, value in sorted(checkpoint_failed_by_id.items())
+        }
+        trace_record["continuous_eager_commit_ready_shadow_proposal_ids"] = list(ready_ids)
+        trace_record["continuous_eager_commit_ready_shadow_seq_ids"] = list(ready_seq_ids)
+        trace_record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {
+            str(proposal_id): gamma for proposal_id in ready_ids
+        }
+        existing_not_ready = set(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_not_ready_shadow_proposal_ids", []))
+        existing_reason = dict(trace_record.get("continuous_eager_not_ready_shadow_reason_by_proposal_id", {}))
+        for proposal_id, reason in not_ready_reason_by_id.items():
+            existing_not_ready.add(proposal_id)
+            existing_reason[str(proposal_id)] = reason
+        trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = sorted(existing_not_ready)
+        trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = existing_reason
+        merged_counts = dict(trace_record.get("continuous_eager_drop_reason_counts", {}))
+        for reason, count in reason_counts.items():
+            merged_counts[reason] = int(merged_counts.get(reason, 0)) + int(count)
+        trace_record["continuous_eager_drop_reason_counts"] = dict(sorted(merged_counts.items()))
+        trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = len(ready_ids)
+        trace_record["continuous_eager_commit_ready_shadow_token_count"] = len(ready_ids) * gamma
+        trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(existing_not_ready)
+        trace_record["continuous_eager_mutation_detected_count"] = sum(1 for value in mutation_by_id.values() if bool(value))
+        trace_record["continuous_eager_real_commit_count"] = 0
+
+
 
     def _run_eager_commit_ready_only(
         self,
@@ -6175,7 +7168,11 @@ class ModelRunnerBase:
         trace_record["eager_tokens_accepted"] = int(committed_tokens)
         trace_record["eager_tokens_rejected"] = 0
         trace_record["eager_tokens_invalidated"] = 0
-        if self._continuous_eager_dry_run_enabled() and side == "target":
+        if (
+            self._continuous_eager_dry_run_enabled()
+            and not self._continuous_eager_verify_apply_dry_run_enabled()
+            and side == "target"
+        ):
             self._run_continuous_eager_shadow_dry_run(
                 plan,
                 trace_record,
