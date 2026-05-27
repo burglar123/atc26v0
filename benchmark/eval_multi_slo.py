@@ -1294,7 +1294,8 @@ def run_eval_chunk(
     run_start_ts = time.time()
     if args.cached_admission:
         output_text, num_tokens, num_acc_tokens, elapsed_time = engine.cached_decode_ready_generate(
-            args.max_active_cached_seqs or 0
+            args.max_active_cached_seqs or 0,
+            execution_mode=args.execution_mode,
         )
     else:
         output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
@@ -1498,9 +1499,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.cached_admission and args.execution_mode != "parallel_pearl":
+    if args.cached_admission and args.execution_mode not in ("parallel_pearl", "serialized_pearl"):
         raise ValueError(
-            "--cached-admission currently supports only --execution-mode parallel_pearl"
+            "--cached-admission currently supports only --execution-mode parallel_pearl or serialized_pearl"
         )
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)

@@ -720,8 +720,8 @@ class ModelRunnerBase:
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)
 
-    def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
-        self._set_execution_mode("parallel_pearl")
+    def _cached_decode_ready_generate_loop(self, execution_mode: str, decode_step_fn, max_active_cached_seqs: int = 0):
+        self._set_execution_mode(execution_mode)
         self.active_decode_ready_mode = True
         if max_active_cached_seqs <= 0:
             max_active_cached_seqs = self.scheduler.max_num_seqs
@@ -815,7 +815,7 @@ class ModelRunnerBase:
                     self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
                 for seq in self.scheduler.running:
                     seq.mark_decode_started()
-                self.pearl_step()
+                decode_step_fn()
             elif pending:
                 next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
                 time.sleep(min(max(next_arrival - now, 0.0), 0.01))
@@ -831,6 +831,12 @@ class ModelRunnerBase:
             )
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)
+
+    def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
+        self._cached_decode_ready_generate_loop("parallel_pearl", self.pearl_step, max_active_cached_seqs)
+
+    def cached_decode_ready_serialized_pearl_generate(self, max_active_cached_seqs: int = 0):
+        self._cached_decode_ready_generate_loop("serialized_pearl", self.serialized_pearl_step, max_active_cached_seqs)
 
     def decode_ready_serialized_pearl_generate(self):
         """Decode-only serialized-PEARL approximation after prepare_decode_ready()."""

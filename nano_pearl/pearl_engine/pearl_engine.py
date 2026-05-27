@@ -359,9 +359,23 @@ class PEARLEngine:
         self.control_event.wait()
         self.control_event.clear()
 
-    def cached_decode_ready_generate(self, max_active_cached_seqs: int):
-        self.controller.write_draft_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
-        self.controller.write_target_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
+    def cached_decode_ready_generate(self, max_active_cached_seqs: int, execution_mode: str = "parallel_pearl"):
+        if execution_mode not in self.config.ALLOWED_EXECUTION_MODES:
+            raise ValueError(
+                f"Invalid execution_mode={execution_mode!r} for cached admission. "
+                f"Expected one of {sorted(self.config.ALLOWED_EXECUTION_MODES)}."
+            )
+        if execution_mode not in ("parallel_pearl", "serialized_pearl"):
+            raise ValueError(
+                f"--cached-admission currently supports only --execution-mode "
+                f"parallel_pearl or serialized_pearl, got {execution_mode!r}"
+            )
+        method_name = {
+            "parallel_pearl": "cached_decode_ready_pearl_generate",
+            "serialized_pearl": "cached_decode_ready_serialized_pearl_generate",
+        }[execution_mode]
+        self.controller.write_draft_shm(method_name, max_active_cached_seqs)
+        self.controller.write_target_shm(method_name, max_active_cached_seqs)
         self.control_event.wait()
         self.control_event.clear()
         output, time, target_traces, target_request_metadata = self.controller.read_output()
