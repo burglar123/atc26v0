@@ -153,6 +153,10 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
             "continuous_eager_commit_decision_broadcast_time_ms"
         ),
         "continuous_eager_result_transfer_time_ms": accounting.get("continuous_eager_result_transfer_time_ms"),
+        "continuous_eager_result_transfer_protocol": accounting.get("continuous_eager_result_transfer_protocol"),
+        "continuous_eager_result_transfer_payload_len_units_before_compact": accounting.get(
+            "continuous_eager_result_transfer_payload_len_units_before_compact"
+        ),
         "continuous_eager_commit_decision_broadcast_payload_len_units": accounting.get(
             "continuous_eager_commit_decision_broadcast_payload_len_units"
         ),
@@ -177,6 +181,12 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
                 "continuous_eager_real_commit_time_ms",
                 "continuous_eager_overhead_time_ms",
             )
+        ),
+        "continuous_zero_result_fast_path_count": accounting.get("continuous_zero_result_fast_path_count"),
+        "continuous_zero_decision_fast_path_count": accounting.get("continuous_zero_decision_fast_path_count"),
+        "continuous_eager_sync_apply_zero_steps": accounting.get("continuous_eager_sync_apply_zero_steps"),
+        "continuous_eager_verify_apply_zero_candidate_steps": accounting.get(
+            "continuous_eager_verify_apply_zero_candidate_steps"
         ),
     }
 

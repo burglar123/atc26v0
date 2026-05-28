@@ -343,6 +343,12 @@ def aggregate_performance_accounting(
     continuous_depth2_real_commit_count = 0
     continuous_result_transfer_payload_len_units = 0
     continuous_commit_decision_payload_len_units = 0
+    continuous_result_transfer_payload_len_units_before_compact = 0
+    continuous_result_transfer_protocols: set[str] = set()
+    continuous_zero_result_fast_path_count = 0
+    continuous_zero_decision_fast_path_count = 0
+    continuous_sync_apply_zero_steps = 0
+    continuous_verify_apply_zero_candidate_steps = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -502,6 +508,20 @@ def aggregate_performance_accounting(
         continuous_result_transfer_payload_len_units += max(
             0,
             int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0),
+        )
+        continuous_result_transfer_payload_len_units_before_compact += max(
+            0,
+            int_value(record.get("continuous_eager_result_transfer_payload_len_units_before_compact"), 0),
+        )
+        protocol = record.get("continuous_eager_result_transfer_protocol")
+        if protocol:
+            continuous_result_transfer_protocols.add(str(protocol))
+        continuous_zero_result_fast_path_count += int_value(record.get("continuous_zero_result_fast_path_count"), 0)
+        continuous_zero_decision_fast_path_count += int_value(record.get("continuous_zero_decision_fast_path_count"), 0)
+        continuous_sync_apply_zero_steps += int_value(record.get("continuous_eager_sync_apply_zero_steps"), 0)
+        continuous_verify_apply_zero_candidate_steps += int_value(
+            record.get("continuous_eager_verify_apply_zero_candidate_steps"),
+            0,
         )
         if "continuous_eager_commit_decision_broadcast_payload_len_units" in record:
             payload_len = int_value(record.get("continuous_eager_commit_decision_broadcast_payload_len_units"), 0)
@@ -739,8 +759,21 @@ def aggregate_performance_accounting(
             + continuous_target_accepted_sum
         ),
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
+        "continuous_eager_result_transfer_protocol": (
+            sorted(continuous_result_transfer_protocols)[0]
+            if len(continuous_result_transfer_protocols) == 1
+            else None
+        ),
+        "continuous_eager_result_transfer_protocols": sorted(continuous_result_transfer_protocols),
+        "continuous_eager_result_transfer_payload_len_units_before_compact": (
+            continuous_result_transfer_payload_len_units_before_compact
+        ),
         "continuous_eager_commit_decision_broadcast_payload_len_units": continuous_commit_decision_payload_len_units,
         "continuous_eager_result_transfer_payload_len_units": continuous_result_transfer_payload_len_units,
+        "continuous_zero_result_fast_path_count": continuous_zero_result_fast_path_count,
+        "continuous_zero_decision_fast_path_count": continuous_zero_decision_fast_path_count,
+        "continuous_eager_sync_apply_zero_steps": continuous_sync_apply_zero_steps,
+        "continuous_eager_verify_apply_zero_candidate_steps": continuous_verify_apply_zero_candidate_steps,
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
         "normal_draft_token_slots_suppressed": lane_token_slots,
         "normal_proposal_missing_allowed_by_eager_count": len(missing_allowed_events),
@@ -888,6 +921,11 @@ def validate_accounting(
         "eager_result_transfer_payload_len_units",
         "continuous_eager_commit_decision_broadcast_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units",
+        "continuous_eager_result_transfer_payload_len_units_before_compact",
+        "continuous_zero_result_fast_path_count",
+        "continuous_zero_decision_fast_path_count",
+        "continuous_eager_sync_apply_zero_steps",
+        "continuous_eager_verify_apply_zero_candidate_steps",
     ):
         if int_value(accounting.get(field), 0) < 0:
             errors.append(f"{field} must be nonnegative")
@@ -978,8 +1016,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",
         "combined_actual_accepted_token_increment_sum",
+        "continuous_eager_result_transfer_protocol",
+        "continuous_eager_result_transfer_protocols",
+        "continuous_eager_result_transfer_payload_len_units_before_compact",
         "continuous_eager_commit_decision_broadcast_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units",
+        "continuous_zero_result_fast_path_count",
+        "continuous_zero_decision_fast_path_count",
+        "continuous_eager_sync_apply_zero_steps",
+        "continuous_eager_verify_apply_zero_candidate_steps",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",
         "suppressed_slots_per_committed_token",

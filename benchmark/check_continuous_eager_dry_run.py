@@ -143,6 +143,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     chain_depths: dict[int, int] = {}
     drop_reason_by_id: dict[int, str] = {}
     step_seq_depth_seen: dict[tuple[int, int, int], set[int]] = defaultdict(set)
+    result_transfer_protocols: set[str] = set()
+    result_transfer_payload_len_units = 0
+    result_transfer_payload_len_units_before_compact = 0
+    zero_result_fast_path_count = 0
 
     for idx, record in enumerate(records):
         enabled = bool(record.get("enable_continuous_eager_dry_run", False))
@@ -308,6 +312,35 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         received_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_received_proposal_ids")))
         validated_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_validated_proposal_ids")))
         invalid_result_ids_seen.update(as_int_set(record.get("continuous_eager_result_transfer_invalid_proposal_ids")))
+        protocol = record.get("continuous_eager_result_transfer_protocol")
+        if protocol:
+            result_transfer_protocols.add(str(protocol))
+            if str(protocol) != "compact_v1":
+                errors.append(f"record[{idx}] unexpected continuous result-transfer protocol {protocol!r}")
+        compacted = record.get("continuous_eager_result_transfer_compacted")
+        if protocol and compacted is not True:
+            errors.append(f"record[{idx}] compact continuous result transfer missing compacted=true")
+        payload_len = int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0)
+        payload_before = int_value(
+            record.get("continuous_eager_result_transfer_payload_len_units_before_compact"),
+            0,
+        )
+        if payload_len < 0 or payload_before < 0:
+            errors.append(f"record[{idx}] continuous result-transfer payload lengths must be nonnegative")
+        if payload_before and payload_len > payload_before:
+            errors.append(f"record[{idx}] compact payload larger than before-compact payload")
+        result_transfer_payload_len_units += max(0, payload_len)
+        result_transfer_payload_len_units_before_compact += max(0, payload_before)
+        zero_result_fast_path_count += int_value(record.get("continuous_zero_result_fast_path_count"), 0)
+        sent_count = int_value(record.get("continuous_eager_result_transfer_sent_count"), -1)
+        received_count = int_value(record.get("continuous_eager_result_transfer_received_count"), -1)
+        validated_count = int_value(record.get("continuous_eager_result_transfer_validated_count"), -1)
+        if sent_count >= 0 and sent_count != len(as_int_set(record.get("continuous_eager_result_transfer_sent_proposal_ids"))):
+            errors.append(f"record[{idx}] continuous sent count/list mismatch")
+        if received_count >= 0 and received_count != len(as_int_set(record.get("continuous_eager_result_transfer_received_proposal_ids"))):
+            errors.append(f"record[{idx}] continuous received count/list mismatch")
+        if validated_count >= 0 and validated_count != len(as_int_set(record.get("continuous_eager_result_transfer_validated_proposal_ids"))):
+            errors.append(f"record[{idx}] continuous validated count/list mismatch")
         sync_executed_ids_seen.update(as_int_set(record.get("continuous_eager_sync_apply_executed_proposal_ids")))
         duplicate_ids_seen.update(as_int_set(record.get("continuous_eager_duplicate_proposal_ids")))
         frontier_mismatch_ids_seen.update(
@@ -401,6 +434,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "continuous_result_transfer_sent_count": len(sent_result_ids_seen),
         "continuous_result_transfer_received_count": len(received_result_ids_seen),
         "continuous_result_transfer_validated_count": len(validated_result_ids_seen),
+        "continuous_result_transfer_protocols": sorted(result_transfer_protocols),
+        "continuous_result_transfer_payload_len_units": result_transfer_payload_len_units,
+        "continuous_result_transfer_payload_len_units_before_compact": result_transfer_payload_len_units_before_compact,
+        "continuous_zero_result_fast_path_count": zero_result_fast_path_count,
         "continuous_sync_apply_executed_count": len(sync_executed_ids_seen),
         "combined_one_shot_plus_continuous_shadow_token_count": accounting.get(
             "combined_one_shot_plus_continuous_shadow_token_count",
@@ -442,6 +479,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_result_transfer_sent_count",
         "continuous_result_transfer_received_count",
         "continuous_result_transfer_validated_count",
+        "continuous_result_transfer_protocols",
+        "continuous_result_transfer_payload_len_units",
+        "continuous_result_transfer_payload_len_units_before_compact",
+        "continuous_zero_result_fast_path_count",
         "continuous_sync_apply_executed_count",
         "combined_one_shot_plus_continuous_shadow_token_count",
         "combined_estimated_token_share_of_output",
@@ -573,6 +614,11 @@ def synthetic_verify_apply_records() -> list[dict[str, Any]]:
             "continuous_eager_apply_mutation_detected_by_proposal_id": {"900000601": False},
             "continuous_eager_apply_checkpoint_failed_by_proposal_id": {"900000601": False},
             "continuous_eager_result_transfer_sent_proposal_ids": [900000601],
+            "continuous_eager_result_transfer_protocol": "compact_v1",
+            "continuous_eager_result_transfer_compacted": True,
+            "continuous_eager_result_transfer_payload_len_units": 13,
+            "continuous_eager_result_transfer_payload_len_units_before_compact": 31,
+            "continuous_eager_result_transfer_sent_count": 1,
             "continuous_eager_real_commit_count": 0,
         }
     )
@@ -598,6 +644,12 @@ def synthetic_verify_apply_records() -> list[dict[str, Any]]:
             "continuous_eager_parent_source_by_proposal_id": {"900000601": ONE_SHOT_PARENT_SOURCE},
             "continuous_eager_result_transfer_received_proposal_ids": [900000601],
             "continuous_eager_result_transfer_validated_proposal_ids": [900000601],
+            "continuous_eager_result_transfer_protocol": "compact_v1",
+            "continuous_eager_result_transfer_compacted": True,
+            "continuous_eager_result_transfer_payload_len_units": 13,
+            "continuous_eager_result_transfer_payload_len_units_before_compact": 31,
+            "continuous_eager_result_transfer_received_count": 1,
+            "continuous_eager_result_transfer_validated_count": 1,
             "continuous_eager_sync_apply_executed_proposal_ids": [900000601],
             "continuous_eager_sync_apply_action_match_by_proposal_id": {"900000601": True},
             "continuous_eager_sync_apply_result_match_by_proposal_id": {"900000601": True},

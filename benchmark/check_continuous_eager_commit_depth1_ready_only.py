@@ -126,6 +126,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     depth2_real_commit_count = 0
     timing_sums = {field: 0.0 for field in CONTINUOUS_TIMING_FIELDS}
     timing_negative_fields: set[str] = set()
+    result_transfer_protocols: set[str] = set()
+    result_transfer_payload_len_units = 0
+    result_transfer_payload_len_units_before_compact = 0
 
     for record in records:
         if not is_dual_record(record):
@@ -158,6 +161,19 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                     errors.append(f"record[{idx}] {field} must be nonnegative")
                 else:
                     timing_sums[field] += value
+        protocol = record.get("continuous_eager_result_transfer_protocol")
+        if protocol:
+            result_transfer_protocols.add(str(protocol))
+            if str(protocol) != "compact_v1":
+                errors.append(f"record[{idx}] unexpected continuous result-transfer protocol {protocol!r}")
+        payload_len = int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0)
+        payload_before = int_value(record.get("continuous_eager_result_transfer_payload_len_units_before_compact"), 0)
+        if payload_len < 0 or payload_before < 0:
+            errors.append(f"record[{idx}] continuous result-transfer payload lengths must be nonnegative")
+        if payload_before and payload_len > payload_before:
+            errors.append(f"record[{idx}] compact continuous result-transfer payload grew")
+        result_transfer_payload_len_units += max(0, payload_len)
+        result_transfer_payload_len_units_before_compact += max(0, payload_before)
 
         enabled = bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
         if enabled:
@@ -328,6 +344,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "continuous_depth2_real_commit_count": depth2_real_commit_count,
         "continuous_timing_sums_ms": dict(timing_sums),
         "continuous_timing_negative_fields": sorted(timing_negative_fields),
+        "continuous_result_transfer_protocols": sorted(result_transfer_protocols),
+        "continuous_result_transfer_payload_len_units": result_transfer_payload_len_units,
+        "continuous_result_transfer_payload_len_units_before_compact": result_transfer_payload_len_units_before_compact,
         "repeated_continuous_commit_proposal_ids": sorted(repeated_commit_ids),
         "continuous_committed_but_not_shadow_ready_ids": sorted(committed_but_not_ready),
         "continuous_committed_non_full_accept_ids": sorted(committed_non_full_accept),
@@ -357,6 +376,9 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_depth2_real_commit_count",
         "continuous_timing_sums_ms",
         "continuous_timing_negative_fields",
+        "continuous_result_transfer_protocols",
+        "continuous_result_transfer_payload_len_units",
+        "continuous_result_transfer_payload_len_units_before_compact",
         "repeated_continuous_commit_proposal_ids",
         "continuous_committed_but_not_shadow_ready_ids",
         "continuous_committed_non_full_accept_ids",
