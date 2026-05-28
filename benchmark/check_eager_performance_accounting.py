@@ -349,6 +349,17 @@ def aggregate_performance_accounting(
     continuous_zero_decision_fast_path_count = 0
     continuous_sync_apply_zero_steps = 0
     continuous_verify_apply_zero_candidate_steps = 0
+    rolling_child_candidate_ids: set[int] = set()
+    rolling_child_ready_ids: set[int] = set()
+    rolling_child_invalidated_ids: set[int] = set()
+    rolling_child_token_by_id: dict[int, int] = {}
+    rolling_drop_reason_by_id: dict[int, str] = {}
+    rolling_same_seq_overlap_count = 0
+    rolling_normal_lane_conflict_count = 0
+    rolling_cascade_discard_ids: set[int] = set()
+    rolling_depth2_real_commit_count = 0
+    rolling_depth_gt1_real_commit_count = 0
+    rolling_max_depth_observed = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -523,6 +534,31 @@ def aggregate_performance_accounting(
             record.get("continuous_eager_verify_apply_zero_candidate_steps"),
             0,
         )
+        rolling_child_candidate_ids.update(as_int_set(record.get("rolling_child_generated_proposal_ids")))
+        rolling_child_ready_ids.update(
+            as_int_set(record.get("rolling_child_ready_after_parent_full_accept_proposal_ids"))
+        )
+        rolling_child_invalidated_ids.update(as_int_set(record.get("rolling_child_invalidated_proposal_ids")))
+        for proposal_id in as_int_set(record.get("rolling_child_generated_proposal_ids")):
+            rolling_child_token_by_id.setdefault(proposal_id, max(0, gamma))
+        reason_map = record.get("rolling_child_invalidated_reason_by_proposal_id")
+        if isinstance(reason_map, dict):
+            for raw_proposal_id, reason in reason_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                rolling_drop_reason_by_id.setdefault(proposal_id, str(reason))
+        rolling_same_seq_overlap_count += int_value(record.get("rolling_same_seq_overlap_count"), 0)
+        rolling_normal_lane_conflict_count += int_value(record.get("rolling_normal_lane_conflict_count"), 0)
+        rolling_cascade_discard_ids.update(as_int_set(record.get("rolling_cascade_discarded_proposal_ids")))
+        rolling_depth2_real_commit_count += int_value(record.get("rolling_depth2_real_commit_count"), 0)
+        rolling_depth_gt1_real_commit_count += int_value(record.get("rolling_depth_gt1_real_commit_count"), 0)
+        rolling_max_depth_observed = max(
+            rolling_max_depth_observed,
+            int_value(record.get("rolling_max_depth_observed"), 0),
+            int_value(record.get("max_rolling_continuous_depth_observed"), 0),
+        )
         if "continuous_eager_commit_decision_broadcast_payload_len_units" in record:
             payload_len = int_value(record.get("continuous_eager_commit_decision_broadcast_payload_len_units"), 0)
             if payload_len < 0:
@@ -637,6 +673,14 @@ def aggregate_performance_accounting(
     continuous_real_committed_token_count = sum(
         int(continuous_real_committed_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
         for proposal_id in continuous_real_committed_ids
+    )
+    rolling_child_candidate_token_count = sum(
+        int(rolling_child_token_by_id.get(proposal_id, max(0, gamma)))
+        for proposal_id in rolling_child_candidate_ids
+    )
+    rolling_child_ready_shadow_token_count = sum(
+        int(rolling_child_token_by_id.get(proposal_id, max(0, gamma)))
+        for proposal_id in rolling_child_ready_ids
     )
     continuous_chain_distribution = Counter(
         str(depth)
@@ -774,6 +818,18 @@ def aggregate_performance_accounting(
         "continuous_zero_decision_fast_path_count": continuous_zero_decision_fast_path_count,
         "continuous_eager_sync_apply_zero_steps": continuous_sync_apply_zero_steps,
         "continuous_eager_verify_apply_zero_candidate_steps": continuous_verify_apply_zero_candidate_steps,
+        "rolling_child_candidate_proposal_count": len(rolling_child_candidate_ids),
+        "rolling_child_candidate_token_count": rolling_child_candidate_token_count,
+        "rolling_child_ready_shadow_proposal_count": len(rolling_child_ready_ids),
+        "rolling_child_ready_shadow_token_count": rolling_child_ready_shadow_token_count,
+        "rolling_child_invalidated_count": len(rolling_child_invalidated_ids),
+        "rolling_cascade_discard_count": len(rolling_cascade_discard_ids),
+        "rolling_same_seq_overlap_count": rolling_same_seq_overlap_count,
+        "rolling_normal_lane_conflict_count": rolling_normal_lane_conflict_count,
+        "rolling_depth2_real_commit_count": rolling_depth2_real_commit_count,
+        "rolling_depth_gt1_real_commit_count": rolling_depth_gt1_real_commit_count,
+        "rolling_max_depth_observed": rolling_max_depth_observed,
+        "rolling_drop_reason_counts": dict(Counter(rolling_drop_reason_by_id.values())),
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
         "normal_draft_token_slots_suppressed": lane_token_slots,
         "normal_proposal_missing_allowed_by_eager_count": len(missing_allowed_events),
@@ -926,6 +982,14 @@ def validate_accounting(
         "continuous_zero_decision_fast_path_count",
         "continuous_eager_sync_apply_zero_steps",
         "continuous_eager_verify_apply_zero_candidate_steps",
+        "rolling_child_candidate_token_count",
+        "rolling_child_ready_shadow_token_count",
+        "rolling_child_invalidated_count",
+        "rolling_cascade_discard_count",
+        "rolling_same_seq_overlap_count",
+        "rolling_normal_lane_conflict_count",
+        "rolling_depth2_real_commit_count",
+        "rolling_depth_gt1_real_commit_count",
     ):
         if int_value(accounting.get(field), 0) < 0:
             errors.append(f"{field} must be nonnegative")
@@ -1025,6 +1089,18 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_zero_decision_fast_path_count",
         "continuous_eager_sync_apply_zero_steps",
         "continuous_eager_verify_apply_zero_candidate_steps",
+        "rolling_child_candidate_proposal_count",
+        "rolling_child_candidate_token_count",
+        "rolling_child_ready_shadow_proposal_count",
+        "rolling_child_ready_shadow_token_count",
+        "rolling_child_invalidated_count",
+        "rolling_cascade_discard_count",
+        "rolling_same_seq_overlap_count",
+        "rolling_normal_lane_conflict_count",
+        "rolling_depth2_real_commit_count",
+        "rolling_depth_gt1_real_commit_count",
+        "rolling_max_depth_observed",
+        "rolling_drop_reason_counts",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",
         "suppressed_slots_per_committed_token",

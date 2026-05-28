@@ -219,10 +219,14 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_continuous_eager_dry_run": args.enable_continuous_eager_dry_run,
         "enable_continuous_eager_verify_apply_dry_run": args.enable_continuous_eager_verify_apply_dry_run,
         "enable_continuous_eager_commit_depth1_ready_only": args.enable_continuous_eager_commit_depth1_ready_only,
+        "enable_rolling_continuous_eager_dry_run": args.enable_rolling_continuous_eager_dry_run,
         "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
         "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
         "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
         "max_continuous_eager_tokens_per_request": args.max_continuous_eager_tokens_per_request,
+        "max_rolling_continuous_depth": args.max_rolling_continuous_depth,
+        "max_rolling_continuous_draft_children_per_step": args.max_rolling_continuous_draft_children_per_step,
+        "max_rolling_continuous_seqs_per_step": args.max_rolling_continuous_seqs_per_step,
     }
 
     # Try new named-path style with gamma.
@@ -261,10 +265,14 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_continuous_eager_dry_run",
         "enable_continuous_eager_verify_apply_dry_run",
         "enable_continuous_eager_commit_depth1_ready_only",
+        "enable_rolling_continuous_eager_dry_run",
         "max_continuous_eager_chain_depth",
         "max_continuous_eager_requests_per_step",
         "max_continuous_eager_tokens_per_step",
         "max_continuous_eager_tokens_per_request",
+        "max_rolling_continuous_depth",
+        "max_rolling_continuous_draft_children_per_step",
+        "max_rolling_continuous_seqs_per_step",
     ):
         legacy_kwargs.pop(key, None)
 
@@ -1648,10 +1656,18 @@ def main() -> None:
         action="store_true",
         help="Enable Phase 1H-7c guarded real continuous depth-1 eager commit for shadow-ready proposals.",
     )
+    parser.add_argument(
+        "--enable-rolling-continuous-eager-dry-run",
+        action="store_true",
+        help="Enable Phase 1H-8a rolling continuous overlap shadow dry-run without depth-2 real commit.",
+    )
     parser.add_argument("--max-continuous-eager-chain-depth", type=int, default=1)
     parser.add_argument("--max-continuous-eager-requests-per-step", type=int, default=2)
     parser.add_argument("--max-continuous-eager-tokens-per-step", type=int, default=0)
     parser.add_argument("--max-continuous-eager-tokens-per-request", type=int, default=0)
+    parser.add_argument("--max-rolling-continuous-depth", type=int, default=2)
+    parser.add_argument("--max-rolling-continuous-draft-children-per-step", type=int, default=2)
+    parser.add_argument("--max-rolling-continuous-seqs-per-step", type=int, default=2)
     parser.add_argument(
         "--eager-trace-level",
         choices=["full", "summary", "minimal"],
