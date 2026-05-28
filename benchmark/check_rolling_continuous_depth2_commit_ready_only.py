@@ -146,10 +146,19 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if as_int_set(record.get("rolling_normal_lane_conflict_seq_ids")):
             normal_lane_conflict_count += len(as_int_set(record.get("rolling_normal_lane_conflict_seq_ids")))
             errors.append(f"record[{idx}] rolling normal lane conflict present")
-        if int_value(record.get("rolling_depth3_real_commit_count"), 0):
+        depth3_commit_enabled = bool(record.get("enable_rolling_continuous_depth3_commit_ready_only", False)) or bool(
+            record.get("rolling_depth3_commit_enabled", False)
+        )
+        if int_value(record.get("rolling_depth3_real_commit_count"), 0) and not depth3_commit_enabled:
             depth3_real_commit_count += int_value(record.get("rolling_depth3_real_commit_count"), 0)
             errors.append(f"record[{idx}] rolling depth-3 real commit count must be zero")
-        if int_value(record.get("rolling_depth_gt2_real_commit_count"), 0):
+        if int_value(record.get("rolling_depth4_real_commit_count"), 0):
+            depth_gt2_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
+            errors.append(f"record[{idx}] rolling depth-4 real commit count must be zero")
+        if int_value(record.get("rolling_depth_gt3_real_commit_count"), 0):
+            depth_gt2_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
+            errors.append(f"record[{idx}] rolling depth>3 real commit count must be zero")
+        if int_value(record.get("rolling_depth_gt2_real_commit_count"), 0) and not depth3_commit_enabled:
             depth_gt2_real_commit_count += int_value(record.get("rolling_depth_gt2_real_commit_count"), 0)
             errors.append(f"record[{idx}] rolling depth>2 real commit count must be zero")
 

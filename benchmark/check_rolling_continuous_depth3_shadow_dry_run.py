@@ -59,6 +59,7 @@ DEPTH3_ACTIVE_COUNT_FIELDS = (
     "rolling_depth3_same_seq_overlap_count",
     "rolling_depth3_normal_lane_conflict_count",
     "rolling_depth3_real_commit_count",
+    "rolling_depth4_real_commit_count",
     "rolling_depth_gt3_real_commit_count",
     "rolling_depth3_parent_resolution_pending_count",
     "rolling_depth3_frontier_mismatch_count",
@@ -220,10 +221,16 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     depth3_real_commit_count = 0
     depth_gt3_real_commit_count = 0
     max_depth_observed = 0
+    commit_enabled_records = 0
 
     for idx, record in enumerate(records):
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
         enabled = bool(record.get("enable_rolling_continuous_depth3_shadow_dry_run", False))
+        commit_enabled = bool(record.get("enable_rolling_continuous_depth3_commit_ready_only", False)) or bool(
+            record.get("rolling_depth3_commit_enabled", False)
+        )
+        if commit_enabled:
+            commit_enabled_records += 1
         if enabled:
             enabled_records += 1
         active = active_depth3_fields(record)
@@ -249,8 +256,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             int_value(record.get("rolling_depth3_max_depth_observed"), 0),
             int_value(record.get("max_rolling_continuous_depth_observed"), 0),
         )
-        if int_value(record.get("rolling_depth3_real_commit_count"), 0):
+        if int_value(record.get("rolling_depth3_real_commit_count"), 0) and not commit_enabled:
             errors.append(f"record[{idx}] rolling depth3 real commit count must be zero")
+        if int_value(record.get("rolling_depth4_real_commit_count"), 0):
+            errors.append(f"record[{idx}] rolling depth4 real commit count must be zero")
         if int_value(record.get("rolling_depth_gt3_real_commit_count"), 0):
             errors.append(f"record[{idx}] rolling depth>3 real commit count must be zero")
 
@@ -269,9 +278,14 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         depth2_ids = as_int_set(record.get("rolling_depth2_real_committed_proposal_ids"))
         depth2_committed_ids.update(depth2_ids)
         merge_int_map(parent_by_child, as_int_map(record.get("rolling_depth3_child_parent_by_proposal_id")))
+        merge_int_map(parent_by_child, as_int_map(record.get("rolling_depth3_commit_parent_by_proposal_id")))
+        merge_int_map(parent_by_child, as_int_map(record.get("rolling_depth3_real_commit_parent_by_proposal_id")))
         merge_int_map(root_by_child, as_int_map(record.get("rolling_depth3_child_root_by_proposal_id")))
+        merge_int_map(root_by_child, as_int_map(record.get("rolling_depth3_real_commit_root_by_proposal_id")))
         merge_int_map(depth_by_child, as_int_map(record.get("rolling_depth3_child_depth_by_proposal_id")))
+        merge_int_map(depth_by_child, as_int_map(record.get("rolling_depth3_real_commit_depth_by_proposal_id")))
         merge_int_map(token_by_child, as_int_map(record.get("rolling_depth3_child_token_count_by_proposal_id")))
+        merge_int_map(token_by_child, as_int_map(record.get("rolling_depth3_real_committed_token_count_by_proposal_id")))
         for proposal_id, status in as_str_map(record.get("rolling_depth3_child_status_by_proposal_id")).items():
             status_by_child.setdefault(proposal_id, status)
         generation_skipped_parent_by_child = as_int_map(
@@ -297,6 +311,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         for proposal_id, seq_id in zip(as_int_list(record.get("draft_rolling_eager_draft_proposal_ids")), as_int_list(record.get("draft_rolling_eager_draft_seq_ids"))):
             seq_by_parent.setdefault(proposal_id, seq_id)
         for proposal_id, seq_id in zip(as_int_list(record.get("rolling_depth3_child_generated_proposal_ids")), child_seq_ids):
+            seq_by_child.setdefault(proposal_id, seq_id)
+        for proposal_id, seq_id in zip(as_int_list(record.get("rolling_depth3_real_committed_proposal_ids")), as_int_list(record.get("rolling_depth3_real_committed_seq_ids"))):
             seq_by_child.setdefault(proposal_id, seq_id)
         for proposal_id, reason in as_str_map(record.get("rolling_depth3_child_invalidated_reason_by_proposal_id")).items():
             invalid_reason_by_child.setdefault(proposal_id, reason)
@@ -417,7 +433,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append("rolling depth3 observed max depth exceeds 3")
     if enabled_records and parent_committed_ids and not generated_ids and not skipped_child_ids and not parent_pending_ids:
         errors.append("rolling depth3 shadow enabled with committed depth2 parents but no generated children or skip reasons")
-    if depth3_real_commit_count:
+    if depth3_real_commit_count and not commit_enabled_records:
         errors.append("rolling_depth3_real_commit_count must be zero")
     if depth_gt3_real_commit_count:
         errors.append("rolling_depth_gt3_real_commit_count must be zero")

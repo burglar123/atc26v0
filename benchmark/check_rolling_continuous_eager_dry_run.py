@@ -399,6 +399,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     token_count_by_id: dict[int, int] = lifecycle["token_count_by_id"]
     gamma: int = lifecycle["gamma"]
     global_depth2_commit_enabled: bool = lifecycle["depth2_commit_enabled"]
+    global_depth3_commit_enabled = any(
+        bool(record.get("enable_rolling_continuous_depth3_commit_ready_only", False))
+        or bool(record.get("rolling_depth3_commit_enabled", False))
+        for record in records
+    )
     records_with_enabled = 0
     active_records = 0
     same_seq_overlap_count = 0
@@ -461,6 +466,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         record_depth_gt1_count = int_value(record.get("rolling_depth_gt1_real_commit_count"), 0)
         record_depth3_count = int_value(record.get("rolling_depth3_real_commit_count"), 0)
         record_depth_gt2_count = int_value(record.get("rolling_depth_gt2_real_commit_count"), 0)
+        record_depth4_count = int_value(record.get("rolling_depth4_real_commit_count"), 0)
+        record_depth_gt3_count = int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
+        depth3_commit_enabled = bool(record.get("enable_rolling_continuous_depth3_commit_ready_only", False)) or bool(
+            record.get("rolling_depth3_commit_enabled", False)
+        )
         depth2_real_commit_count += record_depth2_count
         depth_gt1_real_commit_count += record_depth_gt1_count
         depth3_real_commit_count += record_depth3_count
@@ -498,15 +508,32 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] rolling child entered one-shot target takeover")
         if record_depth2_count and not depth2_commit_enabled:
             errors.append(f"record[{idx}] rolling depth-2 real commit requires depth2 commit flag")
-        if record_depth3_count:
+        if record_depth3_count and not depth3_commit_enabled:
             errors.append(f"record[{idx}] rolling depth-3 real commit count must stay zero")
-        if record_depth_gt2_count:
+        if record_depth_gt2_count and not (
+            depth3_commit_enabled
+            and record_depth_gt2_count == record_depth3_count
+            and record_depth4_count == 0
+            and record_depth_gt3_count == 0
+        ):
             errors.append(f"record[{idx}] rolling depth>2 real commit count must stay zero")
+        if record_depth4_count:
+            errors.append(f"record[{idx}] rolling depth-4 real commit count must stay zero")
+        if record_depth_gt3_count:
+            errors.append(f"record[{idx}] rolling depth>3 real commit count must stay zero")
         if record_depth_gt1_count and not (
             depth2_commit_enabled
             and record_depth_gt1_count == record_depth2_count
-            and record_depth3_count == 0
-            and record_depth_gt2_count == 0
+            and (record_depth3_count == 0 or depth3_commit_enabled)
+            and (
+                record_depth_gt2_count == 0
+                or (
+                    depth3_commit_enabled
+                    and record_depth_gt2_count == record_depth3_count
+                    and record_depth4_count == 0
+                    and record_depth_gt3_count == 0
+                )
+            )
         ):
             errors.append(f"record[{idx}] rolling depth>1 real commit count is not pure enabled depth-2 commit")
 
@@ -647,13 +674,18 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     if depth_gt1_real_commit_count and not (
         global_depth2_commit_enabled
         and depth_gt1_real_commit_count == depth2_real_commit_count
-        and depth3_real_commit_count == 0
-        and depth_gt2_real_commit_count == 0
+        and (depth3_real_commit_count == 0 or global_depth3_commit_enabled)
+        and (
+            depth_gt2_real_commit_count == 0
+            or (global_depth3_commit_enabled and depth_gt2_real_commit_count == depth3_real_commit_count)
+        )
     ):
         errors.append("rolling_depth_gt1_real_commit_count is not pure enabled depth-2 commit")
-    if depth3_real_commit_count:
+    if depth3_real_commit_count and not global_depth3_commit_enabled:
         errors.append("rolling_depth3_real_commit_count must be zero")
-    if depth_gt2_real_commit_count:
+    if depth_gt2_real_commit_count and not (
+        global_depth3_commit_enabled and depth_gt2_real_commit_count == depth3_real_commit_count
+    ):
         errors.append("rolling_depth_gt2_real_commit_count must be zero")
     if child_verified_without_parent_count:
         errors.append("rolling child verified without full-accept parent")
