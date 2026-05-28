@@ -315,7 +315,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if int_value(accounting.get(field), 0) != 0:
             errors.append(f"{field} must be zero")
     if int_value(accounting.get("combined_real_committed_token_count"), 0) != (
-        int_value(one_shot_summary.get("committed_token_count"), 0) + continuous_tokens
+        int_value(one_shot_summary.get("committed_token_count"), 0)
+        + continuous_tokens
+        + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
     ):
         errors.append("combined real committed token count mismatch")
 

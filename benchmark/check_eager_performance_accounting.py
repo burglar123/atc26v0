@@ -34,6 +34,8 @@ TIMING_FIELDS = [
     "continuous_eager_sync_apply_time_ms",
     "continuous_eager_commit_time_ms",
     "continuous_eager_real_commit_time_ms",
+    "rolling_depth2_commit_decision_broadcast_time_ms",
+    "rolling_depth2_commit_time_ms",
 ]
 PROPOSAL_LEN_MAP_KEYS = [
     "eager_commit_ready_token_count_by_proposal_id",
@@ -44,6 +46,7 @@ PROPOSAL_LEN_MAP_KEYS = [
     "eager_result_received_proposal_len_by_proposal_id",
     "eager_transfer_proposal_len_by_proposal_id",
     "eager_schedule_proposal_len_by_proposal_id",
+    "rolling_depth2_real_committed_token_count_by_proposal_id",
 ]
 DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
 DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
@@ -361,6 +364,21 @@ def aggregate_performance_accounting(
     rolling_cascade_discard_ids: set[int] = set()
     rolling_depth2_real_commit_count = 0
     rolling_depth_gt1_real_commit_count = 0
+    rolling_depth2_commit_enabled = False
+    rolling_depth2_real_committed_ids: set[int] = set()
+    rolling_depth2_real_committed_token_by_id: dict[int, int] = {}
+    rolling_depth2_real_commit_skip_reason_by_id: dict[int, str] = {}
+    rolling_depth2_target_verified_sum = 0
+    rolling_depth2_target_accepted_sum = 0
+    rolling_depth2_target_rejected_sum = 0
+    rolling_depth2_target_invalidated_sum = 0
+    rolling_depth2_draft_verified_sum = 0
+    rolling_depth2_draft_accepted_sum = 0
+    rolling_depth2_draft_rejected_sum = 0
+    rolling_depth2_draft_invalidated_sum = 0
+    rolling_depth3_real_commit_count = 0
+    rolling_depth_gt2_real_commit_count = 0
+    rolling_depth2_commit_decision_payload_len_units = 0
     rolling_max_depth_observed = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
@@ -385,6 +403,8 @@ def aggregate_performance_accounting(
     counted_timing_events: set[tuple[str, int, int, float]] = set()
     counted_continuous_commit_events: set[tuple[str, int, int, int]] = set()
     counted_continuous_commit_records: set[tuple[str, int, int]] = set()
+    counted_rolling_depth2_commit_events: set[tuple[str, int, int, int]] = set()
+    counted_rolling_depth2_commit_records: set[tuple[str, int, int]] = set()
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -558,6 +578,88 @@ def aggregate_performance_accounting(
         rolling_cascade_discard_ids.update(as_int_set(record.get("rolling_cascade_discarded_proposal_ids")))
         rolling_depth2_real_commit_count += int_value(record.get("rolling_depth2_real_commit_count"), 0)
         rolling_depth_gt1_real_commit_count += int_value(record.get("rolling_depth_gt1_real_commit_count"), 0)
+        if bool(record.get("enable_rolling_continuous_depth2_commit_ready_only", False)):
+            rolling_depth2_commit_enabled = True
+        rolling_depth3_real_commit_count += int_value(record.get("rolling_depth3_real_commit_count"), 0)
+        rolling_depth_gt2_real_commit_count += int_value(record.get("rolling_depth_gt2_real_commit_count"), 0)
+        rolling_depth2_committed_ids = as_int_set(record.get("rolling_depth2_real_committed_proposal_ids"))
+        rolling_depth2_real_committed_ids.update(rolling_depth2_committed_ids)
+        rolling_depth2_commit_token_by_id = as_int_map(
+            record.get("rolling_depth2_real_committed_token_count_by_proposal_id")
+        )
+        for proposal_id in rolling_depth2_committed_ids:
+            token_count = int(
+                rolling_depth2_commit_token_by_id.get(
+                    proposal_id,
+                    rolling_child_token_by_id.get(proposal_id, max(0, gamma)),
+                )
+            )
+            if token_count > 0:
+                rolling_depth2_real_committed_token_by_id.setdefault(proposal_id, token_count)
+        reason_map = record.get("rolling_depth2_real_commit_skip_reason_by_proposal_id")
+        if isinstance(reason_map, dict):
+            for raw_proposal_id, reason in reason_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                if reason:
+                    rolling_depth2_real_commit_skip_reason_by_id.setdefault(proposal_id, str(reason))
+        rolling_side = str(record.get("rolling_depth2_commit_side") or "")
+        if rolling_depth2_committed_ids and rolling_side in {"target", "draft"}:
+            commit_plan = int_value(record.get("rolling_depth2_commit_plan_id"), key[0])
+            commit_step = int_value(record.get("rolling_depth2_commit_step_id"), key[1])
+            record_event = (rolling_side, commit_plan, commit_step)
+            record_token_sum = 0
+            for proposal_id in rolling_depth2_committed_ids:
+                event = (rolling_side, commit_plan, commit_step, proposal_id)
+                if event in counted_rolling_depth2_commit_events:
+                    continue
+                counted_rolling_depth2_commit_events.add(event)
+                token_count = int(
+                    rolling_depth2_commit_token_by_id.get(
+                        proposal_id,
+                        rolling_child_token_by_id.get(proposal_id, max(0, gamma)),
+                    )
+                )
+                record_token_sum += token_count
+            if record_event not in counted_rolling_depth2_commit_records:
+                counted_rolling_depth2_commit_records.add(record_event)
+                if rolling_side == "target":
+                    rolling_depth2_target_verified_sum += int_value(
+                        record.get("rolling_depth2_tokens_verified"),
+                        record_token_sum,
+                    )
+                    rolling_depth2_target_accepted_sum += int_value(
+                        record.get("rolling_depth2_tokens_accepted"),
+                        record_token_sum,
+                    )
+                    rolling_depth2_target_rejected_sum += int_value(record.get("rolling_depth2_tokens_rejected"), 0)
+                    rolling_depth2_target_invalidated_sum += int_value(record.get("rolling_depth2_tokens_invalidated"), 0)
+                else:
+                    rolling_depth2_draft_verified_sum += int_value(
+                        record.get("rolling_depth2_tokens_verified"),
+                        record_token_sum,
+                    )
+                    rolling_depth2_draft_accepted_sum += int_value(
+                        record.get("rolling_depth2_tokens_accepted"),
+                        record_token_sum,
+                    )
+                    rolling_depth2_draft_rejected_sum += int_value(record.get("rolling_depth2_tokens_rejected"), 0)
+                    rolling_depth2_draft_invalidated_sum += int_value(record.get("rolling_depth2_tokens_invalidated"), 0)
+        if "rolling_depth2_commit_decision_broadcast_payload_len_units" in record:
+            payload_len = int_value(record.get("rolling_depth2_commit_decision_broadcast_payload_len_units"), 0)
+            if payload_len < 0:
+                negative_payload_field_count += 1
+            event_key = (
+                "rolling_depth2_commit_decision_broadcast_payload_len_units",
+                key[0],
+                key[1],
+                payload_len,
+            )
+            if payload_len > 0 and event_key not in counted_payload_len_events:
+                counted_payload_len_events.add(event_key)
+                rolling_depth2_commit_decision_payload_len_units += payload_len
         rolling_max_depth_observed = max(
             rolling_max_depth_observed,
             int_value(record.get("rolling_max_depth_observed"), 0),
@@ -686,6 +788,10 @@ def aggregate_performance_accounting(
         int(rolling_child_token_by_id.get(proposal_id, max(0, gamma)))
         for proposal_id in rolling_child_ready_ids
     )
+    rolling_depth2_real_committed_token_count = sum(
+        int(rolling_depth2_real_committed_token_by_id.get(proposal_id, rolling_child_token_by_id.get(proposal_id, max(0, gamma))))
+        for proposal_id in rolling_depth2_real_committed_ids
+    )
     continuous_chain_distribution = Counter(
         str(depth)
         for proposal_id, depth in continuous_chain_depth_by_id.items()
@@ -793,18 +899,49 @@ def aggregate_performance_accounting(
         "continuous_draft_actual_invalidated_token_increment_sum": continuous_draft_invalidated_sum,
         "continuous_eager_real_commit_skip_reason_counts": dict(Counter(continuous_real_commit_skip_reason_by_id.values())),
         "continuous_depth2_real_commit_count": continuous_depth2_real_commit_count,
-        "combined_real_committed_token_count": committed_token_count + continuous_real_committed_token_count,
+        "rolling_depth2_commit_enabled": bool(rolling_depth2_commit_enabled),
+        "rolling_depth2_real_committed_proposal_count": len(rolling_depth2_real_committed_ids),
+        "rolling_depth2_real_committed_token_count": rolling_depth2_real_committed_token_count,
+        "rolling_depth2_real_committed_token_share_of_output": safe_div(
+            rolling_depth2_real_committed_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
+        "rolling_depth2_commit_rate_by_token": safe_div(
+            rolling_depth2_real_committed_token_count,
+            rolling_child_ready_shadow_token_count,
+        ),
+        "rolling_depth2_commit_rate_by_proposal": safe_div(
+            len(rolling_depth2_real_committed_ids),
+            len(rolling_child_ready_ids),
+        ),
+        "rolling_depth2_target_actual_verified_token_increment_sum": rolling_depth2_target_verified_sum,
+        "rolling_depth2_target_actual_accepted_token_increment_sum": rolling_depth2_target_accepted_sum,
+        "rolling_depth2_target_actual_rejected_token_increment_sum": rolling_depth2_target_rejected_sum,
+        "rolling_depth2_target_actual_invalidated_token_increment_sum": rolling_depth2_target_invalidated_sum,
+        "rolling_depth2_draft_actual_verified_token_increment_sum": rolling_depth2_draft_verified_sum,
+        "rolling_depth2_draft_actual_accepted_token_increment_sum": rolling_depth2_draft_accepted_sum,
+        "rolling_depth2_draft_actual_rejected_token_increment_sum": rolling_depth2_draft_rejected_sum,
+        "rolling_depth2_draft_actual_invalidated_token_increment_sum": rolling_depth2_draft_invalidated_sum,
+        "rolling_depth2_real_commit_skip_reason_counts": dict(Counter(rolling_depth2_real_commit_skip_reason_by_id.values())),
+        "rolling_depth3_real_commit_count": rolling_depth3_real_commit_count,
+        "rolling_depth_gt2_real_commit_count": rolling_depth_gt2_real_commit_count,
+        "rolling_depth2_commit_decision_broadcast_payload_len_units": rolling_depth2_commit_decision_payload_len_units,
+        "combined_real_committed_token_count": (
+            committed_token_count + continuous_real_committed_token_count + rolling_depth2_real_committed_token_count
+        ),
         "combined_real_committed_token_share_of_output": safe_div(
-            committed_token_count + continuous_real_committed_token_count,
+            committed_token_count + continuous_real_committed_token_count + rolling_depth2_real_committed_token_count,
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
         ),
         "combined_actual_verified_token_increment_sum": (
             int_value(commit_summary.get("target_actual_eager_verified_token_increment_sum"), 0)
             + continuous_target_verified_sum
+            + rolling_depth2_target_verified_sum
         ),
         "combined_actual_accepted_token_increment_sum": (
             int_value(commit_summary.get("target_actual_eager_accepted_token_increment_sum"), 0)
             + continuous_target_accepted_sum
+            + rolling_depth2_target_accepted_sum
         ),
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
         "continuous_eager_result_transfer_protocol": (
@@ -957,6 +1094,35 @@ def validate_accounting(
         errors.append("continuous draft invalidated increments must remain zero")
     if int_value(accounting.get("continuous_depth2_real_commit_count"), 0) != 0:
         errors.append("continuous depth-2 real commit count must remain zero")
+    rolling_depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
+    rolling_depth2_proposals = int_value(accounting.get("rolling_depth2_real_committed_proposal_count"), 0)
+    if rolling_depth2_tokens:
+        if not bool(accounting.get("rolling_depth2_commit_enabled", False)):
+            errors.append("rolling depth-2 committed tokens require rolling depth-2 commit enabled")
+        if rolling_depth2_tokens != int_value(accounting.get("rolling_depth2_target_actual_verified_token_increment_sum"), 0):
+            errors.append("rolling depth-2 committed tokens must equal target verified increment sum")
+        if rolling_depth2_tokens != int_value(accounting.get("rolling_depth2_target_actual_accepted_token_increment_sum"), 0):
+            errors.append("rolling depth-2 committed tokens must equal target accepted increment sum")
+        if rolling_depth2_tokens != int_value(accounting.get("rolling_depth2_draft_actual_verified_token_increment_sum"), 0):
+            errors.append("rolling depth-2 committed tokens must equal draft verified increment sum")
+        if rolling_depth2_tokens != int_value(accounting.get("rolling_depth2_draft_actual_accepted_token_increment_sum"), 0):
+            errors.append("rolling depth-2 committed tokens must equal draft accepted increment sum")
+    if rolling_depth2_proposals > int_value(accounting.get("rolling_child_ready_shadow_proposal_count"), 0):
+        errors.append("rolling depth-2 committed proposal count exceeds ready shadow proposal count")
+    if rolling_depth2_tokens > int_value(accounting.get("rolling_child_ready_shadow_token_count"), 0):
+        errors.append("rolling depth-2 committed tokens exceed ready shadow tokens")
+    if int_value(accounting.get("rolling_depth2_target_actual_rejected_token_increment_sum"), 0) != 0:
+        errors.append("rolling depth-2 target rejected increments must remain zero")
+    if int_value(accounting.get("rolling_depth2_target_actual_invalidated_token_increment_sum"), 0) != 0:
+        errors.append("rolling depth-2 target invalidated increments must remain zero")
+    if int_value(accounting.get("rolling_depth2_draft_actual_rejected_token_increment_sum"), 0) != 0:
+        errors.append("rolling depth-2 draft rejected increments must remain zero")
+    if int_value(accounting.get("rolling_depth2_draft_actual_invalidated_token_increment_sum"), 0) != 0:
+        errors.append("rolling depth-2 draft invalidated increments must remain zero")
+    if int_value(accounting.get("rolling_depth3_real_commit_count"), 0) != 0:
+        errors.append("rolling depth-3 real commit count must remain zero")
+    if int_value(accounting.get("rolling_depth_gt2_real_commit_count"), 0) != 0:
+        errors.append("rolling depth>2 real commit count must remain zero")
     if continuous_real_proposals > int_value(accounting.get("continuous_eager_commit_ready_shadow_proposal_count"), 0):
         errors.append("continuous committed proposal count exceeds shadow-ready proposal count")
     if continuous_real_tokens > int_value(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0):
@@ -1003,6 +1169,19 @@ def validate_accounting(
         "rolling_normal_lane_conflict_count",
         "rolling_depth2_real_commit_count",
         "rolling_depth_gt1_real_commit_count",
+        "rolling_depth2_real_committed_proposal_count",
+        "rolling_depth2_real_committed_token_count",
+        "rolling_depth2_target_actual_verified_token_increment_sum",
+        "rolling_depth2_target_actual_accepted_token_increment_sum",
+        "rolling_depth2_target_actual_rejected_token_increment_sum",
+        "rolling_depth2_target_actual_invalidated_token_increment_sum",
+        "rolling_depth2_draft_actual_verified_token_increment_sum",
+        "rolling_depth2_draft_actual_accepted_token_increment_sum",
+        "rolling_depth2_draft_actual_rejected_token_increment_sum",
+        "rolling_depth2_draft_actual_invalidated_token_increment_sum",
+        "rolling_depth3_real_commit_count",
+        "rolling_depth_gt2_real_commit_count",
+        "rolling_depth2_commit_decision_broadcast_payload_len_units",
     ):
         if int_value(accounting.get(field), 0) < 0:
             errors.append(f"{field} must be nonnegative")
@@ -1089,6 +1268,24 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_draft_actual_invalidated_token_increment_sum",
         "continuous_eager_real_commit_skip_reason_counts",
         "continuous_depth2_real_commit_count",
+        "rolling_depth2_commit_enabled",
+        "rolling_depth2_real_committed_proposal_count",
+        "rolling_depth2_real_committed_token_count",
+        "rolling_depth2_real_committed_token_share_of_output",
+        "rolling_depth2_commit_rate_by_token",
+        "rolling_depth2_commit_rate_by_proposal",
+        "rolling_depth2_target_actual_verified_token_increment_sum",
+        "rolling_depth2_target_actual_accepted_token_increment_sum",
+        "rolling_depth2_target_actual_rejected_token_increment_sum",
+        "rolling_depth2_target_actual_invalidated_token_increment_sum",
+        "rolling_depth2_draft_actual_verified_token_increment_sum",
+        "rolling_depth2_draft_actual_accepted_token_increment_sum",
+        "rolling_depth2_draft_actual_rejected_token_increment_sum",
+        "rolling_depth2_draft_actual_invalidated_token_increment_sum",
+        "rolling_depth2_real_commit_skip_reason_counts",
+        "rolling_depth3_real_commit_count",
+        "rolling_depth_gt2_real_commit_count",
+        "rolling_depth2_commit_decision_broadcast_payload_len_units",
         "combined_real_committed_token_count",
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",

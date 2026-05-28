@@ -111,6 +111,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     normal_lane_conflict_count = 0
     depth2_real_commit_count = 0
     depth_gt1_real_commit_count = 0
+    depth3_real_commit_count = 0
+    depth_gt2_real_commit_count = 0
     child_verified_without_parent_count = 0
     child_committed_without_parent_count = 0
     drafted_without_parent_count = 0
@@ -136,6 +138,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] bad rolling stage {record.get('rolling_continuous_stage')!r}")
         if as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids")):
             errors.append(f"record[{idx}] unexpected missing normal proposal while rolling dry-run is active")
+        depth2_commit_enabled = bool(record.get("rolling_depth2_commit_enabled", False)) or bool(
+            record.get("enable_rolling_continuous_depth2_commit_ready_only", False)
+        )
 
         target_ids = as_int_list(record.get("target_rolling_eager_verify_proposal_ids"))
         target_seq_ids = as_int_list(record.get("target_rolling_eager_verify_seq_ids"))
@@ -187,6 +192,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         normal_lane_conflict_count += int_value(record.get("rolling_normal_lane_conflict_count"), 0)
         depth2_real_commit_count += int_value(record.get("rolling_depth2_real_commit_count"), 0)
         depth_gt1_real_commit_count += int_value(record.get("rolling_depth_gt1_real_commit_count"), 0)
+        depth3_real_commit_count += int_value(record.get("rolling_depth3_real_commit_count"), 0)
+        depth_gt2_real_commit_count += int_value(record.get("rolling_depth_gt2_real_commit_count"), 0)
         child_verified_without_parent_count += int_value(
             record.get("rolling_child_verified_without_parent_full_accept_count"), 0
         )
@@ -221,7 +228,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] rolling child entered lane exclusion")
         if generated_ids & as_int_set(record.get("target_eager_verify_proposal_ids_dry_run")):
             errors.append(f"record[{idx}] rolling child entered one-shot target takeover")
-        if depth2_real_commit_count or depth_gt1_real_commit_count:
+        if int_value(record.get("rolling_depth2_real_commit_count"), 0) and not depth2_commit_enabled:
+            errors.append(f"record[{idx}] rolling depth-2 real commit requires depth2 commit flag")
+        if int_value(record.get("rolling_depth3_real_commit_count"), 0):
+            errors.append(f"record[{idx}] rolling depth-3 real commit count must stay zero")
+        if int_value(record.get("rolling_depth_gt2_real_commit_count"), 0):
+            errors.append(f"record[{idx}] rolling depth>2 real commit count must stay zero")
+        if depth_gt1_real_commit_count:
             errors.append(f"record[{idx}] rolling depth>1 real commit count must stay zero")
 
         seq_by_proposal: dict[int, int] = dict(zip(target_ids, target_seq_ids))
@@ -316,6 +329,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_normal_lane_conflict_count": normal_lane_conflict_count,
         "rolling_depth2_real_commit_count": depth2_real_commit_count,
         "rolling_depth_gt1_real_commit_count": depth_gt1_real_commit_count,
+        "rolling_depth3_real_commit_count": depth3_real_commit_count,
+        "rolling_depth_gt2_real_commit_count": depth_gt2_real_commit_count,
         "rolling_child_verified_without_parent_full_accept_count": child_verified_without_parent_count,
         "rolling_child_committed_without_parent_full_accept_count": child_committed_without_parent_count,
         "rolling_child_drafted_without_valid_parent_count": drafted_without_parent_count,
@@ -324,10 +339,18 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_max_depth_observed": max_depth_observed,
         "rolling_drop_reason_counts": dict(sorted(reason_counter.items())),
     }
-    if depth2_real_commit_count:
+    if depth2_real_commit_count and not any(
+        bool(record.get("rolling_depth2_commit_enabled", False))
+        or bool(record.get("enable_rolling_continuous_depth2_commit_ready_only", False))
+        for record in records
+    ):
         errors.append("rolling_depth2_real_commit_count must be zero")
     if depth_gt1_real_commit_count:
         errors.append("rolling_depth_gt1_real_commit_count must be zero")
+    if depth3_real_commit_count:
+        errors.append("rolling_depth3_real_commit_count must be zero")
+    if depth_gt2_real_commit_count:
+        errors.append("rolling_depth_gt2_real_commit_count must be zero")
     if child_verified_without_parent_count:
         errors.append("rolling child verified without full-accept parent")
     if child_committed_without_parent_count:
@@ -355,6 +378,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_normal_lane_conflict_count",
         "rolling_depth2_real_commit_count",
         "rolling_depth_gt1_real_commit_count",
+        "rolling_depth3_real_commit_count",
+        "rolling_depth_gt2_real_commit_count",
         "rolling_max_depth_observed",
         "rolling_drop_reason_counts",
     ):
