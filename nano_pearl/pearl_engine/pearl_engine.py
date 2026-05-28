@@ -166,6 +166,7 @@ class Controller:
 
             merged.append({
                 "trace_type": "decode_iteration",
+                "record_level": "merged_iteration",
                 "execution_mode": mode,
                 "decode_ready_mode": primary.get("decode_ready_mode", False),
                 "decode_iteration_group": gid,
@@ -210,7 +211,7 @@ class Controller:
         # Merge per-step records into consolidated decode-iteration records.
         merged = self._merge_decode_iterations(traces)
         if merged:
-            traces = traces + merged
+            traces = merged
         requests = {req["seq_id"]: req for req in draft_requests + target_requests}.values()
         return traces, list(requests)
 

@@ -455,6 +455,7 @@ class ModelRunnerBase:
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
         record = {
             "trace_type": "prefill" if is_prefill else "decode_iteration",
+            "record_level": "runner_substep",
             "execution_mode": self.active_execution_mode,
             "decode_ready_mode": self.active_decode_ready_mode,
             "decode_iteration_group": self._decode_iteration_group,
@@ -511,10 +512,11 @@ class ModelRunnerBase:
             # rejected = gamma - accepted for each seq that was verified.
             gamma = getattr(self, "gamma", 4)
             rejected = {}
+            seq_to_req = dict(zip(record["scheduled_seq_ids"], record.get("request_ids", [])))
             for seq_id in accepted_lens:
-                # Only compute rejection for seq_ids in the current batch
                 if seq_id in record["scheduled_seq_ids"]:
-                    rejected[seq_id] = max(gamma - accepted_lens[seq_id], 0)
+                    req_id = seq_to_req.get(seq_id, seq_id)
+                    rejected[req_id] = max(gamma - accepted_lens[seq_id], 0)
             if rejected:
                 record["rejected_tokens_by_request"].update(rejected)
         if invalidated_lens:

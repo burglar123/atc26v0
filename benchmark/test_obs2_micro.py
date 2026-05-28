@@ -15,6 +15,8 @@ def test_source_field_presence():
     runner = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
     engine = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
     assert '"trace_type"' in runner
+    assert '"record_level"' in runner
+    assert '"runner_substep"' in runner
     assert '"drafted_tokens_total"' in runner
     assert '"rejected_tokens_by_request"' in runner
     assert '"slo_class_by_request"' in runner
@@ -23,6 +25,8 @@ def test_source_field_presence():
     assert '_decode_iteration_group += 1' in runner
     assert '_decode_iteration_group = 0' in runner
     assert '_merge_decode_iterations' in engine
+    assert '"record_level"' in engine
+    assert '"merged_iteration"' in engine
     assert 'draft_verify_overlap_ms' in engine
     assert '"trace_type"' in engine
 
@@ -45,7 +49,8 @@ def test_merge_logic_comprehensive():
 
     # --- Serialized merge ---
     drafts = [{
-        'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'serialized_pearl',
         'decode_iteration_group': 0, 'runner_role': 'serialized_draft',
         'scheduled_seq_ids': [0, 1], 'request_ids': ['a', 'b'], 'num_seqs_in_batch': 2,
         'is_prefill': False, 'draft_start_ts': 10.0, 'draft_end_ts': 10.01,
@@ -53,13 +58,14 @@ def test_merge_logic_comprehensive():
         'slo_tpot_ms_by_request': {'a': 50, 'b': 40},
     } for _ in range(4)]
     verify = {
-        'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'serialized_pearl',
         'decode_iteration_group': 0, 'runner_role': 'serialized_verify',
         'scheduled_seq_ids': [0, 1], 'request_ids': ['a', 'b'], 'num_seqs_in_batch': 2,
         'is_prefill': False, 'verify_start_ts': 10.02, 'verify_end_ts': 10.03,
         'verify_time_ms': 10.0,
         'total_accepted_tokens': 6, 'accepted_tokens_per_seq': {'0': 3, '1': 3},
-        'rejected_tokens_by_request': {'0': 1, '1': 1},
+        'rejected_tokens_by_request': {'a': 1, 'b': 1},
         'per_seq_invalidated_predraft_len': {},
         'slo_class_by_request': {'a': 'tight', 'b': 'normal'},
         'slo_tpot_ms_by_request': {'a': 50, 'b': 40},
@@ -68,6 +74,7 @@ def test_merge_logic_comprehensive():
     assert len(r) == 1
     m = r[0]
     assert m['trace_type'] == 'decode_iteration'
+    assert m['record_level'] == 'merged_iteration'
     assert m['execution_mode'] == 'serialized_pearl'
     assert m['active_batch_size'] == 2
     assert abs(m['draft_time_ms'] - 10.0) < 0.01
@@ -80,9 +87,16 @@ def test_merge_logic_comprehensive():
     assert m['slo_tpot_ms_by_request'] == {'a': 50, 'b': 40}
     assert m['draft_verify_overlap_ms'] == 0.0
 
+    # --- Verify that rejected_tokens_by_request with already-mapped keys works ---
+    verify2 = dict(verify)
+    verify2['rejected_tokens_by_request'] = {'a': 2, 'b': 0}
+    r1 = merge(drafts + [verify2])
+    assert r1[0]['rejected_tokens_by_request'] == {'a': 2, 'b': 0}
+
     # --- Parallel overlap ---
     d = [{
-        'trace_type': 'decode_iteration', 'execution_mode': 'parallel_pearl',
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'parallel_pearl',
         'decode_iteration_group': 0, 'runner_role': 'draft',
         'scheduled_seq_ids': [0], 'request_ids': ['x'], 'num_seqs_in_batch': 1,
         'is_prefill': False, 'draft_start_ts': 100.0, 'draft_end_ts': 100.015,
@@ -90,7 +104,8 @@ def test_merge_logic_comprehensive():
         'slo_tpot_ms_by_request': {'x': 150},
     }]
     v = {
-        'trace_type': 'decode_iteration', 'execution_mode': 'parallel_pearl',
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'parallel_pearl',
         'decode_iteration_group': 0, 'runner_role': 'verify',
         'scheduled_seq_ids': [0], 'request_ids': ['x'], 'num_seqs_in_batch': 1,
         'is_prefill': False, 'verify_start_ts': 100.008, 'verify_end_ts': 100.020,
@@ -102,6 +117,7 @@ def test_merge_logic_comprehensive():
     r2 = merge(d + [v])
     assert len(r2) == 1
     m2 = r2[0]
+    assert m2['record_level'] == 'merged_iteration'
     assert abs(m2['draft_verify_overlap_ms'] - 7.0) < 0.001
     assert abs(m2['iter_time_ms'] - 20.0) < 0.001
 
@@ -110,14 +126,17 @@ def test_merge_logic_comprehensive():
                        'decode_iteration_group': -1}])) == 0
 
 
-def test_profile_obs2_micro():
+def test_profile_obs2_micro_canonical():
+    """profile_obs2_micro consumes merged_iteration records with canonical fields."""
     with tempfile.TemporaryDirectory() as d:
         trace = {'traces': [
-            {'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+            {'trace_type': 'decode_iteration', 'record_level': 'merged_iteration',
+             'execution_mode': 'serialized_pearl',
              'active_batch_size': 3, 'draft_time_ms': 5, 'verify_time_ms': 10,
              'iter_time_ms': 15, 'drafted_tokens_total': 12, 'accepted_tokens_total': 8,
              'accepted_tokens_by_request': {'a': 4, 'b': 3, 'c': 1}},
-            {'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+            {'trace_type': 'decode_iteration', 'record_level': 'merged_iteration',
+             'execution_mode': 'serialized_pearl',
              'active_batch_size': 3, 'draft_time_ms': 6, 'verify_time_ms': 11,
              'iter_time_ms': 17, 'drafted_tokens_total': 12, 'accepted_tokens_total': 7,
              'accepted_tokens_by_request': {'a': 3, 'b': 3, 'c': 1}},
@@ -140,6 +159,38 @@ def test_profile_obs2_micro():
         assert float(row['avg_active_batch_size']) == 3.0
         assert float(row['mean_draft_time_ms']) == 5.5
         assert abs(float(row['mean_accepted_tokens_per_request_per_iter']) - 2.5) < 0.01
+
+
+def test_profile_obs2_micro_raw_fallback():
+    """profile_obs2_micro falls back to raw field names when canonical are missing."""
+    with tempfile.TemporaryDirectory() as d:
+        trace = {'traces': [
+            {'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+             'num_seqs_in_batch': 2, 'draft_time_ms': 3, 'verify_time_ms': 7,
+             'total_iteration_time_ms': 10, 'drafted_tokens_total': 8,
+             'total_accepted_tokens': 4, 'accepted_tokens_per_seq': {'0': 4}},
+            {'trace_type': 'decode_iteration', 'execution_mode': 'serialized_pearl',
+             'num_seqs_in_batch': 2, 'draft_time_ms': 4, 'verify_time_ms': 8,
+             'total_iteration_time_ms': 12, 'drafted_tokens_total': 8,
+             'total_accepted_tokens': 5, 'accepted_tokens_per_seq': {'0': 5}},
+        ]}
+        tp = os.path.join(d, 'trace.json')
+        with open(tp, 'w') as f:
+            json.dump(trace, f)
+        out = os.path.join(d, 'out.csv')
+        r = subprocess.run([sys.executable, str(ROOT / 'benchmark/profile_obs2_micro.py'),
+                            '--engine-trace', tp, '--out', out],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        with open(out) as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 1
+        row = rows[0]
+        assert int(row['num_iterations']) == 2
+        assert float(row['avg_active_batch_size']) == 2.0
+        assert float(row['mean_iter_time_ms']) == 11.0
+        assert float(row['mean_accepted_tokens_total']) == 4.5
+        assert abs(float(row['mean_accepted_tokens_per_request_per_iter']) - 4.5) < 0.01
 
 
 def test_ar_step_counter():

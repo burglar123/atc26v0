@@ -58,8 +58,21 @@ def load_engine_trace(path: str) -> List[Dict[str, Any]]:
     raise ValueError(f"Unexpected engine trace format in {path}: {type(obj).__name__}")
 
 
+def _get(r: Dict[str, Any], canonical: str, *raw_aliases: str, default=None):
+    """Return the first present value from canonical or raw-alias keys."""
+    if canonical in r:
+        return r[canonical]
+    for alias in raw_aliases:
+        if alias in r:
+            return r[alias]
+    return default
+
+
 def compute_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    iters = [r for r in records if r.get("trace_type") == "decode_iteration"]
+    # Prefer merged iteration-level records, then fall back to raw decode_iteration.
+    iters = [r for r in records if r.get("record_level") == "merged_iteration"]
+    if not iters:
+        iters = [r for r in records if r.get("trace_type") == "decode_iteration"]
     if not iters:
         # Fall back to records that look like decode steps.
         iters = [r for r in records if not r.get("is_prefill") and r.get("runner_role", "") in ("draft", "verify", "serialized_draft", "serialized_verify")]
@@ -69,21 +82,21 @@ def compute_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     mode = iters[0].get("execution_mode", "unknown")
     n = len(iters)
 
-    batch_sizes = [r.get("active_batch_size", r.get("num_seqs_in_batch", 0)) for r in iters]
-    draft_times = [to_float(r.get("draft_time_ms")) for r in iters if to_float(r.get("draft_time_ms")) is not None]
-    verify_times = [to_float(r.get("verify_time_ms")) for r in iters if to_float(r.get("verify_time_ms")) is not None]
-    iter_times = [to_float(r.get("iter_time_ms")) for r in iters if to_float(r.get("iter_time_ms")) is not None]
-    accepted_totals = [r.get("accepted_tokens_total", 0) for r in iters]
-    drafted_totals = [r.get("drafted_tokens_total", 0) for r in iters]
-    verified_totals = [r.get("verified_tokens_total", 0) for r in iters]
+    batch_sizes = [_get(r, "active_batch_size", "num_seqs_in_batch", default=0) for r in iters]
+    draft_times = [to_float(_get(r, "draft_time_ms")) for r in iters if to_float(_get(r, "draft_time_ms")) is not None]
+    verify_times = [to_float(_get(r, "verify_time_ms")) for r in iters if to_float(_get(r, "verify_time_ms")) is not None]
+    iter_times = [to_float(_get(r, "iter_time_ms", "total_iteration_time_ms")) for r in iters if to_float(_get(r, "iter_time_ms", "total_iteration_time_ms")) is not None]
+    accepted_totals = [_get(r, "accepted_tokens_total", "total_accepted_tokens", default=0) for r in iters]
+    drafted_totals = [_get(r, "drafted_tokens_total", default=0) for r in iters]
+    verified_totals = [_get(r, "verified_tokens_total", default=0) for r in iters]
     invalidated_totals = [
-        sum(r.get("invalidated_predraft_tokens_by_request", {}).values()) for r in iters
+        sum(_get(r, "invalidated_predraft_tokens_by_request", default={}).values()) for r in iters
     ]
 
     # Accepted tokens per request per iteration.
     accepted_per_req_per_iter: List[float] = []
     for r in iters:
-        by_req = r.get("accepted_tokens_by_request", {})
+        by_req = _get(r, "accepted_tokens_by_request", "accepted_tokens_per_seq", default={})
         if by_req:
             accepted_per_req_per_iter.extend(float(v) for v in by_req.values())
 
