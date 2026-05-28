@@ -147,6 +147,37 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
         "continuous_not_ready_reason_counts": accounting.get("continuous_eager_drop_reason_counts"),
         "continuous_real_commit_skip_reason_counts": accounting.get("continuous_eager_real_commit_skip_reason_counts"),
         "continuous_depth2_real_commit_count": accounting.get("continuous_depth2_real_commit_count"),
+        "continuous_commit_enabled": accounting.get("continuous_eager_real_commit_enabled"),
+        "continuous_real_commit_count": accounting.get("continuous_eager_real_commit_count"),
+        "continuous_eager_commit_decision_broadcast_time_ms": accounting.get(
+            "continuous_eager_commit_decision_broadcast_time_ms"
+        ),
+        "continuous_eager_result_transfer_time_ms": accounting.get("continuous_eager_result_transfer_time_ms"),
+        "continuous_eager_commit_decision_broadcast_payload_len_units": accounting.get(
+            "continuous_eager_commit_decision_broadcast_payload_len_units"
+        ),
+        "continuous_eager_result_transfer_payload_len_units": accounting.get(
+            "continuous_eager_result_transfer_payload_len_units"
+        ),
+        "continuous_eager_sync_apply_dry_run_time_ms": accounting.get(
+            "continuous_eager_sync_apply_dry_run_time_ms"
+        ),
+        "continuous_eager_commit_time_ms": accounting.get("continuous_eager_commit_time_ms"),
+        "continuous_eager_real_commit_time_ms": accounting.get("continuous_eager_real_commit_time_ms"),
+        "continuous_eager_verify_apply_dry_run_time_ms": accounting.get(
+            "continuous_eager_overhead_time_ms"
+        ),
+        "total_continuous_overhead_time_ms": sum(
+            float(accounting.get(field) or 0.0)
+            for field in (
+                "continuous_eager_commit_decision_broadcast_time_ms",
+                "continuous_eager_result_transfer_time_ms",
+                "continuous_eager_sync_apply_dry_run_time_ms",
+                "continuous_eager_commit_time_ms",
+                "continuous_eager_real_commit_time_ms",
+                "continuous_eager_overhead_time_ms",
+            )
+        ),
     }
 
 

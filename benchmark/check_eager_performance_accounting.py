@@ -28,6 +28,12 @@ TIMING_FIELDS = [
     "eager_commit_readiness_time_ms",
     "eager_commit_time_ms",
     "continuous_eager_overhead_time_ms",
+    "continuous_eager_commit_decision_broadcast_time_ms",
+    "continuous_eager_result_transfer_time_ms",
+    "continuous_eager_sync_apply_dry_run_time_ms",
+    "continuous_eager_sync_apply_time_ms",
+    "continuous_eager_commit_time_ms",
+    "continuous_eager_real_commit_time_ms",
 ]
 PROPOSAL_LEN_MAP_KEYS = [
     "eager_commit_ready_token_count_by_proposal_id",
@@ -230,6 +236,13 @@ def performance_warnings(
         and int_value(accounting.get("normal_draft_token_slots_suppressed"), 0) > committed_tokens
     ):
         warnings.append("suppressed_slots_exceed_committed_tokens")
+    if (
+        int_value(accounting.get("continuous_eager_real_committed_token_count"), 0) > 0
+        and float_value(accounting.get("continuous_eager_commit_decision_broadcast_time_ms"), 0.0) <= 0.0
+        and float_value(accounting.get("continuous_eager_result_transfer_time_ms"), 0.0) <= 0.0
+        and float_value(accounting.get("continuous_eager_sync_apply_dry_run_time_ms"), 0.0) <= 0.0
+    ):
+        warnings.append("continuous_control_plane_timing_unavailable")
     return warnings
 
 
@@ -329,6 +342,7 @@ def aggregate_performance_accounting(
     continuous_draft_invalidated_sum = 0
     continuous_depth2_real_commit_count = 0
     continuous_result_transfer_payload_len_units = 0
+    continuous_commit_decision_payload_len_units = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -489,6 +503,19 @@ def aggregate_performance_accounting(
             0,
             int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0),
         )
+        if "continuous_eager_commit_decision_broadcast_payload_len_units" in record:
+            payload_len = int_value(record.get("continuous_eager_commit_decision_broadcast_payload_len_units"), 0)
+            if payload_len < 0:
+                negative_payload_field_count += 1
+            event_key = (
+                "continuous_eager_commit_decision_broadcast_payload_len_units",
+                key[0],
+                key[1],
+                payload_len,
+            )
+            if payload_len > 0 and event_key not in counted_payload_len_events:
+                counted_payload_len_events.add(event_key)
+                continuous_commit_decision_payload_len_units += payload_len
 
         reason_map = record.get("eager_commit_skip_reason_by_proposal_id")
         if not isinstance(reason_map, dict):
@@ -712,6 +739,7 @@ def aggregate_performance_accounting(
             + continuous_target_accepted_sum
         ),
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
+        "continuous_eager_commit_decision_broadcast_payload_len_units": continuous_commit_decision_payload_len_units,
         "continuous_eager_result_transfer_payload_len_units": continuous_result_transfer_payload_len_units,
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
         "normal_draft_token_slots_suppressed": lane_token_slots,
@@ -858,6 +886,8 @@ def validate_accounting(
         "eager_result_transfer_payload_bytes",
         "eager_proposal_transfer_payload_len_units",
         "eager_result_transfer_payload_len_units",
+        "continuous_eager_commit_decision_broadcast_payload_len_units",
+        "continuous_eager_result_transfer_payload_len_units",
     ):
         if int_value(accounting.get(field), 0) < 0:
             errors.append(f"{field} must be nonnegative")
@@ -948,6 +978,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",
         "combined_actual_accepted_token_increment_sum",
+        "continuous_eager_commit_decision_broadcast_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",

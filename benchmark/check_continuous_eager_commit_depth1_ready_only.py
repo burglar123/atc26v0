@@ -13,6 +13,14 @@ CONTINUOUS_SOURCE = "continuous_shadow"
 CONTINUOUS_COMMIT_SOURCE = "continuous_depth1_ready_only"
 ONE_SHOT_PARENT_SOURCE = "phase1h6a_one_shot_commit"
 FULL_ACCEPT_ACTION = "append_full_accept_then_rollback"
+CONTINUOUS_TIMING_FIELDS = (
+    "continuous_eager_commit_decision_broadcast_time_ms",
+    "continuous_eager_result_transfer_time_ms",
+    "continuous_eager_sync_apply_dry_run_time_ms",
+    "continuous_eager_sync_apply_time_ms",
+    "continuous_eager_commit_time_ms",
+    "continuous_eager_real_commit_time_ms",
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +62,15 @@ def as_str_map(value: Any) -> dict[int, str]:
         except Exception:
             continue
     return result
+
+
+def float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
 def commit_active(record: dict[str, Any]) -> bool:
@@ -107,6 +124,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     missing_unexpected_count = 0
     real_target_eager_nonempty_count = 0
     depth2_real_commit_count = 0
+    timing_sums = {field: 0.0 for field in CONTINUOUS_TIMING_FIELDS}
+    timing_negative_fields: set[str] = set()
 
     for record in records:
         if not is_dual_record(record):
@@ -131,6 +150,14 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if missing_unexpected:
             missing_unexpected_count += len(missing_unexpected)
             errors.append(f"record[{idx}] unexpected missing buffered proposals: {sorted(missing_unexpected)}")
+        for field in CONTINUOUS_TIMING_FIELDS:
+            if field in record:
+                value = float_value(record.get(field), 0.0)
+                if value < 0.0:
+                    timing_negative_fields.add(field)
+                    errors.append(f"record[{idx}] {field} must be nonnegative")
+                else:
+                    timing_sums[field] += value
 
         enabled = bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
         if enabled:
@@ -299,6 +326,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         ),
         "continuous_real_commit_skip_reason_counts": dict(Counter(skip_reason_by_id.values())),
         "continuous_depth2_real_commit_count": depth2_real_commit_count,
+        "continuous_timing_sums_ms": dict(timing_sums),
+        "continuous_timing_negative_fields": sorted(timing_negative_fields),
         "repeated_continuous_commit_proposal_ids": sorted(repeated_commit_ids),
         "continuous_committed_but_not_shadow_ready_ids": sorted(committed_but_not_ready),
         "continuous_committed_non_full_accept_ids": sorted(committed_non_full_accept),
@@ -326,6 +355,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_draft_actual_accepted_token_increment_sum",
         "continuous_real_commit_skip_reason_counts",
         "continuous_depth2_real_commit_count",
+        "continuous_timing_sums_ms",
+        "continuous_timing_negative_fields",
         "repeated_continuous_commit_proposal_ids",
         "continuous_committed_but_not_shadow_ready_ids",
         "continuous_committed_non_full_accept_ids",

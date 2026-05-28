@@ -6753,6 +6753,7 @@ class ModelRunnerBase:
         trace_record: dict,
         results: list[dict],
     ) -> None:
+        timer_start = time.perf_counter()
         meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
         num_results = int(meta_values[2])
         payload_len = int(meta_values[3])
@@ -6770,6 +6771,7 @@ class ModelRunnerBase:
             else:
                 payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        self._record_elapsed_ms(trace_record, "continuous_eager_result_transfer_time_ms", timer_start)
 
     def _receive_continuous_eager_result_transfer_dry_run(
         self,
@@ -6827,6 +6829,7 @@ class ModelRunnerBase:
         trace_record: dict,
         validated_results: list[dict],
     ) -> None:
+        timer_start = time.perf_counter()
         gamma = int(self.gamma)
         seq_by_id = self._local_sequence_by_id()
         known_by_id = dict(self._draft_sent_eager_proposals_by_id)
@@ -6991,6 +6994,7 @@ class ModelRunnerBase:
         trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(existing_not_ready)
         trace_record["continuous_eager_mutation_detected_count"] = sum(1 for value in mutation_by_id.values() if bool(value))
         trace_record["continuous_eager_real_commit_count"] = 0
+        self._record_elapsed_ms(trace_record, "continuous_eager_sync_apply_dry_run_time_ms", timer_start)
 
 
     def _continuous_commit_depth1_decisions_from_trace(self, trace_record: dict) -> list[dict]:
@@ -7094,13 +7098,17 @@ class ModelRunnerBase:
         known_by_id: dict[int, EagerProposal],
         seq_by_id: dict[int, Sequence],
     ) -> None:
+        timer_start = time.perf_counter()
         decisions = self._continuous_commit_depth1_decisions_from_trace(trace_record)
         meta_values, payload_values = self._serialize_continuous_eager_commit_depth1_payload(decisions, plan)
+        trace_record["continuous_eager_commit_decision_broadcast_payload_len_units"] = int(meta_values[5])
+        trace_record["continuous_eager_commit_decision_broadcast_count"] = int(meta_values[4])
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        self._record_elapsed_ms(trace_record, "continuous_eager_commit_decision_broadcast_time_ms", timer_start)
         self._run_continuous_eager_commit_depth1_ready_only(
             plan,
             trace_record,
