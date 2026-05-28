@@ -82,6 +82,32 @@ def step_plan_key(record: dict[str, Any]) -> tuple[int, int]:
     return plan_id, step_id
 
 
+def combined_accounting_errors(accounting: dict[str, Any], *, rolling_depth2_tokens: int) -> list[str]:
+    one_shot_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    depth1_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+    depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    lower_bound = one_shot_tokens + depth1_tokens + rolling_depth2_tokens
+    depth3_enabled_or_present = (
+        depth3_tokens > 0
+        or bool(accounting.get("rolling_depth3_commit_enabled", False))
+        or int_value(accounting.get("rolling_depth3_real_commit_count"), 0) > 0
+    )
+
+    if depth3_tokens > 0:
+        if combined_tokens != lower_bound + depth3_tokens:
+            return [
+                "combined real committed token count mismatch "
+                "(expected one-shot + depth1 + rolling depth2 + known depth3 tokens)"
+            ]
+    elif depth3_enabled_or_present:
+        if combined_tokens < lower_bound:
+            return ["combined real committed token count is below one-shot + depth1 + rolling depth2 lower bound"]
+    elif combined_tokens != lower_bound:
+        return ["combined real committed token count does not include one-shot + depth1 + rolling depth2"]
+    return []
+
+
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     one_shot_errors, _one_shot_summary = validate_one_shot_records(records)
@@ -287,13 +313,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     ):
         if int_value(accounting.get(field), 0) != 0:
             errors.append(f"{field} must remain zero")
-    combined_expected = (
-        int_value(accounting.get("eager_committed_token_count"), 0)
-        + int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
-        + rolling_tokens
-    )
-    if int_value(accounting.get("combined_real_committed_token_count"), 0) != combined_expected:
-        errors.append("combined real committed token count does not include one-shot + depth1 + rolling depth2")
+    errors.extend(combined_accounting_errors(accounting, rolling_depth2_tokens=rolling_tokens))
 
     summary = {
         "total_trace_records": len(records),
@@ -301,6 +321,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth2_commit_active_records": active_records,
         "rolling_depth2_real_committed_proposal_count": len(committed_ids_seen),
         "rolling_depth2_real_committed_token_count": rolling_tokens,
+        "rolling_depth3_real_committed_token_count": accounting.get("rolling_depth3_real_committed_token_count", 0),
         "rolling_depth2_target_actual_verified_token_increment_sum": accounting.get(
             "rolling_depth2_target_actual_verified_token_increment_sum", 0
         ),
@@ -331,6 +352,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth2_commit_active_records",
         "rolling_depth2_real_committed_proposal_count",
         "rolling_depth2_real_committed_token_count",
+        "rolling_depth3_real_committed_token_count",
         "rolling_depth2_target_actual_verified_token_increment_sum",
         "rolling_depth2_draft_actual_verified_token_increment_sum",
         "combined_real_committed_token_count",
@@ -421,11 +443,92 @@ def synthetic_records() -> list[dict[str, Any]]:
     return [rolling_record("target"), rolling_record("draft")]
 
 
+def retokenize_synthetic_depth2_chain(
+    records: list[dict[str, Any]],
+    *,
+    one_shot_tokens: int,
+    depth1_tokens: int,
+    depth2_tokens: int,
+) -> None:
+    for record in records:
+        record["normal_gamma"] = one_shot_tokens
+        one_shot_id = int(record["eager_committed_proposal_ids"][0])
+        one_shot_seq = str(record["eager_committed_seq_ids"][0])
+        record["eager_committed_token_count_by_proposal_id"] = {str(one_shot_id): one_shot_tokens}
+        record["eager_committed_accept_len_by_proposal_id"] = {str(one_shot_id): one_shot_tokens}
+        record["eager_tokens_committed"] = one_shot_tokens
+        record["eager_tokens_committed_full_accept"] = one_shot_tokens
+        record["eager_tokens_verified"] = one_shot_tokens
+        record["eager_tokens_accepted"] = one_shot_tokens
+        one_shot_target_before = int(record["eager_commit_target_seq_len_before_by_seq_id"][one_shot_seq])
+        one_shot_draft_before = int(record["eager_commit_draft_seq_len_before_by_seq_id"][one_shot_seq])
+        record["eager_commit_target_seq_len_after_by_seq_id"] = {one_shot_seq: one_shot_target_before + one_shot_tokens}
+        record["eager_commit_draft_seq_len_after_by_seq_id"] = {one_shot_seq: one_shot_draft_before + one_shot_tokens}
+
+        parent_id = int(record["continuous_eager_real_committed_proposal_ids"][0])
+        record["continuous_eager_real_committed_token_count_by_proposal_id"] = {str(parent_id): depth1_tokens}
+
+        child_id = int(record["rolling_depth2_real_committed_proposal_ids"][0])
+        seq_id = str(record["rolling_depth2_real_committed_seq_ids"][0])
+        record["rolling_depth2_real_committed_token_count_by_proposal_id"] = {str(child_id): depth2_tokens}
+        record["rolling_depth2_real_committed_accept_len_by_proposal_id"] = {str(child_id): depth2_tokens}
+        record["rolling_depth2_tokens_verified"] = depth2_tokens
+        record["rolling_depth2_tokens_accepted"] = depth2_tokens
+        record["rolling_depth2_tokens_committed"] = depth2_tokens
+        record["rolling_depth2_real_committed_token_count"] = depth2_tokens
+        target_before = int(record["rolling_depth2_target_seq_len_before_by_seq_id"][seq_id])
+        draft_before = int(record["rolling_depth2_draft_seq_len_before_by_seq_id"][seq_id])
+        record["rolling_depth2_target_seq_len_after_by_seq_id"] = {seq_id: target_before + depth2_tokens}
+        record["rolling_depth2_draft_seq_len_after_by_seq_id"] = {seq_id: draft_before + depth2_tokens}
+
+
+def add_depth3_commit_accounting(records: list[dict[str, Any]], *, depth3_tokens: int) -> None:
+    for record in records:
+        side = str(record["rolling_depth2_commit_side"])
+        seq_id = int(record["rolling_depth2_real_committed_seq_ids"][0])
+        proposal_id = 900000103
+        record.update(
+            {
+                "enable_rolling_continuous_depth3_commit_ready_only": True,
+                "rolling_depth3_commit_enabled": True,
+                "rolling_depth3_commit_side": side,
+                "rolling_depth3_commit_plan_id": 42,
+                "rolling_depth3_commit_step_id": 22,
+                "rolling_depth3_real_committed_proposal_ids": [proposal_id],
+                "rolling_depth3_real_committed_seq_ids": [seq_id],
+                "rolling_depth3_real_committed_token_count_by_proposal_id": {str(proposal_id): depth3_tokens},
+                "rolling_depth3_tokens_verified": depth3_tokens,
+                "rolling_depth3_tokens_accepted": depth3_tokens,
+                "rolling_depth3_tokens_rejected": 0,
+                "rolling_depth3_tokens_invalidated": 0,
+                "rolling_depth3_real_commit_count": 1,
+            }
+        )
+
+
 def run_synthetic() -> None:
     valid = synthetic_records()
     errors, summary = validate_records(valid)
     if errors:
         raise SystemExit(f"synthetic valid rolling depth2 commit failed: {errors}\nsummary={summary}")
+
+    higher_depth_valid = deepcopy(valid)
+    retokenize_synthetic_depth2_chain(
+        higher_depth_valid,
+        one_shot_tokens=12,
+        depth1_tokens=8,
+        depth2_tokens=8,
+    )
+    add_depth3_commit_accounting(higher_depth_valid, depth3_tokens=8)
+    errors, summary = validate_records(higher_depth_valid)
+    if errors:
+        raise SystemExit(f"synthetic rolling depth2 checker rejected legal depth3 combined accounting: {errors}")
+    if summary["rolling_depth2_real_committed_token_count"] != 8:
+        raise SystemExit("synthetic rolling depth2 retokenized count mismatch")
+    if summary["rolling_depth3_real_committed_token_count"] != 8:
+        raise SystemExit("synthetic rolling depth3 compatibility count mismatch")
+    if summary["combined_real_committed_token_count"] != 36:
+        raise SystemExit("synthetic higher-depth combined accounting mismatch")
 
     invalid_not_ready = deepcopy(valid)
     for record in invalid_not_ready:

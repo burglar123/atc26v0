@@ -90,6 +90,39 @@ def step_plan_key(record: dict[str, Any]) -> tuple[int, int]:
     return plan_id, step_id
 
 
+def combined_accounting_errors(
+    accounting: dict[str, Any],
+    *,
+    one_shot_tokens: int,
+    continuous_tokens: int,
+) -> list[str]:
+    combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
+    depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    lower_bound = one_shot_tokens + continuous_tokens
+    expected_with_known_higher_depth = lower_bound + depth2_tokens + depth3_tokens
+    higher_depth_tokens_present = depth2_tokens > 0 or depth3_tokens > 0
+    higher_depth_enabled_or_present = (
+        higher_depth_tokens_present
+        or bool(accounting.get("rolling_depth2_commit_enabled", False))
+        or bool(accounting.get("rolling_depth3_commit_enabled", False))
+        or int_value(accounting.get("rolling_depth3_real_commit_count"), 0) > 0
+    )
+
+    if higher_depth_tokens_present:
+        if combined_tokens != expected_with_known_higher_depth:
+            return [
+                "combined real committed token count mismatch "
+                "(expected one-shot + depth1 + known rolling depth2/depth3 tokens)"
+            ]
+    elif higher_depth_enabled_or_present:
+        if combined_tokens < lower_bound:
+            return ["combined real committed token count is below one-shot + depth1 lower bound"]
+    elif combined_tokens != lower_bound:
+        return ["combined real committed token count mismatch"]
+    return []
+
+
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     one_shot_errors, one_shot_summary = validate_one_shot_records(records)
@@ -314,21 +347,25 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     ):
         if int_value(accounting.get(field), 0) != 0:
             errors.append(f"{field} must be zero")
-    if int_value(accounting.get("combined_real_committed_token_count"), 0) != (
-        int_value(one_shot_summary.get("committed_token_count"), 0)
-        + continuous_tokens
-        + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
-    ):
-        errors.append("combined real committed token count mismatch")
+    one_shot_tokens = int_value(one_shot_summary.get("committed_token_count"), 0)
+    errors.extend(
+        combined_accounting_errors(
+            accounting,
+            one_shot_tokens=one_shot_tokens,
+            continuous_tokens=continuous_tokens,
+        )
+    )
 
     summary = {
         "total_trace_records": len(records),
         "records_with_continuous_commit_enabled": records_with_commit_enabled,
         "continuous_commit_active_records": commit_active_records,
-        "one_shot_committed_token_count": int_value(one_shot_summary.get("committed_token_count"), 0),
+        "one_shot_committed_token_count": one_shot_tokens,
         "continuous_shadow_ready_proposal_count": len(ready_shadow_ids),
         "continuous_real_committed_proposal_count": len(committed_ids_seen),
         "continuous_real_committed_token_count": continuous_tokens,
+        "rolling_depth2_real_committed_token_count": accounting.get("rolling_depth2_real_committed_token_count", 0),
+        "rolling_depth3_real_committed_token_count": accounting.get("rolling_depth3_real_committed_token_count", 0),
         "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
         "continuous_target_actual_verified_token_increment_sum": accounting.get(
             "continuous_target_actual_verified_token_increment_sum", 0
@@ -369,6 +406,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_shadow_ready_proposal_count",
         "continuous_real_committed_proposal_count",
         "continuous_real_committed_token_count",
+        "rolling_depth2_real_committed_token_count",
+        "rolling_depth3_real_committed_token_count",
         "combined_real_committed_token_count",
         "continuous_target_actual_verified_token_increment_sum",
         "continuous_target_actual_accepted_token_increment_sum",
@@ -467,6 +506,78 @@ def synthetic_continuous_commit_record(side: str, *, proposal_id: int = 90000060
     return record
 
 
+def retokenize_synthetic_record(record: dict[str, Any], *, one_shot_tokens: int, continuous_tokens: int) -> None:
+    record["normal_gamma"] = one_shot_tokens
+    one_shot_id = int(record["eager_committed_proposal_ids"][0])
+    one_shot_seq = str(record["eager_committed_seq_ids"][0])
+    record["eager_committed_token_count_by_proposal_id"] = {str(one_shot_id): one_shot_tokens}
+    record["eager_committed_accept_len_by_proposal_id"] = {str(one_shot_id): one_shot_tokens}
+    record["eager_tokens_committed"] = one_shot_tokens
+    record["eager_tokens_committed_full_accept"] = one_shot_tokens
+    record["eager_tokens_verified"] = one_shot_tokens
+    record["eager_tokens_accepted"] = one_shot_tokens
+    one_shot_target_before = int(record["eager_commit_target_seq_len_before_by_seq_id"][one_shot_seq])
+    one_shot_draft_before = int(record["eager_commit_draft_seq_len_before_by_seq_id"][one_shot_seq])
+    record["eager_commit_target_seq_len_after_by_seq_id"] = {one_shot_seq: one_shot_target_before + one_shot_tokens}
+    record["eager_commit_draft_seq_len_after_by_seq_id"] = {one_shot_seq: one_shot_draft_before + one_shot_tokens}
+
+    continuous_id = int(record["continuous_eager_real_committed_proposal_ids"][0])
+    continuous_seq = str(record["continuous_eager_real_committed_seq_ids"][0])
+    record["continuous_eager_candidate_token_count_by_proposal_id"] = {str(continuous_id): continuous_tokens}
+    record["continuous_eager_accept_len_by_proposal_id"] = {str(continuous_id): continuous_tokens}
+    record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {str(continuous_id): continuous_tokens}
+    record["continuous_eager_real_committed_token_count_by_proposal_id"] = {str(continuous_id): continuous_tokens}
+    record["continuous_eager_real_committed_accept_len_by_proposal_id"] = {str(continuous_id): continuous_tokens}
+    record["continuous_eager_tokens_verified"] = continuous_tokens
+    record["continuous_eager_tokens_accepted"] = continuous_tokens
+    record["continuous_eager_tokens_committed"] = continuous_tokens
+    record["continuous_eager_real_committed_token_count"] = continuous_tokens
+    continuous_target_before = int(record["continuous_eager_target_seq_len_before_by_seq_id"][continuous_seq])
+    continuous_draft_before = int(record["continuous_eager_draft_seq_len_before_by_seq_id"][continuous_seq])
+    record["continuous_eager_target_seq_len_after_by_seq_id"] = {
+        continuous_seq: continuous_target_before + continuous_tokens
+    }
+    record["continuous_eager_draft_seq_len_after_by_seq_id"] = {
+        continuous_seq: continuous_draft_before + continuous_tokens
+    }
+
+
+def add_higher_depth_commit_accounting(record: dict[str, Any], *, depth2_tokens: int, depth3_tokens: int) -> None:
+    side = str(record["continuous_eager_commit_side"])
+    seq_id = int(record["continuous_eager_real_committed_seq_ids"][0])
+    depth2_id = 900000602
+    depth3_id = 900000603
+    record.update(
+        {
+            "enable_rolling_continuous_depth2_commit_ready_only": True,
+            "rolling_depth2_commit_enabled": True,
+            "rolling_depth2_commit_side": side,
+            "rolling_depth2_commit_plan_id": 37,
+            "rolling_depth2_commit_step_id": 17,
+            "rolling_depth2_real_committed_proposal_ids": [depth2_id],
+            "rolling_depth2_real_committed_seq_ids": [seq_id],
+            "rolling_depth2_real_committed_token_count_by_proposal_id": {str(depth2_id): depth2_tokens},
+            "rolling_depth2_tokens_verified": depth2_tokens,
+            "rolling_depth2_tokens_accepted": depth2_tokens,
+            "rolling_depth2_tokens_rejected": 0,
+            "rolling_depth2_tokens_invalidated": 0,
+            "enable_rolling_continuous_depth3_commit_ready_only": True,
+            "rolling_depth3_commit_enabled": True,
+            "rolling_depth3_commit_side": side,
+            "rolling_depth3_commit_plan_id": 38,
+            "rolling_depth3_commit_step_id": 18,
+            "rolling_depth3_real_committed_proposal_ids": [depth3_id],
+            "rolling_depth3_real_committed_seq_ids": [seq_id],
+            "rolling_depth3_real_committed_token_count_by_proposal_id": {str(depth3_id): depth3_tokens},
+            "rolling_depth3_tokens_verified": depth3_tokens,
+            "rolling_depth3_tokens_accepted": depth3_tokens,
+            "rolling_depth3_tokens_rejected": 0,
+            "rolling_depth3_tokens_invalidated": 0,
+            "rolling_depth3_real_commit_count": 1,
+        }
+    )
+
+
 def run_synthetic_tests() -> None:
     valid = [
         synthetic_continuous_commit_record("target"),
@@ -476,6 +587,18 @@ def run_synthetic_tests() -> None:
     assert not errors, f"valid continuous depth-1 commit synthetic failed: {errors}"
     assert summary["continuous_real_committed_token_count"] == 4
     assert summary["combined_real_committed_token_count"] == 8
+
+    higher_depth_valid = deepcopy(valid)
+    for record in higher_depth_valid:
+        retokenize_synthetic_record(record, one_shot_tokens=12, continuous_tokens=8)
+        add_higher_depth_commit_accounting(record, depth2_tokens=8, depth3_tokens=8)
+    errors, summary = validate_records(higher_depth_valid)
+    assert not errors, f"depth1 checker rejected legal higher-depth combined accounting: {errors}"
+    assert summary["one_shot_committed_token_count"] == 12
+    assert summary["continuous_real_committed_token_count"] == 8
+    assert summary["rolling_depth2_real_committed_token_count"] == 8
+    assert summary["rolling_depth3_real_committed_token_count"] == 8
+    assert summary["combined_real_committed_token_count"] == 36
 
     invalid = deepcopy(valid)
     invalid[0]["continuous_eager_chain_depth_by_proposal_id"] = {"900000601": 2}

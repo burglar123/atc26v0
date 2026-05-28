@@ -579,6 +579,19 @@ def run_synthetic() -> None:
     if not errors:
         raise SystemExit("synthetic depth3 real commit should fail")
 
+    legal_real_commit = deepcopy(good)
+    legal_real_commit["enable_rolling_continuous_depth3_commit_ready_only"] = True
+    legal_real_commit["rolling_depth3_commit_enabled"] = True
+    legal_real_commit["rolling_depth3_real_commit_count"] = 1
+    legal_real_commit["rolling_depth3_real_committed_proposal_ids"] = [child_id]
+    legal_real_commit["rolling_depth3_real_committed_seq_ids"] = [7]
+    legal_real_commit["rolling_depth3_real_committed_token_count_by_proposal_id"] = {str(child_id): 4}
+    legal_real_commit["rolling_depth3_real_commit_parent_by_proposal_id"] = {str(child_id): parent_id}
+    legal_real_commit["rolling_depth3_real_commit_depth_by_proposal_id"] = {str(child_id): 3}
+    errors, _summary = validate_records([legal_real_commit])
+    if errors:
+        raise SystemExit(f"synthetic legal depth3 real commit should pass shadow checker: {errors}")
+
     commit_record = deepcopy(good)
     ready_record = deepcopy(good)
     commit_record["rolling_depth3_child_generated_proposal_ids"] = []

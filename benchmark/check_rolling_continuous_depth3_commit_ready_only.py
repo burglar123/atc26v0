@@ -14,6 +14,13 @@ ROLLING_DEPTH3_COMMIT_SOURCE = "rolling_depth3_ready_only"
 ROLLING_ACTION = "append_full_accept_real_commit"
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+
+
 def load_trace(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text())
     if isinstance(data, list):
@@ -122,6 +129,7 @@ def commit_active(record: dict[str, Any]) -> bool:
 
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
+    accounting = aggregate_performance_accounting(records, {})
     gamma = 0
     commit_enabled_records = 0
     active_records = 0
@@ -406,6 +414,14 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append("rolling_depth3_normal_lane_conflict_count must be zero")
     if missing_unexpected_count:
         errors.append("missing_buffered_proposal_unexpected_count must be zero")
+    combined_expected = (
+        int_value(accounting.get("eager_committed_token_count"), 0)
+        + int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+        + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
+        + committed_token_count
+    )
+    if int_value(accounting.get("combined_real_committed_token_count"), 0) != combined_expected:
+        errors.append("combined real committed token count must equal one-shot + depth1 + depth2 + depth3")
 
     summary = {
         "total_trace_records": len(records),
@@ -415,6 +431,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth3_child_ready_shadow_proposal_count": len(ready_ids),
         "rolling_depth3_real_committed_proposal_count": len(committed_ids),
         "rolling_depth3_real_committed_token_count": committed_token_count,
+        "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
         "rolling_depth3_real_commit_count": real_commit_count,
         "rolling_depth4_real_commit_count": depth4_real_commit_count,
         "rolling_depth_gt3_real_commit_count": depth_gt3_real_commit_count,
@@ -438,6 +455,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth3_child_ready_shadow_proposal_count",
         "rolling_depth3_real_committed_proposal_count",
         "rolling_depth3_real_committed_token_count",
+        "combined_real_committed_token_count",
         "rolling_depth3_real_commit_count",
         "rolling_depth4_real_commit_count",
         "rolling_depth_gt3_real_commit_count",
