@@ -315,7 +315,19 @@ def aggregate_performance_accounting(
     continuous_true_frontier_mismatch_ids: set[int] = set()
     continuous_parent_shadow_not_committed_ids: set[int] = set()
     continuous_parent_not_ready_ids: set[int] = set()
-    continuous_real_commit_count = 0
+    continuous_real_commit_enabled = False
+    continuous_real_committed_ids: set[int] = set()
+    continuous_real_committed_token_by_id: dict[int, int] = {}
+    continuous_real_commit_skip_reason_by_id: dict[int, str] = {}
+    continuous_target_verified_sum = 0
+    continuous_target_accepted_sum = 0
+    continuous_target_rejected_sum = 0
+    continuous_target_invalidated_sum = 0
+    continuous_draft_verified_sum = 0
+    continuous_draft_accepted_sum = 0
+    continuous_draft_rejected_sum = 0
+    continuous_draft_invalidated_sum = 0
+    continuous_depth2_real_commit_count = 0
     continuous_result_transfer_payload_len_units = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
@@ -338,6 +350,8 @@ def aggregate_performance_accounting(
     counted_payload_len_events: set[tuple[str, int, int, int]] = set()
     counted_payload_byte_events: set[tuple[str, int, int, int]] = set()
     counted_timing_events: set[tuple[str, int, int, float]] = set()
+    counted_continuous_commit_events: set[tuple[str, int, int, int]] = set()
+    counted_continuous_commit_records: set[tuple[str, int, int]] = set()
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -413,7 +427,64 @@ def aggregate_performance_accounting(
         continuous_parent_not_ready_ids.update(
             as_int_set(record.get("continuous_eager_parent_not_ready_proposal_ids"))
         )
-        continuous_real_commit_count += int_value(record.get("continuous_eager_real_commit_count"), 0)
+        if bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False)):
+            continuous_real_commit_enabled = True
+        continuous_depth2_real_commit_count += int_value(record.get("continuous_depth2_real_commit_count"), 0)
+        continuous_committed_ids = as_int_set(record.get("continuous_eager_real_committed_proposal_ids"))
+        continuous_real_committed_ids.update(continuous_committed_ids)
+        continuous_commit_token_by_id = as_int_map(
+            record.get("continuous_eager_real_committed_token_count_by_proposal_id")
+        )
+        for proposal_id in continuous_committed_ids:
+            token_count = int(continuous_commit_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+            if token_count > 0:
+                continuous_real_committed_token_by_id.setdefault(proposal_id, token_count)
+        continuous_skip_map = record.get("continuous_eager_real_commit_skip_reason_by_proposal_id")
+        if isinstance(continuous_skip_map, dict):
+            for raw_proposal_id, reason in continuous_skip_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                if reason:
+                    continuous_real_commit_skip_reason_by_id.setdefault(proposal_id, str(reason))
+        continuous_side = str(record.get("continuous_eager_commit_side") or "")
+        if continuous_committed_ids and continuous_side in {"target", "draft"}:
+            commit_plan = int_value(record.get("continuous_eager_commit_plan_id"), key[0])
+            commit_step = int_value(record.get("continuous_eager_commit_step_id"), key[1])
+            record_event = (continuous_side, commit_plan, commit_step)
+            record_token_sum = 0
+            for proposal_id in continuous_committed_ids:
+                event = (continuous_side, commit_plan, commit_step, proposal_id)
+                if event in counted_continuous_commit_events:
+                    continue
+                counted_continuous_commit_events.add(event)
+                token_count = int(continuous_commit_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+                record_token_sum += token_count
+            if record_event not in counted_continuous_commit_records:
+                counted_continuous_commit_records.add(record_event)
+                if continuous_side == "target":
+                    continuous_target_verified_sum += int_value(
+                        record.get("continuous_eager_tokens_verified"),
+                        record_token_sum,
+                    )
+                    continuous_target_accepted_sum += int_value(
+                        record.get("continuous_eager_tokens_accepted"),
+                        record_token_sum,
+                    )
+                    continuous_target_rejected_sum += int_value(record.get("continuous_eager_tokens_rejected"), 0)
+                    continuous_target_invalidated_sum += int_value(record.get("continuous_eager_tokens_invalidated"), 0)
+                else:
+                    continuous_draft_verified_sum += int_value(
+                        record.get("continuous_eager_tokens_verified"),
+                        record_token_sum,
+                    )
+                    continuous_draft_accepted_sum += int_value(
+                        record.get("continuous_eager_tokens_accepted"),
+                        record_token_sum,
+                    )
+                    continuous_draft_rejected_sum += int_value(record.get("continuous_eager_tokens_rejected"), 0)
+                    continuous_draft_invalidated_sum += int_value(record.get("continuous_eager_tokens_invalidated"), 0)
         continuous_result_transfer_payload_len_units += max(
             0,
             int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0),
@@ -516,6 +587,10 @@ def aggregate_performance_accounting(
         int(continuous_full_accept_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
         for proposal_id in continuous_full_accept_ids
     )
+    continuous_real_committed_token_count = sum(
+        int(continuous_real_committed_token_by_id.get(proposal_id, continuous_token_by_id.get(proposal_id, max(0, gamma))))
+        for proposal_id in continuous_real_committed_ids
+    )
     continuous_chain_distribution = Counter(
         str(depth)
         for proposal_id, depth in continuous_chain_depth_by_id.items()
@@ -594,7 +669,48 @@ def aggregate_performance_accounting(
         "continuous_true_frontier_mismatch_count": len(continuous_true_frontier_mismatch_ids),
         "continuous_parent_shadow_not_committed_count": len(continuous_parent_shadow_not_committed_ids),
         "continuous_parent_shadow_not_ready_count": len(continuous_parent_not_ready_ids),
-        "continuous_eager_real_commit_count": continuous_real_commit_count,
+        "continuous_eager_real_commit_enabled": bool(continuous_real_commit_enabled),
+        "continuous_eager_real_commit_count": len(continuous_real_committed_ids),
+        "continuous_eager_real_committed_proposal_count": len(continuous_real_committed_ids),
+        "continuous_eager_real_committed_token_count": continuous_real_committed_token_count,
+        "continuous_real_committed_token_share_of_output": safe_div(
+            continuous_real_committed_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
+        "continuous_shadow_ready_but_not_committed_count": len(
+            continuous_ready_shadow_ids - continuous_real_committed_ids
+        ),
+        "continuous_commit_depth1_rate_by_token": safe_div(
+            continuous_real_committed_token_count,
+            continuous_ready_shadow_token_count,
+        ),
+        "continuous_commit_depth1_rate_by_proposal": safe_div(
+            len(continuous_real_committed_ids),
+            len(continuous_ready_shadow_ids),
+        ),
+        "continuous_target_actual_verified_token_increment_sum": continuous_target_verified_sum,
+        "continuous_target_actual_accepted_token_increment_sum": continuous_target_accepted_sum,
+        "continuous_target_actual_rejected_token_increment_sum": continuous_target_rejected_sum,
+        "continuous_target_actual_invalidated_token_increment_sum": continuous_target_invalidated_sum,
+        "continuous_draft_actual_verified_token_increment_sum": continuous_draft_verified_sum,
+        "continuous_draft_actual_accepted_token_increment_sum": continuous_draft_accepted_sum,
+        "continuous_draft_actual_rejected_token_increment_sum": continuous_draft_rejected_sum,
+        "continuous_draft_actual_invalidated_token_increment_sum": continuous_draft_invalidated_sum,
+        "continuous_eager_real_commit_skip_reason_counts": dict(Counter(continuous_real_commit_skip_reason_by_id.values())),
+        "continuous_depth2_real_commit_count": continuous_depth2_real_commit_count,
+        "combined_real_committed_token_count": committed_token_count + continuous_real_committed_token_count,
+        "combined_real_committed_token_share_of_output": safe_div(
+            committed_token_count + continuous_real_committed_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
+        "combined_actual_verified_token_increment_sum": (
+            int_value(commit_summary.get("target_actual_eager_verified_token_increment_sum"), 0)
+            + continuous_target_verified_sum
+        ),
+        "combined_actual_accepted_token_increment_sum": (
+            int_value(commit_summary.get("target_actual_eager_accepted_token_increment_sum"), 0)
+            + continuous_target_accepted_sum
+        ),
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
         "continuous_eager_result_transfer_payload_len_units": continuous_result_transfer_payload_len_units,
         "normal_draft_seq_excluded_count": len(lane_applied_ids) or len(lane_applied_seq_fallback_events),
@@ -688,8 +804,36 @@ def validate_accounting(
         errors.append("skipped plus committed proposals exceeds candidate proposal count")
     if skipped_proposals and not accounting.get("eager_skip_reason_counts"):
         errors.append("skipped proposals require skip reason counts")
-    if int_value(accounting.get("continuous_eager_real_commit_count"), 0) != 0:
+    continuous_real_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+    continuous_real_proposals = int_value(accounting.get("continuous_eager_real_committed_proposal_count"), 0)
+    if (
+        not bool(accounting.get("continuous_eager_real_commit_enabled", False))
+        and int_value(accounting.get("continuous_eager_real_commit_count"), 0) != 0
+    ):
         errors.append("continuous eager shadow dry-run must not real-commit proposals")
+    if continuous_real_tokens:
+        if continuous_real_tokens != int_value(accounting.get("continuous_target_actual_verified_token_increment_sum"), 0):
+            errors.append("continuous committed tokens must equal target continuous verified increment sum")
+        if continuous_real_tokens != int_value(accounting.get("continuous_target_actual_accepted_token_increment_sum"), 0):
+            errors.append("continuous committed tokens must equal target continuous accepted increment sum")
+        if continuous_real_tokens != int_value(accounting.get("continuous_draft_actual_verified_token_increment_sum"), 0):
+            errors.append("continuous committed tokens must equal draft continuous verified increment sum")
+        if continuous_real_tokens != int_value(accounting.get("continuous_draft_actual_accepted_token_increment_sum"), 0):
+            errors.append("continuous committed tokens must equal draft continuous accepted increment sum")
+    if int_value(accounting.get("continuous_target_actual_rejected_token_increment_sum"), 0) != 0:
+        errors.append("continuous target rejected increments must remain zero")
+    if int_value(accounting.get("continuous_target_actual_invalidated_token_increment_sum"), 0) != 0:
+        errors.append("continuous target invalidated increments must remain zero")
+    if int_value(accounting.get("continuous_draft_actual_rejected_token_increment_sum"), 0) != 0:
+        errors.append("continuous draft rejected increments must remain zero")
+    if int_value(accounting.get("continuous_draft_actual_invalidated_token_increment_sum"), 0) != 0:
+        errors.append("continuous draft invalidated increments must remain zero")
+    if int_value(accounting.get("continuous_depth2_real_commit_count"), 0) != 0:
+        errors.append("continuous depth-2 real commit count must remain zero")
+    if continuous_real_proposals > int_value(accounting.get("continuous_eager_commit_ready_shadow_proposal_count"), 0):
+        errors.append("continuous committed proposal count exceeds shadow-ready proposal count")
+    if continuous_real_tokens > int_value(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0):
+        errors.append("continuous committed tokens exceed shadow-ready tokens")
     if int_value(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0) > int_value(
         accounting.get("continuous_eager_candidate_token_count"),
         0,
@@ -782,7 +926,28 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_true_frontier_mismatch_count",
         "continuous_parent_shadow_not_committed_count",
         "continuous_parent_shadow_not_ready_count",
+        "continuous_eager_real_commit_enabled",
         "continuous_eager_real_commit_count",
+        "continuous_eager_real_committed_proposal_count",
+        "continuous_eager_real_committed_token_count",
+        "continuous_real_committed_token_share_of_output",
+        "continuous_shadow_ready_but_not_committed_count",
+        "continuous_commit_depth1_rate_by_token",
+        "continuous_commit_depth1_rate_by_proposal",
+        "continuous_target_actual_verified_token_increment_sum",
+        "continuous_target_actual_accepted_token_increment_sum",
+        "continuous_target_actual_rejected_token_increment_sum",
+        "continuous_target_actual_invalidated_token_increment_sum",
+        "continuous_draft_actual_verified_token_increment_sum",
+        "continuous_draft_actual_accepted_token_increment_sum",
+        "continuous_draft_actual_rejected_token_increment_sum",
+        "continuous_draft_actual_invalidated_token_increment_sum",
+        "continuous_eager_real_commit_skip_reason_counts",
+        "continuous_depth2_real_commit_count",
+        "combined_real_committed_token_count",
+        "combined_real_committed_token_share_of_output",
+        "combined_actual_verified_token_increment_sum",
+        "combined_actual_accepted_token_increment_sum",
         "continuous_eager_result_transfer_payload_len_units",
         "committed_token_share_of_output",
         "candidate_token_share_of_output",
@@ -895,9 +1060,31 @@ def synthetic_records() -> list[dict[str, Any]]:
         "eager_transfer_payload_len": 12,
         "eager_result_transfer_payload_len": 8,
         "eager_result_transfer_zero_result_step": False,
+        "enable_continuous_eager_dry_run": True,
+        "enable_continuous_eager_verify_apply_dry_run": True,
+        "enable_continuous_eager_commit_depth1_ready_only": True,
+        "continuous_eager_candidate_proposal_ids": [900000101],
+        "continuous_eager_candidate_seq_ids": [7],
+        "continuous_eager_candidate_token_count_by_proposal_id": {"900000101": 4},
+        "continuous_eager_chain_depth_by_proposal_id": {"900000101": 1},
+        "continuous_eager_parent_proposal_id_by_proposal_id": {"900000101": 101},
+        "continuous_eager_parent_source_by_proposal_id": {"900000101": "phase1h6a_one_shot_commit"},
+        "continuous_eager_verified_proposal_ids": [900000101],
+        "continuous_eager_full_accept_proposal_ids": [900000101],
+        "continuous_eager_commit_ready_shadow_proposal_ids": [900000101],
+        "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {"900000101": 4},
+        "continuous_eager_real_committed_proposal_ids": [900000101],
+        "continuous_eager_real_committed_seq_ids": [7],
+        "continuous_eager_real_committed_token_count_by_proposal_id": {"900000101": 4},
+        "continuous_eager_tokens_verified": 4,
+        "continuous_eager_tokens_accepted": 4,
+        "continuous_eager_tokens_rejected": 0,
+        "continuous_eager_tokens_invalidated": 0,
+        "continuous_eager_real_commit_count": 1,
+        "continuous_depth2_real_commit_count": 0,
     }
-    target = dict(base, eager_commit_side="target", step_id=11, plan_id=21)
-    draft = dict(base, eager_commit_side="draft", step_id=11, plan_id=21)
+    target = dict(base, eager_commit_side="target", continuous_eager_commit_side="target", step_id=11, plan_id=21)
+    draft = dict(base, eager_commit_side="draft", continuous_eager_commit_side="draft", step_id=11, plan_id=21)
     return [target, draft]
 
 
@@ -913,6 +1100,10 @@ def run_synthetic_tests() -> None:
     assert summary["committed_token_share_of_output"] == 4 / 64
     assert summary["suppressed_slots_per_committed_token"] == 2.0
     assert summary["proposal_payload_len_units_per_committed_token"] == 3.0
+    assert summary["continuous_eager_real_committed_token_count"] == 4
+    assert summary["continuous_target_actual_verified_token_increment_sum"] == 4
+    assert summary["continuous_draft_actual_verified_token_increment_sum"] == 4
+    assert summary["combined_real_committed_token_count"] == 8
     assert summary["timing_available"] is False
     assert summary["missing_timing_reason"] == "not_instrumented"
 
@@ -920,6 +1111,11 @@ def run_synthetic_tests() -> None:
     invalid[0]["eager_tokens_verified"] = 0
     errors, _ = validate_accounting(invalid, synthetic_result_payload())
     assert any("target actual eager verified" in error for error in errors), "missed target counter mismatch"
+
+    invalid = deepcopy(records)
+    invalid[0]["continuous_eager_tokens_verified"] = 0
+    errors, _ = validate_accounting(invalid, synthetic_result_payload())
+    assert any("target continuous verified" in error for error in errors), "missed continuous counter mismatch"
 
     invalid = deepcopy(records)
     invalid[0]["lane_exclusion_applied_proposal_ids"] = []

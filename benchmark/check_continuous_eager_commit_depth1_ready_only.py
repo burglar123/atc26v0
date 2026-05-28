@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter, defaultdict
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+
+CONTINUOUS_SOURCE = "continuous_shadow"
+CONTINUOUS_COMMIT_SOURCE = "continuous_depth1_ready_only"
+ONE_SHOT_PARENT_SOURCE = "phase1h6a_one_shot_commit"
+FULL_ACCEPT_ACTION = "append_full_accept_then_rollback"
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.check_eager_commit_ready_only import (  # noqa: E402
+    as_int_list,
+    as_int_set,
+    dict_get,
+    int_value,
+    is_dual_record,
+    load_trace,
+    synthetic_commit_record,
+    validate_records as validate_one_shot_records,
+)
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+
+
+def as_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
+def as_str_map(value: Any) -> dict[int, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, str] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = str(item)
+        except Exception:
+            continue
+    return result
+
+
+def commit_active(record: dict[str, Any]) -> bool:
+    return (
+        bool(record.get("continuous_eager_commit_enabled", False))
+        or bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
+        or bool(as_int_set(record.get("continuous_eager_commit_candidate_proposal_ids")))
+        or bool(as_int_set(record.get("continuous_eager_real_committed_proposal_ids")))
+        or bool(as_int_set(record.get("continuous_eager_real_commit_skipped_proposal_ids")))
+        or int_value(record.get("continuous_eager_tokens_committed"), 0) > 0
+    )
+
+
+def step_plan_key(record: dict[str, Any]) -> tuple[int, int]:
+    plan_id = int_value(record.get("continuous_eager_commit_plan_id"), int_value(record.get("plan_id"), -1))
+    step_id = int_value(record.get("continuous_eager_commit_step_id"), int_value(record.get("step_id"), -1))
+    return plan_id, step_id
+
+
+def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
+    errors: list[str] = []
+    one_shot_errors, one_shot_summary = validate_one_shot_records(records)
+    errors.extend(f"one-shot commit checker: {error}" for error in one_shot_errors)
+    accounting = aggregate_performance_accounting(records, {})
+
+    one_shot_committed_ids: set[int] = set()
+    ready_shadow_ids: set[int] = set()
+    not_ready_ids: set[int] = set()
+    full_accept_ids: set[int] = set()
+    partial_reject_ids: set[int] = set()
+    parent_by_id: dict[int, int] = {}
+    parent_source_by_id: dict[int, str] = {}
+    depth_by_id: dict[int, int] = {}
+    token_by_id: dict[int, int] = {}
+
+    records_with_commit_enabled = 0
+    commit_active_records = 0
+    committed_ids_seen: set[int] = set()
+    committed_sides_by_id: dict[int, set[str]] = defaultdict(set)
+    committed_steps_by_side: dict[tuple[str, int], set[tuple[int, int]]] = defaultdict(set)
+    skipped_ids_seen: set[int] = set()
+    skip_reason_by_id: dict[int, str] = {}
+    committed_but_not_ready: set[int] = set()
+    committed_depth_not_one: set[int] = set()
+    committed_bad_parent: set[int] = set()
+    committed_non_full_accept: set[int] = set()
+    committed_not_ready: set[int] = set()
+    repeated_commit_ids: set[int] = set()
+    duplicate_seq_depth_events: set[tuple[str, int, int, int, int]] = set()
+    seen_seq_depth: set[tuple[str, int, int, int, int]] = set()
+    missing_unexpected_count = 0
+    real_target_eager_nonempty_count = 0
+    depth2_real_commit_count = 0
+
+    for record in records:
+        if not is_dual_record(record):
+            continue
+        one_shot_committed_ids.update(as_int_set(record.get("eager_committed_proposal_ids")))
+        ready_shadow_ids.update(as_int_set(record.get("continuous_eager_commit_ready_shadow_proposal_ids")))
+        not_ready_ids.update(as_int_set(record.get("continuous_eager_not_ready_shadow_proposal_ids")))
+        full_accept_ids.update(as_int_set(record.get("continuous_eager_full_accept_proposal_ids")))
+        partial_reject_ids.update(as_int_set(record.get("continuous_eager_partial_reject_proposal_ids")))
+        parent_by_id.update(as_int_map(record.get("continuous_eager_parent_proposal_id_by_proposal_id")))
+        parent_source_by_id.update(as_str_map(record.get("continuous_eager_parent_source_by_proposal_id")))
+        depth_by_id.update(as_int_map(record.get("continuous_eager_chain_depth_by_proposal_id")))
+        token_by_id.update(as_int_map(record.get("continuous_eager_candidate_token_count_by_proposal_id")))
+
+    for idx, record in enumerate(records):
+        if not is_dual_record(record):
+            continue
+        if as_int_set(record.get("target_eager_set")):
+            real_target_eager_nonempty_count += 1
+            errors.append(f"record[{idx}] real target_eager_set must remain empty")
+        missing_unexpected = as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids"))
+        if missing_unexpected:
+            missing_unexpected_count += len(missing_unexpected)
+            errors.append(f"record[{idx}] unexpected missing buffered proposals: {sorted(missing_unexpected)}")
+
+        enabled = bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
+        if enabled:
+            records_with_commit_enabled += 1
+        if not commit_active(record):
+            continue
+        commit_active_records += 1
+        if not enabled:
+            errors.append(f"record[{idx}] continuous real commit active while flag disabled")
+        if record.get("continuous_eager_commit_source") not in {None, CONTINUOUS_COMMIT_SOURCE}:
+            errors.append(f"record[{idx}] bad continuous commit source {record.get('continuous_eager_commit_source')!r}")
+
+        side = str(record.get("continuous_eager_commit_side") or "")
+        plan_id, step_id = step_plan_key(record)
+        committed_ids = as_int_set(record.get("continuous_eager_real_committed_proposal_ids"))
+        committed_seq_ids = as_int_list(record.get("continuous_eager_real_committed_seq_ids"))
+        pid_to_seq = dict(zip(as_int_list(record.get("continuous_eager_real_committed_proposal_ids")), committed_seq_ids))
+        token_count_by_id = as_int_map(record.get("continuous_eager_real_committed_token_count_by_proposal_id"))
+        accept_len_by_id = as_int_map(record.get("continuous_eager_real_committed_accept_len_by_proposal_id"))
+        action_by_id = as_str_map(record.get("continuous_eager_real_commit_action_by_proposal_id"))
+        result_by_id = as_str_map(record.get("continuous_eager_real_commit_verify_result_by_proposal_id"))
+        precondition_ok_by_id = record.get("continuous_eager_real_commit_precondition_ok_by_proposal_id") or {}
+        failed_by_id = record.get("continuous_eager_real_commit_precondition_failed_by_proposal_id") or {}
+        skip_reason_map = as_str_map(record.get("continuous_eager_real_commit_skip_reason_by_proposal_id"))
+        skipped = as_int_set(record.get("continuous_eager_real_commit_skipped_proposal_ids"))
+        skipped_ids_seen.update(skipped)
+        for proposal_id, reason in skip_reason_map.items():
+            skip_reason_by_id.setdefault(proposal_id, reason)
+        depth2_real_commit_count += int_value(record.get("continuous_depth2_real_commit_count"), 0)
+
+        if committed_ids & as_int_set(record.get("eager_committed_proposal_ids")):
+            errors.append(f"record[{idx}] continuous proposal appeared in one-shot commit fields")
+        if committed_ids & as_int_set(record.get("lane_exclusion_applied_proposal_ids")):
+            errors.append(f"record[{idx}] continuous proposal affected lane exclusion")
+        if committed_ids & as_int_set(record.get("target_eager_verify_proposal_ids_dry_run")):
+            errors.append(f"record[{idx}] continuous proposal entered target takeover")
+
+        before_map = as_int_map(record.get("continuous_eager_target_seq_len_before_by_seq_id"))
+        after_map = as_int_map(record.get("continuous_eager_target_seq_len_after_by_seq_id"))
+        len_match_map = record.get("continuous_eager_target_draft_len_match_by_seq_id") or {}
+        token_match_map = record.get("continuous_eager_target_draft_token_match_by_seq_id") or {}
+
+        for proposal_id in committed_ids:
+            seq_id = int(pid_to_seq.get(proposal_id, -1))
+            committed_ids_seen.add(proposal_id)
+            committed_sides_by_id[proposal_id].add(side)
+            committed_steps_by_side[(side, proposal_id)].add((plan_id, step_id))
+            depth = int(dict_get(
+                record.get("continuous_eager_chain_depth_by_proposal_id"),
+                proposal_id,
+                depth_by_id.get(proposal_id, 0),
+            ))
+            parent_id = int(dict_get(
+                record.get("continuous_eager_parent_proposal_id_by_proposal_id"),
+                proposal_id,
+                parent_by_id.get(proposal_id, -1),
+            ))
+            parent_source = str(dict_get(
+                record.get("continuous_eager_parent_source_by_proposal_id"),
+                proposal_id,
+                parent_source_by_id.get(proposal_id, ""),
+            ))
+            token_count = int(token_count_by_id.get(proposal_id, token_by_id.get(proposal_id, 0)))
+            accept_len = int(accept_len_by_id.get(proposal_id, -1))
+            if proposal_id not in ready_shadow_ids:
+                committed_but_not_ready.add(proposal_id)
+            if depth != 1:
+                committed_depth_not_one.add(proposal_id)
+            if parent_source != ONE_SHOT_PARENT_SOURCE or parent_id not in one_shot_committed_ids:
+                committed_bad_parent.add(proposal_id)
+            if proposal_id in partial_reject_ids or proposal_id in not_ready_ids:
+                committed_not_ready.add(proposal_id)
+            if result_by_id.get(proposal_id) != "full_accept" or action_by_id.get(proposal_id) != FULL_ACCEPT_ACTION:
+                committed_non_full_accept.add(proposal_id)
+            if token_count <= 0 or accept_len != token_count:
+                errors.append(f"record[{idx}] committed proposal {proposal_id} has bad token/accept count")
+            if precondition_ok_by_id and not bool(dict_get(precondition_ok_by_id, proposal_id, False)):
+                errors.append(f"record[{idx}] committed proposal {proposal_id} has precondition_ok=false")
+            if bool(dict_get(failed_by_id, proposal_id, False)):
+                errors.append(f"record[{idx}] committed proposal {proposal_id} has failed precondition")
+            if seq_id not in before_map or seq_id not in after_map:
+                errors.append(f"record[{idx}] committed seq {seq_id} missing length checkpoint")
+            elif int(after_map[seq_id]) - int(before_map[seq_id]) != token_count:
+                errors.append(f"record[{idx}] committed seq {seq_id} length delta != token count")
+            if len_match_map and not bool(dict_get(len_match_map, seq_id, False)):
+                errors.append(f"record[{idx}] committed seq {seq_id} target/draft length mismatch")
+            if token_match_map and not bool(dict_get(token_match_map, seq_id, False)):
+                errors.append(f"record[{idx}] committed seq {seq_id} target/draft token mismatch")
+            seq_depth_event = (side, plan_id, step_id, seq_id, depth)
+            if seq_depth_event in seen_seq_depth:
+                duplicate_seq_depth_events.add(seq_depth_event)
+            seen_seq_depth.add(seq_depth_event)
+
+    for (_side, proposal_id), steps in committed_steps_by_side.items():
+        if len(steps) > 1:
+            repeated_commit_ids.add(proposal_id)
+
+    missing_target = {proposal_id for proposal_id, sides in committed_sides_by_id.items() if "target" not in sides}
+    missing_draft = {proposal_id for proposal_id, sides in committed_sides_by_id.items() if "draft" not in sides}
+    for proposal_id in skipped_ids_seen:
+        if proposal_id not in skip_reason_by_id:
+            errors.append(f"skipped continuous proposal {proposal_id} lacks reason")
+    if committed_but_not_ready:
+        errors.append(f"continuous committed but not shadow-ready: {sorted(committed_but_not_ready)}")
+    if committed_depth_not_one:
+        errors.append(f"continuous committed non-depth-1 proposals: {sorted(committed_depth_not_one)}")
+    if committed_bad_parent:
+        errors.append(f"continuous committed proposals with bad parent: {sorted(committed_bad_parent)}")
+    if committed_non_full_accept:
+        errors.append(f"continuous committed non-full-accept proposals: {sorted(committed_non_full_accept)}")
+    if committed_not_ready:
+        errors.append(f"continuous not-ready proposals were committed: {sorted(committed_not_ready)}")
+    if repeated_commit_ids:
+        errors.append(f"repeated continuous commit proposal ids: {sorted(repeated_commit_ids)}")
+    if duplicate_seq_depth_events:
+        errors.append(f"duplicate continuous seq/depth commit events: {sorted(duplicate_seq_depth_events)}")
+    if missing_target:
+        errors.append(f"missing target-side continuous commit records: {sorted(missing_target)}")
+    if missing_draft:
+        errors.append(f"missing draft-side continuous commit records: {sorted(missing_draft)}")
+    if depth2_real_commit_count:
+        errors.append("continuous depth-2 real commit count must be zero")
+
+    continuous_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+    if continuous_tokens != int_value(accounting.get("continuous_target_actual_verified_token_increment_sum"), 0):
+        errors.append("continuous tokens != target continuous verified increment sum")
+    if continuous_tokens != int_value(accounting.get("continuous_target_actual_accepted_token_increment_sum"), 0):
+        errors.append("continuous tokens != target continuous accepted increment sum")
+    if continuous_tokens != int_value(accounting.get("continuous_draft_actual_verified_token_increment_sum"), 0):
+        errors.append("continuous tokens != draft continuous verified increment sum")
+    if continuous_tokens != int_value(accounting.get("continuous_draft_actual_accepted_token_increment_sum"), 0):
+        errors.append("continuous tokens != draft continuous accepted increment sum")
+    for field in (
+        "continuous_target_actual_rejected_token_increment_sum",
+        "continuous_target_actual_invalidated_token_increment_sum",
+        "continuous_draft_actual_rejected_token_increment_sum",
+        "continuous_draft_actual_invalidated_token_increment_sum",
+    ):
+        if int_value(accounting.get(field), 0) != 0:
+            errors.append(f"{field} must be zero")
+    if int_value(accounting.get("combined_real_committed_token_count"), 0) != (
+        int_value(one_shot_summary.get("committed_token_count"), 0) + continuous_tokens
+    ):
+        errors.append("combined real committed token count mismatch")
+
+    summary = {
+        "total_trace_records": len(records),
+        "records_with_continuous_commit_enabled": records_with_commit_enabled,
+        "continuous_commit_active_records": commit_active_records,
+        "one_shot_committed_token_count": int_value(one_shot_summary.get("committed_token_count"), 0),
+        "continuous_shadow_ready_proposal_count": len(ready_shadow_ids),
+        "continuous_real_committed_proposal_count": len(committed_ids_seen),
+        "continuous_real_committed_token_count": continuous_tokens,
+        "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
+        "continuous_target_actual_verified_token_increment_sum": accounting.get(
+            "continuous_target_actual_verified_token_increment_sum", 0
+        ),
+        "continuous_target_actual_accepted_token_increment_sum": accounting.get(
+            "continuous_target_actual_accepted_token_increment_sum", 0
+        ),
+        "continuous_draft_actual_verified_token_increment_sum": accounting.get(
+            "continuous_draft_actual_verified_token_increment_sum", 0
+        ),
+        "continuous_draft_actual_accepted_token_increment_sum": accounting.get(
+            "continuous_draft_actual_accepted_token_increment_sum", 0
+        ),
+        "continuous_real_commit_skip_reason_counts": dict(Counter(skip_reason_by_id.values())),
+        "continuous_depth2_real_commit_count": depth2_real_commit_count,
+        "repeated_continuous_commit_proposal_ids": sorted(repeated_commit_ids),
+        "continuous_committed_but_not_shadow_ready_ids": sorted(committed_but_not_ready),
+        "continuous_committed_non_full_accept_ids": sorted(committed_non_full_accept),
+        "missing_target_side_continuous_commit_ids": sorted(missing_target),
+        "missing_draft_side_continuous_commit_ids": sorted(missing_draft),
+        "real_target_eager_non_empty_count": real_target_eager_nonempty_count,
+        "missing_buffered_proposal_unexpected_count": missing_unexpected_count,
+    }
+    return errors, summary
+
+
+def print_summary(summary: dict[str, Any]) -> None:
+    for key in (
+        "total_trace_records",
+        "records_with_continuous_commit_enabled",
+        "continuous_commit_active_records",
+        "one_shot_committed_token_count",
+        "continuous_shadow_ready_proposal_count",
+        "continuous_real_committed_proposal_count",
+        "continuous_real_committed_token_count",
+        "combined_real_committed_token_count",
+        "continuous_target_actual_verified_token_increment_sum",
+        "continuous_target_actual_accepted_token_increment_sum",
+        "continuous_draft_actual_verified_token_increment_sum",
+        "continuous_draft_actual_accepted_token_increment_sum",
+        "continuous_real_commit_skip_reason_counts",
+        "continuous_depth2_real_commit_count",
+        "repeated_continuous_commit_proposal_ids",
+        "continuous_committed_but_not_shadow_ready_ids",
+        "continuous_committed_non_full_accept_ids",
+        "missing_target_side_continuous_commit_ids",
+        "missing_draft_side_continuous_commit_ids",
+        "real_target_eager_non_empty_count",
+        "missing_buffered_proposal_unexpected_count",
+    ):
+        print(f"{key}={summary.get(key)}")
+
+
+def synthetic_continuous_commit_record(side: str, *, proposal_id: int = 900000601) -> dict[str, Any]:
+    seq_id = 12
+    record = synthetic_commit_record(6, seq_id, side, 7, 27)
+    record.update(
+        {
+            "enable_continuous_eager_dry_run": True,
+            "enable_continuous_eager_verify_apply_dry_run": True,
+            "enable_continuous_eager_commit_depth1_ready_only": True,
+            "continuous_eager_dry_run_enabled": True,
+            "continuous_eager_source": CONTINUOUS_SOURCE,
+            "continuous_eager_execution_stage": "verify_apply_dry_run",
+            "continuous_shadow_stage": "verify_apply_dry_run",
+            "continuous_eager_candidate_proposal_ids": [proposal_id],
+            "continuous_eager_candidate_seq_ids": [seq_id],
+            "continuous_eager_candidate_token_count_by_proposal_id": {str(proposal_id): 4},
+            "continuous_eager_parent_proposal_id_by_proposal_id": {str(proposal_id): 6},
+            "continuous_eager_parent_source_by_proposal_id": {str(proposal_id): ONE_SHOT_PARENT_SOURCE},
+            "continuous_eager_chain_depth_by_proposal_id": {str(proposal_id): 1},
+            "continuous_eager_root_proposal_id_by_proposal_id": {str(proposal_id): 6},
+            "continuous_eager_verified_proposal_ids": [proposal_id],
+            "continuous_eager_full_accept_proposal_ids": [proposal_id],
+            "continuous_eager_verify_result_by_proposal_id": {str(proposal_id): "full_accept"},
+            "continuous_eager_accept_len_by_proposal_id": {str(proposal_id): 4},
+            "continuous_eager_apply_dry_run_executed_proposal_ids": [proposal_id],
+            "continuous_eager_apply_action_by_proposal_id": {str(proposal_id): FULL_ACCEPT_ACTION},
+            "continuous_eager_apply_rollback_ok_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_apply_mutation_detected_by_proposal_id": {str(proposal_id): False},
+            "continuous_eager_apply_checkpoint_failed_by_proposal_id": {str(proposal_id): False},
+            "continuous_eager_result_transfer_validated_proposal_ids": [proposal_id],
+            "continuous_eager_sync_apply_executed_proposal_ids": [proposal_id],
+            "continuous_eager_sync_apply_action_match_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_sync_apply_result_match_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_sync_apply_accept_len_match_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_sync_apply_rollback_ok_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_sync_apply_mutation_detected_by_proposal_id": {str(proposal_id): False},
+            "continuous_eager_sync_apply_checkpoint_failed_by_proposal_id": {str(proposal_id): False},
+            "continuous_eager_commit_ready_shadow_proposal_ids": [proposal_id],
+            "continuous_eager_commit_ready_shadow_seq_ids": [seq_id],
+            "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {str(proposal_id): 4},
+            "continuous_eager_commit_enabled": True,
+            "continuous_eager_commit_source": CONTINUOUS_COMMIT_SOURCE,
+            "continuous_eager_commit_side": side,
+            "continuous_eager_commit_step_id": 7,
+            "continuous_eager_commit_plan_id": 27,
+            "continuous_eager_commit_candidate_proposal_ids": [proposal_id],
+            "continuous_eager_commit_candidate_seq_ids": [seq_id],
+            "continuous_eager_commit_ready_source_proposal_ids": [proposal_id],
+            "continuous_eager_real_committed_proposal_ids": [proposal_id],
+            "continuous_eager_real_committed_seq_ids": [seq_id],
+            "continuous_eager_real_committed_token_count_by_proposal_id": {str(proposal_id): 4},
+            "continuous_eager_real_committed_accept_len_by_proposal_id": {str(proposal_id): 4},
+            "continuous_eager_real_commit_action_by_proposal_id": {str(proposal_id): FULL_ACCEPT_ACTION},
+            "continuous_eager_real_commit_verify_result_by_proposal_id": {str(proposal_id): "full_accept"},
+            "continuous_eager_real_commit_precondition_ok_by_proposal_id": {str(proposal_id): True},
+            "continuous_eager_real_commit_precondition_failed_by_proposal_id": {str(proposal_id): False},
+            "continuous_eager_target_seq_len_before_by_seq_id": {str(seq_id): 24},
+            "continuous_eager_target_seq_len_after_by_seq_id": {str(seq_id): 28},
+            "continuous_eager_draft_seq_len_before_by_seq_id": {str(seq_id): 24},
+            "continuous_eager_draft_seq_len_after_by_seq_id": {str(seq_id): 28},
+            "continuous_eager_target_draft_len_match_by_seq_id": {str(seq_id): True},
+            "continuous_eager_target_draft_token_match_by_seq_id": {str(seq_id): True},
+            "continuous_eager_tokens_verified": 4,
+            "continuous_eager_tokens_accepted": 4,
+            "continuous_eager_tokens_committed": 4,
+            "continuous_eager_tokens_rejected": 0,
+            "continuous_eager_tokens_invalidated": 0,
+            "continuous_eager_real_commit_count": 1,
+            "continuous_eager_real_committed_proposal_count": 1,
+            "continuous_eager_real_committed_token_count": 4,
+            "continuous_depth2_real_commit_count": 0,
+        }
+    )
+    return record
+
+
+def run_synthetic_tests() -> None:
+    valid = [
+        synthetic_continuous_commit_record("target"),
+        synthetic_continuous_commit_record("draft"),
+    ]
+    errors, summary = validate_records(valid)
+    assert not errors, f"valid continuous depth-1 commit synthetic failed: {errors}"
+    assert summary["continuous_real_committed_token_count"] == 4
+    assert summary["combined_real_committed_token_count"] == 8
+
+    invalid = deepcopy(valid)
+    invalid[0]["continuous_eager_chain_depth_by_proposal_id"] = {"900000601": 2}
+    errors, _summary = validate_records(invalid)
+    assert any("non-depth-1" in error for error in errors), "missed depth-2 continuous commit"
+
+    invalid = deepcopy(valid)
+    invalid[0]["continuous_eager_real_commit_verify_result_by_proposal_id"] = {"900000601": "partial_accept"}
+    errors, _summary = validate_records(invalid)
+    assert any("non-full-accept" in error for error in errors), "missed committed partial continuous proposal"
+
+    invalid = deepcopy(valid)
+    invalid[0]["continuous_eager_real_committed_proposal_ids"] = []
+    errors, _summary = validate_records(invalid)
+    assert any("missing target-side" in error for error in errors), "missed missing target-side continuous commit"
+
+    invalid = deepcopy(valid)
+    invalid[0]["continuous_eager_tokens_verified"] = 0
+    errors, _summary = validate_records(invalid)
+    assert any("target continuous verified" in error for error in errors), "missed continuous counter mismatch"
+
+    print("Synthetic continuous eager depth-1 commit checks passed.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Check Phase 1H-7c real continuous depth-1 eager commit traces.")
+    parser.add_argument("trace", nargs="?", type=Path)
+    parser.add_argument("--synthetic", action="store_true")
+    args = parser.parse_args()
+    if args.synthetic or args.trace is None:
+        run_synthetic_tests()
+        return 0
+    errors, summary = validate_records(load_trace(args.trace))
+    print_summary(summary)
+    if errors:
+        print("Errors:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -119,6 +119,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
 
     records_with_enabled = 0
     records_with_verify_apply_enabled = 0
+    records_with_commit_enabled = 0
     active_records = 0
     candidate_ids_seen: set[int] = set()
     candidate_token_by_id: dict[int, int] = {}
@@ -146,10 +147,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     for idx, record in enumerate(records):
         enabled = bool(record.get("enable_continuous_eager_dry_run", False))
         verify_apply_enabled = bool(record.get("enable_continuous_eager_verify_apply_dry_run", False))
+        commit_enabled = bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
         if enabled:
             records_with_enabled += 1
         if verify_apply_enabled:
             records_with_verify_apply_enabled += 1
+        if commit_enabled:
+            records_with_commit_enabled += 1
         if not continuous_row(record):
             continue
         if not enabled:
@@ -284,8 +288,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] continuous ids affected lane exclusion")
         if continuous_ids & as_int_set(record.get("target_eager_verify_proposal_ids_dry_run")):
             errors.append(f"record[{idx}] continuous ids entered target takeover lane")
-        if int_value(record.get("continuous_eager_real_commit_count"), 0) != 0:
+        if not commit_enabled and int_value(record.get("continuous_eager_real_commit_count"), 0) != 0:
             errors.append(f"record[{idx}] continuous eager real commit count is nonzero")
+        if int_value(record.get("continuous_depth2_real_commit_count"), 0) != 0:
+            errors.append(f"record[{idx}] continuous depth-2 real commit count is nonzero")
         if int_value(record.get("missing_buffered_proposal_unexpected_count"), 0) != 0:
             errors.append(f"record[{idx}] aggregate missing buffered proposal unexpected count is nonzero")
         if record.get("missing_buffered_proposal_unexpected_seq_ids"):
@@ -372,6 +378,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "total_trace_records": len(records),
         "records_with_continuous_eager_enabled": records_with_enabled,
         "records_with_continuous_verify_apply_enabled": records_with_verify_apply_enabled,
+        "records_with_continuous_commit_enabled": records_with_commit_enabled,
         "continuous_active_records": active_records,
         "one_shot_committed_proposal_count": int_value(commit_summary.get("committed_proposal_count"), 0),
         "one_shot_committed_token_count": int_value(commit_summary.get("committed_token_count"), 0),
@@ -412,6 +419,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "total_trace_records",
         "records_with_continuous_eager_enabled",
         "records_with_continuous_verify_apply_enabled",
+        "records_with_continuous_commit_enabled",
         "continuous_active_records",
         "one_shot_committed_proposal_count",
         "one_shot_committed_token_count",
