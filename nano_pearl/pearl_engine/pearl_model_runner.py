@@ -60,6 +60,7 @@ CONTINUOUS_EAGER_DRY_RUN_SOURCE = "continuous_shadow"
 CONTINUOUS_EAGER_PARENT_SOURCE = "phase1h6a_one_shot_commit"
 ROLLING_CONTINUOUS_EAGER_DRY_RUN_SOURCE = "rolling_continuous_shadow"
 ROLLING_CONTINUOUS_STAGE = "overlap_dry_run"
+ROLLING_DEPTH3_SHADOW_STAGE = "depth3_shadow_dry_run"
 CONTINUOUS_EAGER_TRANSFER_MAGIC = 0x1A70B
 CONTINUOUS_EAGER_TRANSFER_OP_DRY_RUN = 0x1A70B1
 CONTINUOUS_EAGER_TRANSFER_META_LEN = 7
@@ -83,6 +84,7 @@ CONTINUOUS_EAGER_COMMIT_DEPTH1_OP = 0x1A71C1
 CONTINUOUS_EAGER_COMMIT_DEPTH1_META_LEN = 6
 CONTINUOUS_EAGER_COMMIT_DEPTH1_PAYLOAD_WIDTH = 4
 ROLLING_DEPTH2_COMMIT_SOURCE = "rolling_depth2_ready_only"
+ROLLING_DEPTH3_SHADOW_SOURCE = "rolling_depth3_shadow"
 ROLLING_DEPTH2_COMMIT_MAGIC = 0x1A82C
 ROLLING_DEPTH2_COMMIT_OP = 0x1A82C1
 ROLLING_DEPTH2_COMMIT_META_LEN = 7
@@ -189,6 +191,7 @@ class ModelRunnerBase:
         self._continuous_eager_committed_proposal_ids = set()
         self._rolling_depth2_committed_proposal_ids = set()
         self._rolling_continuous_shadow_proposals_by_id = {}
+        self._rolling_depth3_shadow_proposals_by_id = {}
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -923,6 +926,9 @@ class ModelRunnerBase:
             "enable_rolling_continuous_depth2_commit_ready_only": bool(
                 getattr(self.global_config, "enable_rolling_continuous_depth2_commit_ready_only", False)
             ),
+            "enable_rolling_continuous_depth3_shadow_dry_run": bool(
+                getattr(self.global_config, "enable_rolling_continuous_depth3_shadow_dry_run", False)
+            ),
             "continuous_eager_dry_run_enabled": False,
             "continuous_eager_source": None,
             "continuous_eager_parent_source": None,
@@ -1157,6 +1163,53 @@ class ModelRunnerBase:
             "rolling_depth2_real_committed_token_count": 0,
             "rolling_depth2_commit_skip_reason_counts": {},
             "rolling_depth2_commit_decision_broadcast_payload_len_units": 0,
+            "rolling_depth3_shadow_enabled": False,
+            "rolling_depth3_shadow_stage": None,
+            "rolling_depth3_shadow_source": None,
+            "rolling_depth3_child_generated_proposal_ids": [],
+            "rolling_depth3_child_generated_seq_ids": [],
+            "rolling_depth3_child_parent_by_proposal_id": {},
+            "rolling_depth3_child_root_by_proposal_id": {},
+            "rolling_depth3_child_depth_by_proposal_id": {},
+            "rolling_depth3_child_token_count_by_proposal_id": {},
+            "rolling_depth3_child_base_len_by_proposal_id": {},
+            "rolling_depth3_child_status_by_proposal_id": {},
+            "rolling_depth3_child_status_reason_by_proposal_id": {},
+            "rolling_depth3_child_generation_skipped_proposal_ids": [],
+            "rolling_depth3_child_generation_skipped_parent_by_proposal_id": {},
+            "rolling_depth3_child_generation_skip_reason_by_proposal_id": {},
+            "rolling_depth3_child_generation_skip_reason_counts": {},
+            "rolling_depth3_parent_depth2_real_committed_proposal_ids": [],
+            "rolling_depth3_parent_depth2_full_accept_proposal_ids": [],
+            "rolling_depth3_parent_depth2_skipped_proposal_ids": [],
+            "rolling_depth3_parent_depth2_invalidated_proposal_ids": [],
+            "rolling_depth3_parent_resolution_pending_proposal_ids": [],
+            "rolling_depth3_child_ready_shadow_proposal_ids": [],
+            "rolling_depth3_child_ready_shadow_seq_ids": [],
+            "rolling_depth3_child_invalidated_proposal_ids": [],
+            "rolling_depth3_child_invalidated_reason_by_proposal_id": {},
+            "rolling_depth3_drop_reason_counts": {},
+            "rolling_depth3_parent_resolution_pending_count": 0,
+            "rolling_depth3_same_seq_overlap_count": 0,
+            "rolling_depth3_same_seq_overlap_seq_ids": [],
+            "rolling_depth3_normal_lane_conflict_count": 0,
+            "rolling_depth3_normal_lane_conflict_seq_ids": [],
+            "rolling_depth3_normal_lane_excluded_seq_ids": [],
+            "rolling_depth3_real_commit_count": 0,
+            "rolling_depth_gt3_real_commit_count": 0,
+            "rolling_depth3_committed_without_parent_depth2_commit_ids": [],
+            "rolling_depth3_committed_without_ready_shadow_ids": [],
+            "rolling_depth3_committed_invalidated_child_ids": [],
+            "rolling_depth3_committed_cascade_discarded_child_ids": [],
+            "rolling_depth3_duplicate_child_ids": [],
+            "rolling_depth3_frontier_mismatch_count": 0,
+            "rolling_depth3_child_candidate_proposal_count": 0,
+            "rolling_depth3_child_candidate_token_count": 0,
+            "rolling_depth3_child_ready_shadow_proposal_count": 0,
+            "rolling_depth3_child_ready_shadow_token_count": 0,
+            "rolling_depth3_child_invalidated_count": 0,
+            "rolling_depth3_max_depth_observed": 0,
+            "rolling_depth3_shadow_generation_time_ms": 0.0,
             "rolling_child_verified_without_parent_full_accept_count": 0,
             "rolling_child_committed_without_parent_full_accept_count": 0,
             "rolling_child_drafted_without_valid_parent_count": 0,
@@ -1663,6 +1716,9 @@ class ModelRunnerBase:
 
     def _rolling_depth2_commit_ready_only_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_rolling_continuous_depth2_commit_ready_only", False))
+
+    def _rolling_depth3_shadow_dry_run_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_rolling_continuous_depth3_shadow_dry_run", False))
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -5964,6 +6020,14 @@ class ModelRunnerBase:
                         dict(self._rolling_continuous_shadow_proposals_by_id),
                         self._local_sequence_by_id(),
                     )
+                    if self._rolling_depth3_shadow_dry_run_enabled():
+                        self._run_rolling_depth3_shadow_dry_run(
+                            plan,
+                            trace_record,
+                            dict(self._rolling_continuous_shadow_proposals_by_id),
+                            self._local_sequence_by_id(),
+                            self._eager_transfer_plan_context(plan, trace_record),
+                        )
 
     def _receive_eager_commit_ready_only_decision(
         self,
@@ -8667,6 +8731,343 @@ class ModelRunnerBase:
         trace_record["rolling_depth2_real_commit_count"] = len(committed_ids)
         trace_record["rolling_depth_gt1_real_commit_count"] = 0
         self._record_elapsed_ms(trace_record, "rolling_depth2_commit_time_ms", timer_start)
+
+    def _run_rolling_depth3_shadow_dry_run(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        known_by_id: dict[int, EagerProposal],
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+    ) -> None:
+        if not self._rolling_depth3_shadow_dry_run_enabled():
+            return
+        timer_start = time.perf_counter()
+        gamma = int(self.gamma)
+        max_depth, max_children, max_seqs = self._rolling_continuous_limits()
+        trace_record["enable_rolling_continuous_depth3_shadow_dry_run"] = True
+        trace_record["rolling_depth3_shadow_enabled"] = True
+        trace_record["rolling_depth3_shadow_stage"] = ROLLING_DEPTH3_SHADOW_STAGE
+        trace_record["rolling_depth3_shadow_source"] = ROLLING_DEPTH3_SHADOW_SOURCE
+
+        committed_ids = [
+            int(proposal_id)
+            for proposal_id in trace_record.get("rolling_depth2_real_committed_proposal_ids", [])
+        ]
+        committed_seq_by_id = dict(
+            zip(
+                committed_ids,
+                [int(seq_id) for seq_id in trace_record.get("rolling_depth2_real_committed_seq_ids", [])],
+            )
+        )
+        candidate_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("rolling_depth2_commit_candidate_proposal_ids", [])
+        }
+        skipped_ids = {
+            int(proposal_id)
+            for proposal_id in trace_record.get("rolling_depth2_real_commit_skipped_proposal_ids", [])
+        }
+        pending_ids = sorted(candidate_ids - set(committed_ids) - skipped_ids)
+        invalidated_parent_ids = set(
+            int(proposal_id)
+            for proposal_id in trace_record.get("rolling_child_invalidated_proposal_ids", [])
+        )
+        invalidated_parent_ids.update(
+            int(proposal_id)
+            for proposal_id in trace_record.get("rolling_cascade_discarded_proposal_ids", [])
+        )
+        action_by_id = trace_record.get("rolling_depth2_real_commit_action_by_proposal_id", {})
+        result_by_id = trace_record.get("rolling_depth2_real_commit_verify_result_by_proposal_id", {})
+        parent_by_id = trace_record.get("rolling_depth2_real_commit_parent_by_proposal_id", {})
+        root_by_id = trace_record.get("rolling_depth2_real_commit_root_by_proposal_id", {})
+        depth_by_id = trace_record.get("rolling_depth2_real_commit_depth_by_proposal_id", {})
+        token_by_id = trace_record.get("rolling_depth2_real_committed_token_count_by_proposal_id", {})
+        accept_by_id = trace_record.get("rolling_depth2_real_committed_accept_len_by_proposal_id", {})
+        precondition_ok_by_id = trace_record.get("rolling_depth2_commit_precondition_ok_by_proposal_id", {})
+        len_match_by_seq = trace_record.get("rolling_depth2_target_draft_len_match_by_seq_id", {})
+        token_match_by_seq = trace_record.get("rolling_depth2_target_draft_token_match_by_seq_id", {})
+        after_len_by_seq = trace_record.get("rolling_depth2_draft_seq_len_after_by_seq_id", {})
+
+        child_ids: list[int] = []
+        child_seq_ids: list[int] = []
+        ready_ids: list[int] = []
+        ready_seq_ids: list[int] = []
+        invalidated_ids: list[int] = []
+        invalidated_reason_by_id: dict[int, str] = {}
+        child_parent_by_id: dict[int, int] = {}
+        child_root_by_id: dict[int, int] = {}
+        child_depth_by_id: dict[int, int] = {}
+        child_token_by_id: dict[int, int] = {}
+        child_base_len_by_id: dict[int, int] = {}
+        child_status_by_id: dict[int, str] = {}
+        child_status_reason_by_id: dict[int, str] = {}
+        skipped_child_ids: list[int] = []
+        skipped_parent_by_child_id: dict[int, int] = {}
+        skipped_reason_by_child_id: dict[int, str] = {}
+        duplicate_child_ids: list[int] = []
+        frontier_mismatch_ids: list[int] = []
+        selected: list[tuple[int, int, int, int, EagerProposal | None, Sequence, dict]] = []
+        seen_seq_ids: set[int] = set()
+
+        for proposal_id in committed_ids:
+            if len(selected) >= max_children or len(seen_seq_ids) >= max_seqs:
+                break
+            seq_id = int(committed_seq_by_id.get(proposal_id, -1))
+            if seq_id < 0 or seq_id in seen_seq_ids:
+                continue
+            seq = seq_by_id.get(seq_id)
+            parent_proposal = known_by_id.get(proposal_id)
+            root_id = int(self._trace_map_get(root_by_id, proposal_id, -1))
+            parent_id = int(self._trace_map_get(parent_by_id, proposal_id, -1))
+            parent_depth = int(self._trace_map_get(depth_by_id, proposal_id, 0))
+            child_id = self._continuous_shadow_proposal_id(root_id, 3)
+            child_parent_by_id[child_id] = int(proposal_id)
+            child_root_by_id[child_id] = int(root_id)
+            child_depth_by_id[child_id] = 3
+            child_token_by_id[child_id] = gamma
+            child_base = int(self._trace_map_get(after_len_by_seq, seq_id, -1))
+            if child_base < 0 and seq is not None:
+                child_base = int(len(seq))
+            child_base_len_by_id[child_id] = child_base
+
+            token_count = int(self._trace_map_get(token_by_id, proposal_id, 0))
+            accept_len = int(self._trace_map_get(accept_by_id, proposal_id, token_count))
+            reason = None
+            if 3 > max_depth:
+                reason = "max_depth_exceeded"
+            elif parent_depth != 2:
+                reason = "parent_depth2_depth_mismatch"
+            elif parent_id < 0 or root_id < 0:
+                reason = "parent_depth2_chain_missing"
+            elif parent_proposal is None:
+                reason = "parent_depth2_missing_shadow_proposal"
+            elif proposal_id in invalidated_parent_ids:
+                reason = "parent_depth2_invalidated"
+            elif bool(self._trace_map_get(precondition_ok_by_id, proposal_id, True)) is not True:
+                reason = "parent_depth2_precondition_failed"
+            elif str(self._trace_map_get(result_by_id, proposal_id, "")) != "full_accept":
+                reason = "parent_depth2_not_full_accept"
+            elif str(self._trace_map_get(action_by_id, proposal_id, "")) != "append_full_accept_real_commit":
+                reason = "parent_depth2_bad_action"
+            elif token_count <= 0 or accept_len != token_count:
+                reason = "parent_depth2_token_mismatch"
+            elif self._trace_map_get(len_match_by_seq, seq_id, True) is not True:
+                reason = "parent_depth2_len_mismatch"
+            elif self._trace_map_get(token_match_by_seq, seq_id, True) is not True:
+                reason = "parent_depth2_token_mismatch"
+            elif child_id in self._rolling_depth3_shadow_proposals_by_id:
+                reason = "duplicate_child"
+                duplicate_child_ids.append(child_id)
+            elif seq is None:
+                reason = "seq_not_found"
+            elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                reason = "parent_depth2_finished"
+            elif self.is_request_level_finished(seq, plan_context):
+                reason = "parent_depth2_finished"
+            elif bool(getattr(seq, "pre_verify", True)):
+                reason = "seq_pre_verify"
+            elif self.is_speculative_span_invalidated(seq, plan_context):
+                reason = "parent_depth2_invalidated"
+            elif int(len(seq)) != child_base:
+                reason = "frontier_mismatch"
+                frontier_mismatch_ids.append(child_id)
+
+            if reason is not None:
+                skipped_child_ids.append(child_id)
+                skipped_parent_by_child_id[child_id] = int(proposal_id)
+                skipped_reason_by_child_id[child_id] = str(reason)
+                child_status_by_id[child_id] = (
+                    "DEPTH3_DROPPED_FRONTIER_MISMATCH"
+                    if reason == "frontier_mismatch"
+                    else "DEPTH3_INVALIDATED_PARENT_FINISHED"
+                    if reason == "parent_depth2_finished"
+                    else "DEPTH3_INVALIDATED_PARENT_NOT_FULL_ACCEPT"
+                    if reason in {"parent_depth2_not_full_accept", "parent_depth2_bad_action", "parent_depth2_token_mismatch"}
+                    else "DEPTH3_INVALIDATED_PARENT_STALE"
+                    if reason in {"seq_not_found", "seq_pre_verify"}
+                    else "DEPTH3_INVALIDATED_PARENT_NOT_COMMITTED"
+                )
+                child_status_reason_by_id[child_id] = str(reason)
+                continue
+
+            checkpoint = self._make_eager_apply_checkpoint(seq)
+            child_ids.append(child_id)
+            child_seq_ids.append(seq_id)
+            ready_ids.append(child_id)
+            ready_seq_ids.append(seq_id)
+            child_status_by_id[child_id] = "DEPTH3_CHILD_GENERATED_SHADOW"
+            child_status_reason_by_id[child_id] = "parent_depth2_committed"
+            selected.append((child_id, proposal_id, root_id, child_base, parent_proposal, seq, checkpoint))
+            seen_seq_ids.add(seq_id)
+
+        generated_by_child_id: dict[int, list[int]] = {child_id: [] for child_id, *_rest in selected}
+        valid_seqs = [seq for _child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint in selected]
+        draft_error: BaseException | None = None
+        try:
+            for _ in range(gamma):
+                if not valid_seqs:
+                    break
+                self._allocate_decode_slots_for_dual(valid_seqs, plan, "rolling_depth3_shadow_dry_run")
+                input_ids, positions = self.prepare_pearl_decode(valid_seqs)
+                torch.cuda.synchronize()
+                logits = self.run_model(input_ids, positions, False)
+                if self.tp_params.local_rank == 0:
+                    sample_tokens = logits.argmax(dim=-1)
+                else:
+                    sample_tokens = torch.zeros(
+                        len(valid_seqs),
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    ).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                torch.cuda.synchronize()
+                reset_context(self.tp_params)
+                for (child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint), token_id in zip(
+                    selected,
+                    sample_tokens.tolist(),
+                ):
+                    int_token_id = int(token_id)
+                    seq.append_token(int_token_id)
+                    generated_by_child_id[int(child_id)].append(int_token_id)
+
+            for child_id, parent_id, root_id, child_base, parent_proposal, seq, checkpoint in selected:
+                child_tokens = [int(token_id) for token_id in generated_by_child_id[child_id]]
+                to_be_verified = [int(token_id) for token_id in seq.token_ids[-2 * gamma + 1:-gamma + 1]]
+                if len(child_tokens) != gamma or len(to_be_verified) != gamma:
+                    invalidated_ids.append(child_id)
+                    invalidated_reason_by_id[child_id] = "invalid_depth3_token_span"
+                    child_status_by_id[child_id] = "DEPTH3_INVALIDATED_PARENT_STALE"
+                    child_status_reason_by_id[child_id] = "invalid_depth3_token_span"
+                    if child_id in ready_ids:
+                        ready_ids.remove(child_id)
+                    if int(seq.seq_id) in ready_seq_ids:
+                        ready_seq_ids.remove(int(seq.seq_id))
+                    continue
+                proposal = EagerProposal(
+                    proposal_id=int(child_id),
+                    seq_id=int(seq.seq_id),
+                    request_id=seq.request_id,
+                    lane=LANE_EAGER,
+                    parent_proposal_id=int(parent_id),
+                    parent_kind=LANE_EAGER,
+                    parent_step_id=getattr(parent_proposal, "real_rolling_depth2_commit_step_id", None),
+                    source_step_id=0 if plan.step_id is None else int(plan.step_id),
+                    source_plan_id=int(plan.plan_id),
+                    home_batch_id=-1 if seq.home_batch_id is None else int(seq.home_batch_id),
+                    base_len=int(child_base),
+                    base_pre_verify=bool(checkpoint["pre_verify"]),
+                    base_num_completion_tokens=int(checkpoint["num_completion_tokens"]),
+                    proposal_token_ids=child_tokens,
+                    to_be_verified_token_ids=to_be_verified,
+                    proposal_len=gamma,
+                    state=EAGER_STATE_READY_TO_VERIFY,
+                    valid=True,
+                )
+                self._rolling_depth3_shadow_proposals_by_id[int(child_id)] = proposal
+                child_status_by_id[child_id] = "DEPTH3_READY_AFTER_PARENT_DEPTH2_COMMIT"
+                child_status_reason_by_id[child_id] = "parent_depth2_committed_full_accept"
+        except BaseException as exc:
+            draft_error = exc
+        finally:
+            for _child_id, _parent_id, _root_id, _base, _parent, seq, checkpoint in selected:
+                rollback_len = int(len(seq)) - int(checkpoint["len"])
+                if rollback_len > 0:
+                    self.scheduler.rollback(seq, rollback_len)
+                if not self._sequence_matches_eager_apply_checkpoint(seq, checkpoint):
+                    self._restore_eager_apply_checkpoint(seq, checkpoint)
+
+        if draft_error is not None:
+            raise draft_error
+
+        rolling_seq_ids = set(child_seq_ids) | {int(seq_id) for seq_id in committed_seq_by_id.values() if int(seq_id) >= 0}
+        normal_excluded, normal_conflicts = self._rolling_normal_lane_conflicts(trace_record, rolling_seq_ids)
+        overlap_seq_ids = sorted(set(child_seq_ids) & set(committed_seq_by_id.values()))
+        reason_counts: dict[str, int] = {}
+        for reason in invalidated_reason_by_id.values():
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        skip_reason_counts: dict[str, int] = {}
+        for reason in skipped_reason_by_child_id.values():
+            skip_reason_counts[reason] = int(skip_reason_counts.get(reason, 0)) + 1
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+        traced_child_ids = set(child_ids) | set(invalidated_ids) | set(skipped_child_ids)
+        trace_record["rolling_depth3_child_generated_proposal_ids"] = list(child_ids)
+        trace_record["rolling_depth3_child_generated_seq_ids"] = list(child_seq_ids)
+        trace_record["rolling_depth3_child_parent_by_proposal_id"] = {
+            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(child_parent_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_root_by_proposal_id"] = {
+            str(proposal_id): int(root_id) for proposal_id, root_id in sorted(child_root_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_depth_by_proposal_id"] = {
+            str(proposal_id): int(depth) for proposal_id, depth in sorted(child_depth_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_token_count_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(child_token_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_base_len_by_proposal_id"] = {
+            str(proposal_id): int(value) for proposal_id, value in sorted(child_base_len_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_status_by_proposal_id"] = {
+            str(proposal_id): status for proposal_id, status in sorted(child_status_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_status_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(child_status_reason_by_id.items())
+            if proposal_id in traced_child_ids
+        }
+        trace_record["rolling_depth3_child_generation_skipped_proposal_ids"] = sorted(set(skipped_child_ids))
+        trace_record["rolling_depth3_child_generation_skipped_parent_by_proposal_id"] = {
+            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(skipped_parent_by_child_id.items())
+        }
+        trace_record["rolling_depth3_child_generation_skip_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(skipped_reason_by_child_id.items())
+        }
+        trace_record["rolling_depth3_child_generation_skip_reason_counts"] = dict(sorted(skip_reason_counts.items()))
+        trace_record["rolling_depth3_parent_depth2_real_committed_proposal_ids"] = list(committed_ids)
+        trace_record["rolling_depth3_parent_depth2_full_accept_proposal_ids"] = sorted(set(committed_ids))
+        trace_record["rolling_depth3_parent_depth2_skipped_proposal_ids"] = sorted(skipped_ids)
+        trace_record["rolling_depth3_parent_depth2_invalidated_proposal_ids"] = sorted(invalidated_parent_ids & candidate_ids)
+        trace_record["rolling_depth3_parent_resolution_pending_proposal_ids"] = list(pending_ids)
+        trace_record["rolling_depth3_parent_resolution_pending_count"] = len(pending_ids)
+        trace_record["rolling_depth3_child_ready_shadow_proposal_ids"] = sorted(set(ready_ids) - set(invalidated_ids))
+        trace_record["rolling_depth3_child_ready_shadow_seq_ids"] = sorted(set(ready_seq_ids))
+        trace_record["rolling_depth3_child_invalidated_proposal_ids"] = sorted(set(invalidated_ids))
+        trace_record["rolling_depth3_child_invalidated_reason_by_proposal_id"] = {
+            str(proposal_id): reason for proposal_id, reason in sorted(invalidated_reason_by_id.items())
+        }
+        trace_record["rolling_depth3_drop_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["rolling_depth3_same_seq_overlap_count"] = len(overlap_seq_ids)
+        trace_record["rolling_depth3_same_seq_overlap_seq_ids"] = overlap_seq_ids
+        trace_record["rolling_depth3_normal_lane_excluded_seq_ids"] = normal_excluded
+        trace_record["rolling_depth3_normal_lane_conflict_seq_ids"] = normal_conflicts
+        trace_record["rolling_depth3_normal_lane_conflict_count"] = len(normal_conflicts)
+        trace_record["rolling_depth3_real_commit_count"] = 0
+        trace_record["rolling_depth_gt3_real_commit_count"] = 0
+        trace_record["rolling_depth3_committed_without_parent_depth2_commit_ids"] = []
+        trace_record["rolling_depth3_committed_without_ready_shadow_ids"] = []
+        trace_record["rolling_depth3_committed_invalidated_child_ids"] = []
+        trace_record["rolling_depth3_committed_cascade_discarded_child_ids"] = []
+        trace_record["rolling_depth3_duplicate_child_ids"] = sorted(set(duplicate_child_ids))
+        trace_record["rolling_depth3_frontier_mismatch_count"] = len(set(frontier_mismatch_ids))
+        trace_record["rolling_depth3_child_candidate_proposal_count"] = len(set(child_ids))
+        trace_record["rolling_depth3_child_candidate_token_count"] = len(set(child_ids)) * gamma
+        ready_set = set(trace_record["rolling_depth3_child_ready_shadow_proposal_ids"])
+        trace_record["rolling_depth3_child_ready_shadow_proposal_count"] = len(ready_set)
+        trace_record["rolling_depth3_child_ready_shadow_token_count"] = len(ready_set) * gamma
+        trace_record["rolling_depth3_child_invalidated_count"] = len(set(invalidated_ids))
+        trace_record["rolling_depth3_max_depth_observed"] = 3 if child_ids or invalidated_ids or skipped_child_ids else 0
+        trace_record["max_rolling_continuous_depth_observed"] = max(
+            int(trace_record.get("max_rolling_continuous_depth_observed", 0) or 0),
+            int(trace_record["rolling_depth3_max_depth_observed"]),
+        )
+        self._record_elapsed_ms(trace_record, "rolling_depth3_shadow_generation_time_ms", timer_start)
 
 
     def _run_eager_commit_ready_only(
