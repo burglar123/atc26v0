@@ -354,6 +354,8 @@ def aggregate_performance_accounting(
     rolling_child_invalidated_ids: set[int] = set()
     rolling_child_token_by_id: dict[int, int] = {}
     rolling_drop_reason_by_id: dict[int, str] = {}
+    rolling_parent_full_accept_ids: set[int] = set()
+    rolling_parent_partial_reject_ids: set[int] = set()
     rolling_same_seq_overlap_count = 0
     rolling_normal_lane_conflict_count = 0
     rolling_cascade_discard_ids: set[int] = set()
@@ -539,6 +541,8 @@ def aggregate_performance_accounting(
             as_int_set(record.get("rolling_child_ready_after_parent_full_accept_proposal_ids"))
         )
         rolling_child_invalidated_ids.update(as_int_set(record.get("rolling_child_invalidated_proposal_ids")))
+        rolling_parent_full_accept_ids.update(as_int_set(record.get("rolling_parent_full_accept_proposal_ids")))
+        rolling_parent_partial_reject_ids.update(as_int_set(record.get("rolling_parent_partial_reject_proposal_ids")))
         for proposal_id in as_int_set(record.get("rolling_child_generated_proposal_ids")):
             rolling_child_token_by_id.setdefault(proposal_id, max(0, gamma))
         reason_map = record.get("rolling_child_invalidated_reason_by_proposal_id")
@@ -824,6 +828,12 @@ def aggregate_performance_accounting(
         "rolling_child_ready_shadow_token_count": rolling_child_ready_shadow_token_count,
         "rolling_child_invalidated_count": len(rolling_child_invalidated_ids),
         "rolling_cascade_discard_count": len(rolling_cascade_discard_ids),
+        "rolling_parent_full_accept_count": len(rolling_parent_full_accept_ids),
+        "rolling_parent_partial_reject_count": len(rolling_parent_partial_reject_ids),
+        "rolling_parent_resolution_pending_count": max(
+            0,
+            len(rolling_child_candidate_ids) - len(rolling_parent_full_accept_ids) - len(rolling_parent_partial_reject_ids),
+        ),
         "rolling_same_seq_overlap_count": rolling_same_seq_overlap_count,
         "rolling_normal_lane_conflict_count": rolling_normal_lane_conflict_count,
         "rolling_depth2_real_commit_count": rolling_depth2_real_commit_count,
@@ -986,6 +996,9 @@ def validate_accounting(
         "rolling_child_ready_shadow_token_count",
         "rolling_child_invalidated_count",
         "rolling_cascade_discard_count",
+        "rolling_parent_full_accept_count",
+        "rolling_parent_partial_reject_count",
+        "rolling_parent_resolution_pending_count",
         "rolling_same_seq_overlap_count",
         "rolling_normal_lane_conflict_count",
         "rolling_depth2_real_commit_count",
@@ -1095,6 +1108,9 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_child_ready_shadow_token_count",
         "rolling_child_invalidated_count",
         "rolling_cascade_discard_count",
+        "rolling_parent_full_accept_count",
+        "rolling_parent_partial_reject_count",
+        "rolling_parent_resolution_pending_count",
         "rolling_same_seq_overlap_count",
         "rolling_normal_lane_conflict_count",
         "rolling_depth2_real_commit_count",

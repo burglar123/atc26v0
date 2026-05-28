@@ -154,7 +154,23 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         invalid_reason_by_id = as_str_map(record.get("rolling_child_invalidated_reason_by_proposal_id"))
         cascade_reason_by_id = as_str_map(record.get("rolling_cascade_discard_reason_by_proposal_id"))
         full_accept_parent_ids = as_int_set(record.get("rolling_parent_full_accept_proposal_ids"))
+        full_accept_parent_ids.update(as_int_set(record.get("continuous_eager_full_accept_proposal_ids")))
+        full_accept_parent_ids.update(as_int_set(record.get("continuous_eager_commit_ready_shadow_proposal_ids")))
+        full_accept_parent_ids.update(as_int_set(record.get("continuous_eager_real_committed_proposal_ids")))
         partial_parent_ids = as_int_set(record.get("rolling_parent_partial_reject_proposal_ids"))
+        partial_parent_ids.update(as_int_set(record.get("continuous_eager_partial_reject_proposal_ids")))
+        resolved_parent_ids = set(full_accept_parent_ids) | set(partial_parent_ids)
+        verify_result_by_id = as_str_map(record.get("continuous_eager_verify_result_by_proposal_id"))
+        verify_result_by_id.update(as_str_map(record.get("continuous_eager_sync_apply_draft_verify_result_by_proposal_id")))
+        verify_result_by_id.update(as_str_map(record.get("continuous_eager_sync_apply_target_verify_result_by_proposal_id")))
+        verify_result_by_id.update(as_str_map(record.get("continuous_eager_real_commit_verify_result_by_proposal_id")))
+        for proposal_id, verify_result in verify_result_by_id.items():
+            if verify_result == "full_accept":
+                full_accept_parent_ids.add(proposal_id)
+            elif verify_result not in {"unknown", "not_executed"}:
+                partial_parent_ids.add(proposal_id)
+            if verify_result not in {"unknown", "not_executed"}:
+                resolved_parent_ids.add(proposal_id)
         max_depth = int_value(record.get("max_rolling_continuous_depth"), 0)
         observed_depth = max(
             int_value(record.get("rolling_max_depth_observed"), 0),
@@ -229,6 +245,27 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
                 errors.append(f"record[{idx}] rolling child {child_id} missing from parent children map")
             if not status_by_id.get(child_id):
                 errors.append(f"record[{idx}] rolling child {child_id} missing status")
+            child_reason = invalid_reason_by_id.get(child_id) or status_reason_by_id.get(child_id, "")
+            if parent_id in full_accept_parent_ids:
+                if child_id not in ready_ids:
+                    errors.append(f"record[{idx}] rolling child {child_id} not ready despite full-accept parent {parent_id}")
+                if child_id in invalidated_ids:
+                    errors.append(f"record[{idx}] rolling child {child_id} invalidated despite full-accept parent {parent_id}")
+                if child_id in cascade_ids:
+                    errors.append(f"record[{idx}] rolling child {child_id} cascade-discarded despite full-accept parent {parent_id}")
+                if child_reason == "parent_verify_pending":
+                    errors.append(f"record[{idx}] rolling child {child_id} pending despite full-accept parent {parent_id}")
+            elif parent_id in partial_parent_ids:
+                if child_id not in invalidated_ids:
+                    errors.append(f"record[{idx}] rolling child {child_id} not invalidated despite not-full-accept parent {parent_id}")
+                if child_reason not in {
+                    "parent_partial_accept",
+                    "parent_rejected",
+                    "parent_not_full_accept",
+                }:
+                    errors.append(f"record[{idx}] rolling child {child_id} has bad not-full-accept reason {child_reason!r}")
+            elif child_reason == "parent_verify_pending" and parent_id in resolved_parent_ids:
+                errors.append(f"record[{idx}] rolling child {child_id} pending after resolved parent {parent_id}")
 
         if ready_ids & invalidated_ids:
             errors.append(f"record[{idx}] rolling child cannot be both ready and invalidated")
@@ -258,6 +295,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         for child_id, reason in status_reason_by_id.items():
             if reason:
                 reason_counter[reason] += 0
+        full_accept_child_ids = {
+            child_id for child_id in generated_ids if parent_by_id.get(child_id) in full_accept_parent_ids
+        }
+        if full_accept_child_ids and not (full_accept_child_ids & ready_ids):
+            errors.append(f"record[{idx}] no rolling children became ready despite full-accept parents")
 
     summary = {
         "total_trace_records": len(records),
@@ -394,6 +436,28 @@ def run_synthetic() -> None:
     errors, _summary = validate_records([depth2_commit])
     if not errors:
         raise SystemExit("synthetic depth2 real commit should fail")
+    resolved_parent_pending = deepcopy(valid)
+    resolved_parent_pending["rolling_child_ready_after_parent_full_accept_proposal_ids"] = []
+    resolved_parent_pending["rolling_child_invalidated_proposal_ids"] = [102]
+    resolved_parent_pending["rolling_child_invalidated_reason_by_proposal_id"] = {"102": "parent_verify_pending"}
+    resolved_parent_pending["rolling_chain_status_by_proposal_id"] = {
+        "101": "PARENT_FULL_ACCEPT",
+        "102": "CHILD_DROPPED",
+    }
+    resolved_parent_pending["continuous_eager_commit_ready_shadow_proposal_ids"] = [101]
+    errors, _summary = validate_records([resolved_parent_pending])
+    if not errors:
+        raise SystemExit("synthetic resolved parent with pending child should fail")
+    partial_parent_pending = deepcopy(valid)
+    partial_parent_pending["rolling_parent_full_accept_proposal_ids"] = []
+    partial_parent_pending["rolling_parent_partial_reject_proposal_ids"] = [101]
+    partial_parent_pending["rolling_child_ready_after_parent_full_accept_proposal_ids"] = []
+    partial_parent_pending["rolling_child_invalidated_proposal_ids"] = [102]
+    partial_parent_pending["rolling_child_invalidated_reason_by_proposal_id"] = {"102": "parent_verify_pending"}
+    partial_parent_pending["continuous_eager_verify_result_by_proposal_id"] = {"101": "partial_accept"}
+    errors, _summary = validate_records([partial_parent_pending])
+    if not errors:
+        raise SystemExit("synthetic partial parent with pending child should fail")
     print("Synthetic rolling continuous eager dry-run checks passed.")
 
 

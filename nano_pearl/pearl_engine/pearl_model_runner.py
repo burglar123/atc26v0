@@ -6476,12 +6476,29 @@ class ModelRunnerBase:
         }
         child_ids = [int(proposal_id) for proposal_id in trace_record.get("rolling_child_generated_proposal_ids", [])]
         parent_verified = set(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_verified_proposal_ids", []))
+        parent_verified.update(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_result_transfer_validated_proposal_ids", []))
+        parent_verified.update(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_sync_apply_executed_proposal_ids", []))
         parent_full = set(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_full_accept_proposal_ids", []))
+        parent_full.update(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_commit_ready_shadow_proposal_ids", []))
+        parent_full.update(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_real_committed_proposal_ids", []))
         parent_partial = set(int(proposal_id) for proposal_id in trace_record.get("continuous_eager_partial_reject_proposal_ids", []))
         verify_result_by_id = {
             int(key): str(value)
             for key, value in (trace_record.get("continuous_eager_verify_result_by_proposal_id") or {}).items()
         }
+        for field_name in (
+            "continuous_eager_sync_apply_draft_verify_result_by_proposal_id",
+            "continuous_eager_sync_apply_target_verify_result_by_proposal_id",
+            "continuous_eager_real_commit_verify_result_by_proposal_id",
+        ):
+            for key, value in (trace_record.get(field_name) or {}).items():
+                verify_result_by_id[int(key)] = str(value)
+        for proposal_id, verify_result in verify_result_by_id.items():
+            parent_verified.add(int(proposal_id))
+            if verify_result == "full_accept":
+                parent_full.add(int(proposal_id))
+            elif verify_result not in {"unknown", "not_executed"}:
+                parent_partial.add(int(proposal_id))
 
         ready_child_ids: list[int] = []
         ready_seq_ids: list[int] = []
@@ -6520,12 +6537,10 @@ class ModelRunnerBase:
                 status_by_id[child_id] = "CHILD_DROPPED"
                 invalidated_ids.append(child_id)
                 invalidated_reason_by_id[child_id] = existing_reason
-                cascade_ids.append(child_id)
-                cascade_reason_by_id[child_id] = existing_reason
-                cascade_depth_by_id[child_id] = depth
                 continue
             if parent_id in parent_full:
                 status_by_id[child_id] = "CHILD_READY_AFTER_PARENT_FULL_ACCEPT"
+                reason_by_id[child_id] = "parent_full_accept"
                 ready_child_ids.append(child_id)
                 ready_seq_ids.append(int(proposal_seq_by_id.get(child_id, -1)))
                 continue
@@ -6540,20 +6555,18 @@ class ModelRunnerBase:
                 reason = "parent_verify_pending"
             else:
                 reason = "parent_not_full_accept"
-            if reason != "parent_verify_pending":
-                parent_invalidated_ids.append(parent_id)
-            status_by_id[child_id] = "CHILD_INVALIDATED_PARENT_REJECT" if reason in {
-                "parent_partial_accept",
-                "parent_rejected",
-                "parent_not_full_accept",
-            } else "CHILD_DROPPED"
             reason_by_id[child_id] = reason
+            if reason == "parent_verify_pending":
+                status_by_id[child_id] = "PARENT_VERIFY_PENDING"
+                continue
+            parent_invalidated_ids.append(parent_id)
+            status_by_id[child_id] = (
+                "CHILD_INVALIDATED_PARENT_PARTIAL_ACCEPT"
+                if reason == "parent_partial_accept"
+                else "CHILD_INVALIDATED_PARENT_NOT_FULL_ACCEPT"
+            )
             invalidated_ids.append(child_id)
             invalidated_reason_by_id[child_id] = reason
-            if reason != "parent_verify_pending":
-                cascade_ids.append(child_id)
-                cascade_reason_by_id[child_id] = reason
-                cascade_depth_by_id[child_id] = depth
 
         trace_record["rolling_parent_verified_proposal_ids"] = sorted(parent_verified)
         trace_record["rolling_parent_full_accept_proposal_ids"] = sorted(parent_full)
