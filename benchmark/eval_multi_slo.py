@@ -232,6 +232,9 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_rolling_continuous_depth4_shadow_dry_run": (
             args.enable_rolling_continuous_depth4_shadow_dry_run
         ),
+        "enable_rolling_continuous_depth4_commit_ready_only": (
+            args.enable_rolling_continuous_depth4_commit_ready_only
+        ),
         "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
         "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
         "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
@@ -282,6 +285,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_rolling_continuous_depth3_shadow_dry_run",
         "enable_rolling_continuous_depth3_commit_ready_only",
         "enable_rolling_continuous_depth4_shadow_dry_run",
+        "enable_rolling_continuous_depth4_commit_ready_only",
         "max_continuous_eager_chain_depth",
         "max_continuous_eager_requests_per_step",
         "max_continuous_eager_tokens_per_step",
@@ -1696,6 +1700,11 @@ def main() -> None:
         "--enable-rolling-continuous-depth4-shadow-dry-run",
         action="store_true",
         help="Enable Phase 1H-8o rolling depth-4 shadow dry-run without depth-4 real commit.",
+    )
+    parser.add_argument(
+        "--enable-rolling-continuous-depth4-commit-ready-only",
+        action="store_true",
+        help="Enable Phase 1H-8p guarded real rolling depth-4 commit for ready shadow children.",
     )
     parser.add_argument("--max-continuous-eager-chain-depth", type=int, default=1)
     parser.add_argument("--max-continuous-eager-requests-per-step", type=int, default=2)

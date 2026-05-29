@@ -42,6 +42,7 @@ ACCOUNTING_TOKEN_KEYS = {
     1: "continuous_eager_real_committed_token_count",
     2: "rolling_depth2_real_committed_token_count",
     3: "rolling_depth3_real_committed_token_count",
+    4: "rolling_depth4_real_committed_token_count",
 }
 
 DEPTH_INCREMENT_SPECS = {
@@ -88,6 +89,17 @@ DEPTH_INCREMENT_SPECS = {
         "draft_accepted": "rolling_depth3_draft_actual_accepted_token_increment_sum",
         "draft_rejected": "rolling_depth3_draft_actual_rejected_token_increment_sum",
         "draft_invalidated": "rolling_depth3_draft_actual_invalidated_token_increment_sum",
+    },
+    4: {
+        "label": "depth4",
+        "target_verified": "rolling_depth4_target_actual_verified_token_increment_sum",
+        "target_accepted": "rolling_depth4_target_actual_accepted_token_increment_sum",
+        "target_rejected": "rolling_depth4_target_actual_rejected_token_increment_sum",
+        "target_invalidated": "rolling_depth4_target_actual_invalidated_token_increment_sum",
+        "draft_verified": "rolling_depth4_draft_actual_verified_token_increment_sum",
+        "draft_accepted": "rolling_depth4_draft_actual_accepted_token_increment_sum",
+        "draft_rejected": "rolling_depth4_draft_actual_rejected_token_increment_sum",
+        "draft_invalidated": "rolling_depth4_draft_actual_invalidated_token_increment_sum",
     },
 }
 
@@ -222,10 +234,10 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
                 errors.append(f"proposal {proposal_id} root {node.root_id} differs from parent {node.parent_id} root {parent_root}")
 
     if registry.higher_depth_commit_ids:
-        errors.append(f"depth>3 committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
-    if registry.depth4_real_commit_count:
-        errors.append("rolling depth4 real commit count must be zero")
-    if registry.depth_gt3_real_commit_count:
+        errors.append(f"depth>4 committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
+    if registry.depth4_real_commit_count and not registry.flags.get("rolling_depth4_commit_enabled", False):
+        errors.append("rolling depth4 real commit count requires depth4 commit flag")
+    if registry.depth_gt3_real_commit_count and not registry.flags.get("rolling_depth4_commit_enabled", False):
         errors.append("rolling depth>3 real commit count must be zero")
     if registry.depth_gt4_real_commit_count:
         errors.append("rolling depth>4 real commit count must be zero")
@@ -235,6 +247,11 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
         errors.append("unexpected missing buffered proposal evidence present")
     if registry.committed_by_depth[3] and not registry.flags.get("rolling_depth3_commit_enabled", False):
         errors.append("depth3 real commit appears while depth3 commit flag is disabled")
+    if registry.committed_by_depth[4]:
+        if not registry.flags.get("rolling_depth4_commit_enabled", False):
+            errors.append("depth4 real commit appears while depth4 commit flag is disabled")
+        if not registry.flags.get("rolling_depth4_shadow_enabled", False):
+            errors.append("depth4 real commit appears while depth4 shadow flag is disabled")
 
     depth4_shadow_ids = set(registry.generated_by_depth[4]) | set(registry.ready_by_depth[4])
     if depth4_shadow_ids and not registry.flags.get("rolling_depth4_shadow_enabled", False):
@@ -344,6 +361,8 @@ def validate_records(
         "depth2_committed_token_count": token_by_depth[2],
         "depth3_committed_proposal_count": generic_summary["generic_depth3_committed_proposal_count"],
         "depth3_committed_token_count": token_by_depth[3],
+        "depth4_committed_proposal_count": generic_summary["generic_depth4_committed_proposal_count"],
+        "depth4_committed_token_count": token_by_depth[4],
         "depth4_shadow_generated_proposal_count": generic_summary["generic_depth4_shadow_generated_proposal_count"],
         "depth4_shadow_generated_token_count": generic_summary["generic_depth4_shadow_generated_token_count"],
         "depth4_shadow_ready_proposal_count": generic_summary["generic_depth4_shadow_ready_proposal_count"],
@@ -403,6 +422,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth3_shadow_enabled",
         "rolling_depth3_commit_enabled",
         "rolling_depth4_shadow_enabled",
+        "rolling_depth4_commit_enabled",
         "max_configured_depth",
         "max_observed_depth",
         "max_real_committed_depth",
@@ -418,6 +438,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "depth2_committed_token_count",
         "depth3_committed_proposal_count",
         "depth3_committed_token_count",
+        "depth4_committed_proposal_count",
+        "depth4_committed_token_count",
         "depth4_shadow_generated_proposal_count",
         "depth4_shadow_generated_token_count",
         "depth4_shadow_ready_proposal_count",

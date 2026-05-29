@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-MAX_LEGACY_REAL_DEPTH = 3
+MAX_LEGACY_REAL_DEPTH = 4
 MAX_LEGACY_OBSERVED_DEPTH = 4
 GENERIC_ONE_SHOT_ACTION = "append_full_accept_then_rollback"
 GENERIC_ROLLING_ACTION = "append_full_accept_real_commit"
@@ -22,6 +22,7 @@ ACCOUNTING_TOKEN_KEYS_BY_DEPTH = {
     1: "continuous_eager_real_committed_token_count",
     2: "rolling_depth2_real_committed_token_count",
     3: "rolling_depth3_real_committed_token_count",
+    4: "rolling_depth4_real_committed_token_count",
 }
 
 ACCOUNTING_INCREMENT_KEYS_BY_DEPTH = {
@@ -64,6 +65,16 @@ ACCOUNTING_INCREMENT_KEYS_BY_DEPTH = {
         "draft_accepted": "rolling_depth3_draft_actual_accepted_token_increment_sum",
         "draft_rejected": "rolling_depth3_draft_actual_rejected_token_increment_sum",
         "draft_invalidated": "rolling_depth3_draft_actual_invalidated_token_increment_sum",
+    },
+    4: {
+        "target_verified": "rolling_depth4_target_actual_verified_token_increment_sum",
+        "target_accepted": "rolling_depth4_target_actual_accepted_token_increment_sum",
+        "target_rejected": "rolling_depth4_target_actual_rejected_token_increment_sum",
+        "target_invalidated": "rolling_depth4_target_actual_invalidated_token_increment_sum",
+        "draft_verified": "rolling_depth4_draft_actual_verified_token_increment_sum",
+        "draft_accepted": "rolling_depth4_draft_actual_accepted_token_increment_sum",
+        "draft_rejected": "rolling_depth4_draft_actual_rejected_token_increment_sum",
+        "draft_invalidated": "rolling_depth4_draft_actual_invalidated_token_increment_sum",
     },
 }
 
@@ -286,6 +297,10 @@ def update_depth_maps_from_record(registry: RollingChainRegistry, record: dict[s
             registry.higher_depth_commit_ids.add(proposal_id)
     for proposal_id, depth in as_int_map(record.get("rolling_depth4_child_depth_by_proposal_id")).items():
         registry.declared_depth_by_id.setdefault(proposal_id, depth)
+    for proposal_id, depth in as_int_map(record.get("rolling_depth4_real_commit_depth_by_proposal_id")).items():
+        registry.declared_depth_by_id.setdefault(proposal_id, depth)
+        if depth > MAX_LEGACY_REAL_DEPTH:
+            registry.higher_depth_commit_ids.add(proposal_id)
 
 
 def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainRegistry:
@@ -297,6 +312,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "rolling_depth3_shadow_enabled": False,
             "rolling_depth3_commit_enabled": False,
             "rolling_depth4_shadow_enabled": False,
+            "rolling_depth4_commit_enabled": False,
         }
     )
     side_events: dict[tuple[int, str, int], set[tuple[int, int]]] = defaultdict(set)
@@ -336,6 +352,9 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.flags["rolling_depth4_shadow_enabled"] = registry.flags["rolling_depth4_shadow_enabled"] or bool(
             record.get("enable_rolling_continuous_depth4_shadow_dry_run", False)
         ) or bool(record.get("rolling_depth4_shadow_enabled", False))
+        registry.flags["rolling_depth4_commit_enabled"] = registry.flags["rolling_depth4_commit_enabled"] or bool(
+            record.get("enable_rolling_continuous_depth4_commit_ready_only", False)
+        ) or bool(record.get("rolling_depth4_commit_enabled", False))
 
         registry.missing_buffered_proposal_unexpected_count += int_value(
             record.get("missing_buffered_proposal_unexpected_count"), 0
@@ -356,7 +375,6 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
         registry.depth_gt3_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
         registry.depth_gt4_real_commit_count += int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
-        registry.higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth4_real_committed_proposal_ids")))
         registry.higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth_gt3_real_committed_proposal_ids")))
         registry.higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth_gt4_real_committed_proposal_ids")))
 
@@ -365,6 +383,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "continuous_eager_target_draft_len_match_by_seq_id",
             "rolling_depth2_target_draft_len_match_by_seq_id",
             "rolling_depth3_target_draft_len_match_by_seq_id",
+            "rolling_depth4_target_draft_len_match_by_seq_id",
         ):
             false_ids = collect_false_ids(record.get(field_name))
             registry.target_draft_length_mismatch_count += len(false_ids)
@@ -374,6 +393,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "continuous_eager_target_draft_token_match_by_seq_id",
             "rolling_depth2_target_draft_token_match_by_seq_id",
             "rolling_depth3_target_draft_token_match_by_seq_id",
+            "rolling_depth4_target_draft_token_match_by_seq_id",
         ):
             registry.target_draft_token_mismatch_count += false_count(record.get(field_name))
 
@@ -622,12 +642,15 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             id_field="rolling_depth3_real_committed_proposal_ids",
         )
 
+        depth4_committed = as_int_list(record.get("rolling_depth4_real_committed_proposal_ids"))
         depth4_generated = as_int_set(record.get("rolling_depth4_child_generated_proposal_ids"))
         depth4_ready = as_int_set(record.get("rolling_depth4_child_ready_shadow_proposal_ids"))
         depth4_invalid = as_int_set(record.get("rolling_depth4_child_invalidated_proposal_ids"))
+        add_id_set(registry, 4, set(depth4_committed), registry.committed_by_depth)
         add_id_set(registry, 4, depth4_generated, registry.generated_by_depth)
         add_id_set(registry, 4, depth4_ready, registry.ready_by_depth)
         add_id_set(registry, 4, depth4_invalid, registry.invalidated_by_depth)
+        add_seq_map(registry, 4, depth4_committed, as_int_list(record.get("rolling_depth4_real_committed_seq_ids")))
         add_seq_map(
             registry,
             4,
@@ -644,13 +667,41 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             registry.token_by_depth[4],
             as_int_map(record.get("rolling_depth4_child_token_count_by_proposal_id")),
         )
+        merge_positive(
+            registry.token_by_depth[4],
+            as_int_map(record.get("rolling_depth4_real_committed_token_count_by_proposal_id")),
+        )
+        merge_positive(
+            registry.accept_len_by_depth[4],
+            as_int_map(record.get("rolling_depth4_real_committed_accept_len_by_proposal_id")),
+        )
         merge_first(
             registry.parent_by_depth[4],
             as_int_map(record.get("rolling_depth4_child_parent_by_proposal_id")),
         )
         merge_first(
+            registry.parent_by_depth[4],
+            as_int_map(record.get("rolling_depth4_commit_parent_by_proposal_id")),
+        )
+        merge_first(
+            registry.parent_by_depth[4],
+            as_int_map(record.get("rolling_depth4_real_commit_parent_by_proposal_id")),
+        )
+        merge_first(
             registry.root_by_depth[4],
             as_int_map(record.get("rolling_depth4_child_root_by_proposal_id")),
+        )
+        merge_first(
+            registry.root_by_depth[4],
+            as_int_map(record.get("rolling_depth4_real_commit_root_by_proposal_id")),
+        )
+        merge_str_first(
+            registry.action_by_depth[4],
+            as_str_map(record.get("rolling_depth4_real_commit_action_by_proposal_id")),
+        )
+        merge_str_first(
+            registry.verify_result_by_depth[4],
+            as_str_map(record.get("rolling_depth4_real_commit_verify_result_by_proposal_id")),
         )
         registry.committed_without_ready_ids.update(
             as_int_set(record.get("rolling_depth4_committed_without_ready_shadow_ids"))
@@ -661,6 +712,19 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.invalid_committed_ids.update(as_int_set(record.get("rolling_depth4_committed_invalidated_child_ids")))
         registry.cascade_committed_ids.update(
             as_int_set(record.get("rolling_depth4_committed_cascade_discarded_child_ids"))
+        )
+        registry.non_full_accept_ids.update(as_int_set(record.get("rolling_depth4_committed_non_full_accept_ids")))
+        registry.duplicate_commit_ids.update(as_int_set(record.get("rolling_depth4_real_commit_duplicate_proposal_ids")))
+        registry.duplicate_commit_seq_ids.update(as_int_set(record.get("rolling_depth4_real_commit_duplicate_seq_ids")))
+        mark_side_seen(
+            registry,
+            side_events,
+            record,
+            depth=4,
+            side_field="rolling_depth4_commit_side",
+            plan_field="rolling_depth4_commit_plan_id",
+            step_field="rolling_depth4_commit_step_id",
+            id_field="rolling_depth4_real_committed_proposal_ids",
         )
 
         for field_name in (
@@ -903,6 +967,8 @@ def summarize_registry(
         "generic_depth2_committed_token_count": token_by_depth.get(2, 0),
         "generic_depth3_committed_proposal_count": len(registry.committed_by_depth[3]),
         "generic_depth3_committed_token_count": token_by_depth.get(3, 0),
+        "generic_depth4_committed_proposal_count": len(registry.committed_by_depth[4]),
+        "generic_depth4_committed_token_count": token_by_depth.get(4, 0),
         "generic_depth4_shadow_generated_proposal_count": len(registry.generated_by_depth[4]),
         "generic_depth4_shadow_generated_token_count": sum(
             max(0, int(registry.token_by_depth[4].get(proposal_id, registry.gamma)))

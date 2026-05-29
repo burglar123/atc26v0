@@ -41,6 +41,14 @@ def _depth4_shadow_enabled(records: list[dict[str, Any]]) -> bool:
     )
 
 
+def _depth4_commit_enabled(records: list[dict[str, Any]]) -> bool:
+    return any(
+        bool(record.get("enable_rolling_continuous_depth4_commit_ready_only", False))
+        or bool(record.get("rolling_depth4_commit_enabled", False))
+        for record in records
+    )
+
+
 def _node_parent_root(parent: RollingProposalNode) -> int | None:
     return parent.root_id if parent.root_id is not None else parent.proposal_id
 
@@ -55,6 +63,7 @@ def validate_records(
     errors: list[str] = []
 
     enabled = _depth4_shadow_enabled(records)
+    commit_enabled = _depth4_commit_enabled(records)
     generated_ids = set(registry.generated_by_depth[4])
     ready_ids = set(registry.ready_by_depth[4])
     invalidated_ids = set(registry.invalidated_by_depth[4])
@@ -64,17 +73,17 @@ def validate_records(
         errors.append("depth4 shadow evidence appears while depth4 shadow flag is disabled")
     if enabled and not registry.flags.get("rolling_depth3_commit_enabled", False):
         errors.append("depth4 shadow requires depth3 commit to be enabled")
-    if registry.depth4_real_commit_count:
+    if registry.depth4_real_commit_count and not commit_enabled:
         errors.append("rolling depth4 real commit count must remain zero")
     if registry.depth_gt4_real_commit_count:
         errors.append("rolling depth>4 real commit count must remain zero")
     if registry.depth_gt3_real_commit_count:
         errors.append("rolling depth>3 real commit count must remain zero")
     if registry.higher_depth_commit_ids:
-        errors.append(f"depth>3 real committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
-    if int_value(accounting.get("rolling_depth4_real_commit_count"), 0) != 0:
+        errors.append(f"depth>4 real committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
+    if int_value(accounting.get("rolling_depth4_real_commit_count"), 0) != 0 and not commit_enabled:
         errors.append("accounting reports depth4 real commit count")
-    if int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0) != 0:
+    if int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0) != 0 and not commit_enabled:
         errors.append("accounting reports depth4 real committed tokens")
 
     for proposal_id in sorted(observed_ids):
@@ -126,17 +135,21 @@ def validate_records(
         + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
     )
+    expected_combined = lower_depth_sum + (
+        int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0) if commit_enabled else 0
+    )
     combined = int_value(accounting.get("combined_real_committed_token_count"), 0)
-    if combined != lower_depth_sum:
+    if combined != expected_combined:
         errors.append(
-            "combined real committed tokens must exclude depth4 shadow tokens: "
-            f"combined={combined} lower_depth_sum={lower_depth_sum}"
+            "combined real committed tokens must include only real commits: "
+            f"combined={combined} expected={expected_combined}"
         )
 
     max_observed_depth = registry.max_observed_depth
     max_real_committed_depth = registry.max_real_committed_depth
     summary = {
         "depth4_shadow_enabled": enabled,
+        "depth4_commit_enabled": commit_enabled,
         "rolling_depth4_child_candidate_proposal_count": int_value(
             accounting.get("rolling_depth4_child_candidate_proposal_count"), 0
         ),
@@ -165,6 +178,7 @@ def validate_records(
 def print_summary(summary: dict[str, Any]) -> None:
     for key in (
         "depth4_shadow_enabled",
+        "depth4_commit_enabled",
         "rolling_depth4_child_candidate_proposal_count",
         "rolling_depth4_child_candidate_token_count",
         "rolling_depth4_child_ready_shadow_proposal_count",

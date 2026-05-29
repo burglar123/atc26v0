@@ -150,6 +150,7 @@ class PEARLConfig:
     enable_rolling_continuous_depth3_shadow_dry_run: bool = False
     enable_rolling_continuous_depth3_commit_ready_only: bool = False
     enable_rolling_continuous_depth4_shadow_dry_run: bool = False
+    enable_rolling_continuous_depth4_commit_ready_only: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -200,6 +201,11 @@ class PEARLConfig:
         self.enable_rolling_continuous_depth4_shadow_dry_run = bool(
             self.enable_rolling_continuous_depth4_shadow_dry_run
         )
+        self.enable_rolling_continuous_depth4_commit_ready_only = bool(
+            self.enable_rolling_continuous_depth4_commit_ready_only
+        )
+        if self.enable_rolling_continuous_depth4_commit_ready_only:
+            self.enable_rolling_continuous_depth4_shadow_dry_run = True
         if self.enable_rolling_continuous_depth4_shadow_dry_run:
             self.enable_rolling_continuous_depth3_commit_ready_only = True
         if self.enable_rolling_continuous_depth3_commit_ready_only:
@@ -300,6 +306,11 @@ class PEARLConfig:
                     "enable_rolling_continuous_depth4_shadow_dry_run requires "
                     "max_rolling_continuous_depth >= 4"
                 )
+            if self.enable_rolling_continuous_depth4_commit_ready_only and self.max_rolling_continuous_depth < 4:
+                raise ValueError(
+                    "enable_rolling_continuous_depth4_commit_ready_only requires "
+                    "max_rolling_continuous_depth >= 4"
+                )
             if self.max_rolling_continuous_draft_children_per_step <= 0:
                 raise ValueError(
                     "enable_rolling_continuous_eager_dry_run requires "
@@ -378,6 +389,10 @@ class PEARLConfig:
         logger.info(
             "Enable_Rolling_Continuous_Depth4_Shadow_Dry_Run="
             f"{self.enable_rolling_continuous_depth4_shadow_dry_run}"
+        )
+        logger.info(
+            "Enable_Rolling_Continuous_Depth4_Commit_Ready_Only="
+            f"{self.enable_rolling_continuous_depth4_commit_ready_only}"
         )
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")

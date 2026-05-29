@@ -167,6 +167,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     real_commit_count = 0
     depth4_real_commit_count = 0
     depth_gt3_real_commit_count = 0
+    depth4_commit_enabled = False
     target_verified_sum = 0
     target_accepted_sum = 0
     target_rejected_sum = 0
@@ -191,6 +192,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         enabled = enabled or bool(record.get("rolling_depth3_commit_enabled", False))
         if enabled:
             commit_enabled_records += 1
+        depth4_commit_enabled = depth4_commit_enabled or bool(
+            record.get("enable_rolling_continuous_depth4_commit_ready_only", False)
+        ) or bool(record.get("rolling_depth4_commit_enabled", False))
         active = commit_active(record)
         if active:
             active_records += 1
@@ -207,9 +211,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         normal_lane_conflict_count += int_value(record.get("rolling_depth3_normal_lane_conflict_count"), 0)
         depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
         depth_gt3_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
-        if int_value(record.get("rolling_depth4_real_commit_count"), 0):
+        if int_value(record.get("rolling_depth4_real_commit_count"), 0) and not depth4_commit_enabled:
             errors.append(f"record[{idx}] rolling depth4 real commit count must be zero")
-        if int_value(record.get("rolling_depth_gt3_real_commit_count"), 0):
+        if int_value(record.get("rolling_depth_gt3_real_commit_count"), 0) and not depth4_commit_enabled:
             errors.append(f"record[{idx}] rolling depth>3 real commit count must be zero")
         if int_value(record.get("rolling_depth3_real_commit_count"), 0) and not enabled:
             errors.append(f"record[{idx}] depth3 real commit count requires commit flag")
@@ -406,9 +410,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append("rolling depth3 committed tokens must equal draft accepted increment sum")
     if target_rejected_sum or target_invalidated_sum or draft_rejected_sum or draft_invalidated_sum:
         errors.append("rolling depth3 rejected/invalidated increments must be zero")
-    if depth4_real_commit_count:
+    if depth4_real_commit_count and not depth4_commit_enabled:
         errors.append("rolling_depth4_real_commit_count must be zero")
-    if depth_gt3_real_commit_count:
+    if depth_gt3_real_commit_count and not depth4_commit_enabled:
         errors.append("rolling_depth_gt3_real_commit_count must be zero")
     if normal_lane_conflict_count:
         errors.append("rolling_depth3_normal_lane_conflict_count must be zero")
@@ -419,9 +423,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         + int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
         + committed_token_count
+        + int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
     )
     if int_value(accounting.get("combined_real_committed_token_count"), 0) != combined_expected:
-        errors.append("combined real committed token count must equal one-shot + depth1 + depth2 + depth3")
+        errors.append("combined real committed token count must equal one-shot + depth1 + depth2 + depth3 + optional depth4")
 
     summary = {
         "total_trace_records": len(records),

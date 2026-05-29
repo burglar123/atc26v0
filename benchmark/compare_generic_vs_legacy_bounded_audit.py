@@ -31,6 +31,7 @@ CORE_FIELD_PAIRS = (
     ("depth1_committed_token_count", "generic_depth1_committed_token_count"),
     ("depth2_committed_token_count", "generic_depth2_committed_token_count"),
     ("depth3_committed_token_count", "generic_depth3_committed_token_count"),
+    ("depth4_committed_token_count", "generic_depth4_committed_token_count"),
     ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
     ("max_real_committed_depth", "generic_max_real_committed_depth"),
     ("max_observed_depth", "generic_max_observed_depth"),
