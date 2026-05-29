@@ -222,6 +222,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     depth_gt3_real_commit_count = 0
     max_depth_observed = 0
     commit_enabled_records = 0
+    depth4_shadow_enabled_records = 0
 
     for idx, record in enumerate(records):
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -231,6 +232,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         )
         if commit_enabled:
             commit_enabled_records += 1
+        if bool(record.get("enable_rolling_continuous_depth4_shadow_dry_run", False)) or bool(
+            record.get("rolling_depth4_shadow_enabled", False)
+        ):
+            depth4_shadow_enabled_records += 1
         if enabled:
             enabled_records += 1
         active = active_depth3_fields(record)
@@ -429,8 +434,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     pending_child_count = len(generated_ids - ready_ids - invalidated_ids)
     if len(ready_ids) + len(invalidated_ids) + pending_child_count > len(generated_ids):
         errors.append("rolling depth3 ready + invalidated + pending exceeds candidates")
-    if max_depth_observed > 3:
-        errors.append("rolling depth3 observed max depth exceeds 3")
+    allowed_observed_depth = 4 if depth4_shadow_enabled_records else 3
+    if max_depth_observed > allowed_observed_depth:
+        errors.append(f"rolling depth3 observed max depth exceeds {allowed_observed_depth}")
     if enabled_records and parent_committed_ids and not generated_ids and not skipped_child_ids and not parent_pending_ids:
         errors.append("rolling depth3 shadow enabled with committed depth2 parents but no generated children or skip reasons")
     if depth3_real_commit_count and not commit_enabled_records:
@@ -458,6 +464,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth_gt3_real_commit_count": depth_gt3_real_commit_count,
         "rolling_depth3_drop_reason_counts": dict(sorted(drop_reason_counter.items())),
         "rolling_depth3_max_depth_observed": max_depth_observed,
+        "rolling_depth4_shadow_enabled_records": depth4_shadow_enabled_records,
     }
     return errors, summary
 

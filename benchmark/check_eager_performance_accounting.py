@@ -690,7 +690,7 @@ def aggregate_performance_accounting(
                 except Exception:
                     continue
                 if reason:
-                rolling_depth3_drop_reason_by_id.setdefault(proposal_id, str(reason))
+                    rolling_depth3_drop_reason_by_id.setdefault(proposal_id, str(reason))
 
         rolling_depth4_child_candidate_ids.update(
             as_int_set(record.get("rolling_depth4_child_generated_proposal_ids"))
