@@ -14,11 +14,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmark.bounded_rolling_chain_parser import (  # noqa: E402
+    GENERIC_ONE_SHOT_ACTION,
+    GENERIC_ROLLING_ACTION,
     MAX_LEGACY_REAL_DEPTH,
     RollingChainRegistry,
     committed_token_counts_by_depth,
     int_value,
     parse_legacy_rolling_chain,
+    registry_safety_issue_sets,
+    summarize_registry,
 )
 from benchmark.check_bounded_rolling_readiness_audit import (  # noqa: E402
     synthetic_full_chain_record,
@@ -30,8 +34,8 @@ from benchmark.check_eager_performance_accounting import (  # noqa: E402
 )
 
 
-ONE_SHOT_ACTION = "append_full_accept_then_rollback"
-ROLLING_ACTION = "append_full_accept_real_commit"
+ONE_SHOT_ACTION = GENERIC_ONE_SHOT_ACTION
+ROLLING_ACTION = GENERIC_ROLLING_ACTION
 
 ACCOUNTING_TOKEN_KEYS = {
     0: "eager_committed_token_count",
@@ -173,12 +177,13 @@ def validate_accounting(
 
 
 def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[str, int]:
-    invalid_committed_ids = set(registry.invalid_committed_ids)
-    cascade_committed_ids = set(registry.cascade_committed_ids)
-    parent_missing_ids = set(registry.committed_without_parent_ids)
-    generated_only_ids = set(registry.committed_without_ready_ids)
-    non_full_ids = set(registry.non_full_accept_ids)
-    stale_committed_ids: set[int] = set()
+    issue_sets = registry_safety_issue_sets(registry, max_depth=MAX_LEGACY_REAL_DEPTH)
+    invalid_committed_ids = set(issue_sets["invalid_committed_ids"])
+    cascade_committed_ids = set(issue_sets["cascade_committed_ids"])
+    parent_missing_ids = set(issue_sets["parent_missing_ids"])
+    generated_only_ids = set(issue_sets["generated_only_ids"])
+    non_full_ids = set(issue_sets["non_full_ids"])
+    stale_committed_ids = set(issue_sets["stale_committed_ids"])
 
     for depth in range(0, MAX_LEGACY_REAL_DEPTH + 1):
         expected_action = ROLLING_ACTION if depth >= 2 else ONE_SHOT_ACTION
@@ -201,27 +206,15 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
             accept_len = node.accept_len if node.accept_len is not None else token_count
             if token_count <= 0 or accept_len != token_count:
                 errors.append(f"committed proposal {proposal_id} depth {depth} token/accept mismatch")
-            if node.invalidated:
-                invalid_committed_ids.add(proposal_id)
-            if node.cascade_discarded:
-                cascade_committed_ids.add(proposal_id)
-            if node.stale_or_frontier_mismatch:
-                stale_committed_ids.add(proposal_id)
-            if depth >= 1 and not node.ready_shadow:
-                generated_only_ids.add(proposal_id)
             if depth == 0:
                 continue
             if node.parent_id is None:
-                parent_missing_ids.add(proposal_id)
                 continue
             parent = registry.nodes_by_id.get(node.parent_id)
             if parent is None:
-                parent_missing_ids.add(proposal_id)
                 continue
             if parent.depth != depth - 1:
                 errors.append(f"proposal {proposal_id} parent {node.parent_id} depth {parent.depth}, expected {depth - 1}")
-            if not parent.committed:
-                parent_missing_ids.add(proposal_id)
             if parent.seq_id is not None and node.seq_id is not None and parent.seq_id != node.seq_id:
                 errors.append(f"proposal {proposal_id} seq {node.seq_id} differs from parent {node.parent_id} seq {parent.seq_id}")
             parent_root = parent.root_id if parent.root_id is not None else parent.proposal_id
@@ -241,11 +234,7 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
     if registry.committed_by_depth[3] and not registry.flags.get("rolling_depth3_commit_enabled", False):
         errors.append("depth3 real commit appears while depth3 commit flag is disabled")
 
-    duplicate_commit_count = (
-        len(registry.duplicate_commit_ids)
-        + len(registry.duplicate_commit_seq_ids)
-        + len(registry.duplicate_seq_depth_events)
-    )
+    duplicate_commit_count = int(issue_sets["duplicate_commit_count"])
     if duplicate_commit_count:
         errors.append("duplicate commit evidence present")
     if invalid_committed_ids:
@@ -291,11 +280,9 @@ def validate_records(
 
     token_by_depth, combined_ok, target_draft_ok = validate_accounting(registry, accounting, errors)
     chain_summary = validate_chain(registry, errors)
+    generic_summary = summarize_registry(registry, accounting=accounting)
 
-    max_real_depth = registry.max_real_committed_depth
-    for depth, tokens in token_by_depth.items():
-        if tokens:
-            max_real_depth = max(max_real_depth, depth)
+    max_real_depth = int(generic_summary["generic_max_real_committed_depth"])
     if max_real_depth > MAX_LEGACY_REAL_DEPTH:
         errors.append(f"max real committed depth {max_real_depth} exceeds {MAX_LEGACY_REAL_DEPTH}")
 
@@ -312,20 +299,20 @@ def validate_records(
         "total_trace_records": len(records),
         **registry.flags,
         "max_configured_depth": registry.max_configured_depth,
-        "max_observed_depth": registry.max_observed_depth,
+        "max_observed_depth": generic_summary["generic_max_observed_depth"],
         "max_real_committed_depth": max_real_depth,
-        "depth_gt3_real_commit_count": registry.depth_gt3_real_commit_count,
-        "depth4_real_commit_count": registry.depth4_real_commit_count,
-        "depth_gt3_committed_proposal_count": len(registry.higher_depth_commit_ids),
-        "one_shot_committed_proposal_count": len(registry.committed_by_depth[0]),
+        "depth_gt3_real_commit_count": generic_summary["generic_depth_gt3_real_commit_count"],
+        "depth4_real_commit_count": generic_summary["generic_depth4_real_commit_count"],
+        "depth_gt3_committed_proposal_count": generic_summary["generic_depth_gt3_committed_proposal_count"],
+        "one_shot_committed_proposal_count": generic_summary["generic_one_shot_committed_proposal_count"],
         "one_shot_committed_token_count": token_by_depth[0],
-        "depth1_committed_proposal_count": len(registry.committed_by_depth[1]),
+        "depth1_committed_proposal_count": generic_summary["generic_depth1_committed_proposal_count"],
         "depth1_committed_token_count": token_by_depth[1],
-        "depth2_committed_proposal_count": len(registry.committed_by_depth[2]),
+        "depth2_committed_proposal_count": generic_summary["generic_depth2_committed_proposal_count"],
         "depth2_committed_token_count": token_by_depth[2],
-        "depth3_committed_proposal_count": len(registry.committed_by_depth[3]),
+        "depth3_committed_proposal_count": generic_summary["generic_depth3_committed_proposal_count"],
         "depth3_committed_token_count": token_by_depth[3],
-        "combined_real_committed_token_count": sum(token_by_depth.values()),
+        "combined_real_committed_token_count": generic_summary["generic_combined_real_committed_token_count"],
         "accounting_combined_real_committed_token_count": int_value(
             accounting.get("combined_real_committed_token_count"), 0
         ),
@@ -335,12 +322,14 @@ def validate_records(
         "combined_actual_accepted_token_increment_sum": int_value(
             accounting.get("combined_actual_accepted_token_increment_sum"), 0
         ),
-        "combined_accounting_ok": combined_ok,
-        "target_draft_accounting_ok": target_draft_ok,
-        "normal_lane_conflict_count": registry.normal_lane_conflict_count,
-        "missing_buffered_proposal_unexpected_count": registry.missing_buffered_proposal_unexpected_count,
-        "target_draft_length_mismatch_count": registry.target_draft_length_mismatch_count,
-        "target_draft_token_mismatch_count": registry.target_draft_token_mismatch_count,
+        "combined_accounting_ok": combined_ok and bool(generic_summary["generic_combined_accounting_ok"]),
+        "target_draft_accounting_ok": target_draft_ok and bool(generic_summary["generic_target_draft_accounting_ok"]),
+        "normal_lane_conflict_count": generic_summary["generic_normal_lane_conflict_count"],
+        "missing_buffered_proposal_unexpected_count": generic_summary[
+            "generic_missing_buffered_proposal_unexpected_count"
+        ],
+        "target_draft_length_mismatch_count": generic_summary["generic_target_draft_length_mismatch_count"],
+        "target_draft_token_mismatch_count": generic_summary["generic_target_draft_token_mismatch_count"],
         "total_output_tokens": int_value(overall.get("total_output_tokens"), 0),
         "goodput_tokens_per_s": overall.get("goodput_tokens_per_s"),
         "mean_tpot_ms": overall.get("mean_tpot_ms"),

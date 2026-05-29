@@ -20,11 +20,35 @@ from benchmark.check_eager_performance_accounting import (  # noqa: E402
     int_value,
     load_json,
 )
+from benchmark.bounded_rolling_chain_parser import (  # noqa: E402
+    parse_legacy_rolling_chain,
+    summarize_registry,
+)
 
 
 ONE_SHOT_ACTION = "append_full_accept_then_rollback"
 ROLLING_ACTION = "append_full_accept_real_commit"
 MAX_AUDITED_REAL_DEPTH = 3
+
+GENERIC_PARITY_FIELD_PAIRS = (
+    ("one_shot_committed_token_count", "generic_one_shot_committed_token_count"),
+    ("depth1_committed_token_count", "generic_depth1_committed_token_count"),
+    ("depth2_committed_token_count", "generic_depth2_committed_token_count"),
+    ("depth3_committed_token_count", "generic_depth3_committed_token_count"),
+    ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
+    ("max_observed_depth", "generic_max_observed_depth"),
+    ("max_real_committed_depth", "generic_max_real_committed_depth"),
+    ("depth4_real_commit_count", "generic_depth4_real_commit_count"),
+    ("depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
+    ("normal_lane_conflict_count", "generic_normal_lane_conflict_count"),
+    ("missing_buffered_proposal_unexpected_count", "generic_missing_buffered_proposal_unexpected_count"),
+    ("duplicate_commit_count", "generic_duplicate_commit_count"),
+    ("invalid_committed_child_count", "generic_invalid_committed_child_count"),
+    ("cascade_committed_child_count", "generic_cascade_committed_child_count"),
+    ("parent_missing_committed_child_count", "generic_parent_missing_committed_child_count"),
+    ("combined_accounting_ok", "generic_combined_accounting_ok"),
+    ("target_draft_accounting_ok", "generic_target_draft_accounting_ok"),
+)
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
@@ -729,6 +753,26 @@ def validate_records(
     return errors, summary
 
 
+def generic_parity_errors(
+    records: list[dict[str, Any]],
+    result_payload: dict[str, Any] | None,
+    legacy_summary: dict[str, Any],
+) -> list[str]:
+    accounting = aggregate_performance_accounting(records, result_payload or {})
+    registry = parse_legacy_rolling_chain(records)
+    generic_summary = summarize_registry(registry, accounting=accounting)
+    errors: list[str] = []
+    for legacy_key, generic_key in GENERIC_PARITY_FIELD_PAIRS:
+        legacy_value = legacy_summary.get(legacy_key)
+        generic_value = generic_summary.get(generic_key)
+        if legacy_value != generic_value:
+            errors.append(
+                f"generic parity mismatch for {legacy_key}: "
+                f"legacy={legacy_value!r} generic={generic_value!r}"
+            )
+    return errors
+
+
 def print_summary(summary: dict[str, Any]) -> None:
     for key in (
         "total_trace_records",
@@ -931,15 +975,25 @@ def synthetic_result_payload() -> dict[str, Any]:
     }
 
 
-def run_synthetic() -> None:
+def run_synthetic(check_generic_parity: bool = False) -> None:
     records = [synthetic_full_chain_record("target"), synthetic_full_chain_record("draft")]
-    errors, summary = validate_records(records, synthetic_result_payload())
+    result_payload = synthetic_result_payload()
+    errors, summary = validate_records(records, result_payload)
     if errors:
         raise SystemExit(f"synthetic full bounded chain failed: {errors}\nsummary={summary}")
     if summary["combined_real_committed_token_count"] != 16:
         raise SystemExit("synthetic combined token count mismatch")
     if summary["max_real_committed_depth"] != 3:
         raise SystemExit("synthetic max real depth mismatch")
+    if check_generic_parity:
+        parity_errors = generic_parity_errors(records, result_payload, summary)
+        if parity_errors:
+            raise SystemExit(f"synthetic full bounded chain generic parity failed: {parity_errors}")
+        bad_summary = dict(summary)
+        bad_summary["combined_real_committed_token_count"] += 1
+        bad_parity_errors = generic_parity_errors(records, result_payload, bad_summary)
+        if not bad_parity_errors:
+            raise SystemExit("synthetic bad generic parity case should fail")
 
     lower_mode = deepcopy(records)
     for record in lower_mode:
@@ -966,30 +1020,34 @@ def run_synthetic() -> None:
         record["rolling_depth3_tokens_verified"] = 0
         record["rolling_depth3_tokens_accepted"] = 0
         record["rolling_depth3_real_commit_count"] = 0
-    errors, summary = validate_records(lower_mode, synthetic_result_payload())
+    errors, summary = validate_records(lower_mode, result_payload)
     if errors:
         raise SystemExit(f"synthetic lower-mode depth3 shadow failed: {errors}\nsummary={summary}")
     if summary["max_real_committed_depth"] != 2:
         raise SystemExit("synthetic lower-mode max real depth mismatch")
+    if check_generic_parity:
+        parity_errors = generic_parity_errors(lower_mode, result_payload, summary)
+        if parity_errors:
+            raise SystemExit(f"synthetic lower-mode generic parity failed: {parity_errors}")
 
     invalid_parent = deepcopy(records)
     for record in invalid_parent:
         record["rolling_depth3_real_commit_parent_by_proposal_id"] = {"900000103": 12345}
         record["rolling_depth3_child_parent_by_proposal_id"] = {"900000103": 12345}
-    errors, _summary = validate_records(invalid_parent, synthetic_result_payload())
+    errors, _summary = validate_records(invalid_parent, result_payload)
     if not errors or not any("parent-missing" in error for error in errors):
         raise SystemExit("synthetic missing parent should fail")
 
     invalid_counter = deepcopy(records)
     invalid_counter[0]["rolling_depth3_tokens_verified"] = 0
-    errors, _summary = validate_records(invalid_counter, synthetic_result_payload())
+    errors, _summary = validate_records(invalid_counter, result_payload)
     if not errors or not any("depth3 target verified" in error for error in errors):
         raise SystemExit("synthetic depth3 target counter mismatch should fail")
 
     depth4 = deepcopy(records)
     depth4[0]["rolling_depth4_real_commit_count"] = 1
     depth4[0]["rolling_depth_gt3_real_commit_count"] = 1
-    errors, _summary = validate_records(depth4, synthetic_result_payload())
+    errors, _summary = validate_records(depth4, result_payload)
     if not errors or not any("depth4" in error for error in errors):
         raise SystemExit("synthetic depth4 real commit should fail")
 
@@ -1001,13 +1059,16 @@ def main() -> int:
     parser.add_argument("trace", nargs="?", type=Path)
     parser.add_argument("result", nargs="?", type=Path)
     parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--check-generic-parity", action="store_true")
     args = parser.parse_args()
     if args.synthetic or args.trace is None:
-        run_synthetic()
+        run_synthetic(check_generic_parity=args.check_generic_parity)
         return 0
     records = load_trace(args.trace)
     result_payload = load_json(args.result) if args.result else {}
     errors, summary = validate_records(records, result_payload)
+    if args.check_generic_parity:
+        errors.extend(generic_parity_errors(records, result_payload, summary))
     print_summary(summary)
     if errors:
         print("Errors:")

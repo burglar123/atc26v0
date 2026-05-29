@@ -17,31 +17,32 @@ from benchmark.check_bounded_rolling_readiness_audit import (  # noqa: E402
     synthetic_result_payload,
     validate_records as validate_legacy_records,
 )
-from benchmark.check_eager_performance_accounting import load_json  # noqa: E402
+from benchmark.bounded_rolling_chain_parser import parse_legacy_rolling_chain, summarize_registry  # noqa: E402
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
 from benchmark.check_generic_bounded_rolling_chain import (  # noqa: E402
-    summarize_generic_chain,
     synthetic_records,
+    validate_records as validate_generic_records,
 )
 
 
 CORE_FIELD_PAIRS = (
-    ("one_shot_committed_token_count", "one_shot_committed_token_count"),
-    ("depth1_committed_token_count", "depth1_committed_token_count"),
-    ("depth2_committed_token_count", "depth2_committed_token_count"),
-    ("depth3_committed_token_count", "depth3_committed_token_count"),
-    ("combined_real_committed_token_count", "combined_real_committed_token_count"),
-    ("max_real_committed_depth", "max_real_committed_depth"),
-    ("max_observed_depth", "max_observed_depth"),
-    ("depth4_real_commit_count", "depth4_real_commit_count"),
-    ("depth_gt3_real_commit_count", "depth_gt3_real_commit_count"),
-    ("normal_lane_conflict_count", "normal_lane_conflict_count"),
-    ("missing_buffered_proposal_unexpected_count", "missing_buffered_proposal_unexpected_count"),
-    ("duplicate_commit_count", "duplicate_commit_count"),
-    ("invalid_committed_child_count", "invalid_committed_child_count"),
-    ("cascade_committed_child_count", "cascade_committed_child_count"),
-    ("parent_missing_committed_child_count", "parent_missing_committed_child_count"),
-    ("combined_accounting_ok", "combined_accounting_ok"),
-    ("target_draft_accounting_ok", "target_draft_accounting_ok"),
+    ("one_shot_committed_token_count", "generic_one_shot_committed_token_count"),
+    ("depth1_committed_token_count", "generic_depth1_committed_token_count"),
+    ("depth2_committed_token_count", "generic_depth2_committed_token_count"),
+    ("depth3_committed_token_count", "generic_depth3_committed_token_count"),
+    ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
+    ("max_real_committed_depth", "generic_max_real_committed_depth"),
+    ("max_observed_depth", "generic_max_observed_depth"),
+    ("depth4_real_commit_count", "generic_depth4_real_commit_count"),
+    ("depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
+    ("normal_lane_conflict_count", "generic_normal_lane_conflict_count"),
+    ("missing_buffered_proposal_unexpected_count", "generic_missing_buffered_proposal_unexpected_count"),
+    ("duplicate_commit_count", "generic_duplicate_commit_count"),
+    ("invalid_committed_child_count", "generic_invalid_committed_child_count"),
+    ("cascade_committed_child_count", "generic_cascade_committed_child_count"),
+    ("parent_missing_committed_child_count", "generic_parent_missing_committed_child_count"),
+    ("combined_accounting_ok", "generic_combined_accounting_ok"),
+    ("target_draft_accounting_ok", "generic_target_draft_accounting_ok"),
 )
 
 
@@ -57,6 +58,7 @@ def compare_summaries(legacy: dict[str, Any], generic: dict[str, Any]) -> list[s
 
 def print_comparison(legacy: dict[str, Any], generic: dict[str, Any], mismatches: list[str]) -> None:
     print("legacy/generic bounded audit comparison")
+    print("generic_summary_source=bounded_rolling_chain_parser.summarize_registry")
     for legacy_key, generic_key in CORE_FIELD_PAIRS:
         print(f"{legacy_key}: legacy={legacy.get(legacy_key)} generic={generic.get(generic_key)}")
     if mismatches:
@@ -69,15 +71,17 @@ def print_comparison(legacy: dict[str, Any], generic: dict[str, Any], mismatches
 
 def run_compare(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> int:
     legacy_errors, legacy = validate_legacy_records(records, result_payload)
-    generic = summarize_generic_chain(records, result_payload)
+    accounting = aggregate_performance_accounting(records, result_payload)
+    generic = summarize_registry(parse_legacy_rolling_chain(records), accounting=accounting)
+    generic_errors, _generic_checker = validate_generic_records(records, result_payload)
     mismatches = compare_summaries(legacy, generic)
     print_comparison(legacy, generic, mismatches)
 
     errors: list[str] = []
     if legacy_errors:
         errors.append(f"legacy audit errors: {legacy_errors}")
-    if generic.get("generic_errors"):
-        errors.append(f"generic checker errors: {generic.get('generic_errors')}")
+    if generic_errors:
+        errors.append(f"generic checker errors: {generic_errors}")
     errors.extend(mismatches)
     if errors:
         print("Errors:")
@@ -90,17 +94,21 @@ def run_compare(records: list[dict[str, Any]], result_payload: dict[str, Any]) -
 def run_synthetic() -> None:
     records = synthetic_records()
     legacy_errors, legacy = validate_legacy_records(records, synthetic_result_payload())
-    generic = summarize_generic_chain(records, synthetic_result_payload())
+    accounting = aggregate_performance_accounting(records, synthetic_result_payload())
+    generic = summarize_registry(parse_legacy_rolling_chain(records), accounting=accounting)
+    generic_errors, _generic_checker = validate_generic_records(records, synthetic_result_payload())
     if legacy_errors:
         raise SystemExit(f"synthetic legacy audit failed: {legacy_errors}")
-    if generic.get("generic_errors"):
-        raise SystemExit(f"synthetic generic checker failed: {generic.get('generic_errors')}")
+    if generic_errors:
+        raise SystemExit(f"synthetic generic checker failed: {generic_errors}")
     mismatches = compare_summaries(legacy, generic)
     if mismatches:
         raise SystemExit(f"synthetic parity failed: {mismatches}")
 
     bad_generic = deepcopy(generic)
-    bad_generic["depth3_committed_token_count"] = int(bad_generic["depth3_committed_token_count"]) + 1
+    bad_generic["generic_depth3_committed_token_count"] = int(
+        bad_generic["generic_depth3_committed_token_count"]
+    ) + 1
     bad_mismatches = compare_summaries(legacy, bad_generic)
     if not bad_mismatches:
         raise SystemExit("synthetic parity mismatch case should fail")

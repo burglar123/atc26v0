@@ -14,6 +14,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmark.check_eager_commit_ready_only import validate_records as validate_commit_records
+from benchmark.bounded_rolling_chain_parser import (
+    parse_legacy_rolling_chain,
+    summarize_registry,
+)
 
 
 TAKEOVER_SOURCE = "phase1h5e3_takeover_lane"
@@ -54,6 +58,16 @@ PROPOSAL_LEN_MAP_KEYS = [
 ]
 DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
 DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
+
+GENERIC_ACCOUNTING_FIELD_PAIRS = (
+    ("eager_committed_token_count", "generic_one_shot_committed_token_count"),
+    ("continuous_eager_real_committed_token_count", "generic_depth1_committed_token_count"),
+    ("rolling_depth2_real_committed_token_count", "generic_depth2_committed_token_count"),
+    ("rolling_depth3_real_committed_token_count", "generic_depth3_committed_token_count"),
+    ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
+    ("rolling_depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
+    ("rolling_depth4_real_commit_count", "generic_depth4_real_commit_count"),
+)
 
 
 def safe_div(numerator: float, denominator: float) -> float:
@@ -1263,11 +1277,40 @@ def aggregate_performance_accounting(
     return accounting
 
 
+def generic_chain_accounting_errors(records: list[dict[str, Any]], accounting: dict[str, Any]) -> list[str]:
+    registry = parse_legacy_rolling_chain(records)
+    generic_summary = summarize_registry(registry, accounting=accounting)
+    errors: list[str] = []
+    for accounting_key, generic_key in GENERIC_ACCOUNTING_FIELD_PAIRS:
+        accounting_value = int_value(accounting.get(accounting_key), 0)
+        generic_value = int_value(generic_summary.get(generic_key), 0)
+        if accounting_value != generic_value:
+            errors.append(
+                f"generic chain mismatch for {accounting_key}: "
+                f"accounting={accounting_value} generic={generic_value}"
+            )
+    accounting_conflict_count = int_value(accounting.get("rolling_normal_lane_conflict_count"), 0) + int_value(
+        accounting.get("rolling_depth3_normal_lane_conflict_count"), 0
+    )
+    if accounting_conflict_count != int_value(generic_summary.get("generic_normal_lane_conflict_count"), 0):
+        errors.append(
+            "generic chain mismatch for normal lane conflict count: "
+            f"accounting={accounting_conflict_count} "
+            f"generic={generic_summary.get('generic_normal_lane_conflict_count')}"
+        )
+    if not generic_summary.get("generic_combined_accounting_ok", False):
+        errors.append("generic chain combined accounting check failed")
+    if not generic_summary.get("generic_target_draft_accounting_ok", False):
+        errors.append("generic chain target/draft accounting check failed")
+    return errors
+
+
 def validate_accounting(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
     *,
     strict_performance: bool = False,
+    check_generic_chain: bool = False,
     low_committed_share_threshold: float = DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD,
     high_payload_len_per_committed_token_threshold: float = (
         DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD
@@ -1278,6 +1321,8 @@ def validate_accounting(
     errors.extend(f"commit checker: {error}" for error in commit_errors)
     accounting = aggregate_performance_accounting(records, result_payload)
     accounting["commit_checker_error_count"] = len(commit_errors)
+    if check_generic_chain:
+        errors.extend(generic_chain_accounting_errors(records, accounting))
 
     committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
     committed_proposals = int_value(accounting.get("eager_committed_proposal_count"), 0)
@@ -1887,6 +1932,18 @@ def run_synthetic_tests() -> None:
     errors, summary = validate_accounting(
         records,
         synthetic_result_payload(),
+        check_generic_chain=True,
+    )
+    assert not errors, f"valid generic-chain performance accounting synthetic failed: {errors}"
+
+    bad_accounting = aggregate_performance_accounting(records, synthetic_result_payload())
+    bad_accounting["combined_real_committed_token_count"] += 1
+    errors = generic_chain_accounting_errors(records, bad_accounting)
+    assert any("combined" in error for error in errors), "missed generic-chain combined mismatch"
+
+    errors, summary = validate_accounting(
+        records,
+        synthetic_result_payload(),
         strict_performance=True,
         low_committed_share_threshold=0.5,
     )
@@ -1902,6 +1959,7 @@ def main() -> int:
     parser.add_argument("result", nargs="?", type=Path, help="Optional eval result JSON.")
     parser.add_argument("--synthetic", action="store_true", help="Run built-in synthetic checks.")
     parser.add_argument("--strict-performance", action="store_true", help="Fail when diagnostic performance warnings fire.")
+    parser.add_argument("--check-generic-chain", action="store_true", help="Cross-check committed-depth accounting with generic chain parser.")
     parser.add_argument("--low-committed-share-threshold", type=float, default=DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD)
     parser.add_argument(
         "--high-payload-len-per-committed-token-threshold",
@@ -1920,6 +1978,7 @@ def main() -> int:
         records,
         result_payload,
         strict_performance=args.strict_performance,
+        check_generic_chain=args.check_generic_chain,
         low_committed_share_threshold=args.low_committed_share_threshold,
         high_payload_len_per_committed_token_threshold=args.high_payload_len_per_committed_token_threshold,
     )

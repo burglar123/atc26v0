@@ -13,6 +13,58 @@ from typing import Any
 
 
 MAX_LEGACY_REAL_DEPTH = 3
+GENERIC_ONE_SHOT_ACTION = "append_full_accept_then_rollback"
+GENERIC_ROLLING_ACTION = "append_full_accept_real_commit"
+
+ACCOUNTING_TOKEN_KEYS_BY_DEPTH = {
+    0: "eager_committed_token_count",
+    1: "continuous_eager_real_committed_token_count",
+    2: "rolling_depth2_real_committed_token_count",
+    3: "rolling_depth3_real_committed_token_count",
+}
+
+ACCOUNTING_INCREMENT_KEYS_BY_DEPTH = {
+    0: {
+        "target_verified": "target_actual_eager_verified_token_increment_sum",
+        "target_accepted": "target_actual_eager_accepted_token_increment_sum",
+        "target_rejected": "target_actual_eager_rejected_token_increment_sum",
+        "target_invalidated": "target_actual_eager_invalidated_token_increment_sum",
+        "draft_verified": "draft_actual_eager_verified_token_increment_sum",
+        "draft_accepted": "draft_actual_eager_accepted_token_increment_sum",
+        "draft_rejected": None,
+        "draft_invalidated": None,
+    },
+    1: {
+        "target_verified": "continuous_target_actual_verified_token_increment_sum",
+        "target_accepted": "continuous_target_actual_accepted_token_increment_sum",
+        "target_rejected": "continuous_target_actual_rejected_token_increment_sum",
+        "target_invalidated": "continuous_target_actual_invalidated_token_increment_sum",
+        "draft_verified": "continuous_draft_actual_verified_token_increment_sum",
+        "draft_accepted": "continuous_draft_actual_accepted_token_increment_sum",
+        "draft_rejected": "continuous_draft_actual_rejected_token_increment_sum",
+        "draft_invalidated": "continuous_draft_actual_invalidated_token_increment_sum",
+    },
+    2: {
+        "target_verified": "rolling_depth2_target_actual_verified_token_increment_sum",
+        "target_accepted": "rolling_depth2_target_actual_accepted_token_increment_sum",
+        "target_rejected": "rolling_depth2_target_actual_rejected_token_increment_sum",
+        "target_invalidated": "rolling_depth2_target_actual_invalidated_token_increment_sum",
+        "draft_verified": "rolling_depth2_draft_actual_verified_token_increment_sum",
+        "draft_accepted": "rolling_depth2_draft_actual_accepted_token_increment_sum",
+        "draft_rejected": "rolling_depth2_draft_actual_rejected_token_increment_sum",
+        "draft_invalidated": "rolling_depth2_draft_actual_invalidated_token_increment_sum",
+    },
+    3: {
+        "target_verified": "rolling_depth3_target_actual_verified_token_increment_sum",
+        "target_accepted": "rolling_depth3_target_actual_accepted_token_increment_sum",
+        "target_rejected": "rolling_depth3_target_actual_rejected_token_increment_sum",
+        "target_invalidated": "rolling_depth3_target_actual_invalidated_token_increment_sum",
+        "draft_verified": "rolling_depth3_draft_actual_verified_token_increment_sum",
+        "draft_accepted": "rolling_depth3_draft_actual_accepted_token_increment_sum",
+        "draft_rejected": "rolling_depth3_draft_actual_rejected_token_increment_sum",
+        "draft_invalidated": "rolling_depth3_draft_actual_invalidated_token_increment_sum",
+    },
+}
 
 
 @dataclass
@@ -715,3 +767,132 @@ def committed_token_count(registry: RollingChainRegistry, depth: int) -> int:
 
 def committed_token_counts_by_depth(registry: RollingChainRegistry, max_depth: int = MAX_LEGACY_REAL_DEPTH) -> dict[int, int]:
     return {depth: committed_token_count(registry, depth) for depth in range(0, max_depth + 1)}
+
+
+def registry_safety_issue_sets(
+    registry: RollingChainRegistry,
+    *,
+    max_depth: int = MAX_LEGACY_REAL_DEPTH,
+) -> dict[str, Any]:
+    invalid_committed_ids = set(registry.invalid_committed_ids)
+    cascade_committed_ids = set(registry.cascade_committed_ids)
+    parent_missing_ids = set(registry.committed_without_parent_ids)
+    generated_only_ids = set(registry.committed_without_ready_ids)
+    non_full_ids = set(registry.non_full_accept_ids)
+    stale_committed_ids: set[int] = set()
+
+    for depth in range(0, max_depth + 1):
+        expected_action = GENERIC_ROLLING_ACTION if depth >= 2 else GENERIC_ONE_SHOT_ACTION
+        for proposal_id in registry.committed_by_depth[depth]:
+            node = registry.nodes_by_id.get(proposal_id)
+            if node is None:
+                parent_missing_ids.add(proposal_id)
+                continue
+            if node.verify_result is not None and node.verify_result != "full_accept":
+                non_full_ids.add(proposal_id)
+            if node.action is not None and node.action != expected_action:
+                non_full_ids.add(proposal_id)
+            if node.invalidated:
+                invalid_committed_ids.add(proposal_id)
+            if node.cascade_discarded:
+                cascade_committed_ids.add(proposal_id)
+            if node.stale_or_frontier_mismatch:
+                stale_committed_ids.add(proposal_id)
+            if depth >= 1 and not node.ready_shadow:
+                generated_only_ids.add(proposal_id)
+            if depth == 0:
+                continue
+            if node.parent_id is None:
+                parent_missing_ids.add(proposal_id)
+                continue
+            parent = registry.nodes_by_id.get(node.parent_id)
+            if parent is None or not parent.committed:
+                parent_missing_ids.add(proposal_id)
+
+    duplicate_commit_count = (
+        len(registry.duplicate_commit_ids)
+        + len(registry.duplicate_commit_seq_ids)
+        + len(registry.duplicate_seq_depth_events)
+    )
+    return {
+        "duplicate_commit_count": duplicate_commit_count,
+        "invalid_committed_ids": invalid_committed_ids,
+        "cascade_committed_ids": cascade_committed_ids,
+        "parent_missing_ids": parent_missing_ids,
+        "generated_only_ids": generated_only_ids,
+        "non_full_ids": non_full_ids,
+        "stale_committed_ids": stale_committed_ids,
+    }
+
+
+def summarize_registry(
+    registry: RollingChainRegistry,
+    *,
+    max_depth: int = MAX_LEGACY_REAL_DEPTH,
+    accounting: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    token_by_depth = committed_token_counts_by_depth(registry, max_depth)
+    combined_tokens = sum(token_by_depth.values())
+    max_real_depth = registry.max_real_committed_depth
+    for depth, tokens in token_by_depth.items():
+        if tokens:
+            max_real_depth = max(max_real_depth, depth)
+    safety = registry_safety_issue_sets(registry, max_depth=max_depth)
+    summary: dict[str, Any] = {
+        "generic_one_shot_committed_proposal_count": len(registry.committed_by_depth[0]),
+        "generic_one_shot_committed_token_count": token_by_depth.get(0, 0),
+        "generic_depth1_committed_proposal_count": len(registry.committed_by_depth[1]),
+        "generic_depth1_committed_token_count": token_by_depth.get(1, 0),
+        "generic_depth2_committed_proposal_count": len(registry.committed_by_depth[2]),
+        "generic_depth2_committed_token_count": token_by_depth.get(2, 0),
+        "generic_depth3_committed_proposal_count": len(registry.committed_by_depth[3]),
+        "generic_depth3_committed_token_count": token_by_depth.get(3, 0),
+        "generic_combined_real_committed_token_count": combined_tokens,
+        "generic_max_observed_depth": registry.max_observed_depth,
+        "generic_max_real_committed_depth": max_real_depth,
+        "generic_depth4_real_commit_count": registry.depth4_real_commit_count,
+        "generic_depth_gt3_real_commit_count": registry.depth_gt3_real_commit_count,
+        "generic_depth_gt3_committed_proposal_count": len(registry.higher_depth_commit_ids),
+        "generic_normal_lane_conflict_count": registry.normal_lane_conflict_count,
+        "generic_missing_buffered_proposal_unexpected_count": registry.missing_buffered_proposal_unexpected_count,
+        "generic_duplicate_commit_count": safety["duplicate_commit_count"],
+        "generic_invalid_committed_child_count": len(safety["invalid_committed_ids"]),
+        "generic_cascade_committed_child_count": len(safety["cascade_committed_ids"]),
+        "generic_parent_missing_committed_child_count": len(safety["parent_missing_ids"]),
+        "generic_generated_only_committed_child_count": len(safety["generated_only_ids"]),
+        "generic_non_full_accept_committed_count": len(safety["non_full_ids"]),
+        "generic_stale_or_frontier_committed_child_count": len(safety["stale_committed_ids"]),
+        "generic_target_draft_length_mismatch_count": registry.target_draft_length_mismatch_count,
+        "generic_target_draft_token_mismatch_count": registry.target_draft_token_mismatch_count,
+    }
+    if accounting is not None:
+        combined_ok = True
+        for depth, token_key in ACCOUNTING_TOKEN_KEYS_BY_DEPTH.items():
+            accounting_tokens = int_value(accounting.get(token_key), 0)
+            if registry.committed_by_depth[depth] or accounting_tokens:
+                combined_ok = combined_ok and accounting_tokens == token_by_depth.get(depth, 0)
+        combined_ok = combined_ok and int_value(accounting.get("combined_real_committed_token_count"), 0) == combined_tokens
+        combined_ok = combined_ok and int_value(
+            accounting.get("combined_actual_verified_token_increment_sum"), 0
+        ) == combined_tokens
+        combined_ok = combined_ok and int_value(
+            accounting.get("combined_actual_accepted_token_increment_sum"), 0
+        ) == combined_tokens
+
+        target_draft_ok = (
+            registry.target_draft_length_mismatch_count == 0
+            and registry.target_draft_token_mismatch_count == 0
+        )
+        for depth, increment_keys in ACCOUNTING_INCREMENT_KEYS_BY_DEPTH.items():
+            tokens = token_by_depth.get(depth, 0)
+            for key_name in ("target_verified", "target_accepted", "draft_verified", "draft_accepted"):
+                key = increment_keys.get(key_name)
+                if key is not None:
+                    target_draft_ok = target_draft_ok and int_value(accounting.get(key), 0) == tokens
+            for key_name in ("target_rejected", "target_invalidated", "draft_rejected", "draft_invalidated"):
+                key = increment_keys.get(key_name)
+                if key is not None:
+                    target_draft_ok = target_draft_ok and int_value(accounting.get(key), 0) == 0
+        summary["generic_combined_accounting_ok"] = combined_ok
+        summary["generic_target_draft_accounting_ok"] = target_draft_ok
+    return summary
