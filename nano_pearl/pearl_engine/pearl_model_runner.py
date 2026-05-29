@@ -1068,8 +1068,28 @@ class ModelRunnerBase:
                 unaccepted = self.gamma - accepted_len
                 self.scheduler.rollback(seq, unaccepted)
                 seq.append_token(revise_token[idx])
+                self._ensure_block_table_covers_sequence(seq)
 
         return accepted_lens, invalidated_lens
+
+    def _ensure_block_table_covers_sequence(self, seq: Sequence):
+        """Allocate additional KV-cache blocks so block_table covers seq.num_blocks.
+
+        Must be called after any serialized_pearl-specific append that occurs
+        outside of scheduler.schedule() (which normally calls may_append).
+        """
+        missing = seq.num_blocks - len(seq.block_table)
+        assert missing >= 0, (
+            f"_ensure_block_table_covers_sequence: seq {seq.seq_id} "
+            f"num_blocks={seq.num_blocks} block_table_len={len(seq.block_table)} "
+            f"missing={missing}"
+        )
+        while len(seq.block_table) < seq.num_blocks:
+            self.scheduler.block_manager.may_append(seq)
+        assert len(seq.block_table) >= seq.num_blocks, (
+            f"_ensure_block_table_covers_sequence: failed to allocate blocks "
+            f"for seq {seq.seq_id} (need {seq.num_blocks}, have {len(seq.block_table)})"
+        )
 
     @abstractmethod
     def pearl_step(self):
@@ -1288,6 +1308,7 @@ class TargetModelRunner(ModelRunnerBase):
             )
             for tok in toks:
                 seq.append_token(tok)
+            self._ensure_block_table_covers_sequence(seq)
 
     def prepare_serialized_verify_decode(self, seqs: list[Sequence]):
         """Target preparation for serialized speculative decoding baseline.
@@ -1320,6 +1341,11 @@ class TargetModelRunner(ModelRunnerBase):
             input_ids.extend(to_append_tokens)
             positions.extend(range(start, end))
             context_lens.extend(range(start + 1, end + 1))
+            assert len(seq.block_table) >= seq.num_blocks, (
+                f"prepare_serialized_verify_decode: block_table too short for seq {seq.seq_id} "
+                f"request_id={seq.request_id} len(seq)={len(seq)} "
+                f"num_blocks={seq.num_blocks} block_table_len={len(seq.block_table)}"
+            )
             slot_mapping.extend([seq.token_to_slot(i) for i in range(start, end)])
             temp_seqs.extend([seq] * num_tokens)
 
