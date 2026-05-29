@@ -96,6 +96,44 @@ ROLLING_DEPTH3_COMMIT_META_LEN = 7
 ROLLING_DEPTH3_COMMIT_FIXED_PAYLOAD_WIDTH = 8
 
 
+@dataclass
+class RollingProposalCommitRecord:
+    proposal_id: int
+    seq_id: int
+    depth: int
+    token_count: int
+    accept_len: int
+    action: str
+    verify_result: str
+    parent_id: int | None = None
+    root_id: int | None = None
+    ready: bool = False
+    committed: bool = False
+    skipped: bool = False
+    skip_reason: str | None = None
+    precondition_ok: bool = False
+    precondition_failed: bool = False
+    precondition_failure_reason: str | None = None
+
+
+@dataclass
+class RollingCommitTraceBundle:
+    depth: int
+    prefix: str
+    candidate_ids: list[int]
+    candidate_seq_ids: list[int]
+    ready_ids: list[int]
+    candidate_records: list[RollingProposalCommitRecord]
+    committed_records: list[RollingProposalCommitRecord]
+    skipped_records: list[RollingProposalCommitRecord]
+    target_len_before_by_seq: dict[int, int]
+    target_len_after_by_seq: dict[int, int]
+    draft_len_before_by_seq: dict[int, int]
+    draft_len_after_by_seq: dict[int, int]
+    len_match_by_seq: dict[int, bool]
+    token_match_by_seq: dict[int, bool]
+
+
 class ModelRunnerBase:
     """
     Different from ModelRunner in nano-vllm, 
@@ -2740,6 +2778,100 @@ class ModelRunnerBase:
     def _trace_token_sum(self, proposal_ids: list[int], token_count_by_id: dict[int, int]) -> int:
         return sum(int(token_count_by_id.get(int(proposal_id), 0)) for proposal_id in proposal_ids)
 
+    def _build_commit_trace_bundle(
+        self,
+        *,
+        depth: int,
+        prefix: str,
+        candidate_ids: list[int],
+        candidate_seq_ids: list[int],
+        ready_ids: list[int],
+        records: list[RollingProposalCommitRecord],
+        target_len_before_by_seq: dict[int, int],
+        target_len_after_by_seq: dict[int, int],
+        draft_len_before_by_seq: dict[int, int],
+        draft_len_after_by_seq: dict[int, int],
+        len_match_by_seq: dict[int, bool],
+        token_match_by_seq: dict[int, bool],
+    ) -> RollingCommitTraceBundle:
+        return RollingCommitTraceBundle(
+            depth=int(depth),
+            prefix=str(prefix),
+            candidate_ids=list(candidate_ids),
+            candidate_seq_ids=list(candidate_seq_ids),
+            ready_ids=list(ready_ids),
+            candidate_records=list(records),
+            committed_records=[record for record in records if record.committed],
+            skipped_records=[record for record in records if record.skipped],
+            target_len_before_by_seq=target_len_before_by_seq,
+            target_len_after_by_seq=target_len_after_by_seq,
+            draft_len_before_by_seq=draft_len_before_by_seq,
+            draft_len_after_by_seq=draft_len_after_by_seq,
+            len_match_by_seq=len_match_by_seq,
+            token_match_by_seq=token_match_by_seq,
+        )
+
+    def _records_committed_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.proposal_id) for record in records if record.committed]
+
+    def _records_committed_seq_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.seq_id) for record in records if record.committed]
+
+    def _records_skipped_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.proposal_id) for record in records if record.skipped]
+
+    def _records_token_count_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {int(record.proposal_id): int(record.token_count) for record in records}
+
+    def _records_accept_len_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {int(record.proposal_id): int(record.accept_len) for record in records}
+
+    def _records_action_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {int(record.proposal_id): str(record.action) for record in records}
+
+    def _records_verify_result_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {int(record.proposal_id): str(record.verify_result) for record in records}
+
+    def _records_parent_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {
+            int(record.proposal_id): int(record.parent_id)
+            for record in records
+            if record.parent_id is not None
+        }
+
+    def _records_root_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {
+            int(record.proposal_id): int(record.root_id)
+            for record in records
+            if record.root_id is not None
+        }
+
+    def _records_depth_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {int(record.proposal_id): int(record.depth) for record in records}
+
+    def _records_skip_reason_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {
+            int(record.proposal_id): str(record.skip_reason)
+            for record in records
+            if record.skipped and record.skip_reason is not None
+        }
+
+    def _records_precondition_ok_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, bool]:
+        return {int(record.proposal_id): bool(record.precondition_ok) for record in records}
+
+    def _records_precondition_failed_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, bool]:
+        return {int(record.proposal_id): bool(record.precondition_failed) for record in records}
+
+    def _records_precondition_failure_reason_by_id(
+        self,
+        records: list[RollingProposalCommitRecord],
+    ) -> dict[int, str]:
+        return {
+            int(record.proposal_id): str(record.precondition_failure_reason)
+            for record in records
+            if record.precondition_failure_reason is not None
+        }
+
     def _trace_commit_count_summary(
         self,
         committed_ids: list[int],
@@ -2768,6 +2900,7 @@ class ModelRunnerBase:
         draft_len_after_by_seq: dict[int, int],
         len_match_by_seq: dict[int, bool],
         token_match_by_seq: dict[int, bool],
+        record: RollingProposalCommitRecord | None = None,
     ) -> None:
         skipped_ids.append(int(proposal_id))
         skip_reason_by_id[int(proposal_id)] = str(reason)
@@ -2778,6 +2911,12 @@ class ModelRunnerBase:
         draft_len_after_by_seq[int(seq_id)] = int(current_len)
         len_match_by_seq[int(seq_id)] = True
         token_match_by_seq[int(seq_id)] = True
+        if record is not None:
+            record.skipped = True
+            record.skip_reason = str(reason)
+            record.precondition_ok = False
+            record.precondition_failed = True
+            record.precondition_failure_reason = str(reason)
 
     def _mark_commit_precondition_ok(
         self,
@@ -2788,11 +2927,16 @@ class ModelRunnerBase:
         committed_seq_ids: list[int],
         precondition_ok_by_id: dict[int, bool],
         precondition_failed_by_id: dict[int, bool],
+        record: RollingProposalCommitRecord | None = None,
     ) -> None:
         committed_ids.append(int(proposal_id))
         committed_seq_ids.append(int(seq_id))
         precondition_ok_by_id[int(proposal_id)] = True
         precondition_failed_by_id[int(proposal_id)] = False
+        if record is not None:
+            record.committed = True
+            record.precondition_ok = True
+            record.precondition_failed = False
 
     def _emit_target_draft_match_trace(
         self,
@@ -8281,6 +8425,7 @@ class ModelRunnerBase:
         accept_by_id: dict[int, int] = {}
         action_by_id: dict[int, str] = {}
         result_by_id: dict[int, str] = {}
+        commit_records: list[RollingProposalCommitRecord] = []
         target_len_before_by_seq: dict[int, int] = {}
         target_len_after_by_seq: dict[int, int] = {}
         draft_len_before_by_seq: dict[int, int] = {}
@@ -8322,6 +8467,18 @@ class ModelRunnerBase:
             local_frontier_ok = bool(seq is not None and current_len == base_len)
             local_token_payload_ok = bool(len(proposal_tokens) == proposal_len == token_count == gamma)
             seq_depth_key = (seq_id, depth)
+            commit_record = RollingProposalCommitRecord(
+                proposal_id=proposal_id,
+                seq_id=seq_id,
+                depth=depth,
+                token_count=token_count,
+                accept_len=accept_len,
+                action=action,
+                verify_result=verify_result,
+                parent_id=parent_id,
+                ready=proposal_id in ready_ids,
+            )
+            commit_records.append(commit_record)
 
             reason = None
             if proposal_id in self._continuous_eager_committed_proposal_ids:
@@ -8401,6 +8558,7 @@ class ModelRunnerBase:
                     draft_len_after_by_seq=draft_len_after_by_seq,
                     len_match_by_seq=len_match_by_seq,
                     token_match_by_seq=token_match_by_seq,
+                    record=commit_record,
                 )
                 continue
 
@@ -8425,8 +8583,36 @@ class ModelRunnerBase:
                 committed_seq_ids=committed_seq_ids,
                 precondition_ok_by_id=precondition_ok_by_id,
                 precondition_failed_by_id=precondition_failed_by_id,
+                record=commit_record,
             )
 
+        commit_bundle = self._build_commit_trace_bundle(
+            depth=1,
+            prefix="continuous_eager",
+            candidate_ids=candidate_ids,
+            candidate_seq_ids=candidate_seq_ids,
+            ready_ids=sorted(ready_ids),
+            records=commit_records,
+            target_len_before_by_seq=target_len_before_by_seq,
+            target_len_after_by_seq=target_len_after_by_seq,
+            draft_len_before_by_seq=draft_len_before_by_seq,
+            draft_len_after_by_seq=draft_len_after_by_seq,
+            len_match_by_seq=len_match_by_seq,
+            token_match_by_seq=token_match_by_seq,
+        )
+        committed_ids = self._records_committed_ids(commit_bundle.committed_records)
+        committed_seq_ids = self._records_committed_seq_ids(commit_bundle.committed_records)
+        skipped_ids = self._records_skipped_ids(commit_bundle.skipped_records)
+        skip_reason_by_id = self._records_skip_reason_by_id(commit_bundle.skipped_records)
+        precondition_ok_by_id = self._records_precondition_ok_by_id(commit_bundle.candidate_records)
+        precondition_failed_by_id = self._records_precondition_failed_by_id(commit_bundle.candidate_records)
+        precondition_failure_reason_by_id = self._records_precondition_failure_reason_by_id(
+            commit_bundle.candidate_records
+        )
+        token_count_by_id = self._records_token_count_by_id(commit_bundle.candidate_records)
+        accept_by_id = self._records_accept_len_by_id(commit_bundle.candidate_records)
+        action_by_id = self._records_action_by_id(commit_bundle.candidate_records)
+        result_by_id = self._records_verify_result_by_id(commit_bundle.candidate_records)
         commit_summary = self._trace_commit_count_summary(committed_ids, token_count_by_id, skip_reason_by_id)
         committed_tokens = int(commit_summary["committed_tokens"])
         reason_counts = commit_summary["skip_reason_counts"]
@@ -8437,9 +8623,9 @@ class ModelRunnerBase:
         trace_record["continuous_eager_commit_side"] = side
         trace_record["continuous_eager_commit_step_id"] = None if plan.step_id is None else int(plan.step_id)
         trace_record["continuous_eager_commit_plan_id"] = int(plan.plan_id)
-        trace_record["continuous_eager_commit_candidate_proposal_ids"] = list(candidate_ids)
-        trace_record["continuous_eager_commit_candidate_seq_ids"] = list(candidate_seq_ids)
-        trace_record["continuous_eager_commit_ready_source_proposal_ids"] = sorted(ready_ids)
+        trace_record["continuous_eager_commit_candidate_proposal_ids"] = list(commit_bundle.candidate_ids)
+        trace_record["continuous_eager_commit_candidate_seq_ids"] = list(commit_bundle.candidate_seq_ids)
+        trace_record["continuous_eager_commit_ready_source_proposal_ids"] = list(commit_bundle.ready_ids)
         self._emit_committed_proposal_detail_trace(
             trace_record,
             proposal_ids_field="continuous_eager_real_committed_proposal_ids",
@@ -8473,13 +8659,13 @@ class ModelRunnerBase:
         trace_record["continuous_eager_real_commit_duplicate_seq_ids"] = sorted(set(duplicate_seq_ids))
         self._emit_target_draft_match_trace(
             trace_record,
-            prefix="continuous_eager",
-            target_len_before_by_seq=target_len_before_by_seq,
-            target_len_after_by_seq=target_len_after_by_seq,
-            draft_len_before_by_seq=draft_len_before_by_seq,
-            draft_len_after_by_seq=draft_len_after_by_seq,
-            len_match_by_seq=len_match_by_seq,
-            token_match_by_seq=token_match_by_seq,
+            prefix=commit_bundle.prefix,
+            target_len_before_by_seq=commit_bundle.target_len_before_by_seq,
+            target_len_after_by_seq=commit_bundle.target_len_after_by_seq,
+            draft_len_before_by_seq=commit_bundle.draft_len_before_by_seq,
+            draft_len_after_by_seq=commit_bundle.draft_len_after_by_seq,
+            len_match_by_seq=commit_bundle.len_match_by_seq,
+            token_match_by_seq=commit_bundle.token_match_by_seq,
         )
         trace_record["continuous_eager_tokens_verified"] = int(committed_tokens)
         trace_record["continuous_eager_tokens_accepted"] = int(committed_tokens)
@@ -9022,6 +9208,7 @@ class ModelRunnerBase:
         parent_commit_by_id: dict[int, int] = {}
         root_commit_by_id: dict[int, int] = {}
         depth_commit_by_id: dict[int, int] = {}
+        commit_records: list[RollingProposalCommitRecord] = []
         target_len_before_by_seq: dict[int, int] = {}
         target_len_after_by_seq: dict[int, int] = {}
         draft_len_before_by_seq: dict[int, int] = {}
@@ -9071,6 +9258,19 @@ class ModelRunnerBase:
                 token_payload_ok = proposal_tokens[:gamma] == [int(token_id) for token_id in proposal.proposal_token_ids]
             frontier_ok = bool(seq is not None and current_len == base_len)
             seq_depth_key = (seq_id, depth)
+            commit_record = RollingProposalCommitRecord(
+                proposal_id=proposal_id,
+                seq_id=seq_id,
+                depth=depth,
+                token_count=token_count,
+                accept_len=accept_len,
+                action=action,
+                verify_result=verify_result,
+                parent_id=parent_id,
+                root_id=root_id,
+                ready=proposal_id in ready_ids,
+            )
+            commit_records.append(commit_record)
 
             reason = None
             if proposal_id in self._rolling_depth3_committed_proposal_ids:
@@ -9177,6 +9377,7 @@ class ModelRunnerBase:
                     draft_len_after_by_seq=draft_len_after_by_seq,
                     len_match_by_seq=len_match_by_seq,
                     token_match_by_seq=token_match_by_seq,
+                    record=commit_record,
                 )
                 continue
 
@@ -9203,8 +9404,39 @@ class ModelRunnerBase:
                 committed_seq_ids=committed_seq_ids,
                 precondition_ok_by_id=precondition_ok_by_id,
                 precondition_failed_by_id=precondition_failed_by_id,
+                record=commit_record,
             )
 
+        commit_bundle = self._build_commit_trace_bundle(
+            depth=3,
+            prefix="rolling_depth3",
+            candidate_ids=candidate_ids,
+            candidate_seq_ids=candidate_seq_ids,
+            ready_ids=sorted(ready_ids),
+            records=commit_records,
+            target_len_before_by_seq=target_len_before_by_seq,
+            target_len_after_by_seq=target_len_after_by_seq,
+            draft_len_before_by_seq=draft_len_before_by_seq,
+            draft_len_after_by_seq=draft_len_after_by_seq,
+            len_match_by_seq=len_match_by_seq,
+            token_match_by_seq=token_match_by_seq,
+        )
+        committed_ids = self._records_committed_ids(commit_bundle.committed_records)
+        committed_seq_ids = self._records_committed_seq_ids(commit_bundle.committed_records)
+        skipped_ids = self._records_skipped_ids(commit_bundle.skipped_records)
+        skip_reason_by_id = self._records_skip_reason_by_id(commit_bundle.skipped_records)
+        precondition_ok_by_id = self._records_precondition_ok_by_id(commit_bundle.candidate_records)
+        precondition_failed_by_id = self._records_precondition_failed_by_id(commit_bundle.candidate_records)
+        precondition_failure_reason_by_id = self._records_precondition_failure_reason_by_id(
+            commit_bundle.candidate_records
+        )
+        token_count_by_id = self._records_token_count_by_id(commit_bundle.candidate_records)
+        accept_by_id = self._records_accept_len_by_id(commit_bundle.candidate_records)
+        action_by_id = self._records_action_by_id(commit_bundle.candidate_records)
+        result_by_id = self._records_verify_result_by_id(commit_bundle.candidate_records)
+        parent_commit_by_id = self._records_parent_by_id(commit_bundle.candidate_records)
+        root_commit_by_id = self._records_root_by_id(commit_bundle.candidate_records)
+        depth_commit_by_id = self._records_depth_by_id(commit_bundle.candidate_records)
         commit_summary = self._trace_commit_count_summary(committed_ids, token_count_by_id, skip_reason_by_id)
         committed_tokens = int(commit_summary["committed_tokens"])
         reason_counts = commit_summary["skip_reason_counts"]
@@ -9215,9 +9447,9 @@ class ModelRunnerBase:
         trace_record["rolling_depth3_commit_side"] = side
         trace_record["rolling_depth3_commit_step_id"] = None if plan.step_id is None else int(plan.step_id)
         trace_record["rolling_depth3_commit_plan_id"] = int(plan.plan_id)
-        trace_record["rolling_depth3_commit_candidate_proposal_ids"] = list(candidate_ids)
-        trace_record["rolling_depth3_commit_candidate_seq_ids"] = list(candidate_seq_ids)
-        trace_record["rolling_depth3_commit_ready_source_proposal_ids"] = sorted(ready_ids)
+        trace_record["rolling_depth3_commit_candidate_proposal_ids"] = list(commit_bundle.candidate_ids)
+        trace_record["rolling_depth3_commit_candidate_seq_ids"] = list(commit_bundle.candidate_seq_ids)
+        trace_record["rolling_depth3_commit_ready_source_proposal_ids"] = list(commit_bundle.ready_ids)
         trace_record["rolling_depth3_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_commit_by_id)
         self._emit_commit_precondition_trace(
             trace_record,
@@ -9267,13 +9499,13 @@ class ModelRunnerBase:
         trace_record["rolling_depth3_committed_non_full_accept_ids"] = sorted(set(non_full_accept_ids) & committed_set)
         self._emit_target_draft_match_trace(
             trace_record,
-            prefix="rolling_depth3",
-            target_len_before_by_seq=target_len_before_by_seq,
-            target_len_after_by_seq=target_len_after_by_seq,
-            draft_len_before_by_seq=draft_len_before_by_seq,
-            draft_len_after_by_seq=draft_len_after_by_seq,
-            len_match_by_seq=len_match_by_seq,
-            token_match_by_seq=token_match_by_seq,
+            prefix=commit_bundle.prefix,
+            target_len_before_by_seq=commit_bundle.target_len_before_by_seq,
+            target_len_after_by_seq=commit_bundle.target_len_after_by_seq,
+            draft_len_before_by_seq=commit_bundle.draft_len_before_by_seq,
+            draft_len_after_by_seq=commit_bundle.draft_len_after_by_seq,
+            len_match_by_seq=commit_bundle.len_match_by_seq,
+            token_match_by_seq=commit_bundle.token_match_by_seq,
         )
         trace_record["rolling_depth3_tokens_verified"] = int(committed_tokens)
         trace_record["rolling_depth3_tokens_accepted"] = int(committed_tokens)
@@ -9345,6 +9577,7 @@ class ModelRunnerBase:
         parent_commit_by_id: dict[int, int] = {}
         root_commit_by_id: dict[int, int] = {}
         depth_commit_by_id: dict[int, int] = {}
+        commit_records: list[RollingProposalCommitRecord] = []
         target_len_before_by_seq: dict[int, int] = {}
         target_len_after_by_seq: dict[int, int] = {}
         draft_len_before_by_seq: dict[int, int] = {}
@@ -9394,6 +9627,19 @@ class ModelRunnerBase:
                 token_payload_ok = proposal_tokens[:gamma] == [int(token_id) for token_id in proposal.proposal_token_ids]
             frontier_ok = bool(seq is not None and current_len == base_len)
             seq_depth_key = (seq_id, depth)
+            commit_record = RollingProposalCommitRecord(
+                proposal_id=proposal_id,
+                seq_id=seq_id,
+                depth=depth,
+                token_count=token_count,
+                accept_len=accept_len,
+                action=action,
+                verify_result=verify_result,
+                parent_id=parent_id,
+                root_id=root_id,
+                ready=proposal_id in ready_ids,
+            )
+            commit_records.append(commit_record)
 
             reason = None
             if proposal_id in self._rolling_depth2_committed_proposal_ids:
@@ -9472,6 +9718,7 @@ class ModelRunnerBase:
                     draft_len_after_by_seq=draft_len_after_by_seq,
                     len_match_by_seq=len_match_by_seq,
                     token_match_by_seq=token_match_by_seq,
+                    record=commit_record,
                 )
                 continue
 
@@ -9498,8 +9745,39 @@ class ModelRunnerBase:
                 committed_seq_ids=committed_seq_ids,
                 precondition_ok_by_id=precondition_ok_by_id,
                 precondition_failed_by_id=precondition_failed_by_id,
+                record=commit_record,
             )
 
+        commit_bundle = self._build_commit_trace_bundle(
+            depth=2,
+            prefix="rolling_depth2",
+            candidate_ids=candidate_ids,
+            candidate_seq_ids=candidate_seq_ids,
+            ready_ids=sorted(ready_ids),
+            records=commit_records,
+            target_len_before_by_seq=target_len_before_by_seq,
+            target_len_after_by_seq=target_len_after_by_seq,
+            draft_len_before_by_seq=draft_len_before_by_seq,
+            draft_len_after_by_seq=draft_len_after_by_seq,
+            len_match_by_seq=len_match_by_seq,
+            token_match_by_seq=token_match_by_seq,
+        )
+        committed_ids = self._records_committed_ids(commit_bundle.committed_records)
+        committed_seq_ids = self._records_committed_seq_ids(commit_bundle.committed_records)
+        skipped_ids = self._records_skipped_ids(commit_bundle.skipped_records)
+        skip_reason_by_id = self._records_skip_reason_by_id(commit_bundle.skipped_records)
+        precondition_ok_by_id = self._records_precondition_ok_by_id(commit_bundle.candidate_records)
+        precondition_failed_by_id = self._records_precondition_failed_by_id(commit_bundle.candidate_records)
+        precondition_failure_reason_by_id = self._records_precondition_failure_reason_by_id(
+            commit_bundle.candidate_records
+        )
+        token_count_by_id = self._records_token_count_by_id(commit_bundle.candidate_records)
+        accept_by_id = self._records_accept_len_by_id(commit_bundle.candidate_records)
+        action_by_id = self._records_action_by_id(commit_bundle.candidate_records)
+        result_by_id = self._records_verify_result_by_id(commit_bundle.candidate_records)
+        parent_commit_by_id = self._records_parent_by_id(commit_bundle.candidate_records)
+        root_commit_by_id = self._records_root_by_id(commit_bundle.candidate_records)
+        depth_commit_by_id = self._records_depth_by_id(commit_bundle.candidate_records)
         commit_summary = self._trace_commit_count_summary(committed_ids, token_count_by_id, skip_reason_by_id)
         committed_tokens = int(commit_summary["committed_tokens"])
         reason_counts = commit_summary["skip_reason_counts"]
@@ -9510,9 +9788,9 @@ class ModelRunnerBase:
         trace_record["rolling_depth2_commit_side"] = side
         trace_record["rolling_depth2_commit_step_id"] = None if plan.step_id is None else int(plan.step_id)
         trace_record["rolling_depth2_commit_plan_id"] = int(plan.plan_id)
-        trace_record["rolling_depth2_commit_candidate_proposal_ids"] = list(candidate_ids)
-        trace_record["rolling_depth2_commit_candidate_seq_ids"] = list(candidate_seq_ids)
-        trace_record["rolling_depth2_commit_ready_source_proposal_ids"] = sorted(ready_ids)
+        trace_record["rolling_depth2_commit_candidate_proposal_ids"] = list(commit_bundle.candidate_ids)
+        trace_record["rolling_depth2_commit_candidate_seq_ids"] = list(commit_bundle.candidate_seq_ids)
+        trace_record["rolling_depth2_commit_ready_source_proposal_ids"] = list(commit_bundle.ready_ids)
         trace_record["rolling_depth2_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_commit_by_id)
         self._emit_commit_precondition_trace(
             trace_record,
@@ -9561,13 +9839,13 @@ class ModelRunnerBase:
         )
         self._emit_target_draft_match_trace(
             trace_record,
-            prefix="rolling_depth2",
-            target_len_before_by_seq=target_len_before_by_seq,
-            target_len_after_by_seq=target_len_after_by_seq,
-            draft_len_before_by_seq=draft_len_before_by_seq,
-            draft_len_after_by_seq=draft_len_after_by_seq,
-            len_match_by_seq=len_match_by_seq,
-            token_match_by_seq=token_match_by_seq,
+            prefix=commit_bundle.prefix,
+            target_len_before_by_seq=commit_bundle.target_len_before_by_seq,
+            target_len_after_by_seq=commit_bundle.target_len_after_by_seq,
+            draft_len_before_by_seq=commit_bundle.draft_len_before_by_seq,
+            draft_len_after_by_seq=commit_bundle.draft_len_after_by_seq,
+            len_match_by_seq=commit_bundle.len_match_by_seq,
+            token_match_by_seq=commit_bundle.token_match_by_seq,
         )
         trace_record["rolling_depth2_tokens_verified"] = int(committed_tokens)
         trace_record["rolling_depth2_tokens_accepted"] = int(committed_tokens)
