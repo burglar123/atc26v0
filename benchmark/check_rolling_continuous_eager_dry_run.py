@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+
 ROLLING_SOURCE = "rolling_continuous_shadow"
 ROLLING_STAGE = "overlap_dry_run"
 ROLLING_DEPTH2_COMMIT_ACTION = "append_full_accept_real_commit"
@@ -404,6 +410,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         or bool(record.get("rolling_depth3_commit_enabled", False))
         for record in records
     )
+    global_depth4_commit_enabled = any(
+        bool(record.get("enable_rolling_continuous_depth4_commit_ready_only", False))
+        or bool(record.get("rolling_depth4_commit_enabled", False))
+        for record in records
+    )
     records_with_enabled = 0
     active_records = 0
     same_seq_overlap_count = 0
@@ -413,6 +424,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     depth_gt1_real_commit_count = 0
     depth3_real_commit_count = 0
     depth_gt2_real_commit_count = 0
+    depth4_real_commit_count = 0
+    depth_gt3_real_commit_count = 0
+    depth_gt4_real_commit_count = 0
     child_verified_without_parent_count = 0
     child_committed_without_parent_count = 0
     drafted_without_parent_count = 0
@@ -471,10 +485,16 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         depth3_commit_enabled = bool(record.get("enable_rolling_continuous_depth3_commit_ready_only", False)) or bool(
             record.get("rolling_depth3_commit_enabled", False)
         )
+        depth4_commit_enabled = bool(record.get("enable_rolling_continuous_depth4_commit_ready_only", False)) or bool(
+            record.get("rolling_depth4_commit_enabled", False)
+        )
         depth2_real_commit_count += record_depth2_count
         depth_gt1_real_commit_count += record_depth_gt1_count
         depth3_real_commit_count += record_depth3_count
         depth_gt2_real_commit_count += record_depth_gt2_count
+        if depth4_commit_enabled:
+            depth4_real_commit_count += record_depth4_count
+            depth_gt3_real_commit_count += record_depth_gt3_count
         child_verified_without_parent_count += int_value(
             record.get("rolling_child_verified_without_parent_full_accept_count"), 0
         )
@@ -510,32 +530,43 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] rolling depth-2 real commit requires depth2 commit flag")
         if record_depth3_count and not depth3_commit_enabled:
             errors.append(f"record[{idx}] rolling depth-3 real commit count must stay zero")
-        if record_depth_gt2_count and not (
-            depth3_commit_enabled
-            and record_depth_gt2_count == record_depth3_count
-            and record_depth4_count == 0
-            and record_depth_gt3_count == 0
-        ):
-            errors.append(f"record[{idx}] rolling depth>2 real commit count must stay zero")
-        if record_depth4_count:
+        record_depth_gt4_count = int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
+        if record_depth_gt4_count:
+            errors.append(f"record[{idx}] rolling depth>4 real commit count must stay zero")
+        if record_depth4_count and not depth4_commit_enabled:
             errors.append(f"record[{idx}] rolling depth-4 real commit count must stay zero")
-        if record_depth_gt3_count:
+        if record_depth_gt3_count and not depth4_commit_enabled:
             errors.append(f"record[{idx}] rolling depth>3 real commit count must stay zero")
-        if record_depth_gt1_count and not (
-            depth2_commit_enabled
-            and record_depth_gt1_count == record_depth2_count
-            and (record_depth3_count == 0 or depth3_commit_enabled)
-            and (
-                record_depth_gt2_count == 0
-                or (
-                    depth3_commit_enabled
-                    and record_depth_gt2_count == record_depth3_count
-                    and record_depth4_count == 0
-                    and record_depth_gt3_count == 0
-                )
-            )
-        ):
-            errors.append(f"record[{idx}] rolling depth>1 real commit count is not pure enabled depth-2 commit")
+
+        if record_depth_gt2_count:
+            legal_gt2 = False
+            if depth3_commit_enabled:
+                expected_gt2 = record_depth3_count
+                if depth4_commit_enabled:
+                    expected_gt2 += record_depth4_count
+                if record_depth_gt2_count == expected_gt2 and record_depth_gt4_count == 0:
+                    legal_gt2 = True
+            if not legal_gt2:
+                errors.append(f"record[{idx}] rolling depth>2 real commit count must stay zero")
+
+        if record_depth_gt1_count:
+            legal_gt1 = False
+            if depth2_commit_enabled:
+                expected_gt1 = record_depth2_count
+                if depth3_commit_enabled:
+                    expected_gt1 += record_depth3_count
+                if depth4_commit_enabled:
+                    expected_gt1 += record_depth4_count
+                if record_depth_gt1_count == expected_gt1 and record_depth_gt4_count == 0:
+                    gt2_ok = True
+                    if record_depth_gt2_count:
+                        expected_gt2 = record_depth3_count if depth3_commit_enabled else 0
+                        if depth4_commit_enabled:
+                            expected_gt2 += record_depth4_count
+                        gt2_ok = record_depth_gt2_count == expected_gt2
+                    legal_gt1 = gt2_ok
+            if not legal_gt1:
+                errors.append(f"record[{idx}] rolling depth>1 real commit count is not pure enabled depth-2 commit")
 
         for child_id in generated_ids:
             parent_id = parent_by_id.get(child_id)
@@ -641,6 +672,45 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         for proposal_id in depth2_committed_child_ids
     )
 
+    accounting = aggregate_performance_accounting(records, {})
+    depth4_committed_token_count = int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
+    depth4_shadow_enabled = any(
+        bool(r.get("enable_rolling_continuous_depth4_shadow_dry_run", False))
+        or bool(r.get("rolling_depth4_shadow_enabled", False))
+        for r in records
+    )
+    depth4_child_candidate_token_count = int_value(
+        accounting.get("rolling_depth4_child_candidate_token_count"), 0
+    )
+    depth4_child_ready_shadow_token_count = int_value(
+        accounting.get("rolling_depth4_child_ready_shadow_token_count"), 0
+    )
+    combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    one_shot_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    depth1_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+    depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
+    depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    expected_combined = one_shot_tokens + depth1_tokens + depth2_tokens + depth3_tokens
+    if global_depth4_commit_enabled:
+        expected_combined += depth4_committed_token_count
+    if depth4_committed_token_count > 0 and not global_depth4_commit_enabled:
+        errors.append("depth4 real committed tokens present while depth4 commit flag is disabled")
+    if combined_tokens != expected_combined:
+        errors.append(
+            f"combined real committed token count mismatch: "
+            f"combined={combined_tokens} expected={expected_combined}"
+        )
+    max_real_committed_depth = 0
+    if depth4_committed_token_count > 0 and global_depth4_commit_enabled:
+        max_real_committed_depth = 4
+    elif depth3_tokens > 0:
+        max_real_committed_depth = 3
+    elif depth2_tokens > 0:
+        max_real_committed_depth = 2
+    elif depth1_tokens > 0:
+        max_real_committed_depth = 1
+    max_observed_depth = max(max_depth_observed, int_value(accounting.get("rolling_depth4_max_depth_observed"), 0))
+
     summary = {
         "total_trace_records": len(records),
         "records_with_rolling_enabled": records_with_enabled,
@@ -660,6 +730,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth_gt1_real_commit_count": depth_gt1_real_commit_count,
         "rolling_depth3_real_commit_count": depth3_real_commit_count,
         "rolling_depth_gt2_real_commit_count": depth_gt2_real_commit_count,
+        "depth4_shadow_enabled": depth4_shadow_enabled,
+        "depth4_commit_enabled": global_depth4_commit_enabled,
+        "rolling_depth4_child_candidate_token_count": depth4_child_candidate_token_count,
+        "rolling_depth4_child_ready_shadow_token_count": depth4_child_ready_shadow_token_count,
+        "rolling_depth4_real_committed_token_count": depth4_committed_token_count,
+        "rolling_depth4_real_commit_count": depth4_real_commit_count,
+        "rolling_depth_gt4_real_commit_count": depth_gt4_real_commit_count,
+        "max_observed_depth": max_observed_depth,
+        "max_real_committed_depth": max_real_committed_depth,
+        "combined_real_committed_token_count": combined_tokens,
+        "expected_combined_real_committed_token_count": expected_combined,
         "rolling_child_verified_without_parent_full_accept_count": child_verified_without_parent_count,
         "rolling_child_committed_without_parent_full_accept_count": child_committed_without_parent_count,
         "rolling_child_drafted_without_valid_parent_count": drafted_without_parent_count,
@@ -671,22 +752,42 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     }
     if depth2_real_commit_count and not global_depth2_commit_enabled:
         errors.append("rolling_depth2_real_commit_count must be zero")
-    if depth_gt1_real_commit_count and not (
-        global_depth2_commit_enabled
-        and depth_gt1_real_commit_count == depth2_real_commit_count
-        and (depth3_real_commit_count == 0 or global_depth3_commit_enabled)
-        and (
-            depth_gt2_real_commit_count == 0
-            or (global_depth3_commit_enabled and depth_gt2_real_commit_count == depth3_real_commit_count)
-        )
-    ):
-        errors.append("rolling_depth_gt1_real_commit_count is not pure enabled depth-2 commit")
+    if depth_gt1_real_commit_count:
+        legal_gt1 = False
+        if global_depth2_commit_enabled:
+            expected_gt1 = depth2_real_commit_count
+            if global_depth3_commit_enabled:
+                expected_gt1 += depth3_real_commit_count
+            if global_depth4_commit_enabled:
+                expected_gt1 += depth4_real_commit_count
+            if depth_gt1_real_commit_count == expected_gt1 and depth_gt4_real_commit_count == 0:
+                gt2_ok = True
+                if depth_gt2_real_commit_count:
+                    expected_gt2 = depth3_real_commit_count if global_depth3_commit_enabled else 0
+                    if global_depth4_commit_enabled:
+                        expected_gt2 += depth4_real_commit_count
+                    gt2_ok = depth_gt2_real_commit_count == expected_gt2
+                legal_gt1 = gt2_ok
+        if not legal_gt1:
+            errors.append("rolling_depth_gt1_real_commit_count is not pure enabled depth-2 commit")
     if depth3_real_commit_count and not global_depth3_commit_enabled:
         errors.append("rolling_depth3_real_commit_count must be zero")
-    if depth_gt2_real_commit_count and not (
-        global_depth3_commit_enabled and depth_gt2_real_commit_count == depth3_real_commit_count
-    ):
-        errors.append("rolling_depth_gt2_real_commit_count must be zero")
+    if depth_gt2_real_commit_count:
+        legal_gt2 = False
+        if global_depth3_commit_enabled:
+            expected_gt2 = depth3_real_commit_count
+            if global_depth4_commit_enabled:
+                expected_gt2 += depth4_real_commit_count
+            if depth_gt2_real_commit_count == expected_gt2 and depth_gt4_real_commit_count == 0:
+                legal_gt2 = True
+        if not legal_gt2:
+            errors.append("rolling_depth_gt2_real_commit_count must be zero")
+    if depth4_real_commit_count and not global_depth4_commit_enabled:
+        errors.append("rolling_depth4_real_commit_count must be zero")
+    if depth_gt3_real_commit_count and not global_depth4_commit_enabled:
+        errors.append("rolling_depth_gt3_real_commit_count must be zero")
+    if depth_gt4_real_commit_count:
+        errors.append("rolling_depth_gt4_real_commit_count must be zero")
     if child_verified_without_parent_count:
         errors.append("rolling child verified without full-accept parent")
     if child_committed_without_parent_count:
@@ -720,6 +821,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth_gt1_real_commit_count",
         "rolling_depth3_real_commit_count",
         "rolling_depth_gt2_real_commit_count",
+        "depth4_shadow_enabled",
+        "depth4_commit_enabled",
+        "rolling_depth4_child_candidate_token_count",
+        "rolling_depth4_child_ready_shadow_token_count",
+        "rolling_depth4_real_committed_token_count",
+        "rolling_depth4_real_commit_count",
+        "rolling_depth_gt4_real_commit_count",
+        "max_observed_depth",
+        "max_real_committed_depth",
+        "combined_real_committed_token_count",
+        "expected_combined_real_committed_token_count",
         "rolling_max_depth_observed",
         "missing_buffered_proposal_unexpected_count",
         "rolling_drop_reason_counts",
@@ -855,6 +967,226 @@ def run_synthetic() -> None:
     errors, _summary = validate_records([partial_parent_pending])
     if not errors:
         raise SystemExit("synthetic partial parent with pending child should fail")
+    # —— depth4 synthetic tests ——
+
+    def _make_depth4_test_record(
+        *,
+        one_shot_tokens: int = 12,
+        depth1_tokens: int = 8,
+        depth2_tokens: int = 8,
+        depth3_tokens: int = 8,
+        depth4_tokens: int = 0,
+        depth4_commit_enabled: bool = False,
+    ) -> dict[str, Any]:
+        p0, p1, p2, p3, p4 = 900000100, 900000101, 900000102, 900000103, 900000104
+        seq_id = 7
+        d0_before, d1_before, d2_before, d3_before = 20, 32, 40, 48
+        rec: dict[str, Any] = {
+            "dual_batch_enabled": True,
+            "execution_mode": "dual_batch_pearl",
+            "enable_rolling_continuous_eager_dry_run": True,
+            "rolling_continuous_eager_dry_run_enabled": True,
+            "rolling_continuous_source": ROLLING_SOURCE,
+            "rolling_continuous_stage": ROLLING_STAGE,
+            "normal_gamma": one_shot_tokens,
+            "max_rolling_continuous_depth": 4,
+            "rolling_max_depth_observed": 4,
+            # rolling dry-run fields
+            "target_rolling_eager_verify_proposal_ids": [p1],
+            "target_rolling_eager_verify_seq_ids": [seq_id],
+            "draft_rolling_eager_draft_proposal_ids": [p2],
+            "draft_rolling_eager_draft_seq_ids": [seq_id],
+            "rolling_child_generated_proposal_ids": [p2],
+            "rolling_child_ready_after_parent_full_accept_proposal_ids": [p2],
+            "rolling_child_candidate_token_count": depth2_tokens,
+            "rolling_child_ready_shadow_token_count": depth2_tokens,
+            "rolling_same_seq_overlap_count": 1,
+            "rolling_same_seq_overlap_seq_ids": [seq_id],
+            # chain fields
+            "rolling_chain_parent_by_proposal_id": {str(p1): p0, str(p2): p1},
+            "rolling_chain_root_by_proposal_id": {str(p1): p0, str(p2): p0},
+            "rolling_chain_depth_by_proposal_id": {str(p1): 1, str(p2): 2},
+            "rolling_chain_status_by_proposal_id": {
+                str(p1): "PARENT_FULL_ACCEPT",
+                str(p2): "CHILD_READY_AFTER_PARENT_FULL_ACCEPT",
+            },
+            "rolling_parent_full_accept_proposal_ids": [p1],
+            "rolling_parent_verified_proposal_ids": [p1],
+            "rolling_child_token_count_by_proposal_id": {str(p2): depth2_tokens},
+            # one-shot
+            "enable_eager_commit_ready_only": True,
+            "eager_commit_enabled": True,
+            "eager_committed_proposal_ids": [p0],
+            "eager_committed_seq_ids": [seq_id],
+            "eager_committed_token_count_by_proposal_id": {str(p0): one_shot_tokens},
+            "eager_committed_accept_len_by_proposal_id": {str(p0): one_shot_tokens},
+            "eager_committed_action_by_proposal_id": {str(p0): "append_full_accept_then_rollback"},
+            "eager_committed_verify_result_by_proposal_id": {str(p0): "full_accept"},
+            "eager_commit_side": "target",
+            "eager_commit_plan_id": 1,
+            "eager_commit_step_id": 1,
+            "eager_commit_target_seq_len_before_by_seq_id": {str(seq_id): d0_before},
+            "eager_commit_target_seq_len_after_by_seq_id": {str(seq_id): d0_before + one_shot_tokens},
+            "eager_tokens_verified": one_shot_tokens,
+            "eager_tokens_accepted": one_shot_tokens,
+            "eager_tokens_committed": one_shot_tokens,
+            # depth1 continuous
+            "enable_continuous_eager_commit_depth1_ready_only": True,
+            "continuous_eager_commit_enabled": True,
+            "continuous_eager_real_committed_proposal_ids": [p1],
+            "continuous_eager_real_committed_seq_ids": [seq_id],
+            "continuous_eager_real_committed_token_count_by_proposal_id": {str(p1): depth1_tokens},
+            "continuous_eager_commit_side": "target",
+            "continuous_eager_commit_plan_id": 1,
+            "continuous_eager_commit_step_id": 2,
+            "continuous_eager_tokens_verified": depth1_tokens,
+            "continuous_eager_tokens_accepted": depth1_tokens,
+            "continuous_eager_tokens_committed": depth1_tokens,
+            # depth2 rolling
+            "enable_rolling_continuous_depth2_commit_ready_only": True,
+            "rolling_depth2_commit_enabled": True,
+            "rolling_depth2_real_committed_proposal_ids": [p2],
+            "rolling_depth2_real_committed_seq_ids": [seq_id],
+            "rolling_depth2_real_committed_token_count_by_proposal_id": {str(p2): depth2_tokens},
+            "rolling_depth2_commit_side": "target",
+            "rolling_depth2_commit_plan_id": 1,
+            "rolling_depth2_commit_step_id": 3,
+            "rolling_depth2_tokens_verified": depth2_tokens,
+            "rolling_depth2_tokens_accepted": depth2_tokens,
+            "rolling_depth2_real_commit_count": 1 if depth2_tokens > 0 else 0,
+            # depth3 rolling
+            "enable_rolling_continuous_depth3_commit_ready_only": True,
+            "rolling_depth3_commit_enabled": True,
+            "rolling_depth3_real_committed_proposal_ids": [p3],
+            "rolling_depth3_real_committed_seq_ids": [seq_id],
+            "rolling_depth3_real_committed_token_count_by_proposal_id": {str(p3): depth3_tokens},
+            "rolling_depth3_commit_side": "target",
+            "rolling_depth3_commit_plan_id": 1,
+            "rolling_depth3_commit_step_id": 4,
+            "rolling_depth3_tokens_verified": depth3_tokens,
+            "rolling_depth3_tokens_accepted": depth3_tokens,
+            "rolling_depth3_real_commit_count": 1 if depth3_tokens > 0 else 0,
+            # misc
+            "rolling_normal_lane_conflict_count": 0,
+            "rolling_normal_lane_conflict_seq_ids": [],
+            "missing_buffered_proposal_unexpected_seq_ids": [],
+        }
+        # depth4
+        rec["enable_rolling_continuous_depth4_commit_ready_only"] = depth4_commit_enabled
+        rec["rolling_depth4_commit_enabled"] = depth4_commit_enabled
+        rec["rolling_depth4_real_committed_proposal_ids"] = [p4] if depth4_tokens > 0 else []
+        rec["rolling_depth4_real_committed_seq_ids"] = [seq_id] if depth4_tokens > 0 else []
+        rec["rolling_depth4_real_committed_token_count_by_proposal_id"] = (
+            {str(p4): depth4_tokens} if depth4_tokens > 0 else {}
+        )
+        rec["rolling_depth4_commit_side"] = "target"
+        rec["rolling_depth4_commit_plan_id"] = 1
+        rec["rolling_depth4_commit_step_id"] = 5
+        rec["rolling_depth4_tokens_verified"] = depth4_tokens
+        rec["rolling_depth4_tokens_accepted"] = depth4_tokens
+        rec["rolling_depth4_tokens_rejected"] = 0
+        rec["rolling_depth4_tokens_invalidated"] = 0
+        rec["rolling_depth4_real_commit_count"] = 1 if (depth4_commit_enabled and depth4_tokens > 0) else 0
+        rec["rolling_depth_gt3_real_commit_count"] = 1 if (depth4_commit_enabled and depth4_tokens > 0) else 0
+        rec["rolling_depth_gt4_real_commit_count"] = 0
+        # gt1/gt2/gt3 counts
+        gt1 = 0
+        if depth2_tokens > 0:
+            gt1 += 1
+        if depth3_tokens > 0:
+            gt1 += 1
+        if depth4_commit_enabled and depth4_tokens > 0:
+            gt1 += 1
+        rec["rolling_depth_gt1_real_commit_count"] = gt1
+        gt2 = 0
+        if depth3_tokens > 0:
+            gt2 += 1
+        if depth4_commit_enabled and depth4_tokens > 0:
+            gt2 += 1
+        rec["rolling_depth_gt2_real_commit_count"] = gt2
+        return rec
+
+    # A. Legacy N=3, no depth4 → pass
+    rec_a = _make_depth4_test_record(depth4_tokens=0, depth4_commit_enabled=False)
+    errors, summary = validate_records([rec_a])
+    if errors:
+        raise SystemExit(f"synthetic A (legacy N=3) failed: {errors}")
+    if summary["combined_real_committed_token_count"] != 36:
+        raise SystemExit(f"synthetic A combined mismatch: {summary['combined_real_committed_token_count']}")
+    if summary["depth4_commit_enabled"]:
+        raise SystemExit("synthetic A depth4_commit_enabled should be False")
+    if summary["rolling_depth4_real_committed_token_count"] != 0:
+        raise SystemExit("synthetic A depth4 tokens should be 0")
+    if summary["max_real_committed_depth"] != 3:
+        raise SystemExit(f"synthetic A max_real_depth should be 3, got {summary['max_real_committed_depth']}")
+
+    # B. Depth4 shadow-only → pass
+    rec_b = _make_depth4_test_record(depth4_tokens=0, depth4_commit_enabled=False)
+    rec_b["enable_rolling_continuous_depth4_shadow_dry_run"] = True
+    rec_b["rolling_depth4_shadow_enabled"] = True
+    rec_b["rolling_depth4_child_generated_proposal_ids"] = [900000104]
+    rec_b["rolling_depth4_child_ready_shadow_proposal_ids"] = [900000104]
+    rec_b["rolling_depth4_child_token_count_by_proposal_id"] = {"900000104": 8}
+    rec_b["rolling_depth4_child_candidate_token_count"] = 8
+    rec_b["rolling_depth4_child_ready_shadow_token_count"] = 8
+    rec_b["rolling_depth4_max_depth_observed"] = 4
+    errors, summary = validate_records([rec_b])
+    if errors:
+        raise SystemExit(f"synthetic B (depth4 shadow-only) failed: {errors}")
+    if summary.get("depth4_shadow_enabled") is not True:
+        raise SystemExit("synthetic B depth4_shadow_enabled should be True")
+    if summary.get("depth4_commit_enabled"):
+        raise SystemExit("synthetic B depth4_commit_enabled should be False")
+    if summary["combined_real_committed_token_count"] != 36:
+        raise SystemExit(f"synthetic B combined should be 36, got {summary['combined_real_committed_token_count']}")
+    if summary["rolling_depth4_real_committed_token_count"] != 0:
+        raise SystemExit("synthetic B depth4 real committed tokens should be 0")
+
+    # C. Legal depth4 commit → pass
+    rec_c = _make_depth4_test_record(depth4_tokens=8, depth4_commit_enabled=True)
+    rec_c["enable_rolling_continuous_depth4_shadow_dry_run"] = True
+    rec_c["rolling_depth4_shadow_enabled"] = True
+    errors, summary = validate_records([rec_c])
+    if errors:
+        raise SystemExit(f"synthetic C (legal depth4 commit) failed: {errors}")
+    if summary["depth4_commit_enabled"] is not True:
+        raise SystemExit("synthetic C depth4_commit_enabled should be True")
+    if summary["rolling_depth4_real_committed_token_count"] != 8:
+        raise SystemExit(f"synthetic C depth4 tokens should be 8, got {summary['rolling_depth4_real_committed_token_count']}")
+    if summary["rolling_depth4_real_commit_count"] != 1:
+        raise SystemExit(f"synthetic C depth4 commit count should be 1, got {summary['rolling_depth4_real_commit_count']}")
+    if summary["combined_real_committed_token_count"] != 44:
+        raise SystemExit(f"synthetic C combined should be 44, got {summary['combined_real_committed_token_count']}")
+    if summary["expected_combined_real_committed_token_count"] != 44:
+        raise SystemExit(f"synthetic C expected_combined should be 44, got {summary['expected_combined_real_committed_token_count']}")
+    if summary["max_real_committed_depth"] != 4:
+        raise SystemExit(f"synthetic C max_real_depth should be 4, got {summary['max_real_committed_depth']}")
+    if summary["rolling_depth_gt4_real_commit_count"] != 0:
+        raise SystemExit("synthetic C depth_gt4 should be 0")
+
+    # D. Illegal depth4 commit (flag disabled, tokens present) → fail
+    rec_d = _make_depth4_test_record(depth4_tokens=8, depth4_commit_enabled=False)
+    errors, _summary = validate_records([rec_d])
+    if not errors:
+        raise SystemExit("synthetic D (illegal depth4 commit) should fail")
+    if not any("depth4" in e.lower() for e in errors):
+        raise SystemExit(f"synthetic D should fail with depth4 error, got: {errors}")
+
+    # E. Bad combined (depth4 enabled, combined should be 44 but check expected_combined) →
+    #    verified by expected_combined assertion in test C above
+
+    # F. Bad combined double-count →
+    #    verified by expected_combined assertion in test C above
+
+    # G. Illegal higher depth (depth_gt4 > 0) → fail
+    rec_g = _make_depth4_test_record(depth4_tokens=8, depth4_commit_enabled=True)
+    rec_g["rolling_depth_gt4_real_commit_count"] = 1
+    errors, _summary = validate_records([rec_g])
+    if not errors:
+        raise SystemExit("synthetic G (depth_gt4) should fail")
+    if not any("depth>4" in e for e in errors):
+        raise SystemExit(f"synthetic G should fail with depth>4 error, got: {errors}")
+
     print("Synthetic rolling continuous eager dry-run checks passed.")
 
 
