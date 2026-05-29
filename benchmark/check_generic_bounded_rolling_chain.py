@@ -227,12 +227,43 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
         errors.append("rolling depth4 real commit count must be zero")
     if registry.depth_gt3_real_commit_count:
         errors.append("rolling depth>3 real commit count must be zero")
+    if registry.depth_gt4_real_commit_count:
+        errors.append("rolling depth>4 real commit count must be zero")
     if registry.normal_lane_conflict_count:
         errors.append("normal lane conflict evidence present")
     if registry.missing_buffered_proposal_unexpected_count:
         errors.append("unexpected missing buffered proposal evidence present")
     if registry.committed_by_depth[3] and not registry.flags.get("rolling_depth3_commit_enabled", False):
         errors.append("depth3 real commit appears while depth3 commit flag is disabled")
+
+    depth4_shadow_ids = set(registry.generated_by_depth[4]) | set(registry.ready_by_depth[4])
+    if depth4_shadow_ids and not registry.flags.get("rolling_depth4_shadow_enabled", False):
+        errors.append("depth4 shadow evidence appears while depth4 shadow flag is disabled")
+    for proposal_id in sorted(depth4_shadow_ids):
+        node = registry.nodes_by_id.get(proposal_id)
+        if node is None:
+            errors.append(f"depth4 shadow proposal {proposal_id} missing generic node")
+            continue
+        if node.depth != 4:
+            errors.append(f"depth4 shadow proposal {proposal_id} has depth {node.depth}")
+        if node.parent_id is None:
+            errors.append(f"depth4 shadow proposal {proposal_id} missing depth3 parent")
+            continue
+        parent = registry.nodes_by_id.get(node.parent_id)
+        if parent is None:
+            errors.append(f"depth4 shadow proposal {proposal_id} parent {node.parent_id} missing")
+            continue
+        if parent.depth != 3:
+            errors.append(f"depth4 shadow proposal {proposal_id} parent depth {parent.depth}, expected 3")
+        if not parent.committed:
+            errors.append(f"depth4 shadow proposal {proposal_id} parent {node.parent_id} is not committed")
+        if parent.seq_id is not None and node.seq_id is not None and parent.seq_id != node.seq_id:
+            errors.append(f"depth4 shadow proposal {proposal_id} seq differs from parent")
+        parent_root = parent.root_id if parent.root_id is not None else parent.proposal_id
+        if node.root_id is not None and parent_root is not None and node.root_id != parent_root:
+            errors.append(f"depth4 shadow proposal {proposal_id} root differs from parent root")
+        if node.ready_shadow and not node.generated:
+            errors.append(f"depth4 shadow proposal {proposal_id} ready without generated evidence")
 
     duplicate_commit_count = int(issue_sets["duplicate_commit_count"])
     if duplicate_commit_count:
@@ -302,6 +333,7 @@ def validate_records(
         "max_observed_depth": generic_summary["generic_max_observed_depth"],
         "max_real_committed_depth": max_real_depth,
         "depth_gt3_real_commit_count": generic_summary["generic_depth_gt3_real_commit_count"],
+        "depth_gt4_real_commit_count": generic_summary["generic_depth_gt4_real_commit_count"],
         "depth4_real_commit_count": generic_summary["generic_depth4_real_commit_count"],
         "depth_gt3_committed_proposal_count": generic_summary["generic_depth_gt3_committed_proposal_count"],
         "one_shot_committed_proposal_count": generic_summary["generic_one_shot_committed_proposal_count"],
@@ -312,6 +344,11 @@ def validate_records(
         "depth2_committed_token_count": token_by_depth[2],
         "depth3_committed_proposal_count": generic_summary["generic_depth3_committed_proposal_count"],
         "depth3_committed_token_count": token_by_depth[3],
+        "depth4_shadow_generated_proposal_count": generic_summary["generic_depth4_shadow_generated_proposal_count"],
+        "depth4_shadow_generated_token_count": generic_summary["generic_depth4_shadow_generated_token_count"],
+        "depth4_shadow_ready_proposal_count": generic_summary["generic_depth4_shadow_ready_proposal_count"],
+        "depth4_shadow_ready_token_count": generic_summary["generic_depth4_shadow_ready_token_count"],
+        "depth4_shadow_invalidated_count": generic_summary["generic_depth4_shadow_invalidated_count"],
         "combined_real_committed_token_count": generic_summary["generic_combined_real_committed_token_count"],
         "accounting_combined_real_committed_token_count": int_value(
             accounting.get("combined_real_committed_token_count"), 0
@@ -365,10 +402,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth2_commit_enabled",
         "rolling_depth3_shadow_enabled",
         "rolling_depth3_commit_enabled",
+        "rolling_depth4_shadow_enabled",
         "max_configured_depth",
         "max_observed_depth",
         "max_real_committed_depth",
         "depth_gt3_real_commit_count",
+        "depth_gt4_real_commit_count",
         "depth4_real_commit_count",
         "depth_gt3_committed_proposal_count",
         "one_shot_committed_proposal_count",
@@ -379,6 +418,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "depth2_committed_token_count",
         "depth3_committed_proposal_count",
         "depth3_committed_token_count",
+        "depth4_shadow_generated_proposal_count",
+        "depth4_shadow_generated_token_count",
+        "depth4_shadow_ready_proposal_count",
+        "depth4_shadow_ready_token_count",
+        "depth4_shadow_invalidated_count",
         "combined_real_committed_token_count",
         "accounting_combined_real_committed_token_count",
         "combined_actual_verified_token_increment_sum",
@@ -545,6 +589,50 @@ def clear_depth2_and_depth3(record: dict[str, Any]) -> None:
         record[field] = 0
 
 
+def add_depth4_shadow(record: dict[str, Any], *, token_count: int = 8) -> None:
+    seq_id = 7
+    p0 = 900000100
+    p3 = 900000103
+    p4 = 900000104
+    record["max_rolling_continuous_depth"] = 4
+    record["max_rolling_continuous_depth_observed"] = 4
+    record["rolling_depth4_max_depth_observed"] = 4
+    record["enable_rolling_continuous_depth4_shadow_dry_run"] = True
+    record["rolling_depth4_shadow_enabled"] = True
+    record["rolling_depth4_shadow_stage"] = "depth4_shadow_dry_run"
+    record["rolling_depth4_shadow_source"] = "rolling_depth4_shadow"
+    record["rolling_depth4_child_generated_proposal_ids"] = [p4]
+    record["rolling_depth4_child_generated_seq_ids"] = [seq_id]
+    record["rolling_depth4_child_parent_by_proposal_id"] = {str(p4): p3}
+    record["rolling_depth4_child_root_by_proposal_id"] = {str(p4): p0}
+    record["rolling_depth4_child_depth_by_proposal_id"] = {str(p4): 4}
+    record["rolling_depth4_child_token_count_by_proposal_id"] = {str(p4): token_count}
+    record["rolling_depth4_child_base_len_by_proposal_id"] = {str(p4): 36}
+    record["rolling_depth4_child_status_by_proposal_id"] = {str(p4): "DEPTH4_READY_AFTER_PARENT_DEPTH3_COMMIT"}
+    record["rolling_depth4_child_status_reason_by_proposal_id"] = {
+        str(p4): "parent_depth3_committed_full_accept"
+    }
+    record["rolling_depth4_parent_depth3_real_committed_proposal_ids"] = [p3]
+    record["rolling_depth4_parent_depth3_full_accept_proposal_ids"] = [p3]
+    record["rolling_depth4_child_ready_shadow_proposal_ids"] = [p4]
+    record["rolling_depth4_child_ready_shadow_seq_ids"] = [seq_id]
+    record["rolling_depth4_child_invalidated_proposal_ids"] = []
+    record["rolling_depth4_child_invalidated_reason_by_proposal_id"] = {}
+    record["rolling_depth4_child_candidate_proposal_count"] = 1
+    record["rolling_depth4_child_candidate_token_count"] = token_count
+    record["rolling_depth4_child_ready_shadow_proposal_count"] = 1
+    record["rolling_depth4_child_ready_shadow_token_count"] = token_count
+    record["rolling_depth4_child_invalidated_count"] = 0
+    record["rolling_depth4_parent_resolution_pending_count"] = 0
+    record["rolling_depth4_drop_reason_counts"] = {}
+    record["rolling_depth4_same_seq_overlap_count"] = 1
+    record["rolling_depth4_same_seq_overlap_seq_ids"] = [seq_id]
+    record["rolling_depth4_normal_lane_conflict_count"] = 0
+    record["rolling_depth4_real_commit_count"] = 0
+    record["rolling_depth4_real_committed_token_count"] = 0
+    record["rolling_depth_gt4_real_commit_count"] = 0
+
+
 def assert_synthetic_pass(name: str, records: list[dict[str, Any]], expected: dict[str, Any]) -> None:
     errors, summary = validate_records(records, synthetic_result_payload())
     if errors:
@@ -609,6 +697,25 @@ def run_synthetic() -> None:
             "combined_real_committed_token_count": 28,
             "max_observed_depth": 3,
             "max_real_committed_depth": 2,
+            "combined_accounting_ok": True,
+            "target_draft_accounting_ok": True,
+        },
+    )
+
+    depth4_shadow = deepcopy(records)
+    for record in depth4_shadow:
+        add_depth4_shadow(record)
+    assert_synthetic_pass(
+        "depth4 shadow",
+        depth4_shadow,
+        {
+            "depth3_committed_token_count": 8,
+            "depth4_shadow_generated_token_count": 8,
+            "depth4_shadow_ready_token_count": 8,
+            "combined_real_committed_token_count": 36,
+            "max_observed_depth": 4,
+            "max_real_committed_depth": 3,
+            "depth4_real_commit_count": 0,
             "combined_accounting_ok": True,
             "target_draft_accounting_ok": True,
         },

@@ -36,6 +36,7 @@ CORE_FIELD_PAIRS = (
     ("max_observed_depth", "generic_max_observed_depth"),
     ("depth4_real_commit_count", "generic_depth4_real_commit_count"),
     ("depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
+    ("depth_gt4_real_commit_count", "generic_depth_gt4_real_commit_count"),
     ("normal_lane_conflict_count", "generic_normal_lane_conflict_count"),
     ("missing_buffered_proposal_unexpected_count", "generic_missing_buffered_proposal_unexpected_count"),
     ("duplicate_commit_count", "generic_duplicate_commit_count"),

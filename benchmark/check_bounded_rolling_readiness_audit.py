@@ -40,6 +40,7 @@ GENERIC_PARITY_FIELD_PAIRS = (
     ("max_real_committed_depth", "generic_max_real_committed_depth"),
     ("depth4_real_commit_count", "generic_depth4_real_commit_count"),
     ("depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
+    ("depth_gt4_real_commit_count", "generic_depth_gt4_real_commit_count"),
     ("normal_lane_conflict_count", "generic_normal_lane_conflict_count"),
     ("missing_buffered_proposal_unexpected_count", "generic_missing_buffered_proposal_unexpected_count"),
     ("duplicate_commit_count", "generic_duplicate_commit_count"),
@@ -204,6 +205,7 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
     missing_unexpected_count = 0
     depth4_real_commit_count = 0
     depth_gt3_real_commit_count = 0
+    depth_gt4_real_commit_count = 0
     max_configured_depth = 0
     max_observed_depth = 0
     gamma = 0
@@ -213,6 +215,7 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         "rolling_depth2_commit_enabled": False,
         "rolling_depth3_shadow_enabled": False,
         "rolling_depth3_commit_enabled": False,
+        "rolling_depth4_shadow_enabled": False,
     }
 
     for record in records:
@@ -223,6 +226,7 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
             int_value(record.get("rolling_max_depth_observed"), 0),
             int_value(record.get("max_rolling_continuous_depth_observed"), 0),
             int_value(record.get("rolling_depth3_max_depth_observed"), 0),
+            int_value(record.get("rolling_depth4_max_depth_observed"), 0),
         )
         flags["one_shot_commit_enabled"] = flags["one_shot_commit_enabled"] or bool(
             record.get("enable_eager_commit_ready_only", False)
@@ -239,6 +243,9 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         flags["rolling_depth3_commit_enabled"] = flags["rolling_depth3_commit_enabled"] or bool(
             record.get("enable_rolling_continuous_depth3_commit_ready_only", False)
         ) or bool(record.get("rolling_depth3_commit_enabled", False))
+        flags["rolling_depth4_shadow_enabled"] = flags["rolling_depth4_shadow_enabled"] or bool(
+            record.get("enable_rolling_continuous_depth4_shadow_dry_run", False)
+        ) or bool(record.get("rolling_depth4_shadow_enabled", False))
 
         missing_unexpected_count += int_value(record.get("missing_buffered_proposal_unexpected_count"), 0)
         missing_unexpected_count += len(as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids")))
@@ -246,10 +253,14 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         normal_lane_conflict_count += len(as_int_set(record.get("rolling_normal_lane_conflict_seq_ids")))
         normal_lane_conflict_count += int_value(record.get("rolling_depth3_normal_lane_conflict_count"), 0)
         normal_lane_conflict_count += len(as_int_set(record.get("rolling_depth3_normal_lane_conflict_seq_ids")))
+        normal_lane_conflict_count += int_value(record.get("rolling_depth4_normal_lane_conflict_count"), 0)
+        normal_lane_conflict_count += len(as_int_set(record.get("rolling_depth4_normal_lane_conflict_seq_ids")))
         depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
         depth_gt3_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
+        depth_gt4_real_commit_count += int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
         higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth4_real_committed_proposal_ids")))
         higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth_gt3_real_committed_proposal_ids")))
+        higher_depth_commit_ids.update(as_int_set(record.get("rolling_depth_gt4_real_committed_proposal_ids")))
         length_mismatch_count += bool_false_count(record.get("eager_commit_target_draft_len_match_by_seq_id"))
         length_mismatch_count += bool_false_count(record.get("continuous_eager_target_draft_len_match_by_seq_id"))
         length_mismatch_count += bool_false_count(record.get("rolling_depth2_target_draft_len_match_by_seq_id"))
@@ -456,6 +467,7 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         "missing_unexpected_count": missing_unexpected_count,
         "depth4_real_commit_count": depth4_real_commit_count,
         "depth_gt3_real_commit_count": depth_gt3_real_commit_count,
+        "depth_gt4_real_commit_count": depth_gt4_real_commit_count,
         "max_configured_depth": max_configured_depth,
         "max_observed_depth": max_observed_depth,
         "gamma": gamma,
@@ -703,6 +715,8 @@ def validate_records(
         errors.append("rolling depth4 real commit count must be zero")
     if trace["depth_gt3_real_commit_count"]:
         errors.append("rolling depth>3 real commit count must be zero")
+    if trace["depth_gt4_real_commit_count"]:
+        errors.append("rolling depth>4 real commit count must be zero")
 
     max_real_depth = max((depth for depth, ids in committed_by_depth.items() if ids), default=0)
     max_real_depth = max(
@@ -721,6 +735,7 @@ def validate_records(
         "max_observed_depth": trace["max_observed_depth"],
         "max_real_committed_depth": max_real_depth,
         "depth_gt3_real_commit_count": trace["depth_gt3_real_commit_count"],
+        "depth_gt4_real_commit_count": trace["depth_gt4_real_commit_count"],
         "depth4_real_commit_count": trace["depth4_real_commit_count"],
         "depth_gt3_committed_proposal_count": len(trace["higher_depth_commit_ids"]),
         "one_shot_committed_proposal_count": len(committed_by_depth[0]),
@@ -781,10 +796,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth2_commit_enabled",
         "rolling_depth3_shadow_enabled",
         "rolling_depth3_commit_enabled",
+        "rolling_depth4_shadow_enabled",
         "max_configured_depth",
         "max_observed_depth",
         "max_real_committed_depth",
         "depth_gt3_real_commit_count",
+        "depth_gt4_real_commit_count",
         "depth4_real_commit_count",
         "depth_gt3_committed_proposal_count",
         "one_shot_committed_proposal_count",

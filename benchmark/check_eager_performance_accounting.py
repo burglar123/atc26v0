@@ -41,6 +41,7 @@ TIMING_FIELDS = [
     "rolling_depth2_commit_decision_broadcast_time_ms",
     "rolling_depth2_commit_time_ms",
     "rolling_depth3_shadow_generation_time_ms",
+    "rolling_depth4_shadow_generation_time_ms",
     "rolling_depth3_commit_decision_broadcast_time_ms",
     "rolling_depth3_commit_time_ms",
 ]
@@ -55,6 +56,7 @@ PROPOSAL_LEN_MAP_KEYS = [
     "eager_schedule_proposal_len_by_proposal_id",
     "rolling_depth2_real_committed_token_count_by_proposal_id",
     "rolling_depth3_real_committed_token_count_by_proposal_id",
+    "rolling_depth4_child_token_count_by_proposal_id",
 ]
 DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
 DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
@@ -67,6 +69,7 @@ GENERIC_ACCOUNTING_FIELD_PAIRS = (
     ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
     ("rolling_depth_gt3_real_commit_count", "generic_depth_gt3_real_commit_count"),
     ("rolling_depth4_real_commit_count", "generic_depth4_real_commit_count"),
+    ("rolling_depth_gt4_real_commit_count", "generic_depth_gt4_real_commit_count"),
 )
 
 
@@ -418,8 +421,19 @@ def aggregate_performance_accounting(
     rolling_depth3_same_seq_overlap_count = 0
     rolling_depth3_normal_lane_conflict_count = 0
     rolling_depth_gt3_real_commit_count = 0
+    rolling_depth_gt4_real_commit_count = 0
     rolling_depth3_drop_reason_by_id: dict[int, str] = {}
     rolling_depth3_max_depth_observed = 0
+    rolling_depth4_shadow_enabled = False
+    rolling_depth4_child_candidate_ids: set[int] = set()
+    rolling_depth4_child_ready_ids: set[int] = set()
+    rolling_depth4_child_invalidated_ids: set[int] = set()
+    rolling_depth4_child_token_by_id: dict[int, int] = {}
+    rolling_depth4_parent_pending_ids: set[int] = set()
+    rolling_depth4_same_seq_overlap_count = 0
+    rolling_depth4_normal_lane_conflict_count = 0
+    rolling_depth4_drop_reason_by_id: dict[int, str] = {}
+    rolling_depth4_max_depth_observed = 0
     rolling_depth2_commit_decision_payload_len_units = 0
     rolling_depth3_commit_decision_payload_len_units = 0
     rolling_max_depth_observed = 0
@@ -635,6 +649,11 @@ def aggregate_performance_accounting(
             rolling_depth3_commit_enabled = True
         rolling_depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
         rolling_depth_gt3_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
+        rolling_depth_gt4_real_commit_count += int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
+        if bool(record.get("enable_rolling_continuous_depth4_shadow_dry_run", False)) or bool(
+            record.get("rolling_depth4_shadow_enabled", False)
+        ):
+            rolling_depth4_shadow_enabled = True
         rolling_depth3_child_candidate_ids.update(
             as_int_set(record.get("rolling_depth3_child_generated_proposal_ids"))
         )
@@ -671,7 +690,52 @@ def aggregate_performance_accounting(
                 except Exception:
                     continue
                 if reason:
-                    rolling_depth3_drop_reason_by_id.setdefault(proposal_id, str(reason))
+                rolling_depth3_drop_reason_by_id.setdefault(proposal_id, str(reason))
+
+        rolling_depth4_child_candidate_ids.update(
+            as_int_set(record.get("rolling_depth4_child_generated_proposal_ids"))
+        )
+        rolling_depth4_child_ready_ids.update(
+            as_int_set(record.get("rolling_depth4_child_ready_shadow_proposal_ids"))
+        )
+        rolling_depth4_child_invalidated_ids.update(
+            as_int_set(record.get("rolling_depth4_child_invalidated_proposal_ids"))
+        )
+        rolling_depth4_parent_pending_ids.update(
+            as_int_set(record.get("rolling_depth4_parent_resolution_pending_proposal_ids"))
+        )
+        rolling_depth4_same_seq_overlap_count += int_value(record.get("rolling_depth4_same_seq_overlap_count"), 0)
+        rolling_depth4_normal_lane_conflict_count += int_value(
+            record.get("rolling_depth4_normal_lane_conflict_count"),
+            0,
+        )
+        rolling_depth4_max_depth_observed = max(
+            rolling_depth4_max_depth_observed,
+            int_value(record.get("rolling_depth4_max_depth_observed"), 0),
+        )
+        for proposal_id, token_count in as_int_map(
+            record.get("rolling_depth4_child_token_count_by_proposal_id")
+        ).items():
+            if token_count > 0:
+                rolling_depth4_child_token_by_id.setdefault(proposal_id, token_count)
+        for proposal_id in as_int_set(record.get("rolling_depth4_child_generated_proposal_ids")):
+            rolling_depth4_child_token_by_id.setdefault(proposal_id, max(0, gamma))
+        reason_map = record.get("rolling_depth4_child_invalidated_reason_by_proposal_id")
+        if isinstance(reason_map, dict):
+            for raw_proposal_id, reason in reason_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                rolling_depth4_drop_reason_by_id.setdefault(proposal_id, str(reason))
+        reason_map = record.get("rolling_depth4_child_generation_skip_reason_by_proposal_id")
+        if isinstance(reason_map, dict):
+            for raw_proposal_id, reason in reason_map.items():
+                try:
+                    proposal_id = int(raw_proposal_id)
+                except Exception:
+                    continue
+                rolling_depth4_drop_reason_by_id.setdefault(proposal_id, str(reason))
         skip_reason_map = record.get("rolling_depth3_child_generation_skip_reason_by_proposal_id")
         if isinstance(skip_reason_map, dict):
             for raw_proposal_id, reason in skip_reason_map.items():
@@ -986,6 +1050,14 @@ def aggregate_performance_accounting(
         )
         for proposal_id in rolling_depth3_real_committed_ids
     )
+    rolling_depth4_child_candidate_token_count = sum(
+        int(rolling_depth4_child_token_by_id.get(proposal_id, max(0, gamma)))
+        for proposal_id in rolling_depth4_child_candidate_ids
+    )
+    rolling_depth4_child_ready_shadow_token_count = sum(
+        int(rolling_depth4_child_token_by_id.get(proposal_id, max(0, gamma)))
+        for proposal_id in rolling_depth4_child_ready_ids
+    )
     continuous_chain_distribution = Counter(
         str(depth)
         for proposal_id, depth in continuous_chain_depth_by_id.items()
@@ -1164,6 +1236,24 @@ def aggregate_performance_accounting(
             rolling_depth3_child_ready_shadow_token_count,
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
         ),
+        "rolling_depth4_shadow_enabled": bool(rolling_depth4_shadow_enabled),
+        "rolling_depth4_child_candidate_proposal_count": len(rolling_depth4_child_candidate_ids),
+        "rolling_depth4_child_candidate_token_count": rolling_depth4_child_candidate_token_count,
+        "rolling_depth4_child_ready_shadow_proposal_count": len(rolling_depth4_child_ready_ids),
+        "rolling_depth4_child_ready_shadow_token_count": rolling_depth4_child_ready_shadow_token_count,
+        "rolling_depth4_child_invalidated_count": len(rolling_depth4_child_invalidated_ids),
+        "rolling_depth4_parent_resolution_pending_count": len(rolling_depth4_parent_pending_ids),
+        "rolling_depth4_same_seq_overlap_count": rolling_depth4_same_seq_overlap_count,
+        "rolling_depth4_normal_lane_conflict_count": rolling_depth4_normal_lane_conflict_count,
+        "rolling_depth4_real_committed_token_count": 0,
+        "rolling_depth_gt4_real_commit_count": rolling_depth_gt4_real_commit_count,
+        "rolling_depth4_drop_reason_counts": dict(Counter(rolling_depth4_drop_reason_by_id.values())),
+        "rolling_depth4_max_depth_observed": rolling_depth4_max_depth_observed,
+        "rolling_depth4_estimated_future_token_count": rolling_depth4_child_ready_shadow_token_count,
+        "rolling_depth4_estimated_future_token_share_of_output": safe_div(
+            rolling_depth4_child_ready_shadow_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
+        ),
         "combined_real_committed_token_count": (
             committed_token_count
             + continuous_real_committed_token_count
@@ -1291,6 +1381,8 @@ def generic_chain_accounting_errors(records: list[dict[str, Any]], accounting: d
             )
     accounting_conflict_count = int_value(accounting.get("rolling_normal_lane_conflict_count"), 0) + int_value(
         accounting.get("rolling_depth3_normal_lane_conflict_count"), 0
+    ) + int_value(
+        accounting.get("rolling_depth4_normal_lane_conflict_count"), 0
     )
     if accounting_conflict_count != int_value(generic_summary.get("generic_normal_lane_conflict_count"), 0):
         errors.append(
@@ -1434,6 +1526,8 @@ def validate_accounting(
         errors.append("rolling depth>2 real commit count must remain zero")
     if int_value(accounting.get("rolling_depth_gt3_real_commit_count"), 0) != 0:
         errors.append("rolling depth>3 real commit count must remain zero")
+    if int_value(accounting.get("rolling_depth_gt4_real_commit_count"), 0) != 0:
+        errors.append("rolling depth>4 real commit count must remain zero")
     if int_value(accounting.get("rolling_depth3_child_ready_shadow_token_count"), 0) > int_value(
         accounting.get("rolling_depth3_child_candidate_token_count"),
         0,
@@ -1444,6 +1538,18 @@ def validate_accounting(
         0,
     ):
         errors.append("rolling depth-3 ready shadow proposals exceed candidate proposals")
+    if int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0) != 0:
+        errors.append("rolling depth-4 real committed tokens must remain zero")
+    if int_value(accounting.get("rolling_depth4_child_ready_shadow_token_count"), 0) > int_value(
+        accounting.get("rolling_depth4_child_candidate_token_count"),
+        0,
+    ):
+        errors.append("rolling depth-4 ready shadow tokens exceed candidate tokens")
+    if int_value(accounting.get("rolling_depth4_child_ready_shadow_proposal_count"), 0) > int_value(
+        accounting.get("rolling_depth4_child_candidate_proposal_count"),
+        0,
+    ):
+        errors.append("rolling depth-4 ready shadow proposals exceed candidate proposals")
     if int_value(accounting.get("rolling_depth3_child_invalidated_count"), 0) > int_value(
         accounting.get("rolling_depth3_child_candidate_proposal_count"),
         0,
@@ -1533,6 +1639,18 @@ def validate_accounting(
         "rolling_depth_gt3_real_commit_count",
         "rolling_depth3_max_depth_observed",
         "rolling_depth3_estimated_future_token_count",
+        "rolling_depth4_child_candidate_proposal_count",
+        "rolling_depth4_child_candidate_token_count",
+        "rolling_depth4_child_ready_shadow_proposal_count",
+        "rolling_depth4_child_ready_shadow_token_count",
+        "rolling_depth4_child_invalidated_count",
+        "rolling_depth4_parent_resolution_pending_count",
+        "rolling_depth4_same_seq_overlap_count",
+        "rolling_depth4_normal_lane_conflict_count",
+        "rolling_depth4_real_committed_token_count",
+        "rolling_depth_gt4_real_commit_count",
+        "rolling_depth4_max_depth_observed",
+        "rolling_depth4_estimated_future_token_count",
         "rolling_depth2_commit_decision_broadcast_payload_len_units",
         "rolling_depth3_commit_decision_broadcast_payload_len_units",
     ):
@@ -1670,6 +1788,21 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth3_max_depth_observed",
         "rolling_depth3_estimated_future_token_count",
         "rolling_depth3_estimated_future_token_share_of_output",
+        "rolling_depth4_shadow_enabled",
+        "rolling_depth4_child_candidate_proposal_count",
+        "rolling_depth4_child_candidate_token_count",
+        "rolling_depth4_child_ready_shadow_proposal_count",
+        "rolling_depth4_child_ready_shadow_token_count",
+        "rolling_depth4_child_invalidated_count",
+        "rolling_depth4_parent_resolution_pending_count",
+        "rolling_depth4_same_seq_overlap_count",
+        "rolling_depth4_normal_lane_conflict_count",
+        "rolling_depth4_real_committed_token_count",
+        "rolling_depth_gt4_real_commit_count",
+        "rolling_depth4_drop_reason_counts",
+        "rolling_depth4_max_depth_observed",
+        "rolling_depth4_estimated_future_token_count",
+        "rolling_depth4_estimated_future_token_share_of_output",
         "combined_real_committed_token_count",
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",

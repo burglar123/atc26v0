@@ -30,6 +30,7 @@ from benchmark.check_eager_performance_accounting import (  # noqa: E402
     load_json,
 )
 from benchmark.check_generic_bounded_rolling_chain import (  # noqa: E402
+    add_depth4_shadow,
     clear_depth3_commit,
     synthetic_records,
 )
@@ -44,11 +45,17 @@ ALIAS_FROM_GENERIC = {
     "depth2_committed_token_count": "generic_depth2_committed_token_count",
     "depth3_committed_proposal_count": "generic_depth3_committed_proposal_count",
     "depth3_committed_token_count": "generic_depth3_committed_token_count",
+    "depth4_shadow_generated_proposal_count": "generic_depth4_shadow_generated_proposal_count",
+    "depth4_shadow_generated_token_count": "generic_depth4_shadow_generated_token_count",
+    "depth4_shadow_ready_proposal_count": "generic_depth4_shadow_ready_proposal_count",
+    "depth4_shadow_ready_token_count": "generic_depth4_shadow_ready_token_count",
+    "depth4_shadow_invalidated_count": "generic_depth4_shadow_invalidated_count",
     "combined_real_committed_token_count": "generic_combined_real_committed_token_count",
     "max_observed_depth": "generic_max_observed_depth",
     "max_real_committed_depth": "generic_max_real_committed_depth",
     "depth4_real_commit_count": "generic_depth4_real_commit_count",
     "depth_gt3_real_commit_count": "generic_depth_gt3_real_commit_count",
+    "depth_gt4_real_commit_count": "generic_depth_gt4_real_commit_count",
     "depth_gt3_committed_proposal_count": "generic_depth_gt3_committed_proposal_count",
     "normal_lane_conflict_count": "generic_normal_lane_conflict_count",
     "missing_buffered_proposal_unexpected_count": "generic_missing_buffered_proposal_unexpected_count",
@@ -139,10 +146,13 @@ def print_compact(summary: dict[str, Any]) -> None:
         "depth1_committed_token_count",
         "depth2_committed_token_count",
         "depth3_committed_token_count",
+        "depth4_shadow_generated_token_count",
+        "depth4_shadow_ready_token_count",
         "combined_real_committed_token_count",
         "max_observed_depth",
         "max_real_committed_depth",
         "depth_gt3_real_commit_count",
+        "depth_gt4_real_commit_count",
         "depth4_real_commit_count",
         "normal_lane_conflict_count",
         "combined_accounting_ok",
@@ -196,6 +206,31 @@ def run_synthetic() -> None:
             "max_observed_depth": 3,
             "max_real_committed_depth": 2,
             "depth_gt3_real_commit_count": 0,
+            "combined_accounting_ok": True,
+            "target_draft_accounting_ok": True,
+            "legacy_generic_parity_ok": True,
+            "generic_chain_accounting_ok": True,
+        },
+    )
+
+    depth4_shadow = deepcopy(records)
+    for record in depth4_shadow:
+        add_depth4_shadow(record)
+    summary = build_chain_summary(
+        depth4_shadow,
+        synthetic_result_payload(),
+        case_name="synthetic_depth4_shadow",
+    )
+    assert_summary(
+        "depth4 shadow",
+        summary,
+        {
+            "depth4_shadow_generated_token_count": 8,
+            "depth4_shadow_ready_token_count": 8,
+            "combined_real_committed_token_count": 36,
+            "max_observed_depth": 4,
+            "max_real_committed_depth": 3,
+            "depth4_real_commit_count": 0,
             "combined_accounting_ok": True,
             "target_draft_accounting_ok": True,
             "legacy_generic_parity_ok": True,
