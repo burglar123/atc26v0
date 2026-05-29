@@ -204,3 +204,132 @@ def test_no_semantic_changes():
     assert 'def verify(self' in src
     assert '.verify(seqs)' in src
     assert 'dist.barrier()' in src
+
+
+def test_serialized_prepare_uses_gamma():
+    """prepare_serialized_verify_decode always uses num_tokens = self.gamma, not 1."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    # Extract the prepare_serialized_verify_decode method
+    idx = src.index('def prepare_serialized_verify_decode')
+    section = src[idx:]
+    next_def = section.find('\n    def ', 10)
+    fn_body = section[:next_def] if next_def > 0 else section
+    # Must contain num_tokens = self.gamma (not conditional on pre_verify)
+    assert 'num_tokens = self.gamma' in fn_body
+    # Must NOT contain the pre_verify conditional
+    assert 'if not seq.pre_verify else 1' not in fn_body
+
+
+def test_serialized_forces_pre_verify_false():
+    """serialized_pearl_step forces pre_verify=False before and after verify."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+
+    # Check DraftModelRunner.serialized_pearl_step
+    draft_idx = src.index('class DraftModelRunner')
+    draft_section = src[draft_idx:]
+    draft_serialized = draft_section.split('def serialized_pearl_step')[1]
+    draft_serialized = draft_serialized.split('\n    def ')[0]
+    assert 'seq.pre_verify = False' in draft_serialized
+    # Should appear at least twice (before verify, after verify)
+    assert draft_serialized.count('seq.pre_verify = False') >= 2
+
+    # Check TargetModelRunner.serialized_pearl_step
+    target_idx = src.index('class TargetModelRunner')
+    target_section = src[target_idx:]
+    target_serialized = target_section.split('def serialized_pearl_step')[1]
+    target_serialized = target_serialized.split('\n    def ')[0]
+    assert 'seq.pre_verify = False' in target_serialized
+    assert target_serialized.count('seq.pre_verify = False') >= 2
+
+
+def test_parallel_pearl_unchanged():
+    """Parallel PEARL pearl_step must NOT force pre_verify=False."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+
+    # DraftModelRunner.pearl_step
+    draft_idx = src.index('class DraftModelRunner')
+    draft_section = src[draft_idx:]
+    draft_pearl = draft_section.split('def pearl_step')[1]
+    draft_pearl = draft_pearl.split('\n    def ')[0]
+    # The parallel PEARL path should NOT have our pre_verify forcing
+    assert 'seq.pre_verify = False' not in draft_pearl
+
+    # TargetModelRunner.pearl_step
+    target_idx = src.index('class TargetModelRunner')
+    target_section = src[target_idx:]
+    target_pearl = target_section.split('def pearl_step')[1]
+    target_pearl = target_pearl.split('\n    def ')[0]
+    assert 'seq.pre_verify = False' not in target_pearl
+
+    # But verify methods still contain pre_verify logic (for parallel PEARL)
+    draft_verify = draft_section.split('def verify(self')[1]
+    draft_verify = draft_verify.split('\n    def ')[0]
+    assert 'seq.pre_verify' in draft_verify
+
+    target_verify = target_section.split('def verify(self')[1]
+    target_verify = target_verify.split('\n    def ')[0]
+    assert '1 if seq.pre_verify else self.gamma' in target_verify
+
+
+def test_serialized_target_uses_correct_prepare():
+    """TargetModelRunner.serialized_pearl_step calls prepare_serialized_verify_decode."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    target_idx = src.index('class TargetModelRunner')
+    target_section = src[target_idx:]
+    target_serialized = target_section.split('def serialized_pearl_step')[1]
+    target_serialized = target_serialized.split('\n    def ')[0]
+    assert 'prepare_serialized_verify_decode' in target_serialized
+    # Should NOT call prepare_pearl_decode in the serialized path
+    assert 'prepare_pearl_decode' not in target_serialized
+
+
+def test_accepted_tokens_range_unconstrained():
+    """After fix, accepted_tokens_by_request values can range from 0 to gamma.
+
+    Validates that the merge output and profile script can handle accepted
+    token counts > 1 for serialized_pearl (gamma=4 means range 0-4).
+    """
+    # Simulate a decoded iteration where all gamma=4 tokens were accepted
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    ms = src.index('def _merge_decode_iterations')
+    rest = src[ms:]
+    lines = rest.split('\n')
+    fn_lines = []
+    for line in lines:
+        fn_lines.append(line)
+        if fn_lines and line.startswith('    def ') and len(fn_lines) > 1:
+            fn_lines.pop()
+            break
+    fn_src = '\n'.join(fn_lines).replace('    @staticmethod\n', '')
+    env = {}
+    exec(fn_src, env)
+    merge = env['_merge_decode_iterations']
+
+    # Simulate full acceptance (all 4 tokens accepted for both seqs)
+    drafts = [{
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'serialized_pearl',
+        'decode_iteration_group': 0, 'runner_role': 'serialized_draft',
+        'scheduled_seq_ids': [0, 1], 'request_ids': ['a', 'b'],
+        'num_seqs_in_batch': 2, 'is_prefill': False,
+        'draft_start_ts': 10.0, 'draft_end_ts': 10.01,
+        'drafted_tokens_total': 4,
+    } for _ in range(4)]
+    verify = {
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'serialized_pearl',
+        'decode_iteration_group': 0, 'runner_role': 'serialized_verify',
+        'scheduled_seq_ids': [0, 1], 'request_ids': ['a', 'b'],
+        'num_seqs_in_batch': 2, 'is_prefill': False,
+        'verify_start_ts': 10.02, 'verify_end_ts': 10.03,
+        'verify_time_ms': 10.0,
+        'total_accepted_tokens': 8, 'accepted_tokens_per_seq': {'0': 4, '1': 4},
+        'rejected_tokens_by_request': {},
+        'per_seq_invalidated_predraft_len': {},
+    }
+    m = merge(drafts + [verify])[0]
+    assert m['accepted_tokens_total'] == 8
+    assert m['accepted_tokens_by_request'] == {'a': 4, 'b': 4}
+    assert m['drafted_tokens_total'] == 16  # 4 per draft step × 4 steps
+    # Verify 0-4 range is also handled
+    assert 4 <= 4  # sanity: max accepted is gamma

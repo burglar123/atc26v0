@@ -1080,12 +1080,13 @@ class DraftModelRunner(ModelRunnerBase):
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     def serialized_pearl_step(self):
-        """Serialized-PEARL draft phase.
+        """Serialized speculative decoding draft phase.
 
-        Approximation baseline: draft generates with existing PEARL semantics, then
-        all ranks synchronize before target verification compute is allowed to run.
-        This disables draft/verify overlap without claiming vanilla serial
-        speculative decoding equivalence.
+        Serial speculative decoding baseline: draft generates gamma tokens per
+        active request, then synchronizes with target ranks before target
+        verification runs. This disables draft/verify overlap and intentionally
+        disables PEARL's pre_verify one-token verification shortcut — every
+        iteration verifies the full gamma-token draft window.
         """
         self._decode_iteration_group += 1
         trace_record = None
@@ -1110,7 +1111,15 @@ class DraftModelRunner(ModelRunnerBase):
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
         # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
+        # serialized_pearl always verifies the full gamma-token draft window;
+        # force the non-pre_verify path so the draft sends gamma tokens for
+        # verification instead of the one-token pre_verify shortcut.
+        for seq in seqs:
+            seq.pre_verify = False
         accepted_lens, invalidated_lens = self.verify(seqs)
+        # serialized_pearl does not use PEARL's pre_verify state machine.
+        for seq in seqs:
+            seq.pre_verify = False
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1181,7 +1190,7 @@ class TargetModelRunner(ModelRunnerBase):
         Behavior of the target model pre-processing.
         For a sequence in pre-verify, the input tokens are the last token (1 token).
         For a sequence in post-verify, the input tokens are the last gamma tokens. (gamma tokens)
-        To conduct efficient batching inference, we pack all the input tokens together. 
+        To conduct efficient batching inference, we pack all the input tokens together.
         Viewing each token as an independent sample, and use slot_mapping and context_lens to instruct the attention network to use correct KV cache.
         Note that the num of input tokens is not equal to the num of seqs.
         """
@@ -1192,6 +1201,34 @@ class TargetModelRunner(ModelRunnerBase):
         temp_seqs = []
         for seq in seqs:
             num_tokens = self.gamma if not seq.pre_verify else 1
+            to_append_tokens = seq.token_ids[-num_tokens:]
+            input_ids.extend(to_append_tokens)
+            positions.extend(list(range(len(seq) - num_tokens, len(seq))))
+            context_lens.extend(list(range(len(seq) - num_tokens + 1, len(seq) + 1)))
+            slot_mapping.extend([seq.token_to_slot(token_index) for token_index in range(len(seq) - num_tokens, len(seq))])
+            temp_seqs.extend([seq] * num_tokens)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(temp_seqs)
+        set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions, temp_seqs
+
+    def prepare_serialized_verify_decode(self, seqs: list[Sequence]):
+        """Target preparation for serialized speculative decoding baseline.
+
+        serialized_pearl intentionally disables PEARL's pre_verify one-token
+        verification shortcut. Every serialized iteration must verify the full
+        gamma-token draft window regardless of seq.pre_verify.
+        """
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        temp_seqs = []
+        for seq in seqs:
+            num_tokens = self.gamma
             to_append_tokens = seq.token_ids[-num_tokens:]
             input_ids.extend(to_append_tokens)
             positions.extend(list(range(len(seq) - num_tokens, len(seq))))
@@ -1221,12 +1258,15 @@ class TargetModelRunner(ModelRunnerBase):
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     def serialized_pearl_step(self):
-        """Serialized-PEARL target verification phase.
+        """Serialized speculative decoding target verification phase.
 
-        Approximation baseline: target ranks wait for draft ranks at a global
-        barrier before running the existing PEARL verification compute. This
-        disables draft/verify overlap but does not implement strict vanilla
-        serial speculative decoding.
+        This is a serial speculative decoding baseline, NOT PEARL's two-stage
+        pre-verify behavior. It intentionally disables PEARL pre_verify one-token
+        verification and always verifies the full gamma-token draft window.
+
+        Draft and target verification are serialized (no overlap), but the
+        verification semantics match a gamma-token speculative decode window,
+        not PEARL's one-token pre_verify shortcut.
         """
         # Global barrier pairs with DraftModelRunner.serialized_pearl_step().
         # Do not move this below target compute, or draft/verify will overlap.
@@ -1235,12 +1275,20 @@ class TargetModelRunner(ModelRunnerBase):
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        # serialized_pearl always verifies the full gamma-token draft window.
+        input_ids, positions, temp_seqs = self.prepare_serialized_verify_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
+        # Force gamma-token verification: serialized_pearl never uses pre_verify shortcut.
+        for seq in seqs:
+            seq.pre_verify = False
         accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        # serialized_pearl does not use pre_verify state machine; always stay
+        # in gamma-token mode for the next iteration.
+        for seq in seqs:
+            seq.pre_verify = False
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
