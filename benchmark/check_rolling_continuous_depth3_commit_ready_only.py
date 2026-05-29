@@ -167,6 +167,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     real_commit_count = 0
     depth4_real_commit_count = 0
     depth_gt3_real_commit_count = 0
+    depth_gt4_real_commit_count = 0
     depth4_commit_enabled = False
     target_verified_sum = 0
     target_accepted_sum = 0
@@ -211,6 +212,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         normal_lane_conflict_count += int_value(record.get("rolling_depth3_normal_lane_conflict_count"), 0)
         depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
         depth_gt3_real_commit_count += int_value(record.get("rolling_depth_gt3_real_commit_count"), 0)
+        depth_gt4_real_commit_count += int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
+        if int_value(record.get("rolling_depth_gt4_real_commit_count"), 0):
+            errors.append(f"record[{idx}] rolling depth>4 real commit count must be zero")
         if int_value(record.get("rolling_depth4_real_commit_count"), 0) and not depth4_commit_enabled:
             errors.append(f"record[{idx}] rolling depth4 real commit count must be zero")
         if int_value(record.get("rolling_depth_gt3_real_commit_count"), 0) and not depth4_commit_enabled:
@@ -414,6 +418,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append("rolling_depth4_real_commit_count must be zero")
     if depth_gt3_real_commit_count and not depth4_commit_enabled:
         errors.append("rolling_depth_gt3_real_commit_count must be zero")
+    if depth_gt4_real_commit_count:
+        errors.append("rolling_depth_gt4_real_commit_count must be zero")
     if normal_lane_conflict_count:
         errors.append("rolling_depth3_normal_lane_conflict_count must be zero")
     if missing_unexpected_count:
@@ -440,6 +446,8 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth3_real_commit_count": real_commit_count,
         "rolling_depth4_real_commit_count": depth4_real_commit_count,
         "rolling_depth_gt3_real_commit_count": depth_gt3_real_commit_count,
+        "rolling_depth_gt4_real_commit_count": depth_gt4_real_commit_count,
+        "depth4_commit_enabled": depth4_commit_enabled,
         "rolling_depth3_target_actual_verified_token_increment_sum": target_verified_sum,
         "rolling_depth3_target_actual_accepted_token_increment_sum": target_accepted_sum,
         "rolling_depth3_draft_actual_verified_token_increment_sum": draft_verified_sum,
@@ -464,6 +472,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth3_real_commit_count",
         "rolling_depth4_real_commit_count",
         "rolling_depth_gt3_real_commit_count",
+        "rolling_depth_gt4_real_commit_count",
+        "depth4_commit_enabled",
         "rolling_depth3_target_actual_verified_token_increment_sum",
         "rolling_depth3_target_actual_accepted_token_increment_sum",
         "rolling_depth3_draft_actual_verified_token_increment_sum",
@@ -533,6 +543,33 @@ def synthetic_good_record() -> dict[str, Any]:
     }
 
 
+def add_depth4_commit_for_depth3(record: dict[str, Any], *, depth4_tokens: int, enabled: bool = True) -> None:
+    side = str(record.get("rolling_depth3_commit_side", ""))
+    seq_id = int(record.get("rolling_depth3_real_committed_seq_ids", [0])[0]) if record.get(
+        "rolling_depth3_real_committed_seq_ids"
+    ) else 7
+    proposal_id = 900000104
+    has_commit = enabled and depth4_tokens > 0
+    record["enable_rolling_continuous_depth4_commit_ready_only"] = enabled
+    record["rolling_depth4_commit_enabled"] = enabled
+    record["rolling_depth4_commit_side"] = side
+    record["rolling_depth4_commit_plan_id"] = 42
+    record["rolling_depth4_commit_step_id"] = 22
+    record["rolling_depth4_real_committed_proposal_ids"] = [proposal_id] if has_commit else []
+    record["rolling_depth4_real_committed_seq_ids"] = [seq_id] if has_commit else []
+    record["rolling_depth4_real_committed_token_count_by_proposal_id"] = (
+        {str(proposal_id): depth4_tokens} if has_commit else {}
+    )
+    record["rolling_depth4_tokens_verified"] = depth4_tokens
+    record["rolling_depth4_tokens_accepted"] = depth4_tokens
+    record["rolling_depth4_tokens_rejected"] = 0
+    record["rolling_depth4_tokens_invalidated"] = 0
+    record["rolling_depth4_real_committed_token_count"] = depth4_tokens if has_commit else 0
+    record["rolling_depth4_real_commit_count"] = 1 if has_commit else 0
+    record["rolling_depth_gt3_real_commit_count"] = 1 if has_commit else 0
+    record["rolling_depth_gt4_real_commit_count"] = 0
+
+
 def run_synthetic() -> None:
     target = synthetic_good_record()
     draft = deepcopy(target)
@@ -563,12 +600,34 @@ def run_synthetic() -> None:
     if not errors:
         raise SystemExit("synthetic invalidated depth3 child commit should fail")
 
-    depth4 = deepcopy(target)
-    depth4["rolling_depth4_real_commit_count"] = 1
-    depth4["rolling_depth_gt3_real_commit_count"] = 1
-    errors, _summary = validate_records([depth4, draft])
+    # depth4 without flag enabled, should fail
+    depth4_no_flag = deepcopy(target)
+    depth4_no_flag["rolling_depth4_real_commit_count"] = 1
+    depth4_no_flag["rolling_depth_gt3_real_commit_count"] = 1
+    errors, _summary = validate_records([depth4_no_flag, draft])
     if not errors:
-        raise SystemExit("synthetic depth4 commit should fail")
+        raise SystemExit("synthetic depth4 commit without flag should fail")
+
+    # legal depth4 commit with flag enabled, should pass
+    depth4_legal_target = deepcopy(target)
+    add_depth4_commit_for_depth3(depth4_legal_target, depth4_tokens=8, enabled=True)
+    depth4_legal_draft = deepcopy(draft)
+    add_depth4_commit_for_depth3(depth4_legal_draft, depth4_tokens=8, enabled=True)
+    errors, summary = validate_records([depth4_legal_target, depth4_legal_draft])
+    if errors:
+        raise SystemExit(f"synthetic depth3 checker legal depth4 commit failed: {errors}")
+    if summary.get("rolling_depth4_real_commit_count") != 2:
+        raise SystemExit(f"legal depth4: real commit count must be 2, got {summary.get('rolling_depth4_real_commit_count')}")
+    if summary.get("depth4_commit_enabled") is not True:
+        raise SystemExit("legal depth4: depth4_commit_enabled must be True")
+
+    # depth_gt4 > 0, should fail
+    depth4_gt4_target = deepcopy(target)
+    add_depth4_commit_for_depth3(depth4_gt4_target, depth4_tokens=8, enabled=True)
+    depth4_gt4_target["rolling_depth_gt4_real_commit_count"] = 1
+    errors, _summary = validate_records([depth4_gt4_target, draft])
+    if not errors:
+        raise SystemExit("synthetic depth3 checker depth_gt4 should fail")
 
     parent_record = deepcopy(target)
     ready_record = deepcopy(target)

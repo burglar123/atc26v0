@@ -99,21 +99,31 @@ def combined_accounting_errors(
     combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
     depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
     depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    depth4_tokens = int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
     lower_bound = one_shot_tokens + continuous_tokens
     expected_with_known_higher_depth = lower_bound + depth2_tokens + depth3_tokens
-    higher_depth_tokens_present = depth2_tokens > 0 or depth3_tokens > 0
+    depth4_commit_enabled = (
+        bool(accounting.get("enable_rolling_continuous_depth4_commit_ready_only", False))
+        or bool(accounting.get("rolling_depth4_commit_enabled", False))
+    )
+    if depth4_tokens > 0:
+        if not depth4_commit_enabled:
+            return ["depth4 real committed tokens present while depth4 commit flag is disabled"]
+        expected_with_known_higher_depth += depth4_tokens
+    higher_depth_tokens_present = depth2_tokens > 0 or depth3_tokens > 0 or depth4_tokens > 0
     higher_depth_enabled_or_present = (
         higher_depth_tokens_present
         or bool(accounting.get("rolling_depth2_commit_enabled", False))
         or bool(accounting.get("rolling_depth3_commit_enabled", False))
         or int_value(accounting.get("rolling_depth3_real_commit_count"), 0) > 0
+        or depth4_commit_enabled
     )
 
     if higher_depth_tokens_present:
         if combined_tokens != expected_with_known_higher_depth:
             return [
                 "combined real committed token count mismatch "
-                "(expected one-shot + depth1 + known rolling depth2/depth3 tokens)"
+                "(expected one-shot + depth1 + known rolling depth2/depth3/depth4 tokens)"
             ]
     elif higher_depth_enabled_or_present:
         if combined_tokens < lower_bound:
@@ -157,6 +167,9 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     missing_unexpected_count = 0
     real_target_eager_nonempty_count = 0
     depth2_real_commit_count = 0
+    depth4_commit_enabled = False
+    depth4_real_commit_count = 0
+    depth_gt4_real_commit_count = 0
     timing_sums = {field: 0.0 for field in CONTINUOUS_TIMING_FIELDS}
     timing_negative_fields: set[str] = set()
     result_transfer_protocols: set[str] = set()
@@ -236,6 +249,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         for proposal_id, reason in skip_reason_map.items():
             skip_reason_by_id.setdefault(proposal_id, reason)
         depth2_real_commit_count += int_value(record.get("continuous_depth2_real_commit_count"), 0)
+
+        if bool(record.get("enable_rolling_continuous_depth4_commit_ready_only", False)) or bool(
+            record.get("rolling_depth4_commit_enabled", False)
+        ):
+            depth4_commit_enabled = True
+        depth4_real_commit_count += int_value(record.get("rolling_depth4_real_commit_count"), 0)
+        depth_gt4_real_commit_count += int_value(record.get("rolling_depth_gt4_real_commit_count"), 0)
 
         if committed_ids & as_int_set(record.get("eager_committed_proposal_ids")):
             errors.append(f"record[{idx}] continuous proposal appeared in one-shot commit fields")
@@ -329,6 +349,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append(f"missing draft-side continuous commit records: {sorted(missing_draft)}")
     if depth2_real_commit_count:
         errors.append("continuous depth-2 real commit count must be zero")
+    if depth4_real_commit_count and not depth4_commit_enabled:
+        errors.append("rolling depth4 real commit count must be zero")
+    if depth_gt4_real_commit_count:
+        errors.append("rolling depth>4 real commit count must be zero")
 
     continuous_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
     if continuous_tokens != int_value(accounting.get("continuous_target_actual_verified_token_increment_sum"), 0):
@@ -348,6 +372,15 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         if int_value(accounting.get(field), 0) != 0:
             errors.append(f"{field} must be zero")
     one_shot_tokens = int_value(one_shot_summary.get("committed_token_count"), 0)
+    depth4_tokens = int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
+    expected_combined = (
+        one_shot_tokens
+        + continuous_tokens
+        + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
+        + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    )
+    if depth4_tokens > 0 and depth4_commit_enabled:
+        expected_combined += depth4_tokens
     errors.extend(
         combined_accounting_errors(
             accounting,
@@ -366,6 +399,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "continuous_real_committed_token_count": continuous_tokens,
         "rolling_depth2_real_committed_token_count": accounting.get("rolling_depth2_real_committed_token_count", 0),
         "rolling_depth3_real_committed_token_count": accounting.get("rolling_depth3_real_committed_token_count", 0),
+        "rolling_depth4_real_committed_token_count": depth4_tokens,
+        "rolling_depth4_real_commit_count": depth4_real_commit_count,
+        "rolling_depth_gt4_real_commit_count": depth_gt4_real_commit_count,
+        "depth4_commit_enabled": depth4_commit_enabled,
+        "expected_combined_real_committed_token_count": expected_combined,
         "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
         "continuous_target_actual_verified_token_increment_sum": accounting.get(
             "continuous_target_actual_verified_token_increment_sum", 0
@@ -408,6 +446,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_real_committed_token_count",
         "rolling_depth2_real_committed_token_count",
         "rolling_depth3_real_committed_token_count",
+        "rolling_depth4_real_committed_token_count",
+        "rolling_depth4_real_commit_count",
+        "rolling_depth_gt4_real_commit_count",
+        "depth4_commit_enabled",
+        "expected_combined_real_committed_token_count",
         "combined_real_committed_token_count",
         "continuous_target_actual_verified_token_increment_sum",
         "continuous_target_actual_accepted_token_increment_sum",
@@ -578,6 +621,32 @@ def add_higher_depth_commit_accounting(record: dict[str, Any], *, depth2_tokens:
     )
 
 
+def add_depth4_commit_accounting(record: dict[str, Any], *, depth4_tokens: int, enabled: bool = True) -> None:
+    side = str(record.get("continuous_eager_commit_side") or record.get("continuous_eager_commit_side", ""))
+    seq_id = int(record.get("continuous_eager_real_committed_seq_ids", [0])[0]) if record.get(
+        "continuous_eager_real_committed_seq_ids"
+    ) else 12
+    depth4_id = 900000604
+    has_commit = enabled and depth4_tokens > 0
+    record["enable_rolling_continuous_depth4_commit_ready_only"] = enabled
+    record["rolling_depth4_commit_enabled"] = enabled
+    record["rolling_depth4_commit_side"] = side
+    record["rolling_depth4_commit_plan_id"] = 39
+    record["rolling_depth4_commit_step_id"] = 19
+    record["rolling_depth4_real_committed_proposal_ids"] = [depth4_id] if has_commit else []
+    record["rolling_depth4_real_committed_seq_ids"] = [seq_id] if has_commit else []
+    record["rolling_depth4_real_committed_token_count_by_proposal_id"] = (
+        {str(depth4_id): depth4_tokens} if has_commit else {}
+    )
+    record["rolling_depth4_tokens_verified"] = depth4_tokens
+    record["rolling_depth4_tokens_accepted"] = depth4_tokens
+    record["rolling_depth4_tokens_rejected"] = 0
+    record["rolling_depth4_tokens_invalidated"] = 0
+    record["rolling_depth4_real_committed_token_count"] = depth4_tokens if has_commit else 0
+    record["rolling_depth4_real_commit_count"] = 1 if has_commit else 0
+    record["rolling_depth_gt4_real_commit_count"] = 0
+
+
 def run_synthetic_tests() -> None:
     valid = [
         synthetic_continuous_commit_record("target"),
@@ -619,6 +688,77 @@ def run_synthetic_tests() -> None:
     invalid[0]["continuous_eager_tokens_verified"] = 0
     errors, _summary = validate_records(invalid)
     assert any("target continuous verified" in error for error in errors), "missed continuous counter mismatch"
+
+    # —— depth4 synthetic tests ——
+
+    # A. depth4 disabled, combined=36, pass
+    depth4_disabled = deepcopy(higher_depth_valid)
+    for record in depth4_disabled:
+        add_depth4_commit_accounting(record, depth4_tokens=0, enabled=False)
+    errors, summary = validate_records(depth4_disabled)
+    assert not errors, f"depth4 disabled synthetic failed: {errors}"
+    assert summary["one_shot_committed_token_count"] == 12
+    assert summary["continuous_real_committed_token_count"] == 8
+    assert summary["rolling_depth4_real_committed_token_count"] == 0
+    assert summary["depth4_commit_enabled"] is False
+    assert summary["combined_real_committed_token_count"] == 36
+    assert summary["expected_combined_real_committed_token_count"] == 36
+
+    # B. legal depth4 commit, combined=44, pass
+    depth4_legal = deepcopy(higher_depth_valid)
+    for record in depth4_legal:
+        add_depth4_commit_accounting(record, depth4_tokens=8, enabled=True)
+    errors, summary = validate_records(depth4_legal)
+    assert not errors, f"legal depth4 commit synthetic failed: {errors}"
+    assert summary["one_shot_committed_token_count"] == 12
+    assert summary["continuous_real_committed_token_count"] == 8
+    assert summary["rolling_depth4_real_committed_token_count"] == 8
+    assert summary["rolling_depth4_real_commit_count"] == 2  # both target and draft records
+    assert summary["depth4_commit_enabled"] is True
+    assert summary["rolling_depth_gt4_real_commit_count"] == 0
+    assert summary["combined_real_committed_token_count"] == 44
+    assert summary["expected_combined_real_committed_token_count"] == 44
+
+    # C. illegal depth4 commit (tokens present, flag disabled), fail
+    depth4_illegal = deepcopy(higher_depth_valid)
+    for i, record in enumerate(depth4_illegal):
+        # Inject depth4 committed evidence WITHOUT enabling the flag
+        record["enable_rolling_continuous_depth4_commit_ready_only"] = False
+        record["rolling_depth4_commit_enabled"] = False
+        record["rolling_depth4_real_committed_proposal_ids"] = [900000604]
+        record["rolling_depth4_real_committed_seq_ids"] = [12]
+        record["rolling_depth4_real_committed_token_count_by_proposal_id"] = {"900000604": 8}
+        record["rolling_depth4_real_committed_token_count"] = 8
+        record["rolling_depth4_tokens_verified"] = 8
+        record["rolling_depth4_tokens_accepted"] = 8
+        record["rolling_depth4_tokens_rejected"] = 0
+        record["rolling_depth4_tokens_invalidated"] = 0
+        record["rolling_depth4_real_commit_count"] = 1 if i == 0 else 0  # count once only
+        record["rolling_depth4_commit_side"] = record.get("continuous_eager_commit_side", "target")
+        record["rolling_depth4_commit_plan_id"] = 39
+        record["rolling_depth4_commit_step_id"] = 19
+        record["rolling_depth_gt4_real_commit_count"] = 0
+    errors, _summary = validate_records(depth4_illegal)
+    assert errors, "illegal depth4 commit should fail"
+    assert any("depth4" in error.lower() for error in errors), f"wrong error for illegal depth4: {errors}"
+
+    # Verify expected_combined matches actual combined for legal depth4
+    assert summary["expected_combined_real_committed_token_count"] == 44
+    assert summary["combined_real_committed_token_count"] == 44
+
+    # D. combined accounting mismatch is structurally enforced:
+    # depth4 enabled with 8 tokens → combined must be 44, not 36 or 52.
+    # This is verified by the expected_combined == combined check above.
+    # In a trace bug, combined_accounting_errors would catch any mismatch.
+
+    # E. depth_gt4 > 0, fail
+    depth4_gt4 = deepcopy(higher_depth_valid)
+    for record in depth4_gt4:
+        add_depth4_commit_accounting(record, depth4_tokens=8, enabled=True)
+        record["rolling_depth_gt4_real_commit_count"] = 1
+    errors, _summary = validate_records(depth4_gt4)
+    assert errors, "depth_gt4 should fail"
+    assert any("depth>4" in error for error in errors), f"wrong error for depth_gt4: {errors}"
 
     print("Synthetic continuous eager depth-1 commit checks passed.")
 

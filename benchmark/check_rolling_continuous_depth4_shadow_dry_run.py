@@ -77,7 +77,7 @@ def validate_records(
         errors.append("rolling depth4 real commit count must remain zero")
     if registry.depth_gt4_real_commit_count:
         errors.append("rolling depth>4 real commit count must remain zero")
-    if registry.depth_gt3_real_commit_count:
+    if registry.depth_gt3_real_commit_count and not commit_enabled:
         errors.append("rolling depth>3 real commit count must remain zero")
     if registry.higher_depth_commit_ids:
         errors.append(f"depth>4 real committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
@@ -267,6 +267,48 @@ def run_synthetic() -> None:
         record["rolling_depth4_child_ready_shadow_seq_ids"] = [7, 7]
         record["rolling_depth4_child_token_count_by_proposal_id"]["900000105"] = 8
     assert_fail("bad depth4 ready accounting", bad_ready_accounting, "ready")
+
+    # legal depth4 commit with commit flag enabled — should pass
+    legal_d4_commit = deepcopy(good)
+    p4 = 900000104
+    for i, record in enumerate(legal_d4_commit):
+        side = record.get("rolling_depth3_commit_side", "target")
+        seq_id = 7
+        record["enable_rolling_continuous_depth4_commit_ready_only"] = True
+        record["rolling_depth4_commit_enabled"] = True
+        record["rolling_depth4_commit_source"] = "rolling_depth4_ready_only"
+        record["rolling_depth4_commit_side"] = side
+        record["rolling_depth4_commit_plan_id"] = 42
+        record["rolling_depth4_commit_step_id"] = 22
+        record["rolling_depth4_real_committed_proposal_ids"] = [p4]
+        record["rolling_depth4_real_committed_seq_ids"] = [seq_id]
+        record["rolling_depth4_real_committed_token_count_by_proposal_id"] = {str(p4): 8}
+        record["rolling_depth4_real_committed_token_count"] = 8
+        record["rolling_depth4_tokens_verified"] = 8
+        record["rolling_depth4_tokens_accepted"] = 8
+        record["rolling_depth4_tokens_rejected"] = 0
+        record["rolling_depth4_tokens_invalidated"] = 0
+        record["rolling_depth4_real_commit_count"] = 1 if i == 0 else 0
+        record["rolling_depth_gt3_real_commit_count"] = 1 if i == 0 else 0
+        record["rolling_depth_gt4_real_commit_count"] = 0
+    assert_pass(
+        "legal depth4 commit passes shadow checker",
+        legal_d4_commit,
+        {
+            "depth4_shadow_enabled": True,
+            "depth4_commit_enabled": True,
+            "rolling_depth4_real_commit_count": 1,
+            "rolling_depth4_real_committed_token_count": 8,
+            "rolling_depth_gt4_real_commit_count": 0,
+            "combined_real_committed_token_count": 44,
+            "max_real_committed_depth": 4,
+        },
+    )
+
+    # depth5 (depth_gt4) — always fail
+    bad_d5 = deepcopy(good)
+    bad_d5[0]["rolling_depth_gt4_real_commit_count"] = 1
+    assert_fail("bad depth_gt4", bad_d5, "depth>4")
 
     print("Synthetic rolling depth4 shadow dry-run checks passed.")
 
