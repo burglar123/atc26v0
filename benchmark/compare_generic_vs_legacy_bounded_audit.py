@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.check_bounded_rolling_readiness_audit import (  # noqa: E402
+    load_trace,
+    synthetic_result_payload,
+    validate_records as validate_legacy_records,
+)
+from benchmark.check_eager_performance_accounting import load_json  # noqa: E402
+from benchmark.check_generic_bounded_rolling_chain import (  # noqa: E402
+    summarize_generic_chain,
+    synthetic_records,
+)
+
+
+CORE_FIELD_PAIRS = (
+    ("one_shot_committed_token_count", "one_shot_committed_token_count"),
+    ("depth1_committed_token_count", "depth1_committed_token_count"),
+    ("depth2_committed_token_count", "depth2_committed_token_count"),
+    ("depth3_committed_token_count", "depth3_committed_token_count"),
+    ("combined_real_committed_token_count", "combined_real_committed_token_count"),
+    ("max_real_committed_depth", "max_real_committed_depth"),
+    ("max_observed_depth", "max_observed_depth"),
+    ("depth4_real_commit_count", "depth4_real_commit_count"),
+    ("depth_gt3_real_commit_count", "depth_gt3_real_commit_count"),
+    ("normal_lane_conflict_count", "normal_lane_conflict_count"),
+    ("missing_buffered_proposal_unexpected_count", "missing_buffered_proposal_unexpected_count"),
+    ("duplicate_commit_count", "duplicate_commit_count"),
+    ("invalid_committed_child_count", "invalid_committed_child_count"),
+    ("cascade_committed_child_count", "cascade_committed_child_count"),
+    ("parent_missing_committed_child_count", "parent_missing_committed_child_count"),
+    ("combined_accounting_ok", "combined_accounting_ok"),
+    ("target_draft_accounting_ok", "target_draft_accounting_ok"),
+)
+
+
+def compare_summaries(legacy: dict[str, Any], generic: dict[str, Any]) -> list[str]:
+    mismatches: list[str] = []
+    for legacy_key, generic_key in CORE_FIELD_PAIRS:
+        legacy_value = legacy.get(legacy_key)
+        generic_value = generic.get(generic_key)
+        if legacy_value != generic_value:
+            mismatches.append(f"{legacy_key}: legacy={legacy_value!r} generic={generic_value!r}")
+    return mismatches
+
+
+def print_comparison(legacy: dict[str, Any], generic: dict[str, Any], mismatches: list[str]) -> None:
+    print("legacy/generic bounded audit comparison")
+    for legacy_key, generic_key in CORE_FIELD_PAIRS:
+        print(f"{legacy_key}: legacy={legacy.get(legacy_key)} generic={generic.get(generic_key)}")
+    if mismatches:
+        print("Mismatches:")
+        for mismatch in mismatches:
+            print(f"- {mismatch}")
+    else:
+        print("Parity: pass")
+
+
+def run_compare(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> int:
+    legacy_errors, legacy = validate_legacy_records(records, result_payload)
+    generic = summarize_generic_chain(records, result_payload)
+    mismatches = compare_summaries(legacy, generic)
+    print_comparison(legacy, generic, mismatches)
+
+    errors: list[str] = []
+    if legacy_errors:
+        errors.append(f"legacy audit errors: {legacy_errors}")
+    if generic.get("generic_errors"):
+        errors.append(f"generic checker errors: {generic.get('generic_errors')}")
+    errors.extend(mismatches)
+    if errors:
+        print("Errors:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+    return 0
+
+
+def run_synthetic() -> None:
+    records = synthetic_records()
+    legacy_errors, legacy = validate_legacy_records(records, synthetic_result_payload())
+    generic = summarize_generic_chain(records, synthetic_result_payload())
+    if legacy_errors:
+        raise SystemExit(f"synthetic legacy audit failed: {legacy_errors}")
+    if generic.get("generic_errors"):
+        raise SystemExit(f"synthetic generic checker failed: {generic.get('generic_errors')}")
+    mismatches = compare_summaries(legacy, generic)
+    if mismatches:
+        raise SystemExit(f"synthetic parity failed: {mismatches}")
+
+    bad_generic = deepcopy(generic)
+    bad_generic["depth3_committed_token_count"] = int(bad_generic["depth3_committed_token_count"]) + 1
+    bad_mismatches = compare_summaries(legacy, bad_generic)
+    if not bad_mismatches:
+        raise SystemExit("synthetic parity mismatch case should fail")
+
+    print("Synthetic generic vs legacy bounded audit comparison checks passed.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Compare legacy bounded audit output with generic checker output.")
+    parser.add_argument("trace", nargs="?", type=Path)
+    parser.add_argument("result", nargs="?", type=Path)
+    parser.add_argument("--synthetic", action="store_true")
+    args = parser.parse_args()
+
+    if args.synthetic or args.trace is None:
+        run_synthetic()
+        return 0
+
+    records = load_trace(args.trace)
+    result_payload = load_json(args.result) if args.result else {}
+    return run_compare(records, result_payload)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -350,6 +350,24 @@ def validate_records(
     return errors, summary
 
 
+def summarize_generic_chain(
+    trace_records: list[dict[str, Any]],
+    result_payload: dict[str, Any] | None = None,
+    *,
+    strict_performance: bool = False,
+) -> dict[str, Any]:
+    errors, summary = validate_records(
+        trace_records,
+        result_payload,
+        strict_performance=strict_performance,
+    )
+    return {
+        **summary,
+        "generic_error_count": len(errors),
+        "generic_errors": errors,
+    }
+
+
 def print_summary(summary: dict[str, Any]) -> None:
     for key in (
         "total_trace_records",

@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmark.check_bounded_rolling_readiness_audit import validate_records as validate_audit_records  # noqa: E402
 from benchmark.check_eager_commit_ready_only import load_trace  # noqa: E402
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
+from benchmark.check_generic_bounded_rolling_chain import summarize_generic_chain  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ CHECKERS = [
     ("benchmark/check_rolling_continuous_depth3_shadow_dry_run.py", "trace"),
     ("benchmark/check_rolling_continuous_depth3_commit_ready_only.py", "trace"),
     ("benchmark/check_bounded_rolling_readiness_audit.py", "trace_result"),
+    ("benchmark/check_generic_bounded_rolling_chain.py", "trace_result"),
     ("benchmark/check_eager_performance_accounting.py", "trace_result"),
     ("benchmark/check_multislo_result.py", "result"),
 ]
@@ -169,6 +171,37 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
     result_payload = load_json(result_json) if result_json.exists() else {}
     accounting = aggregate_performance_accounting(records, result_payload)
     audit_errors, audit = validate_audit_records(records, result_payload)
+    generic = summarize_generic_chain(records, result_payload)
+    generic_depth_token_parity_ok = all(
+        generic.get(generic_key) == audit.get(legacy_key)
+        for generic_key, legacy_key in (
+            ("one_shot_committed_token_count", "one_shot_committed_token_count"),
+            ("depth1_committed_token_count", "depth1_committed_token_count"),
+            ("depth2_committed_token_count", "depth2_committed_token_count"),
+            ("depth3_committed_token_count", "depth3_committed_token_count"),
+        )
+    )
+    generic_legacy_combined_parity_ok = (
+        generic.get("combined_real_committed_token_count") == audit.get("combined_real_committed_token_count")
+        == accounting.get("combined_real_committed_token_count")
+    )
+    generic_legacy_safety_parity_ok = all(
+        generic.get(field) == audit.get(field)
+        for field in (
+            "max_real_committed_depth",
+            "max_observed_depth",
+            "depth_gt3_real_commit_count",
+            "depth4_real_commit_count",
+            "normal_lane_conflict_count",
+            "missing_buffered_proposal_unexpected_count",
+            "duplicate_commit_count",
+            "invalid_committed_child_count",
+            "cascade_committed_child_count",
+            "parent_missing_committed_child_count",
+            "combined_accounting_ok",
+            "target_draft_accounting_ok",
+        )
+    )
     summary = {
         "goodput_tokens_per_s": accounting.get("goodput_tokens_per_s"),
         "mean_tpot_ms": accounting.get("mean_tpot_ms"),
@@ -198,6 +231,29 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
         "combined_accounting_ok": audit.get("combined_accounting_ok"),
         "target_draft_accounting_ok": audit.get("target_draft_accounting_ok"),
         "audit_error_count": len(audit_errors),
+        "generic_error_count": generic.get("generic_error_count"),
+        "generic_max_real_committed_depth": generic.get("max_real_committed_depth"),
+        "generic_max_observed_depth": generic.get("max_observed_depth"),
+        "generic_depth_gt3_real_commit_count": generic.get("depth_gt3_real_commit_count"),
+        "generic_depth4_real_commit_count": generic.get("depth4_real_commit_count"),
+        "generic_one_shot_committed_tokens": generic.get("one_shot_committed_token_count"),
+        "generic_depth1_committed_tokens": generic.get("depth1_committed_token_count"),
+        "generic_depth2_committed_tokens": generic.get("depth2_committed_token_count"),
+        "generic_depth3_committed_tokens": generic.get("depth3_committed_token_count"),
+        "generic_combined_real_committed_tokens": generic.get("combined_real_committed_token_count"),
+        "generic_combined_accounting_ok": generic.get("combined_accounting_ok"),
+        "generic_target_draft_accounting_ok": generic.get("target_draft_accounting_ok"),
+        "generic_normal_lane_conflict_count": generic.get("normal_lane_conflict_count"),
+        "generic_missing_buffered_proposal_unexpected_count": generic.get(
+            "missing_buffered_proposal_unexpected_count"
+        ),
+        "generic_duplicate_commit_count": generic.get("duplicate_commit_count"),
+        "generic_invalid_committed_child_count": generic.get("invalid_committed_child_count"),
+        "generic_cascade_committed_child_count": generic.get("cascade_committed_child_count"),
+        "generic_parent_missing_committed_child_count": generic.get("parent_missing_committed_child_count"),
+        "generic_legacy_combined_parity_ok": generic_legacy_combined_parity_ok,
+        "generic_legacy_depth_token_parity_ok": generic_depth_token_parity_ok,
+        "generic_legacy_safety_parity_ok": generic_legacy_safety_parity_ok,
         "rolling_depth3_child_candidate_tokens": accounting.get("rolling_depth3_child_candidate_token_count"),
         "rolling_depth3_child_ready_shadow_tokens": accounting.get("rolling_depth3_child_ready_shadow_token_count"),
         "rolling_depth3_commit_skip_reason_counts": accounting.get("rolling_depth3_real_commit_skip_reason_counts"),
@@ -255,6 +311,17 @@ def run_case(args: argparse.Namespace, case: BoundedRegressionCase, env: dict[st
     }
     if status == 0 and not args.print_only:
         row.update(load_case_summary(engine_trace, result_json))
+        parity_ok = all(
+            bool(row.get(field))
+            for field in (
+                "generic_legacy_combined_parity_ok",
+                "generic_legacy_depth_token_parity_ok",
+                "generic_legacy_safety_parity_ok",
+            )
+        )
+        if not parity_ok:
+            status = 1
+            row["check_status"] = "failed:generic_legacy_parity"
     return status, row
 
 
