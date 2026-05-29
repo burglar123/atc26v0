@@ -20,6 +20,7 @@ from benchmark.check_bounded_rolling_readiness_audit import validate_records as 
 from benchmark.check_eager_commit_ready_only import load_trace  # noqa: E402
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
 from benchmark.check_generic_bounded_rolling_chain import summarize_generic_chain  # noqa: E402
+from benchmark.write_bounded_chain_summary import build_chain_summary, write_chain_summary  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -80,17 +81,17 @@ CASE_PRESETS: dict[str, BoundedRegressionCase] = {
 
 
 CHECKERS = [
-    ("benchmark/check_eager_commit_ready_only.py", "trace"),
-    ("benchmark/check_continuous_eager_dry_run.py", "trace"),
-    ("benchmark/check_continuous_eager_commit_depth1_ready_only.py", "trace"),
-    ("benchmark/check_rolling_continuous_eager_dry_run.py", "trace"),
-    ("benchmark/check_rolling_continuous_depth2_commit_ready_only.py", "trace"),
-    ("benchmark/check_rolling_continuous_depth3_shadow_dry_run.py", "trace"),
-    ("benchmark/check_rolling_continuous_depth3_commit_ready_only.py", "trace"),
-    ("benchmark/check_bounded_rolling_readiness_audit.py", "trace_result"),
-    ("benchmark/check_generic_bounded_rolling_chain.py", "trace_result"),
-    ("benchmark/check_eager_performance_accounting.py", "trace_result"),
-    ("benchmark/check_multislo_result.py", "result"),
+    ("benchmark/check_eager_commit_ready_only.py", "trace", ()),
+    ("benchmark/check_continuous_eager_dry_run.py", "trace", ()),
+    ("benchmark/check_continuous_eager_commit_depth1_ready_only.py", "trace", ()),
+    ("benchmark/check_rolling_continuous_eager_dry_run.py", "trace", ()),
+    ("benchmark/check_rolling_continuous_depth2_commit_ready_only.py", "trace", ()),
+    ("benchmark/check_rolling_continuous_depth3_shadow_dry_run.py", "trace", ()),
+    ("benchmark/check_rolling_continuous_depth3_commit_ready_only.py", "trace", ()),
+    ("benchmark/check_bounded_rolling_readiness_audit.py", "trace_result", ("--check-generic-parity",)),
+    ("benchmark/check_generic_bounded_rolling_chain.py", "trace_result", ()),
+    ("benchmark/check_eager_performance_accounting.py", "trace_result", ("--check-generic-chain",)),
+    ("benchmark/check_multislo_result.py", "result", ()),
 ]
 
 
@@ -162,16 +163,24 @@ def eval_command(
     return command
 
 
-def checker_command(args: argparse.Namespace, checker: str, *paths: Path) -> list[str]:
-    return [args.python, checker, *(str(path) for path in paths)]
+def checker_command(args: argparse.Namespace, checker: str, *paths: Path, extra_args: tuple[str, ...] = ()) -> list[str]:
+    return [args.python, checker, *(str(path) for path in paths), *extra_args]
 
 
-def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
+def load_case_summary(
+    engine_trace: Path,
+    result_json: Path,
+    *,
+    case_name: str,
+    chain_summary_path: Path,
+) -> dict[str, Any]:
     records = load_trace(engine_trace) if engine_trace.exists() else []
     result_payload = load_json(result_json) if result_json.exists() else {}
     accounting = aggregate_performance_accounting(records, result_payload)
     audit_errors, audit = validate_audit_records(records, result_payload)
     generic = summarize_generic_chain(records, result_payload)
+    chain_summary = build_chain_summary(records, result_payload, case_name=case_name)
+    write_chain_summary(chain_summary, chain_summary_path)
     generic_depth_token_parity_ok = all(
         generic.get(generic_key) == audit.get(legacy_key)
         for generic_key, legacy_key in (
@@ -254,6 +263,10 @@ def load_case_summary(engine_trace: Path, result_json: Path) -> dict[str, Any]:
         "generic_legacy_combined_parity_ok": generic_legacy_combined_parity_ok,
         "generic_legacy_depth_token_parity_ok": generic_depth_token_parity_ok,
         "generic_legacy_safety_parity_ok": generic_legacy_safety_parity_ok,
+        "legacy_generic_parity_ok": chain_summary.get("legacy_generic_parity_ok"),
+        "generic_chain_accounting_ok": chain_summary.get("generic_chain_accounting_ok"),
+        "chain_summary_written": chain_summary_path.exists(),
+        "chain_summary_path": str(chain_summary_path),
         "rolling_depth3_child_candidate_tokens": accounting.get("rolling_depth3_child_candidate_token_count"),
         "rolling_depth3_child_ready_shadow_tokens": accounting.get("rolling_depth3_child_ready_shadow_token_count"),
         "rolling_depth3_commit_skip_reason_counts": accounting.get("rolling_depth3_real_commit_skip_reason_counts"),
@@ -279,19 +292,28 @@ def run_case(args: argparse.Namespace, case: BoundedRegressionCase, env: dict[st
     case_dir = Path(args.out_root) / case.name
     result_json = case_dir / "result.json"
     engine_trace = case_dir / "engine_trace.json"
+    chain_summary_path = case_dir / "chain_summary.json"
     if not args.print_only:
         case_dir.mkdir(parents=True, exist_ok=True)
     status = run_command(eval_command(args, case, result_json, engine_trace), env, args.print_only)
     check_status = "eval_failed" if status else "pass"
     if status == 0:
-        for checker, input_kind in CHECKERS:
+        for checker, input_kind, extra_args in CHECKERS:
             if input_kind == "trace":
-                checker_status = run_command(checker_command(args, checker, engine_trace), env, args.print_only)
+                checker_status = run_command(
+                    checker_command(args, checker, engine_trace, extra_args=extra_args),
+                    env,
+                    args.print_only,
+                )
             elif input_kind == "result":
-                checker_status = run_command(checker_command(args, checker, result_json), env, args.print_only)
+                checker_status = run_command(
+                    checker_command(args, checker, result_json, extra_args=extra_args),
+                    env,
+                    args.print_only,
+                )
             else:
                 checker_status = run_command(
-                    checker_command(args, checker, engine_trace, result_json),
+                    checker_command(args, checker, engine_trace, result_json, extra_args=extra_args),
                     env,
                     args.print_only,
                 )
@@ -310,13 +332,23 @@ def run_case(args: argparse.Namespace, case: BoundedRegressionCase, env: dict[st
         "description": case.description,
     }
     if status == 0 and not args.print_only:
-        row.update(load_case_summary(engine_trace, result_json))
+        row.update(
+            load_case_summary(
+                engine_trace,
+                result_json,
+                case_name=case.name,
+                chain_summary_path=chain_summary_path,
+            )
+        )
         parity_ok = all(
             bool(row.get(field))
             for field in (
                 "generic_legacy_combined_parity_ok",
                 "generic_legacy_depth_token_parity_ok",
                 "generic_legacy_safety_parity_ok",
+                "legacy_generic_parity_ok",
+                "generic_chain_accounting_ok",
+                "chain_summary_written",
             )
         )
         if not parity_ok:
