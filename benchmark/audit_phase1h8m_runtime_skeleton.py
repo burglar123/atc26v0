@@ -11,6 +11,27 @@ from typing import Any
 
 RUNTIME_FILE = Path("nano_pearl/pearl_engine/pearl_model_runner.py")
 REQUIRED_RUNTIME_RECORDS = ("RollingProposalCommitRecord", "RollingCommitTraceBundle")
+OPTIONAL_RECORD_FIELDS = (
+    "base_len",
+    "generated",
+    "ready_shadow",
+    "invalidated",
+    "cascade_discarded",
+    "status",
+    "status_reason",
+)
+RUNTIME_RECORD_HELPERS = (
+    "_records_generated_ids",
+    "_records_generated_seq_ids",
+    "_records_ready_shadow_ids",
+    "_records_ready_shadow_seq_ids",
+    "_records_invalidated_ids",
+    "_records_invalidated_reason_by_id",
+    "_records_base_len_by_id",
+    "_records_status_by_id",
+    "_records_status_reason_by_id",
+    "_records_by_status",
+)
 FORBIDDEN_FLAG_RE = re.compile(r"\benable_[a-zA-Z0-9_]*\b")
 SUSPICIOUS_RUNTIME_RE = re.compile(r"\b(depth4|depth_?4|unbounded|partial)\b", re.IGNORECASE)
 ADDED_DEF_RE = re.compile(r"^\+\s+def ([a-zA-Z0-9_]+)\(")
@@ -101,6 +122,24 @@ def audit_runtime_skeleton(repo_root: Path) -> tuple[list[str], dict[str, Any]]:
         name for name in added_class_names if name not in REQUIRED_RUNTIME_RECORDS
     ]
     missing_records = [name for name in REQUIRED_RUNTIME_RECORDS if name not in runtime_text]
+    optional_record_fields_present = {
+        field: bool(re.search(rf"\b{re.escape(field)}\s*:", runtime_text))
+        for field in OPTIONAL_RECORD_FIELDS
+    }
+    record_helper_names_present = {
+        name: name in runtime_text for name in RUNTIME_RECORD_HELPERS
+    }
+    shadow_start = runtime_text.find("def _run_rolling_depth3_shadow_dry_run")
+    shadow_end = runtime_text.find("def _run_eager_commit_ready_only", shadow_start)
+    shadow_text = runtime_text[shadow_start:shadow_end if shadow_end >= 0 else None] if shadow_start >= 0 else ""
+    depth3_shadow_record_adoption = {
+        "has_shadow_records": "shadow_records" in shadow_text,
+        "constructs_runtime_record": "RollingProposalCommitRecord" in shadow_text,
+        "uses_generated_record_helper": "_records_generated_ids" in shadow_text,
+        "uses_ready_record_helper": "_records_ready_shadow_ids" in shadow_text,
+        "uses_invalidated_record_helper": "_records_invalidated_ids" in shadow_text,
+        "uses_status_reason_record_helper": "_records_status_reason_by_id" in shadow_text,
+    }
 
     errors: list[str] = []
     if missing_records:
@@ -121,6 +160,9 @@ def audit_runtime_skeleton(repo_root: Path) -> tuple[list[str], dict[str, Any]]:
         "runtime_record_names_present": {
             name: name in runtime_text for name in REQUIRED_RUNTIME_RECORDS
         },
+        "optional_record_fields_present": optional_record_fields_present,
+        "record_helper_names_present": record_helper_names_present,
+        "depth3_shadow_record_adoption": depth3_shadow_record_adoption,
         "runtime_function_names_added": added_function_names,
         "runtime_class_names_added": added_class_names,
         "runtime_function_style_ok": not non_internal_functions,

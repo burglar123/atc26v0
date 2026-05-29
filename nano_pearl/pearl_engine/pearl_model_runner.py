@@ -107,7 +107,14 @@ class RollingProposalCommitRecord:
     verify_result: str
     parent_id: int | None = None
     root_id: int | None = None
+    base_len: int | None = None
     ready: bool = False
+    generated: bool = False
+    ready_shadow: bool = False
+    invalidated: bool = False
+    cascade_discarded: bool = False
+    status: str | None = None
+    status_reason: str | None = None
     committed: bool = False
     skipped: bool = False
     skip_reason: str | None = None
@@ -2820,6 +2827,29 @@ class ModelRunnerBase:
     def _records_skipped_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
         return [int(record.proposal_id) for record in records if record.skipped]
 
+    def _records_generated_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.proposal_id) for record in records if record.generated]
+
+    def _records_generated_seq_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.seq_id) for record in records if record.generated]
+
+    def _records_ready_shadow_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.proposal_id) for record in records if record.ready_shadow]
+
+    def _records_ready_shadow_seq_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.seq_id) for record in records if record.ready_shadow]
+
+    def _records_invalidated_ids(self, records: list[RollingProposalCommitRecord]) -> list[int]:
+        return [int(record.proposal_id) for record in records if record.invalidated]
+
+    def _records_by_status(
+        self,
+        records: list[RollingProposalCommitRecord],
+        *statuses: str,
+    ) -> list[RollingProposalCommitRecord]:
+        status_set = {str(status) for status in statuses}
+        return [record for record in records if record.status in status_set]
+
     def _records_token_count_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
         return {int(record.proposal_id): int(record.token_count) for record in records}
 
@@ -2848,6 +2878,34 @@ class ModelRunnerBase:
 
     def _records_depth_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
         return {int(record.proposal_id): int(record.depth) for record in records}
+
+    def _records_base_len_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, int]:
+        return {
+            int(record.proposal_id): int(record.base_len)
+            for record in records
+            if record.base_len is not None
+        }
+
+    def _records_status_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {
+            int(record.proposal_id): str(record.status)
+            for record in records
+            if record.status is not None
+        }
+
+    def _records_status_reason_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {
+            int(record.proposal_id): str(record.status_reason)
+            for record in records
+            if record.status_reason is not None
+        }
+
+    def _records_invalidated_reason_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
+        return {
+            int(record.proposal_id): str(record.status_reason)
+            for record in records
+            if record.invalidated and record.status_reason is not None
+        }
 
     def _records_skip_reason_by_id(self, records: list[RollingProposalCommitRecord]) -> dict[int, str]:
         return {
@@ -9939,7 +9997,8 @@ class ModelRunnerBase:
         skipped_reason_by_child_id: dict[int, str] = {}
         duplicate_child_ids: list[int] = []
         frontier_mismatch_ids: list[int] = []
-        selected: list[tuple[int, int, int, int, EagerProposal | None, Sequence, dict]] = []
+        shadow_records: list[RollingProposalCommitRecord] = []
+        selected: list[tuple[int, int, int, int, EagerProposal | None, Sequence, dict, RollingProposalCommitRecord]] = []
         seen_seq_ids: set[int] = set()
 
         for proposal_id in committed_ids:
@@ -9962,6 +10021,21 @@ class ModelRunnerBase:
             if child_base < 0 and seq is not None:
                 child_base = int(len(seq))
             child_base_len_by_id[child_id] = child_base
+            shadow_record = RollingProposalCommitRecord(
+                proposal_id=child_id,
+                seq_id=seq_id,
+                depth=3,
+                token_count=gamma,
+                accept_len=0,
+                action="shadow_dry_run",
+                verify_result="pending",
+                parent_id=int(proposal_id),
+                root_id=int(root_id),
+                base_len=child_base,
+                status="DEPTH3_PARENT_COMMIT_PENDING",
+                status_reason="parent_depth2_pending",
+            )
+            shadow_records.append(shadow_record)
 
             token_count = int(self._trace_map_get(token_by_id, proposal_id, 0))
             accept_len = int(self._trace_map_get(accept_by_id, proposal_id, token_count))
@@ -10009,7 +10083,7 @@ class ModelRunnerBase:
                 skipped_child_ids.append(child_id)
                 skipped_parent_by_child_id[child_id] = int(proposal_id)
                 skipped_reason_by_child_id[child_id] = str(reason)
-                child_status_by_id[child_id] = (
+                child_status = (
                     "DEPTH3_DROPPED_FRONTIER_MISMATCH"
                     if reason == "frontier_mismatch"
                     else "DEPTH3_INVALIDATED_PARENT_FINISHED"
@@ -10020,7 +10094,12 @@ class ModelRunnerBase:
                     if reason in {"seq_not_found", "seq_pre_verify"}
                     else "DEPTH3_INVALIDATED_PARENT_NOT_COMMITTED"
                 )
+                child_status_by_id[child_id] = child_status
                 child_status_reason_by_id[child_id] = str(reason)
+                shadow_record.skipped = True
+                shadow_record.skip_reason = str(reason)
+                shadow_record.status = child_status
+                shadow_record.status_reason = str(reason)
                 continue
 
             checkpoint = self._make_eager_apply_checkpoint(seq)
@@ -10030,11 +10109,14 @@ class ModelRunnerBase:
             ready_seq_ids.append(seq_id)
             child_status_by_id[child_id] = "DEPTH3_CHILD_GENERATED_SHADOW"
             child_status_reason_by_id[child_id] = "parent_depth2_committed"
-            selected.append((child_id, proposal_id, root_id, child_base, parent_proposal, seq, checkpoint))
+            shadow_record.generated = True
+            shadow_record.status = "DEPTH3_CHILD_GENERATED_SHADOW"
+            shadow_record.status_reason = "parent_depth2_committed"
+            selected.append((child_id, proposal_id, root_id, child_base, parent_proposal, seq, checkpoint, shadow_record))
             seen_seq_ids.add(seq_id)
 
         generated_by_child_id: dict[int, list[int]] = {child_id: [] for child_id, *_rest in selected}
-        valid_seqs = [seq for _child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint in selected]
+        valid_seqs = [seq for _child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint, _record in selected]
         draft_error: BaseException | None = None
         try:
             for _ in range(gamma):
@@ -10055,7 +10137,7 @@ class ModelRunnerBase:
                 dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
                 torch.cuda.synchronize()
                 reset_context(self.tp_params)
-                for (child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint), token_id in zip(
+                for (child_id, _parent_id, _root_id, _base, _parent, seq, _checkpoint, _record), token_id in zip(
                     selected,
                     sample_tokens.tolist(),
                 ):
@@ -10063,7 +10145,7 @@ class ModelRunnerBase:
                     seq.append_token(int_token_id)
                     generated_by_child_id[int(child_id)].append(int_token_id)
 
-            for child_id, parent_id, root_id, child_base, parent_proposal, seq, checkpoint in selected:
+            for child_id, parent_id, root_id, child_base, parent_proposal, seq, checkpoint, shadow_record in selected:
                 child_tokens = [int(token_id) for token_id in generated_by_child_id[child_id]]
                 to_be_verified = [int(token_id) for token_id in seq.token_ids[-2 * gamma + 1:-gamma + 1]]
                 if len(child_tokens) != gamma or len(to_be_verified) != gamma:
@@ -10071,6 +10153,10 @@ class ModelRunnerBase:
                     invalidated_reason_by_id[child_id] = "invalid_depth3_token_span"
                     child_status_by_id[child_id] = "DEPTH3_INVALIDATED_PARENT_STALE"
                     child_status_reason_by_id[child_id] = "invalid_depth3_token_span"
+                    shadow_record.invalidated = True
+                    shadow_record.ready_shadow = False
+                    shadow_record.status = "DEPTH3_INVALIDATED_PARENT_STALE"
+                    shadow_record.status_reason = "invalid_depth3_token_span"
                     if child_id in ready_ids:
                         ready_ids.remove(child_id)
                     if int(seq.seq_id) in ready_seq_ids:
@@ -10099,10 +10185,13 @@ class ModelRunnerBase:
                 self._rolling_depth3_shadow_proposals_by_id[int(child_id)] = proposal
                 child_status_by_id[child_id] = "DEPTH3_READY_AFTER_PARENT_DEPTH2_COMMIT"
                 child_status_reason_by_id[child_id] = "parent_depth2_committed_full_accept"
+                shadow_record.ready_shadow = True
+                shadow_record.status = "DEPTH3_READY_AFTER_PARENT_DEPTH2_COMMIT"
+                shadow_record.status_reason = "parent_depth2_committed_full_accept"
         except BaseException as exc:
             draft_error = exc
         finally:
-            for _child_id, _parent_id, _root_id, _base, _parent, seq, checkpoint in selected:
+            for _child_id, _parent_id, _root_id, _base, _parent, seq, checkpoint, _record in selected:
                 rollback_len = int(len(seq)) - int(checkpoint["len"])
                 if rollback_len > 0:
                     self.scheduler.rollback(seq, rollback_len)
@@ -10111,6 +10200,24 @@ class ModelRunnerBase:
 
         if draft_error is not None:
             raise draft_error
+
+        skipped_records = [record for record in shadow_records if record.skipped]
+        child_ids = self._records_generated_ids(shadow_records)
+        child_seq_ids = self._records_generated_seq_ids(shadow_records)
+        ready_ids = self._records_ready_shadow_ids(shadow_records)
+        ready_seq_ids = self._records_ready_shadow_seq_ids(shadow_records)
+        invalidated_ids = self._records_invalidated_ids(shadow_records)
+        invalidated_reason_by_id = self._records_invalidated_reason_by_id(shadow_records)
+        child_parent_by_id = self._records_parent_by_id(shadow_records)
+        child_root_by_id = self._records_root_by_id(shadow_records)
+        child_depth_by_id = self._records_depth_by_id(shadow_records)
+        child_token_by_id = self._records_token_count_by_id(shadow_records)
+        child_base_len_by_id = self._records_base_len_by_id(shadow_records)
+        child_status_by_id = self._records_status_by_id(shadow_records)
+        child_status_reason_by_id = self._records_status_reason_by_id(shadow_records)
+        skipped_child_ids = self._records_skipped_ids(skipped_records)
+        skipped_parent_by_child_id = self._records_parent_by_id(skipped_records)
+        skipped_reason_by_child_id = self._records_skip_reason_by_id(skipped_records)
 
         rolling_seq_ids = set(child_seq_ids) | {int(seq_id) for seq_id in committed_seq_by_id.values() if int(seq_id) >= 0}
         normal_excluded, normal_conflicts = self._rolling_normal_lane_conflicts(trace_record, rolling_seq_ids)
