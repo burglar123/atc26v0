@@ -866,6 +866,49 @@ class ModelRunnerBase:
     def cached_decode_ready_serialized_pearl_generate(self, max_active_cached_seqs: int = 0):
         self._cached_decode_ready_generate_loop("serialized_pearl", self.serialized_pearl_step, max_active_cached_seqs)
 
+    def ar_step(self):
+        """Single AR decode step for cached admission.
+
+        Target side runs the full AR decode (prepare → model → sample →
+        postprocess), then broadcasts sampled tokens globally so the draft
+        side can update its scheduler state without running model computation.
+        """
+        self._decode_iteration_group += 1
+        seqs = list(self.scheduler.running)
+        if not seqs:
+            return
+        if not self.is_draft:
+            # --- Target side: actual AR decode ---
+            trace_record = self._trace_schedule(seqs, False, self._runner_role())
+            input_ids, positions = self.prepare_decode(seqs)
+            temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, False)
+            sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            torch.cuda.synchronize()
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            self.scheduler.postprocess(seqs, token_ids)
+            accepted_lens = {seq.seq_id: 1 for seq in seqs}
+            for seq in seqs:
+                seq.record_accepted(1)
+            self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
+            # Global broadcast so draft side stays in sync.
+            dist.broadcast(sample_tokens, src=self.global_config.target_config.master_rank)
+        else:
+            # --- Draft side: receive tokens from target ---
+            sample_tokens = torch.zeros(len(seqs), dtype=torch.int64, device="cuda")
+            dist.broadcast(sample_tokens, src=self.global_config.target_config.master_rank)
+            token_ids = sample_tokens.tolist()
+            self.scheduler.postprocess(seqs, token_ids)
+            for seq in seqs:
+                seq.record_accepted(1)
+
+    def cached_decode_ready_ar_generate(self, max_active_cached_seqs: int = 0):
+        self._cached_decode_ready_generate_loop("ar", self.ar_step, max_active_cached_seqs)
+
     def decode_ready_serialized_pearl_generate(self):
         """Decode-only serialized-PEARL approximation after prepare_decode_ready()."""
         self._set_execution_mode("serialized_pearl")

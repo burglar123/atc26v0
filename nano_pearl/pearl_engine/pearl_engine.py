@@ -491,12 +491,13 @@ class PEARLEngine:
                 f"Invalid execution_mode={execution_mode!r} for cached admission. "
                 f"Expected one of {sorted(self.config.ALLOWED_EXECUTION_MODES)}."
             )
-        if execution_mode not in ("parallel_pearl", "serialized_pearl"):
+        if execution_mode not in ("ar", "parallel_pearl", "serialized_pearl"):
             raise ValueError(
                 f"--cached-admission currently supports only --execution-mode "
-                f"parallel_pearl or serialized_pearl, got {execution_mode!r}"
+                f"ar, parallel_pearl, or serialized_pearl, got {execution_mode!r}"
             )
         method_name = {
+            "ar": "cached_decode_ready_ar_generate",
             "parallel_pearl": "cached_decode_ready_pearl_generate",
             "serialized_pearl": "cached_decode_ready_serialized_pearl_generate",
         }[execution_mode]
@@ -518,6 +519,8 @@ class PEARLEngine:
             for req in self.last_request_metadata
         }
         num_tokens = [max(len(t) - prefill_tokens.get(seq, 0), 0) for seq, t in zip(seq_id, token_ids)]
+        if execution_mode == "ar":
+            num_acc_tokens = None
         return output_text, num_tokens, num_acc_tokens, time
 
     def get_traces(self):

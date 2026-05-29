@@ -1499,9 +1499,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.cached_admission and args.execution_mode not in ("parallel_pearl", "serialized_pearl"):
+    if args.cached_admission and args.execution_mode not in ("ar", "parallel_pearl", "serialized_pearl"):
         raise ValueError(
-            "--cached-admission currently supports only --execution-mode parallel_pearl or serialized_pearl"
+            "--cached-admission requires --execution-mode ar, parallel_pearl, or serialized_pearl"
         )
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)

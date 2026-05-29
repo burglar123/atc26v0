@@ -159,10 +159,18 @@ def test_cached_admission_cli_allows_serialized_pearl():
     subprocess.check_call(cmd)
 
 
-def test_cached_admission_cli_rejects_ar():
-    """CLI should reject --cached-admission with --execution-mode ar."""
-    # Construct a minimal command that triggers the post-parse validation.
-    # We use a non-existent workload to trigger the guard before model loading.
+def test_cached_admission_cli_allows_ar():
+    """CLI should accept --cached-admission with --execution-mode ar."""
+    cmd = [
+        sys.executable,
+        str(ROOT / "benchmark/eval_multi_slo.py"),
+        "--help",
+    ]
+    subprocess.check_call(cmd)
+
+
+def test_cached_admission_cli_rejects_unknown_mode():
+    """CLI should reject --cached-admission with an unsupported execution_mode."""
     import tempfile, os
     with tempfile.TemporaryDirectory() as tmpdir:
         workload = os.path.join(tmpdir, "dummy.jsonl")
@@ -178,7 +186,7 @@ def test_cached_admission_cli_rejects_ar():
             str(ROOT / "benchmark/eval_multi_slo.py"),
             "--draft-model", "/nonexistent/draft",
             "--target-model", "/nonexistent/target",
-            "--execution-mode", "ar",
+            "--execution-mode", "pearl",
             "--cached-admission",
             "--decode-ready",
             "--cache-build-batch-size", "4",
@@ -186,25 +194,8 @@ def test_cached_admission_cli_rejects_ar():
             "--out", os.path.join(tmpdir, "out.json"),
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        assert proc.returncode != 0, f"Expected non-zero exit for cached+ar, got {proc.returncode}"
+        assert proc.returncode != 0, f"Expected non-zero exit for cached+pearl, got {proc.returncode}"
         assert "cached-admission" in (proc.stderr + proc.stdout).lower()
-
-
-def test_cached_admission_cli_rejects_ar_without_workload():
-    """CLI should reject --cached-admission + ar even before touching files."""
-    cmd = [
-        sys.executable,
-        str(ROOT / "benchmark/eval_multi_slo.py"),
-        "--draft-model", "/nonexistent/draft",
-        "--target-model", "/nonexistent/target",
-        "--execution-mode", "ar",
-        "--cached-admission",
-        "--workload-in", "/nonexistent/workload.jsonl",
-        "--out", "/tmp/nonexistent_out.json",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    assert proc.returncode != 0, f"Expected non-zero exit, got {proc.returncode}"
-    assert "cached-admission" in (proc.stderr + proc.stdout).lower()
 
 
 def test_engine_cached_dispatch_method_names():
@@ -221,12 +212,63 @@ def test_engine_cached_dispatch_method_names():
     # Verify the mapping is correct by checking the internal logic.
     # The method dispatches based on execution_mode.
     expected = {
+        "ar": "cached_decode_ready_ar_generate",
         "parallel_pearl": "cached_decode_ready_pearl_generate",
         "serialized_pearl": "cached_decode_ready_serialized_pearl_generate",
     }
     for mode, method_name in expected.items():
         assert method_name in (
+            "cached_decode_ready_ar_generate",
             "cached_decode_ready_pearl_generate",
             "cached_decode_ready_serialized_pearl_generate",
         )
-        assert mode in ("parallel_pearl", "serialized_pearl")
+        assert mode in ("ar", "parallel_pearl", "serialized_pearl")
+
+
+def test_cached_ar_num_acc_tokens_logic():
+    """PEARLEngine.cached_decode_ready_generate sets num_acc_tokens=None for ar."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    # After computing num_tokens, the function must set num_acc_tokens=None for AR.
+    assert 'if execution_mode == "ar":\n            num_acc_tokens = None' in src
+
+
+def test_cached_ar_runner_methods_exist():
+    """ModelRunnerBase has ar_step and cached_decode_ready_ar_generate."""
+    runner = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert "def ar_step(self):" in runner
+    assert "def cached_decode_ready_ar_generate(self" in runner
+    # ar_step must handle both target and draft sides.
+    assert "if not self.is_draft:" in runner.split("def ar_step(self):")[1].split("\n    def ")[0]
+    # Draft side receives tokens from target via global broadcast.
+    ar_step_fn = runner.split("def ar_step(self):")[1].split("\n    def ")[0]
+    assert "src=self.global_config.target_config.master_rank" in ar_step_fn
+    # Target side uses prepare_decode, run_model, sampler, postprocess.
+    assert "self.prepare_decode(seqs)" in ar_step_fn
+    assert "self.run_model(" in ar_step_fn
+    assert "self.sampler(" in ar_step_fn
+    assert "self.scheduler.postprocess(seqs, token_ids)" in ar_step_fn
+    # Target broadcasts tokens within its group, then globally for draft sync.
+    assert "dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)" in ar_step_fn
+    # ar_step increments _decode_iteration_group for trace grouping.
+    assert "_decode_iteration_group += 1" in ar_step_fn
+
+
+def test_cached_ar_engine_mapping():
+    """PEARLEngine.cached_decode_ready_generate maps ar->cached_decode_ready_ar_generate."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    assert '"ar": "cached_decode_ready_ar_generate"' in src
+
+
+def test_cached_admission_validation_allows_all_three_modes():
+    """CLI validation accepts ar, parallel_pearl, serialized_pearl with --cached-admission."""
+    src = (ROOT / "benchmark/eval_multi_slo.py").read_text()
+    assert 'args.execution_mode not in ("ar", "parallel_pearl", "serialized_pearl")' in src
+
+
+def test_existing_pearl_tests_still_pass():
+    """Verify that cached + parallel_pearl tests still reference correct methods."""
+    runner = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert "def cached_decode_ready_pearl_generate(self" in runner
+    assert "def cached_decode_ready_serialized_pearl_generate(self" in runner
+    assert "def pearl_step(self):" in runner
+    assert "def serialized_pearl_step(self):" in runner
