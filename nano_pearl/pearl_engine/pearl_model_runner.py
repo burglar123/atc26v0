@@ -2688,6 +2688,51 @@ class ModelRunnerBase:
             return mapping[key]
         return mapping.get(str(key), default)
 
+    def _trace_sorted_int_map(self, mapping: dict, only_ids: set[int] | None = None) -> dict[str, int]:
+        items = []
+        for raw_key, value in mapping.items():
+            try:
+                key = int(raw_key)
+            except Exception:
+                continue
+            if only_ids is not None and key not in only_ids:
+                continue
+            items.append((key, value))
+        return {str(key): int(value) for key, value in sorted(items)}
+
+    def _trace_sorted_bool_map(self, mapping: dict, only_ids: set[int] | None = None) -> dict[str, bool]:
+        items = []
+        for raw_key, value in mapping.items():
+            try:
+                key = int(raw_key)
+            except Exception:
+                continue
+            if only_ids is not None and key not in only_ids:
+                continue
+            items.append((key, value))
+        return {str(key): bool(value) for key, value in sorted(items)}
+
+    def _trace_sorted_str_map(self, mapping: dict, only_ids: set[int] | None = None) -> dict[str, str]:
+        items = []
+        for raw_key, value in mapping.items():
+            try:
+                key = int(raw_key)
+            except Exception:
+                continue
+            if only_ids is not None and key not in only_ids:
+                continue
+            items.append((key, value))
+        return {str(key): str(value) for key, value in sorted(items)}
+
+    def _trace_reason_counts(self, reason_by_id: dict[int, str]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for reason in reason_by_id.values():
+            counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+        return dict(sorted(counts.items()))
+
+    def _trace_token_sum(self, proposal_ids: list[int], token_count_by_id: dict[int, int]) -> int:
+        return sum(int(token_count_by_id.get(int(proposal_id), 0)) for proposal_id in proposal_ids)
+
     def _build_takeover_eager_result_transfer_results(self, plan: StepPlan, trace_record: dict) -> list[dict]:
         proposal_ids = [
             int(proposal_id)
@@ -8211,10 +8256,8 @@ class ModelRunnerBase:
             precondition_ok_by_id[proposal_id] = True
             precondition_failed_by_id[proposal_id] = False
 
-        committed_tokens = sum(int(token_count_by_id.get(proposal_id, 0)) for proposal_id in committed_ids)
-        reason_counts: dict[str, int] = {}
-        for reason in skip_reason_by_id.values():
-            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        committed_tokens = self._trace_token_sum(committed_ids, token_count_by_id)
+        reason_counts = self._trace_reason_counts(skip_reason_by_id)
 
         committed_set = set(committed_ids)
         trace_record["enable_continuous_eager_commit_depth1_ready_only"] = True
@@ -8228,55 +8271,55 @@ class ModelRunnerBase:
         trace_record["continuous_eager_commit_ready_source_proposal_ids"] = sorted(ready_ids)
         trace_record["continuous_eager_real_committed_proposal_ids"] = list(committed_ids)
         trace_record["continuous_eager_real_committed_seq_ids"] = list(committed_seq_ids)
-        trace_record["continuous_eager_real_committed_token_count_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(token_count_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["continuous_eager_real_committed_accept_len_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(accept_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["continuous_eager_real_commit_action_by_proposal_id"] = {
-            str(proposal_id): action for proposal_id, action in sorted(action_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["continuous_eager_real_commit_verify_result_by_proposal_id"] = {
-            str(proposal_id): result for proposal_id, result in sorted(result_by_id.items())
-            if proposal_id in committed_set
-        }
+        trace_record["continuous_eager_real_committed_token_count_by_proposal_id"] = self._trace_sorted_int_map(
+            token_count_by_id,
+            committed_set,
+        )
+        trace_record["continuous_eager_real_committed_accept_len_by_proposal_id"] = self._trace_sorted_int_map(
+            accept_by_id,
+            committed_set,
+        )
+        trace_record["continuous_eager_real_commit_action_by_proposal_id"] = self._trace_sorted_str_map(
+            action_by_id,
+            committed_set,
+        )
+        trace_record["continuous_eager_real_commit_verify_result_by_proposal_id"] = self._trace_sorted_str_map(
+            result_by_id,
+            committed_set,
+        )
         trace_record["continuous_eager_real_commit_skipped_proposal_ids"] = sorted(set(skipped_ids))
-        trace_record["continuous_eager_real_commit_skip_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(skip_reason_by_id.items())
-        }
-        trace_record["continuous_eager_real_commit_precondition_ok_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_ok_by_id.items())
-        }
-        trace_record["continuous_eager_real_commit_precondition_failed_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_failed_by_id.items())
-        }
-        trace_record["continuous_eager_real_commit_precondition_failure_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(precondition_failure_reason_by_id.items())
-        }
+        trace_record["continuous_eager_real_commit_skip_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            skip_reason_by_id
+        )
+        trace_record["continuous_eager_real_commit_precondition_ok_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_ok_by_id
+        )
+        trace_record["continuous_eager_real_commit_precondition_failed_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_failed_by_id
+        )
+        trace_record["continuous_eager_real_commit_precondition_failure_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            precondition_failure_reason_by_id
+        )
         trace_record["continuous_eager_real_commit_duplicate_proposal_ids"] = sorted(set(duplicate_proposal_ids))
         trace_record["continuous_eager_real_commit_duplicate_seq_ids"] = sorted(set(duplicate_seq_ids))
-        trace_record["continuous_eager_target_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_before_by_seq.items())
-        }
-        trace_record["continuous_eager_target_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_after_by_seq.items())
-        }
-        trace_record["continuous_eager_draft_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_before_by_seq.items())
-        }
-        trace_record["continuous_eager_draft_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_after_by_seq.items())
-        }
-        trace_record["continuous_eager_target_draft_len_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(len_match_by_seq.items())
-        }
-        trace_record["continuous_eager_target_draft_token_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(token_match_by_seq.items())
-        }
+        trace_record["continuous_eager_target_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_before_by_seq
+        )
+        trace_record["continuous_eager_target_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_after_by_seq
+        )
+        trace_record["continuous_eager_draft_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_before_by_seq
+        )
+        trace_record["continuous_eager_draft_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_after_by_seq
+        )
+        trace_record["continuous_eager_target_draft_len_match_by_seq_id"] = self._trace_sorted_bool_map(
+            len_match_by_seq
+        )
+        trace_record["continuous_eager_target_draft_token_match_by_seq_id"] = self._trace_sorted_bool_map(
+            token_match_by_seq
+        )
         trace_record["continuous_eager_tokens_verified"] = int(committed_tokens)
         trace_record["continuous_eager_tokens_accepted"] = int(committed_tokens)
         trace_record["continuous_eager_tokens_committed"] = int(committed_tokens)
@@ -8286,7 +8329,7 @@ class ModelRunnerBase:
         trace_record["continuous_eager_real_committed_token_count"] = int(committed_tokens)
         trace_record["continuous_eager_real_commit_count"] = len(committed_ids)
         trace_record["continuous_depth2_real_commit_count"] = int(depth2_real_commit_count)
-        trace_record["continuous_eager_real_commit_skip_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["continuous_eager_real_commit_skip_reason_counts"] = reason_counts
         self._record_elapsed_ms(trace_record, "continuous_eager_commit_time_ms", timer_start)
 
 
@@ -8989,10 +9032,8 @@ class ModelRunnerBase:
             precondition_ok_by_id[proposal_id] = True
             precondition_failed_by_id[proposal_id] = False
 
-        committed_tokens = sum(int(token_count_by_id.get(proposal_id, 0)) for proposal_id in committed_ids)
-        reason_counts: dict[str, int] = {}
-        for reason in skip_reason_by_id.values():
-            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        committed_tokens = self._trace_token_sum(committed_ids, token_count_by_id)
+        reason_counts = self._trace_reason_counts(skip_reason_by_id)
         committed_set = set(committed_ids)
         trace_record["enable_rolling_continuous_depth3_commit_ready_only"] = True
         trace_record["rolling_depth3_commit_enabled"] = True
@@ -9003,52 +9044,50 @@ class ModelRunnerBase:
         trace_record["rolling_depth3_commit_candidate_proposal_ids"] = list(candidate_ids)
         trace_record["rolling_depth3_commit_candidate_seq_ids"] = list(candidate_seq_ids)
         trace_record["rolling_depth3_commit_ready_source_proposal_ids"] = sorted(ready_ids)
-        trace_record["rolling_depth3_commit_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(parent_commit_by_id.items())
-        }
-        trace_record["rolling_depth3_commit_precondition_ok_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_ok_by_id.items())
-        }
-        trace_record["rolling_depth3_commit_precondition_failed_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_failed_by_id.items())
-        }
-        trace_record["rolling_depth3_commit_precondition_failure_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(precondition_failure_reason_by_id.items())
-        }
+        trace_record["rolling_depth3_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_commit_by_id)
+        trace_record["rolling_depth3_commit_precondition_ok_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_ok_by_id
+        )
+        trace_record["rolling_depth3_commit_precondition_failed_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_failed_by_id
+        )
+        trace_record["rolling_depth3_commit_precondition_failure_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            precondition_failure_reason_by_id
+        )
         trace_record["rolling_depth3_real_committed_proposal_ids"] = list(committed_ids)
         trace_record["rolling_depth3_real_committed_seq_ids"] = list(committed_seq_ids)
-        trace_record["rolling_depth3_real_committed_token_count_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(token_count_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_committed_accept_len_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(accept_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_commit_action_by_proposal_id"] = {
-            str(proposal_id): action for proposal_id, action in sorted(action_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_commit_verify_result_by_proposal_id"] = {
-            str(proposal_id): result for proposal_id, result in sorted(result_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_commit_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(parent_commit_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_commit_root_by_proposal_id"] = {
-            str(proposal_id): int(root_id) for proposal_id, root_id in sorted(root_commit_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth3_real_commit_depth_by_proposal_id"] = {
-            str(proposal_id): int(depth) for proposal_id, depth in sorted(depth_commit_by_id.items())
-            if proposal_id in committed_set
-        }
+        trace_record["rolling_depth3_real_committed_token_count_by_proposal_id"] = self._trace_sorted_int_map(
+            token_count_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_committed_accept_len_by_proposal_id"] = self._trace_sorted_int_map(
+            accept_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_commit_action_by_proposal_id"] = self._trace_sorted_str_map(
+            action_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_commit_verify_result_by_proposal_id"] = self._trace_sorted_str_map(
+            result_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(
+            parent_commit_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_commit_root_by_proposal_id"] = self._trace_sorted_int_map(
+            root_commit_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth3_real_commit_depth_by_proposal_id"] = self._trace_sorted_int_map(
+            depth_commit_by_id,
+            committed_set,
+        )
         trace_record["rolling_depth3_real_commit_skipped_proposal_ids"] = sorted(set(skipped_ids))
-        trace_record["rolling_depth3_real_commit_skip_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(skip_reason_by_id.items())
-        }
+        trace_record["rolling_depth3_real_commit_skip_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            skip_reason_by_id
+        )
         trace_record["rolling_depth3_real_commit_duplicate_proposal_ids"] = sorted(set(duplicate_proposal_ids))
         trace_record["rolling_depth3_real_commit_duplicate_seq_ids"] = sorted(set(duplicate_seq_ids))
         trace_record["rolling_depth3_committed_without_ready_shadow_ids"] = sorted(set(without_ready_ids) & committed_set)
@@ -9060,24 +9099,24 @@ class ModelRunnerBase:
             set(committed_cascade_ids) & committed_set
         )
         trace_record["rolling_depth3_committed_non_full_accept_ids"] = sorted(set(non_full_accept_ids) & committed_set)
-        trace_record["rolling_depth3_target_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_before_by_seq.items())
-        }
-        trace_record["rolling_depth3_target_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_after_by_seq.items())
-        }
-        trace_record["rolling_depth3_draft_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_before_by_seq.items())
-        }
-        trace_record["rolling_depth3_draft_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_after_by_seq.items())
-        }
-        trace_record["rolling_depth3_target_draft_len_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(len_match_by_seq.items())
-        }
-        trace_record["rolling_depth3_target_draft_token_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(token_match_by_seq.items())
-        }
+        trace_record["rolling_depth3_target_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_before_by_seq
+        )
+        trace_record["rolling_depth3_target_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_after_by_seq
+        )
+        trace_record["rolling_depth3_draft_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_before_by_seq
+        )
+        trace_record["rolling_depth3_draft_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_after_by_seq
+        )
+        trace_record["rolling_depth3_target_draft_len_match_by_seq_id"] = self._trace_sorted_bool_map(
+            len_match_by_seq
+        )
+        trace_record["rolling_depth3_target_draft_token_match_by_seq_id"] = self._trace_sorted_bool_map(
+            token_match_by_seq
+        )
         trace_record["rolling_depth3_tokens_verified"] = int(committed_tokens)
         trace_record["rolling_depth3_tokens_accepted"] = int(committed_tokens)
         trace_record["rolling_depth3_tokens_committed"] = int(committed_tokens)
@@ -9086,7 +9125,7 @@ class ModelRunnerBase:
         trace_record["rolling_depth3_real_committed_proposal_count"] = len(committed_ids)
         trace_record["rolling_depth3_real_committed_token_count"] = int(committed_tokens)
         trace_record["rolling_depth3_real_commit_count"] = len(committed_ids)
-        trace_record["rolling_depth3_real_commit_skip_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["rolling_depth3_real_commit_skip_reason_counts"] = reason_counts
         trace_record["rolling_depth4_real_commit_count"] = int(depth4_real_commit_count)
         trace_record["rolling_depth_gt3_real_commit_count"] = int(depth_gt3_real_commit_count)
         self._record_elapsed_ms(trace_record, "rolling_depth3_commit_time_ms", timer_start)
@@ -9291,10 +9330,8 @@ class ModelRunnerBase:
             precondition_ok_by_id[proposal_id] = True
             precondition_failed_by_id[proposal_id] = False
 
-        committed_tokens = sum(int(token_count_by_id.get(proposal_id, 0)) for proposal_id in committed_ids)
-        reason_counts: dict[str, int] = {}
-        for reason in skip_reason_by_id.values():
-            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        committed_tokens = self._trace_token_sum(committed_ids, token_count_by_id)
+        reason_counts = self._trace_reason_counts(skip_reason_by_id)
         committed_set = set(committed_ids)
         trace_record["enable_rolling_continuous_depth2_commit_ready_only"] = True
         trace_record["rolling_depth2_commit_enabled"] = True
@@ -9305,52 +9342,50 @@ class ModelRunnerBase:
         trace_record["rolling_depth2_commit_candidate_proposal_ids"] = list(candidate_ids)
         trace_record["rolling_depth2_commit_candidate_seq_ids"] = list(candidate_seq_ids)
         trace_record["rolling_depth2_commit_ready_source_proposal_ids"] = sorted(ready_ids)
-        trace_record["rolling_depth2_commit_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(parent_commit_by_id.items())
-        }
-        trace_record["rolling_depth2_commit_precondition_ok_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_ok_by_id.items())
-        }
-        trace_record["rolling_depth2_commit_precondition_failed_by_proposal_id"] = {
-            str(proposal_id): bool(value) for proposal_id, value in sorted(precondition_failed_by_id.items())
-        }
-        trace_record["rolling_depth2_commit_precondition_failure_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(precondition_failure_reason_by_id.items())
-        }
+        trace_record["rolling_depth2_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_commit_by_id)
+        trace_record["rolling_depth2_commit_precondition_ok_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_ok_by_id
+        )
+        trace_record["rolling_depth2_commit_precondition_failed_by_proposal_id"] = self._trace_sorted_bool_map(
+            precondition_failed_by_id
+        )
+        trace_record["rolling_depth2_commit_precondition_failure_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            precondition_failure_reason_by_id
+        )
         trace_record["rolling_depth2_real_committed_proposal_ids"] = list(committed_ids)
         trace_record["rolling_depth2_real_committed_seq_ids"] = list(committed_seq_ids)
-        trace_record["rolling_depth2_real_committed_token_count_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(token_count_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_committed_accept_len_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(accept_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_commit_action_by_proposal_id"] = {
-            str(proposal_id): action for proposal_id, action in sorted(action_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_commit_verify_result_by_proposal_id"] = {
-            str(proposal_id): result for proposal_id, result in sorted(result_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_commit_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(parent_commit_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_commit_root_by_proposal_id"] = {
-            str(proposal_id): int(root_id) for proposal_id, root_id in sorted(root_commit_by_id.items())
-            if proposal_id in committed_set
-        }
-        trace_record["rolling_depth2_real_commit_depth_by_proposal_id"] = {
-            str(proposal_id): int(depth) for proposal_id, depth in sorted(depth_commit_by_id.items())
-            if proposal_id in committed_set
-        }
+        trace_record["rolling_depth2_real_committed_token_count_by_proposal_id"] = self._trace_sorted_int_map(
+            token_count_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_committed_accept_len_by_proposal_id"] = self._trace_sorted_int_map(
+            accept_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_commit_action_by_proposal_id"] = self._trace_sorted_str_map(
+            action_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_commit_verify_result_by_proposal_id"] = self._trace_sorted_str_map(
+            result_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_commit_parent_by_proposal_id"] = self._trace_sorted_int_map(
+            parent_commit_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_commit_root_by_proposal_id"] = self._trace_sorted_int_map(
+            root_commit_by_id,
+            committed_set,
+        )
+        trace_record["rolling_depth2_real_commit_depth_by_proposal_id"] = self._trace_sorted_int_map(
+            depth_commit_by_id,
+            committed_set,
+        )
         trace_record["rolling_depth2_real_commit_skipped_proposal_ids"] = sorted(set(skipped_ids))
-        trace_record["rolling_depth2_real_commit_skip_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(skip_reason_by_id.items())
-        }
+        trace_record["rolling_depth2_real_commit_skip_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            skip_reason_by_id
+        )
         trace_record["rolling_depth2_real_commit_duplicate_proposal_ids"] = sorted(set(duplicate_proposal_ids))
         trace_record["rolling_depth2_real_commit_duplicate_seq_ids"] = sorted(set(duplicate_seq_ids))
         trace_record["rolling_depth2_committed_without_ready_shadow_ids"] = sorted(set(without_ready_ids) & committed_set)
@@ -9361,24 +9396,24 @@ class ModelRunnerBase:
         trace_record["rolling_depth2_committed_cascade_discarded_child_ids"] = sorted(
             set(committed_cascade_ids) & committed_set
         )
-        trace_record["rolling_depth2_target_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_before_by_seq.items())
-        }
-        trace_record["rolling_depth2_target_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(target_len_after_by_seq.items())
-        }
-        trace_record["rolling_depth2_draft_seq_len_before_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_before_by_seq.items())
-        }
-        trace_record["rolling_depth2_draft_seq_len_after_by_seq_id"] = {
-            str(seq_id): int(value) for seq_id, value in sorted(draft_len_after_by_seq.items())
-        }
-        trace_record["rolling_depth2_target_draft_len_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(len_match_by_seq.items())
-        }
-        trace_record["rolling_depth2_target_draft_token_match_by_seq_id"] = {
-            str(seq_id): bool(value) for seq_id, value in sorted(token_match_by_seq.items())
-        }
+        trace_record["rolling_depth2_target_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_before_by_seq
+        )
+        trace_record["rolling_depth2_target_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            target_len_after_by_seq
+        )
+        trace_record["rolling_depth2_draft_seq_len_before_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_before_by_seq
+        )
+        trace_record["rolling_depth2_draft_seq_len_after_by_seq_id"] = self._trace_sorted_int_map(
+            draft_len_after_by_seq
+        )
+        trace_record["rolling_depth2_target_draft_len_match_by_seq_id"] = self._trace_sorted_bool_map(
+            len_match_by_seq
+        )
+        trace_record["rolling_depth2_target_draft_token_match_by_seq_id"] = self._trace_sorted_bool_map(
+            token_match_by_seq
+        )
         trace_record["rolling_depth2_tokens_verified"] = int(committed_tokens)
         trace_record["rolling_depth2_tokens_accepted"] = int(committed_tokens)
         trace_record["rolling_depth2_tokens_committed"] = int(committed_tokens)
@@ -9387,7 +9422,7 @@ class ModelRunnerBase:
         trace_record["rolling_depth2_real_committed_proposal_count"] = len(committed_ids)
         trace_record["rolling_depth2_real_committed_token_count"] = int(committed_tokens)
         trace_record["rolling_depth2_real_commit_count"] = len(committed_ids)
-        trace_record["rolling_depth2_real_commit_skip_reason_counts"] = dict(sorted(reason_counts.items()))
+        trace_record["rolling_depth2_real_commit_skip_reason_counts"] = reason_counts
         trace_record["rolling_depth3_real_commit_count"] = int(depth3_real_commit_count)
         trace_record["rolling_depth_gt2_real_commit_count"] = int(depth_gt2_real_commit_count)
         trace_record["rolling_depth2_real_commit_count"] = len(committed_ids)
@@ -9656,41 +9691,41 @@ class ModelRunnerBase:
         traced_child_ids = set(child_ids) | set(invalidated_ids) | set(skipped_child_ids)
         trace_record["rolling_depth3_child_generated_proposal_ids"] = list(child_ids)
         trace_record["rolling_depth3_child_generated_seq_ids"] = list(child_seq_ids)
-        trace_record["rolling_depth3_child_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(child_parent_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_root_by_proposal_id"] = {
-            str(proposal_id): int(root_id) for proposal_id, root_id in sorted(child_root_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_depth_by_proposal_id"] = {
-            str(proposal_id): int(depth) for proposal_id, depth in sorted(child_depth_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_token_count_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(child_token_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_base_len_by_proposal_id"] = {
-            str(proposal_id): int(value) for proposal_id, value in sorted(child_base_len_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_status_by_proposal_id"] = {
-            str(proposal_id): status for proposal_id, status in sorted(child_status_by_id.items())
-            if proposal_id in traced_child_ids
-        }
-        trace_record["rolling_depth3_child_status_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(child_status_reason_by_id.items())
-            if proposal_id in traced_child_ids
-        }
+        trace_record["rolling_depth3_child_parent_by_proposal_id"] = self._trace_sorted_int_map(
+            child_parent_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_root_by_proposal_id"] = self._trace_sorted_int_map(
+            child_root_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_depth_by_proposal_id"] = self._trace_sorted_int_map(
+            child_depth_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_token_count_by_proposal_id"] = self._trace_sorted_int_map(
+            child_token_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_base_len_by_proposal_id"] = self._trace_sorted_int_map(
+            child_base_len_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_status_by_proposal_id"] = self._trace_sorted_str_map(
+            child_status_by_id,
+            traced_child_ids,
+        )
+        trace_record["rolling_depth3_child_status_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            child_status_reason_by_id,
+            traced_child_ids,
+        )
         trace_record["rolling_depth3_child_generation_skipped_proposal_ids"] = sorted(set(skipped_child_ids))
-        trace_record["rolling_depth3_child_generation_skipped_parent_by_proposal_id"] = {
-            str(proposal_id): int(parent_id) for proposal_id, parent_id in sorted(skipped_parent_by_child_id.items())
-        }
-        trace_record["rolling_depth3_child_generation_skip_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(skipped_reason_by_child_id.items())
-        }
+        trace_record["rolling_depth3_child_generation_skipped_parent_by_proposal_id"] = self._trace_sorted_int_map(
+            skipped_parent_by_child_id
+        )
+        trace_record["rolling_depth3_child_generation_skip_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            skipped_reason_by_child_id
+        )
         trace_record["rolling_depth3_child_generation_skip_reason_counts"] = dict(sorted(skip_reason_counts.items()))
         trace_record["rolling_depth3_parent_depth2_real_committed_proposal_ids"] = list(committed_ids)
         trace_record["rolling_depth3_parent_depth2_full_accept_proposal_ids"] = sorted(set(committed_ids))
@@ -9701,9 +9736,9 @@ class ModelRunnerBase:
         trace_record["rolling_depth3_child_ready_shadow_proposal_ids"] = sorted(set(ready_ids) - set(invalidated_ids))
         trace_record["rolling_depth3_child_ready_shadow_seq_ids"] = sorted(set(ready_seq_ids))
         trace_record["rolling_depth3_child_invalidated_proposal_ids"] = sorted(set(invalidated_ids))
-        trace_record["rolling_depth3_child_invalidated_reason_by_proposal_id"] = {
-            str(proposal_id): reason for proposal_id, reason in sorted(invalidated_reason_by_id.items())
-        }
+        trace_record["rolling_depth3_child_invalidated_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            invalidated_reason_by_id
+        )
         trace_record["rolling_depth3_drop_reason_counts"] = dict(sorted(reason_counts.items()))
         trace_record["rolling_depth3_same_seq_overlap_count"] = len(overlap_seq_ids)
         trace_record["rolling_depth3_same_seq_overlap_seq_ids"] = overlap_seq_ids
