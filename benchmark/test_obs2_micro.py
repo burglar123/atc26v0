@@ -220,26 +220,50 @@ def test_serialized_prepare_uses_gamma():
     assert 'if not seq.pre_verify else 1' not in fn_body
 
 
-def test_serialized_forces_pre_verify_false():
-    """serialized_pearl_step forces pre_verify=False before and after verify."""
+def test_serialized_protocol_methods():
+    """serialized_pearl uses separate protocol methods, not pre_verify patching."""
     src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
 
-    # Check DraftModelRunner.serialized_pearl_step
+    # DraftModelRunner.serialized_pearl_step — uses send + postprocess, no PEARL verify
     draft_idx = src.index('class DraftModelRunner')
     draft_section = src[draft_idx:]
     draft_serialized = draft_section.split('def serialized_pearl_step')[1]
     draft_serialized = draft_serialized.split('\n    def ')[0]
-    assert 'seq.pre_verify = False' in draft_serialized
-    # Should appear at least twice (before verify, after verify)
-    assert draft_serialized.count('seq.pre_verify = False') >= 2
+    assert 'send_serialized_draft_window' in draft_serialized
+    assert '_serialized_postprocess' in draft_serialized
+    # Must NOT call the old PEARL verify
+    assert 'self.verify(seqs)' not in draft_serialized
 
-    # Check TargetModelRunner.serialized_pearl_step
+    # TargetModelRunner.serialized_pearl_step — full protocol
     target_idx = src.index('class TargetModelRunner')
     target_section = src[target_idx:]
     target_serialized = target_section.split('def serialized_pearl_step')[1]
     target_serialized = target_serialized.split('\n    def ')[0]
-    assert 'seq.pre_verify = False' in target_serialized
-    assert target_serialized.count('seq.pre_verify = False') >= 2
+    assert 'recv_serialized_draft_window' in target_serialized
+    assert 'prepare_serialized_verify_decode' in target_serialized
+    assert 'serialized_verify_full_gamma' in target_serialized
+    assert '_serialized_postprocess' in target_serialized
+    # Must NOT call the old PEARL verify
+    assert 'self.verify(logits, seqs, temperatures)' not in target_serialized
+
+
+def test_serialized_prepare_verifies_all_gamma():
+    """prepare_serialized_verify_decode starts one token before the draft window."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    target_idx = src.index('class TargetModelRunner')
+    target_section = src[target_idx:]
+    prepare_fn = target_section.split('def prepare_serialized_verify_decode')[1]
+    prepare_fn = prepare_fn.split('\n    def ')[0]
+    # Uses start = len(seq) - num_tokens - 1 (last confirmed token)
+    assert 'start = len(seq) - num_tokens - 1' in prepare_fn
+    # Uses end = len(seq) - 1 (before last draft token)
+    assert 'end = len(seq) - 1' in prepare_fn
+    # Feeds exactly gamma tokens
+    assert 'num_tokens = self.gamma' in prepare_fn
+    # Has strict size assertion
+    assert 'size mismatch' in prepare_fn
+    # Does NOT use pre_verify conditional
+    assert 'if not seq.pre_verify else 1' not in prepare_fn
 
 
 def test_parallel_pearl_unchanged():

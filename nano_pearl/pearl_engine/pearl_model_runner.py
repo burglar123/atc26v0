@@ -1035,6 +1035,42 @@ class ModelRunnerBase:
 
         self.clear_requests()
 
+    def _serialized_postprocess(self, seqs: list[Sequence], verify_res: torch.Tensor):
+        """Serialized speculative decoding postprocess — shared by draft and target.
+
+        Full-gamma semantics: accepted_len ∈ [0, gamma]. No pre_verify state.
+        On rejection, rollback the unaccepted draft suffix and append the
+        target correction token. Both sides must end the iteration with
+        consistent seq.token_ids lengths.
+        """
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        accepted_lens: dict[int, int] = {}
+        invalidated_lens: dict[int, int] = {}
+
+        for idx, seq in enumerate(seqs):
+            accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
+            invalidated_len = 0 if acc[idx] else rollout[idx]
+            accepted_lens[seq.seq_id] = accepted_len
+            invalidated_lens[seq.seq_id] = invalidated_len
+            seq.record_accepted(accepted_len)
+            seq.record_invalidated_predraft(invalidated_len)
+
+            if finish[idx]:
+                seq.mark_finished()
+                seq.num_acc_tokens.append(seq.cur_acc_tokens)
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+
+            if not acc[idx]:
+                # Rejection: rollback unaccepted draft suffix + correction token.
+                unaccepted = self.gamma - accepted_len
+                self.scheduler.rollback(seq, unaccepted)
+                seq.append_token(revise_token[idx])
+
+        return accepted_lens, invalidated_lens
+
     @abstractmethod
     def pearl_step(self):
         pass
@@ -1050,7 +1086,25 @@ class DraftModelRunner(ModelRunnerBase):
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         return super().prepare_decode(seqs)
-    
+
+    def send_serialized_draft_window(self, seqs: list[Sequence]):
+        """Broadcast the current iteration's gamma-token draft window to verify_group.
+
+        Only the draft master sends. All target devices (members of verify_group)
+        receive via recv_serialized_draft_window.
+        """
+        if self.tp_params.local_rank == 0:
+            flat = []
+            for seq in seqs:
+                toks = seq.token_ids[-self.gamma:]
+                assert len(toks) == self.gamma, (
+                    f"send_serialized_draft_window: seq {seq.seq_id} "
+                    f"has {len(toks)} tokens in draft window, expected {self.gamma}"
+                )
+                flat.extend(toks)
+            msg = torch.tensor(flat, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.rank, group=self.verify_group)
+
     def pearl_step(self):
         self._decode_iteration_group += 1
         trace_record = None
@@ -1083,10 +1137,11 @@ class DraftModelRunner(ModelRunnerBase):
         """Serialized speculative decoding draft phase.
 
         Serial speculative decoding baseline: draft generates gamma tokens per
-        active request, then synchronizes with target ranks before target
-        verification runs. This disables draft/verify overlap and intentionally
-        disables PEARL's pre_verify one-token verification shortcut — every
-        iteration verifies the full gamma-token draft window.
+        active request, broadcasts the draft window to the target verify group,
+        then receives verification results from the target. Draft and target
+        verification are serialized (no overlap). This intentionally does NOT
+        use PEARL's pre_verify one-token shortcut — every iteration verifies
+        the full gamma-token draft window.
         """
         self._decode_iteration_group += 1
         trace_record = None
@@ -1109,17 +1164,17 @@ class DraftModelRunner(ModelRunnerBase):
             self._mark_trace_end(trace_record, drafted_tokens=len(seqs))
 
         # Global barrier pairs with TargetModelRunner.serialized_pearl_step().
-        # It prevents target verification compute from overlapping this draft phase.
         dist.barrier()
-        # serialized_pearl always verifies the full gamma-token draft window;
-        # force the non-pre_verify path so the draft sends gamma tokens for
-        # verification instead of the one-token pre_verify shortcut.
-        for seq in seqs:
-            seq.pre_verify = False
-        accepted_lens, invalidated_lens = self.verify(seqs)
-        # serialized_pearl does not use PEARL's pre_verify state machine.
-        for seq in seqs:
-            seq.pre_verify = False
+
+        # Broadcast the gamma-token draft window to the target verify group.
+        self.send_serialized_draft_window(seqs)
+
+        # Receive verify_res from target (global broadcast).
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Apply serialized full-gamma postprocess.
+        accepted_lens, invalidated_lens = self._serialized_postprocess(seqs, verify_res)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1215,12 +1270,35 @@ class TargetModelRunner(ModelRunnerBase):
         set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions, temp_seqs
 
+    def recv_serialized_draft_window(self, seqs: list[Sequence]):
+        """Receive gamma draft tokens from draft master and append to local sequences.
+
+        Must be called after the global barrier (so the draft has finished its
+        gamma-step loop) and before prepare_serialized_verify_decode.
+        """
+        total_tokens = self.gamma * len(seqs)
+        msg = torch.empty(total_tokens, dtype=torch.int64, device="cuda")
+        dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        flat = msg.tolist()
+        for i, seq in enumerate(seqs):
+            toks = flat[i * self.gamma : (i + 1) * self.gamma]
+            assert len(toks) == self.gamma, (
+                f"recv_serialized_draft_window: seq {seq.seq_id} "
+                f"expected {self.gamma} tokens, got {len(toks)}"
+            )
+            for tok in toks:
+                seq.append_token(tok)
+
     def prepare_serialized_verify_decode(self, seqs: list[Sequence]):
         """Target preparation for serialized speculative decoding baseline.
 
+        Feeds gamma input tokens per sequence: [last_confirmed, d_0, …, d_{γ-2}].
+        This produces gamma logits that predict d_0 through d_{γ-1}, enabling
+        full-gamma verification of all γ draft tokens.
+
         serialized_pearl intentionally disables PEARL's pre_verify one-token
-        verification shortcut. Every serialized iteration must verify the full
-        gamma-token draft window regardless of seq.pre_verify.
+        shortcut. Input positions start one token before the draft window so
+        the model predicts every draft token.
         """
         input_ids = []
         positions = []
@@ -1229,12 +1307,29 @@ class TargetModelRunner(ModelRunnerBase):
         temp_seqs = []
         for seq in seqs:
             num_tokens = self.gamma
-            to_append_tokens = seq.token_ids[-num_tokens:]
+            start = len(seq) - num_tokens - 1   # last confirmed token position
+            end = len(seq) - 1                    # position before the last draft token
+            to_append_tokens = seq.token_ids[start:end]
+            assert len(to_append_tokens) == num_tokens, (
+                f"prepare_serialized_verify_decode: seq {seq.seq_id} request_id={seq.request_id} "
+                f"len(seq)={len(seq)} num_prompt_tokens={seq.num_prompt_tokens} "
+                f"num_completion_tokens={seq.num_completion_tokens} "
+                f"gamma={self.gamma} start={start} end={end} "
+                f"expected {num_tokens} tokens, got {len(to_append_tokens)}"
+            )
             input_ids.extend(to_append_tokens)
-            positions.extend(list(range(len(seq) - num_tokens, len(seq))))
-            context_lens.extend(list(range(len(seq) - num_tokens + 1, len(seq) + 1)))
-            slot_mapping.extend([seq.token_to_slot(token_index) for token_index in range(len(seq) - num_tokens, len(seq))])
+            positions.extend(range(start, end))
+            context_lens.extend(range(start + 1, end + 1))
+            slot_mapping.extend([seq.token_to_slot(i) for i in range(start, end)])
             temp_seqs.extend([seq] * num_tokens)
+
+        n = len(input_ids)
+        assert n == len(positions) == len(slot_mapping) == len(context_lens) == len(temp_seqs), (
+            f"prepare_serialized_verify_decode: size mismatch "
+            f"input_ids={n} positions={len(positions)} slot_mapping={len(slot_mapping)} "
+            f"context_lens={len(context_lens)} temp_seqs={len(temp_seqs)}"
+        )
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -1242,6 +1337,70 @@ class TargetModelRunner(ModelRunnerBase):
         block_tables = self.prepare_block_tables(temp_seqs)
         set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions, temp_seqs
+
+    @torch.inference_mode()
+    def serialized_verify_full_gamma(self, logits: torch.Tensor, seqs: list[Sequence],
+                                     temperatures: torch.Tensor):
+        """Full-gamma verification for serialized speculative decoding.
+
+        Verifies exactly gamma draft tokens per active sequence. Does NOT use
+        PEARL's pre_verify state machine. accepted_len ∈ [0, gamma].
+
+        Returns verify_res tensor [4, len(seqs)]: acc, rollout, revise_token, finish.
+        The caller must broadcast verify_res to the draft group and call
+        _serialized_postprocess on both sides.
+        """
+        # to_be_verified_tokens = gamma draft tokens per seq
+        num_to_verify = self.gamma * len(seqs)
+        to_be_verified_tokens = []
+        for seq in seqs:
+            toks = seq.token_ids[-self.gamma:]
+            assert len(toks) == self.gamma, (
+                f"serialized_verify_full_gamma: seq {seq.seq_id} "
+                f"has {len(toks)} draft tokens, expected {self.gamma}"
+            )
+            to_be_verified_tokens.extend(toks)
+
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+
+        if self.tp_params.local_rank == 0:
+            r = torch.rand(num_to_verify, device="cuda")
+            target_logits = norm_logits(logits, temperatures)
+
+            draft_t = torch.tensor(to_be_verified_tokens, dtype=torch.int64, device="cuda")
+            target_prob = target_logits.gather(dim=1, index=draft_t.unsqueeze(1)).squeeze(1)
+            judge = (r <= target_prob).tolist()
+
+            logits.scatter_(1, draft_t.unsqueeze(1), -float("inf"))
+            revised_tokens = self.sampler(logits, temperatures)
+
+            acc, rollout, revise_token, finish = [], [], [], []
+
+            for i, seq in enumerate(seqs):
+                n = self.gamma
+                finish_flag = False
+                offset = i * self.gamma
+                for j in range(self.gamma):
+                    tok = to_be_verified_tokens[offset + j]
+                    if not seq.ignore_eos and judge[offset + j] and is_eos(tok, self.scheduler.eos):
+                        finish_flag = True
+                    if not judge[offset + j]:
+                        n = j
+                        break
+                acc.append(n == self.gamma)
+                rollout.append(self.gamma - n)
+                revise_token.append(revised_tokens[offset + n] if n < self.gamma else -1)
+                finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, self.gamma))
+
+                if n == self.gamma:
+                    seq.cur_acc_tokens += n
+                else:
+                    seq.num_acc_tokens.append(seq.cur_acc_tokens + n + 1)
+                    seq.cur_acc_tokens = 0
+
+            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+
+        return verify_res
 
     def pearl_step(self):
         self._decode_iteration_group += 1
@@ -1261,34 +1420,45 @@ class TargetModelRunner(ModelRunnerBase):
         """Serialized speculative decoding target verification phase.
 
         This is a serial speculative decoding baseline, NOT PEARL's two-stage
-        pre-verify behavior. It intentionally disables PEARL pre_verify one-token
-        verification and always verifies the full gamma-token draft window.
+        pre-verify behavior. Protocol:
 
-        Draft and target verification are serialized (no overlap), but the
-        verification semantics match a gamma-token speculative decode window,
-        not PEARL's one-token pre_verify shortcut.
+        1. Global barrier (paired with draft).
+        2. Receive the gamma-token draft window from the draft runner.
+        3. Prepare target inputs spanning the last confirmed token + draft window.
+        4. Run the target model over all gamma positions.
+        5. Full-gamma verification → verify_res broadcast to draft group.
+        6. Serialized postprocess (shared with draft side).
+
+        Every iteration verifies exactly gamma draft tokens per active request.
+        accepted_len ∈ [0, gamma]. Does not use PEARL's pre_verify state machine.
         """
-        # Global barrier pairs with DraftModelRunner.serialized_pearl_step().
-        # Do not move this below target compute, or draft/verify will overlap.
         self._decode_iteration_group += 1
         dist.barrier()
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, "serialized_verify")
         assert not is_prefill, "wrong match. current stage is prefill."
-        # serialized_pearl always verifies the full gamma-token draft window.
+
+        # Receive the current iteration's gamma-token draft window.
+        self.recv_serialized_draft_window(seqs)
+
+        # Prepare inputs for full-gamma verification.
         input_ids, positions, temp_seqs = self.prepare_serialized_verify_decode(seqs)
+        assert input_ids.size(0) == positions.size(0), (
+            f"serialized_pearl_step: input_ids={input_ids.size(0)} != positions={positions.size(0)}"
+        )
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        # Force gamma-token verification: serialized_pearl never uses pre_verify shortcut.
-        for seq in seqs:
-            seq.pre_verify = False
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
-        # serialized_pearl does not use pre_verify state machine; always stay
-        # in gamma-token mode for the next iteration.
-        for seq in seqs:
-            seq.pre_verify = False
+
+        # Full-gamma verification.
+        verify_res = self.serialized_verify_full_gamma(logits, seqs, temperatures)
+
+        # Broadcast verify_res so draft ranks can apply postprocess.
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Postprocess (same logic as draft side).
+        accepted_lens, invalidated_lens = self._serialized_postprocess(seqs, verify_res)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
