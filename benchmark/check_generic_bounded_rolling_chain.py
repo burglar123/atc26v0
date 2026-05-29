@@ -122,7 +122,29 @@ def validate_accounting(
     errors: list[str],
 ) -> tuple[dict[int, int], bool, bool]:
     token_by_depth = committed_token_counts_by_depth(registry, MAX_LEGACY_REAL_DEPTH)
-    combined_from_registry = sum(token_by_depth.values())
+    partial_total = sum(
+        max(
+            0,
+            int(
+                registry.partial_committed_token_count_by_id.get(
+                    proposal_id,
+                    int(registry.partial_accepted_len_by_id.get(proposal_id, 0))
+                    + int(registry.partial_revised_count_by_id.get(proposal_id, 0)),
+                )
+            ),
+        )
+        for proposal_id in registry.partial_recovered_ids
+    )
+    partial_accepted = sum(
+        max(0, int(registry.partial_accepted_len_by_id.get(proposal_id, 0)))
+        for proposal_id in registry.partial_recovered_ids
+    )
+    partial_revised = sum(
+        max(0, int(registry.partial_revised_count_by_id.get(proposal_id, 0)))
+        for proposal_id in registry.partial_recovered_ids
+    )
+    full_accept_combined = sum(token_by_depth.values())
+    combined_from_registry = full_accept_combined + partial_total
     combined_ok = True
     target_draft_ok = True
 
@@ -151,7 +173,27 @@ def validate_accounting(
             f"combined actual verified token mismatch: "
             f"generic={combined_from_registry} accounting={accounting_verified}"
         )
-    if accounting_accepted != combined_from_registry:
+    if partial_total:
+        expected_accepted = full_accept_combined + partial_accepted
+        accounting_revised = int_value(accounting.get("combined_actual_revised_token_increment_sum"), 0)
+        accounting_output = int_value(accounting.get("combined_actual_output_token_increment_sum"), 0)
+        if accounting_accepted != expected_accepted:
+            combined_ok = False
+            errors.append(
+                f"combined actual accepted token mismatch: "
+                f"generic={expected_accepted} accounting={accounting_accepted}"
+            )
+        if accounting_revised != partial_revised:
+            combined_ok = False
+            errors.append(
+                f"combined revised token mismatch: generic={partial_revised} accounting={accounting_revised}"
+            )
+        if accounting_output != combined_from_registry:
+            combined_ok = False
+            errors.append(
+                f"combined output token mismatch: generic={combined_from_registry} accounting={accounting_output}"
+            )
+    elif accounting_accepted != combined_from_registry:
         combined_ok = False
         errors.append(
             f"combined actual accepted token mismatch: "
@@ -368,6 +410,13 @@ def validate_records(
         "depth4_shadow_ready_proposal_count": generic_summary["generic_depth4_shadow_ready_proposal_count"],
         "depth4_shadow_ready_token_count": generic_summary["generic_depth4_shadow_ready_token_count"],
         "depth4_shadow_invalidated_count": generic_summary["generic_depth4_shadow_invalidated_count"],
+        "partial_prefix_recovery_enabled": generic_summary["generic_partial_prefix_recovery_enabled"],
+        "partial_prefix_recovery_success_count": generic_summary["generic_partial_prefix_recovery_success_count"],
+        "partial_prefix_accepted_token_count": generic_summary["generic_partial_prefix_accepted_token_count"],
+        "partial_prefix_revised_token_count": generic_summary["generic_partial_prefix_revised_token_count"],
+        "partial_prefix_total_recovered_token_count": generic_summary[
+            "generic_partial_prefix_total_recovered_token_count"
+        ],
         "combined_real_committed_token_count": generic_summary["generic_combined_real_committed_token_count"],
         "accounting_combined_real_committed_token_count": int_value(
             accounting.get("combined_real_committed_token_count"), 0
@@ -377,6 +426,12 @@ def validate_records(
         ),
         "combined_actual_accepted_token_increment_sum": int_value(
             accounting.get("combined_actual_accepted_token_increment_sum"), 0
+        ),
+        "combined_actual_revised_token_increment_sum": int_value(
+            accounting.get("combined_actual_revised_token_increment_sum"), 0
+        ),
+        "combined_actual_output_token_increment_sum": int_value(
+            accounting.get("combined_actual_output_token_increment_sum"), 0
         ),
         "combined_accounting_ok": combined_ok and bool(generic_summary["generic_combined_accounting_ok"]),
         "target_draft_accounting_ok": target_draft_ok and bool(generic_summary["generic_target_draft_accounting_ok"]),
@@ -445,10 +500,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "depth4_shadow_ready_proposal_count",
         "depth4_shadow_ready_token_count",
         "depth4_shadow_invalidated_count",
+        "partial_prefix_recovery_enabled",
+        "partial_prefix_recovery_success_count",
+        "partial_prefix_accepted_token_count",
+        "partial_prefix_revised_token_count",
+        "partial_prefix_total_recovered_token_count",
         "combined_real_committed_token_count",
         "accounting_combined_real_committed_token_count",
         "combined_actual_verified_token_increment_sum",
         "combined_actual_accepted_token_increment_sum",
+        "combined_actual_revised_token_increment_sum",
+        "combined_actual_output_token_increment_sum",
         "combined_accounting_ok",
         "target_draft_accounting_ok",
         "normal_lane_conflict_count",

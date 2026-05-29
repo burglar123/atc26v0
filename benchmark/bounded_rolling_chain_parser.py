@@ -144,6 +144,14 @@ class RollingChainRegistry:
     target_draft_token_mismatch_count: int = 0
     target_side_seen_by_id: set[int] = field(default_factory=set)
     draft_side_seen_by_id: set[int] = field(default_factory=set)
+    partial_recovery_enabled: bool = False
+    partial_recovered_ids: set[int] = field(default_factory=set)
+    partial_recovered_seq_ids: set[int] = field(default_factory=set)
+    partial_recovered_depth_by_id: dict[int, int] = field(default_factory=dict)
+    partial_accepted_len_by_id: dict[int, int] = field(default_factory=dict)
+    partial_revised_count_by_id: dict[int, int] = field(default_factory=dict)
+    partial_committed_token_count_by_id: dict[int, int] = field(default_factory=dict)
+    partial_cascade_descendant_ids: set[int] = field(default_factory=set)
 
 
 def int_value(value: Any, default: int = 0) -> int:
@@ -355,6 +363,30 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.flags["rolling_depth4_commit_enabled"] = registry.flags["rolling_depth4_commit_enabled"] or bool(
             record.get("enable_rolling_continuous_depth4_commit_ready_only", False)
         ) or bool(record.get("rolling_depth4_commit_enabled", False))
+        registry.partial_recovery_enabled = registry.partial_recovery_enabled or bool(
+            record.get("partial_prefix_recovery_enabled", False)
+        ) or bool(record.get("enable_rolling_continuous_partial_prefix_recovery", False))
+        registry.partial_recovered_ids.update(as_int_set(record.get("partial_prefix_recovered_proposal_ids")))
+        registry.partial_recovered_seq_ids.update(as_int_set(record.get("partial_prefix_recovered_seq_ids")))
+        merge_first(
+            registry.partial_recovered_depth_by_id,
+            as_int_map(record.get("partial_prefix_recovered_depth_by_proposal_id")),
+        )
+        merge_first(
+            registry.partial_accepted_len_by_id,
+            as_int_map(record.get("partial_prefix_accepted_len_by_proposal_id")),
+        )
+        merge_first(
+            registry.partial_revised_count_by_id,
+            as_int_map(record.get("partial_prefix_revised_token_count_by_proposal_id")),
+        )
+        merge_first(
+            registry.partial_committed_token_count_by_id,
+            as_int_map(record.get("partial_prefix_committed_token_count_by_proposal_id")),
+        )
+        registry.partial_cascade_descendant_ids.update(
+            as_int_set(record.get("partial_recovery_cascade_discarded_descendant_proposal_ids"))
+        )
 
         registry.missing_buffered_proposal_unexpected_count += int_value(
             record.get("missing_buffered_proposal_unexpected_count"), 0
@@ -384,6 +416,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "rolling_depth2_target_draft_len_match_by_seq_id",
             "rolling_depth3_target_draft_len_match_by_seq_id",
             "rolling_depth4_target_draft_len_match_by_seq_id",
+            "partial_recovery_target_draft_len_match_by_seq_id",
         ):
             false_ids = collect_false_ids(record.get(field_name))
             registry.target_draft_length_mismatch_count += len(false_ids)
@@ -394,6 +427,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "rolling_depth2_target_draft_token_match_by_seq_id",
             "rolling_depth3_target_draft_token_match_by_seq_id",
             "rolling_depth4_target_draft_token_match_by_seq_id",
+            "partial_recovery_target_draft_token_match_by_seq_id",
         ):
             registry.target_draft_token_mismatch_count += false_count(record.get(field_name))
 
@@ -952,7 +986,29 @@ def summarize_registry(
     accounting: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     token_by_depth = committed_token_counts_by_depth(registry, max_depth)
-    combined_tokens = sum(token_by_depth.values())
+    full_accept_combined_tokens = sum(token_by_depth.values())
+    partial_accepted_tokens = sum(
+        max(0, int(registry.partial_accepted_len_by_id.get(proposal_id, 0)))
+        for proposal_id in registry.partial_recovered_ids
+    )
+    partial_revised_tokens = sum(
+        max(0, int(registry.partial_revised_count_by_id.get(proposal_id, 0)))
+        for proposal_id in registry.partial_recovered_ids
+    )
+    partial_total_tokens = sum(
+        max(
+            0,
+            int(
+                registry.partial_committed_token_count_by_id.get(
+                    proposal_id,
+                    int(registry.partial_accepted_len_by_id.get(proposal_id, 0))
+                    + int(registry.partial_revised_count_by_id.get(proposal_id, 0)),
+                )
+            ),
+        )
+        for proposal_id in registry.partial_recovered_ids
+    )
+    combined_tokens = full_accept_combined_tokens + partial_total_tokens
     max_real_depth = registry.max_real_committed_depth
     for depth, tokens in token_by_depth.items():
         if tokens:
@@ -980,6 +1036,12 @@ def summarize_registry(
             for proposal_id in registry.ready_by_depth[4]
         ),
         "generic_depth4_shadow_invalidated_count": len(registry.invalidated_by_depth[4]),
+        "generic_partial_prefix_recovery_enabled": registry.partial_recovery_enabled,
+        "generic_partial_prefix_recovery_success_count": len(registry.partial_recovered_ids),
+        "generic_partial_prefix_accepted_token_count": partial_accepted_tokens,
+        "generic_partial_prefix_revised_token_count": partial_revised_tokens,
+        "generic_partial_prefix_total_recovered_token_count": partial_total_tokens,
+        "generic_partial_recovery_cascade_discard_count": len(registry.partial_cascade_descendant_ids),
         "generic_combined_real_committed_token_count": combined_tokens,
         "generic_max_observed_depth": registry.max_observed_depth,
         "generic_max_real_committed_depth": max_real_depth,
@@ -1009,9 +1071,21 @@ def summarize_registry(
         combined_ok = combined_ok and int_value(
             accounting.get("combined_actual_verified_token_increment_sum"), 0
         ) == combined_tokens
-        combined_ok = combined_ok and int_value(
-            accounting.get("combined_actual_accepted_token_increment_sum"), 0
-        ) == combined_tokens
+        accounting_partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+        if accounting_partial_total:
+            combined_ok = combined_ok and int_value(
+                accounting.get("combined_actual_output_token_increment_sum"), 0
+            ) == combined_tokens
+            combined_ok = combined_ok and int_value(
+                accounting.get("combined_actual_accepted_token_increment_sum"), 0
+            ) == full_accept_combined_tokens + partial_accepted_tokens
+            combined_ok = combined_ok and int_value(
+                accounting.get("combined_actual_revised_token_increment_sum"), 0
+            ) == partial_revised_tokens
+        else:
+            combined_ok = combined_ok and int_value(
+                accounting.get("combined_actual_accepted_token_increment_sum"), 0
+            ) == combined_tokens
 
         target_draft_ok = (
             registry.target_draft_length_mismatch_count == 0

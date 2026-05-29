@@ -151,6 +151,7 @@ class PEARLConfig:
     enable_rolling_continuous_depth3_commit_ready_only: bool = False
     enable_rolling_continuous_depth4_shadow_dry_run: bool = False
     enable_rolling_continuous_depth4_commit_ready_only: bool = False
+    enable_rolling_continuous_partial_prefix_recovery: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -203,6 +204,9 @@ class PEARLConfig:
         )
         self.enable_rolling_continuous_depth4_commit_ready_only = bool(
             self.enable_rolling_continuous_depth4_commit_ready_only
+        )
+        self.enable_rolling_continuous_partial_prefix_recovery = bool(
+            self.enable_rolling_continuous_partial_prefix_recovery
         )
         if self.enable_rolling_continuous_depth4_commit_ready_only:
             self.enable_rolling_continuous_depth4_shadow_dry_run = True
@@ -393,6 +397,10 @@ class PEARLConfig:
         logger.info(
             "Enable_Rolling_Continuous_Depth4_Commit_Ready_Only="
             f"{self.enable_rolling_continuous_depth4_commit_ready_only}"
+        )
+        logger.info(
+            "Enable_Rolling_Continuous_Partial_Prefix_Recovery="
+            f"{self.enable_rolling_continuous_partial_prefix_recovery}"
         )
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")

@@ -454,6 +454,17 @@ def aggregate_performance_accounting(
     rolling_depth3_commit_decision_payload_len_units = 0
     rolling_depth4_commit_decision_payload_len_units = 0
     rolling_max_depth_observed = 0
+    partial_prefix_recovery_enabled = False
+    partial_prefix_recovered_ids: set[int] = set()
+    partial_prefix_recovered_seq_ids: set[int] = set()
+    partial_prefix_accepted_len_by_id: dict[int, int] = {}
+    partial_prefix_revised_token_count_by_id: dict[int, int] = {}
+    partial_prefix_committed_token_count_by_id: dict[int, int] = {}
+    partial_prefix_depth_by_id: dict[int, int] = {}
+    partial_prefix_skip_reason_counts: Counter[str] = Counter()
+    partial_recovery_target_draft_length_mismatch_count = 0
+    partial_recovery_target_draft_token_mismatch_count = 0
+    partial_recovery_cascade_discard_ids: set[int] = set()
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -491,6 +502,61 @@ def aggregate_performance_accounting(
             for proposal_id, token_count in as_int_map(record.get(map_key)).items():
                 if token_count > 0:
                     proposal_len_by_id.setdefault(proposal_id, token_count)
+        if bool(record.get("partial_prefix_recovery_enabled", False)) or bool(
+            record.get("enable_rolling_continuous_partial_prefix_recovery", False)
+        ):
+            partial_prefix_recovery_enabled = True
+        partial_prefix_recovered_ids.update(as_int_set(record.get("partial_prefix_recovered_proposal_ids")))
+        partial_prefix_recovered_seq_ids.update(as_int_set(record.get("partial_prefix_recovered_seq_ids")))
+        partial_prefix_accepted_len_by_id.update(
+            {
+                proposal_id: token_count
+                for proposal_id, token_count in as_int_map(
+                    record.get("partial_prefix_accepted_len_by_proposal_id")
+                ).items()
+                if token_count >= 0
+            }
+        )
+        partial_prefix_revised_token_count_by_id.update(
+            {
+                proposal_id: token_count
+                for proposal_id, token_count in as_int_map(
+                    record.get("partial_prefix_revised_token_count_by_proposal_id")
+                ).items()
+                if token_count >= 0
+            }
+        )
+        partial_prefix_committed_token_count_by_id.update(
+            {
+                proposal_id: token_count
+                for proposal_id, token_count in as_int_map(
+                    record.get("partial_prefix_committed_token_count_by_proposal_id")
+                ).items()
+                if token_count >= 0
+            }
+        )
+        partial_prefix_depth_by_id.update(as_int_map(record.get("partial_prefix_recovered_depth_by_proposal_id")))
+        if isinstance(record.get("partial_prefix_recovery_skip_reason_counts"), dict):
+            partial_prefix_skip_reason_counts.update(
+                {
+                    str(reason): int_value(count, 0)
+                    for reason, count in record["partial_prefix_recovery_skip_reason_counts"].items()
+                }
+            )
+        for field, counter_name in (
+            ("partial_recovery_target_draft_len_match_by_seq_id", "len"),
+            ("partial_recovery_target_draft_token_match_by_seq_id", "token"),
+        ):
+            values = record.get(field)
+            if isinstance(values, dict):
+                mismatches = sum(1 for value in values.values() if not bool(value))
+                if counter_name == "len":
+                    partial_recovery_target_draft_length_mismatch_count += mismatches
+                else:
+                    partial_recovery_target_draft_token_mismatch_count += mismatches
+        partial_recovery_cascade_discard_ids.update(
+            as_int_set(record.get("partial_recovery_cascade_discarded_descendant_proposal_ids"))
+        )
 
         candidate_ids.update(as_int_set(record.get("eager_commit_candidate_proposal_ids")))
         candidate_ids.update(as_int_set(record.get("eager_commit_readiness_candidate_proposal_ids")))
@@ -1168,6 +1234,49 @@ def aggregate_performance_accounting(
         )
         for proposal_id in rolling_depth4_real_committed_ids
     )
+    partial_prefix_accepted_token_count = sum(
+        int(partial_prefix_accepted_len_by_id.get(proposal_id, 0))
+        for proposal_id in partial_prefix_recovered_ids
+    )
+    partial_prefix_revised_token_count = sum(
+        int(partial_prefix_revised_token_count_by_id.get(proposal_id, 0))
+        for proposal_id in partial_prefix_recovered_ids
+    )
+    partial_prefix_total_recovered_token_count = sum(
+        int(
+            partial_prefix_committed_token_count_by_id.get(
+                proposal_id,
+                int(partial_prefix_accepted_len_by_id.get(proposal_id, 0))
+                + int(partial_prefix_revised_token_count_by_id.get(proposal_id, 0)),
+            )
+        )
+        for proposal_id in partial_prefix_recovered_ids
+    )
+    full_accept_combined_real_committed_token_count = (
+        committed_token_count
+        + continuous_real_committed_token_count
+        + rolling_depth2_real_committed_token_count
+        + rolling_depth3_real_committed_token_count
+        + rolling_depth4_real_committed_token_count
+    )
+    combined_real_committed_token_count = (
+        full_accept_combined_real_committed_token_count
+        + partial_prefix_total_recovered_token_count
+    )
+    combined_actual_accepted_token_increment_sum = (
+        int_value(commit_summary.get("target_actual_eager_accepted_token_increment_sum"), 0)
+        + continuous_target_accepted_sum
+        + rolling_depth2_target_accepted_sum
+        + rolling_depth3_target_accepted_sum
+        + rolling_depth4_target_accepted_sum
+        + partial_prefix_accepted_token_count
+    )
+    combined_actual_revised_token_increment_sum = partial_prefix_revised_token_count
+    combined_actual_output_token_increment_sum = (
+        full_accept_combined_real_committed_token_count
+        + partial_prefix_accepted_token_count
+        + partial_prefix_revised_token_count
+    )
     continuous_chain_distribution = Counter(
         str(depth)
         for proposal_id, depth in continuous_chain_depth_by_id.items()
@@ -1389,19 +1498,23 @@ def aggregate_performance_accounting(
             rolling_depth4_child_ready_shadow_token_count,
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
         ),
-        "combined_real_committed_token_count": (
-            committed_token_count
-            + continuous_real_committed_token_count
-            + rolling_depth2_real_committed_token_count
-            + rolling_depth3_real_committed_token_count
-            + rolling_depth4_real_committed_token_count
+        "partial_prefix_recovery_enabled": bool(partial_prefix_recovery_enabled),
+        "partial_prefix_recovery_attempt_count": (
+            len(partial_prefix_recovered_ids) + sum(partial_prefix_skip_reason_counts.values())
         ),
+        "partial_prefix_recovery_success_count": len(partial_prefix_recovered_ids),
+        "partial_prefix_recovery_skip_reason_counts": dict(sorted(partial_prefix_skip_reason_counts.items())),
+        "partial_prefix_recovered_proposal_count": len(partial_prefix_recovered_ids),
+        "partial_prefix_recovered_seq_count": len(partial_prefix_recovered_seq_ids),
+        "partial_prefix_accepted_token_count": partial_prefix_accepted_token_count,
+        "partial_prefix_revised_token_count": partial_prefix_revised_token_count,
+        "partial_prefix_total_recovered_token_count": partial_prefix_total_recovered_token_count,
+        "partial_recovery_cascade_discard_count": len(partial_recovery_cascade_discard_ids),
+        "partial_recovery_target_draft_length_mismatch_count": partial_recovery_target_draft_length_mismatch_count,
+        "partial_recovery_target_draft_token_mismatch_count": partial_recovery_target_draft_token_mismatch_count,
+        "combined_real_committed_token_count": combined_real_committed_token_count,
         "combined_real_committed_token_share_of_output": safe_div(
-            committed_token_count
-            + continuous_real_committed_token_count
-            + rolling_depth2_real_committed_token_count
-            + rolling_depth3_real_committed_token_count
-            + rolling_depth4_real_committed_token_count,
+            combined_real_committed_token_count,
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
         ),
         "combined_actual_verified_token_increment_sum": (
@@ -1410,14 +1523,12 @@ def aggregate_performance_accounting(
             + rolling_depth2_target_verified_sum
             + rolling_depth3_target_verified_sum
             + rolling_depth4_target_verified_sum
+            + partial_prefix_accepted_token_count
+            + partial_prefix_revised_token_count
         ),
-        "combined_actual_accepted_token_increment_sum": (
-            int_value(commit_summary.get("target_actual_eager_accepted_token_increment_sum"), 0)
-            + continuous_target_accepted_sum
-            + rolling_depth2_target_accepted_sum
-            + rolling_depth3_target_accepted_sum
-            + rolling_depth4_target_accepted_sum
-        ),
+        "combined_actual_accepted_token_increment_sum": combined_actual_accepted_token_increment_sum,
+        "combined_actual_revised_token_increment_sum": combined_actual_revised_token_increment_sum,
+        "combined_actual_output_token_increment_sum": combined_actual_output_token_increment_sum,
         "continuous_eager_payload_len_units_per_ready_token": 0.0,
         "continuous_eager_result_transfer_protocol": (
             sorted(continuous_result_transfer_protocols)[0]
@@ -1578,6 +1689,19 @@ def validate_accounting(
         errors.append("skipped plus committed proposals exceeds candidate proposal count")
     if skipped_proposals and not accounting.get("eager_skip_reason_counts"):
         errors.append("skipped proposals require skip reason counts")
+    partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+    partial_accepted = int_value(accounting.get("partial_prefix_accepted_token_count"), 0)
+    partial_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+    if partial_total and not bool(accounting.get("partial_prefix_recovery_enabled", False)):
+        errors.append("partial recovery tokens require partial-prefix recovery enabled")
+    if partial_total != partial_accepted + partial_revised:
+        errors.append("partial recovery total tokens must equal accepted prefix plus revised tokens")
+    if int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0) != 0:
+        errors.append("partial recovery target/draft length mismatch count must be zero")
+    if int_value(accounting.get("partial_recovery_target_draft_token_mismatch_count"), 0) != 0:
+        errors.append("partial recovery target/draft token mismatch count must be zero")
+    if partial_revised and partial_revised != int_value(accounting.get("partial_prefix_recovery_success_count"), 0):
+        errors.append("partial recovery revised token count must equal successful recovery count")
     continuous_real_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
     continuous_real_proposals = int_value(accounting.get("continuous_eager_real_committed_proposal_count"), 0)
     if (
@@ -1996,10 +2120,24 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth4_max_depth_observed",
         "rolling_depth4_estimated_future_token_count",
         "rolling_depth4_estimated_future_token_share_of_output",
+        "partial_prefix_recovery_enabled",
+        "partial_prefix_recovery_attempt_count",
+        "partial_prefix_recovery_success_count",
+        "partial_prefix_recovery_skip_reason_counts",
+        "partial_prefix_recovered_proposal_count",
+        "partial_prefix_recovered_seq_count",
+        "partial_prefix_accepted_token_count",
+        "partial_prefix_revised_token_count",
+        "partial_prefix_total_recovered_token_count",
+        "partial_recovery_cascade_discard_count",
+        "partial_recovery_target_draft_length_mismatch_count",
+        "partial_recovery_target_draft_token_mismatch_count",
         "combined_real_committed_token_count",
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",
         "combined_actual_accepted_token_increment_sum",
+        "combined_actual_revised_token_increment_sum",
+        "combined_actual_output_token_increment_sum",
         "continuous_eager_result_transfer_protocol",
         "continuous_eager_result_transfer_protocols",
         "continuous_eager_result_transfer_payload_len_units_before_compact",

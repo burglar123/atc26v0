@@ -36,6 +36,11 @@ GENERIC_PARITY_FIELD_PAIRS = (
     ("depth2_committed_token_count", "generic_depth2_committed_token_count"),
     ("depth3_committed_token_count", "generic_depth3_committed_token_count"),
     ("depth4_committed_token_count", "generic_depth4_committed_token_count"),
+    ("partial_prefix_recovery_enabled", "generic_partial_prefix_recovery_enabled"),
+    ("partial_prefix_recovery_success_count", "generic_partial_prefix_recovery_success_count"),
+    ("partial_prefix_accepted_token_count", "generic_partial_prefix_accepted_token_count"),
+    ("partial_prefix_revised_token_count", "generic_partial_prefix_revised_token_count"),
+    ("partial_prefix_total_recovered_token_count", "generic_partial_prefix_total_recovered_token_count"),
     ("combined_real_committed_token_count", "generic_combined_real_committed_token_count"),
     ("max_observed_depth", "generic_max_observed_depth"),
     ("max_real_committed_depth", "generic_max_real_committed_depth"),
@@ -623,12 +628,23 @@ def validate_accounting_by_depth(accounting: dict[str, Any], errors: list[str]) 
         + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
+        + int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
     )
     combined_ok = int_value(accounting.get("combined_real_committed_token_count"), 0) == combined_expected
     combined_ok = combined_ok and int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0) == combined_expected
-    combined_ok = combined_ok and int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) == combined_expected
+    partial_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+    if partial_revised:
+        combined_ok = combined_ok and int_value(accounting.get("combined_actual_output_token_increment_sum"), 0) == combined_expected
+        combined_ok = combined_ok and int_value(
+            accounting.get("combined_actual_accepted_token_increment_sum"), 0
+        ) == combined_expected - partial_revised
+        combined_ok = combined_ok and int_value(
+            accounting.get("combined_actual_revised_token_increment_sum"), 0
+        ) == partial_revised
+    else:
+        combined_ok = combined_ok and int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) == combined_expected
     if not combined_ok:
-        errors.append("combined accounting does not equal one-shot + depth1 + depth2 + depth3 + depth4")
+        errors.append("combined accounting does not equal full-accept commits plus partial recovery output")
     return combined_ok, target_draft_ok
 
 
@@ -827,6 +843,19 @@ def validate_records(
         "depth3_committed_token_count": int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0),
         "depth4_committed_proposal_count": len(committed_by_depth[4]),
         "depth4_committed_token_count": int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0),
+        "partial_prefix_recovery_enabled": bool(accounting.get("partial_prefix_recovery_enabled", False)),
+        "partial_prefix_recovery_success_count": int_value(
+            accounting.get("partial_prefix_recovery_success_count"), 0
+        ),
+        "partial_prefix_accepted_token_count": int_value(
+            accounting.get("partial_prefix_accepted_token_count"), 0
+        ),
+        "partial_prefix_revised_token_count": int_value(
+            accounting.get("partial_prefix_revised_token_count"), 0
+        ),
+        "partial_prefix_total_recovered_token_count": int_value(
+            accounting.get("partial_prefix_total_recovered_token_count"), 0
+        ),
         "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
         "combined_actual_verified_token_increment_sum": int_value(
             accounting.get("combined_actual_verified_token_increment_sum"),
@@ -834,6 +863,14 @@ def validate_records(
         ),
         "combined_actual_accepted_token_increment_sum": int_value(
             accounting.get("combined_actual_accepted_token_increment_sum"),
+            0,
+        ),
+        "combined_actual_revised_token_increment_sum": int_value(
+            accounting.get("combined_actual_revised_token_increment_sum"),
+            0,
+        ),
+        "combined_actual_output_token_increment_sum": int_value(
+            accounting.get("combined_actual_output_token_increment_sum"),
             0,
         ),
         "combined_accounting_ok": combined_ok,
@@ -896,9 +933,16 @@ def print_summary(summary: dict[str, Any]) -> None:
         "depth3_committed_token_count",
         "depth4_committed_proposal_count",
         "depth4_committed_token_count",
+        "partial_prefix_recovery_enabled",
+        "partial_prefix_recovery_success_count",
+        "partial_prefix_accepted_token_count",
+        "partial_prefix_revised_token_count",
+        "partial_prefix_total_recovered_token_count",
         "combined_real_committed_token_count",
         "combined_actual_verified_token_increment_sum",
         "combined_actual_accepted_token_increment_sum",
+        "combined_actual_revised_token_increment_sum",
+        "combined_actual_output_token_increment_sum",
         "combined_accounting_ok",
         "target_draft_accounting_ok",
         "normal_lane_conflict_count",

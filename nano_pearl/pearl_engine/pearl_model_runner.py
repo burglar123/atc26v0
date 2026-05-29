@@ -75,7 +75,7 @@ CONTINUOUS_EAGER_RESULT_TRANSFER_MAGIC = 0x1A72D
 CONTINUOUS_EAGER_RESULT_TRANSFER_OP_COMPACT_V1 = 0x1A72D1
 CONTINUOUS_EAGER_RESULT_TRANSFER_PROTOCOL_COMPACT_V1 = "compact_v1"
 CONTINUOUS_EAGER_RESULT_TRANSFER_META_LEN = 7
-CONTINUOUS_EAGER_RESULT_TRANSFER_PAYLOAD_WIDTH = 13
+CONTINUOUS_EAGER_RESULT_TRANSFER_PAYLOAD_WIDTH = 14
 EAGER_COMMIT_READY_ONLY_MAGIC = 0x1A60A
 EAGER_COMMIT_READY_ONLY_OP = 0x1A60A1
 EAGER_COMMIT_READY_ONLY_META_LEN = 6
@@ -128,6 +128,18 @@ class RollingProposalCommitRecord:
     precondition_ok: bool = False
     precondition_failed: bool = False
     precondition_failure_reason: str | None = None
+    partial_recovered: bool = False
+    partial_recovery_attempted: bool = False
+    accepted_prefix_len: int = 0
+    reject_index: int | None = None
+    revised_token_id: int | None = None
+    revised_token_count: int = 0
+    partial_prefix_token_count: int = 0
+    partial_recovery_token_count: int = 0
+    partial_recovery_reason: str | None = None
+    recovery_frontier_before: int | None = None
+    recovery_frontier_after: int | None = None
+    descendant_cascade_discard_count: int = 0
 
 
 @dataclass
@@ -1118,6 +1130,56 @@ class ModelRunnerBase:
             "continuous_eager_tokens_invalidated": 0,
             "continuous_eager_real_committed_proposal_count": 0,
             "continuous_eager_real_committed_token_count": 0,
+            "partial_prefix_recovery_enabled": bool(
+                getattr(self.global_config, "enable_rolling_continuous_partial_prefix_recovery", False)
+            ),
+            "enable_rolling_continuous_partial_prefix_recovery": bool(
+                getattr(self.global_config, "enable_rolling_continuous_partial_prefix_recovery", False)
+            ),
+            "partial_prefix_recovery_attempt_count": 0,
+            "partial_prefix_recovery_success_count": 0,
+            "partial_prefix_recovery_skip_reason_counts": {},
+            "partial_prefix_recovered_proposal_ids": [],
+            "partial_prefix_recovered_seq_ids": [],
+            "partial_prefix_recovered_depth_by_proposal_id": {},
+            "partial_prefix_accepted_len_by_proposal_id": {},
+            "partial_prefix_reject_index_by_proposal_id": {},
+            "partial_prefix_revised_token_count_by_proposal_id": {},
+            "partial_prefix_committed_token_count_by_proposal_id": {},
+            "partial_prefix_recovery_frontier_before_by_seq_id": {},
+            "partial_prefix_recovery_frontier_after_by_seq_id": {},
+            "partial_prefix_descendant_cascade_discard_count_by_proposal_id": {},
+            "partial_prefix_recovery_normal_release_seq_ids": [],
+            "partial_prefix_accepted_token_count": 0,
+            "partial_prefix_revised_token_count": 0,
+            "partial_prefix_total_recovered_token_count": 0,
+            "partial_recovery_cascade_discarded_descendant_proposal_ids": [],
+            "partial_recovery_cascade_discarded_descendant_depth_by_proposal_id": {},
+            "partial_recovery_cascade_discarded_descendant_reason_by_proposal_id": {},
+            "partial_recovery_target_seq_len_before_by_seq_id": {},
+            "partial_recovery_target_seq_len_after_by_seq_id": {},
+            "partial_recovery_draft_seq_len_before_by_seq_id": {},
+            "partial_recovery_draft_seq_len_after_by_seq_id": {},
+            "partial_recovery_target_draft_len_match_by_seq_id": {},
+            "partial_recovery_target_draft_token_match_by_seq_id": {},
+            "continuous_depth1_partial_recovery_attempt_count": 0,
+            "continuous_depth1_partial_recovery_success_count": 0,
+            "continuous_depth1_partial_recovery_skip_reason_counts": {},
+            "continuous_depth1_partial_recovered_proposal_ids": [],
+            "continuous_depth1_partial_recovered_seq_ids": [],
+            "continuous_depth1_partial_recovery_committed_token_count": 0,
+            "rolling_depth2_partial_recovery_attempt_count": 0,
+            "rolling_depth2_partial_recovery_success_count": 0,
+            "rolling_depth2_partial_recovery_skip_reason_counts": {},
+            "rolling_depth2_partial_recovery_committed_token_count": 0,
+            "rolling_depth3_partial_recovery_attempt_count": 0,
+            "rolling_depth3_partial_recovery_success_count": 0,
+            "rolling_depth3_partial_recovery_skip_reason_counts": {},
+            "rolling_depth3_partial_recovery_committed_token_count": 0,
+            "rolling_depth4_partial_recovery_attempt_count": 0,
+            "rolling_depth4_partial_recovery_success_count": 0,
+            "rolling_depth4_partial_recovery_skip_reason_counts": {},
+            "rolling_depth4_partial_recovery_committed_token_count": 0,
             "continuous_eager_unexpected_lane_overlap_count": 0,
             "continuous_eager_unexpected_takeover_overlap_count": 0,
             "continuous_eager_candidate_proposal_count": 0,
@@ -1932,6 +1994,9 @@ class ModelRunnerBase:
 
     def _rolling_depth4_commit_ready_only_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_rolling_continuous_depth4_commit_ready_only", False))
+
+    def _partial_prefix_recovery_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_rolling_continuous_partial_prefix_recovery", False))
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -2792,6 +2857,7 @@ class ModelRunnerBase:
             "discard_partial_no_mutation": 2,
             "discard_reject_no_mutation": 3,
             "skipped_invalid_no_mutation": 4,
+            "partial_prefix_recovery": 5,
         }.get(str(action), 0)
 
     def _result_action_from_code(self, action_code: int) -> str:
@@ -2800,6 +2866,7 @@ class ModelRunnerBase:
             2: "discard_partial_no_mutation",
             3: "discard_reject_no_mutation",
             4: "skipped_invalid_no_mutation",
+            5: "partial_prefix_recovery",
         }.get(int(action_code), "unknown")
 
     def _result_verify_code(self, result: str) -> int:
@@ -3041,6 +3108,118 @@ class ModelRunnerBase:
             for record in records
             if record.precondition_failure_reason is not None
         }
+
+    def _partial_recovery_prefix_for_depth(self, depth: int) -> str:
+        depth = int(depth)
+        if depth == 1:
+            return "continuous_depth1_partial_recovery"
+        return f"rolling_depth{depth}_partial_recovery"
+
+    def _increment_partial_recovery_skip(
+        self,
+        trace_record: dict,
+        *,
+        depth: int,
+        reason: str,
+    ) -> None:
+        prefix = self._partial_recovery_prefix_for_depth(depth)
+        trace_record["partial_prefix_recovery_attempt_count"] = int(
+            trace_record.get("partial_prefix_recovery_attempt_count", 0)
+        ) + 1
+        trace_record[f"{prefix}_attempt_count"] = int(trace_record.get(f"{prefix}_attempt_count", 0)) + 1
+        counts = dict(trace_record.get("partial_prefix_recovery_skip_reason_counts", {}) or {})
+        counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+        trace_record["partial_prefix_recovery_skip_reason_counts"] = dict(sorted(counts.items()))
+        depth_counts = dict(trace_record.get(f"{prefix}_skip_reason_counts", {}) or {})
+        depth_counts[str(reason)] = int(depth_counts.get(str(reason), 0)) + 1
+        trace_record[f"{prefix}_skip_reason_counts"] = dict(sorted(depth_counts.items()))
+
+    def _record_partial_prefix_recovery_success(
+        self,
+        trace_record: dict,
+        *,
+        proposal_id: int,
+        seq_id: int,
+        depth: int,
+        accepted_prefix_len: int,
+        reject_index: int,
+        revised_token_id: int,
+        frontier_before: int,
+        frontier_after: int,
+        descendant_cascade_discard_count: int = 0,
+    ) -> None:
+        depth = int(depth)
+        proposal_id = int(proposal_id)
+        seq_id = int(seq_id)
+        accepted_prefix_len = int(accepted_prefix_len)
+        revised_token_count = 1
+        committed_token_count = accepted_prefix_len + revised_token_count
+        prefix = self._partial_recovery_prefix_for_depth(depth)
+
+        recovered_ids = set(int(pid) for pid in trace_record.get("partial_prefix_recovered_proposal_ids", []))
+        recovered_ids.add(proposal_id)
+        trace_record["partial_prefix_recovered_proposal_ids"] = sorted(recovered_ids)
+        recovered_seq_ids = set(int(sid) for sid in trace_record.get("partial_prefix_recovered_seq_ids", []))
+        recovered_seq_ids.add(seq_id)
+        trace_record["partial_prefix_recovered_seq_ids"] = sorted(recovered_seq_ids)
+        release_seq_ids = set(int(sid) for sid in trace_record.get("partial_prefix_recovery_normal_release_seq_ids", []))
+        release_seq_ids.add(seq_id)
+        trace_record["partial_prefix_recovery_normal_release_seq_ids"] = sorted(release_seq_ids)
+
+        trace_record["partial_prefix_recovery_attempt_count"] = int(
+            trace_record.get("partial_prefix_recovery_attempt_count", 0)
+        ) + 1
+        trace_record["partial_prefix_recovery_success_count"] = int(
+            trace_record.get("partial_prefix_recovery_success_count", 0)
+        ) + 1
+        trace_record["partial_prefix_accepted_token_count"] = int(
+            trace_record.get("partial_prefix_accepted_token_count", 0)
+        ) + accepted_prefix_len
+        trace_record["partial_prefix_revised_token_count"] = int(
+            trace_record.get("partial_prefix_revised_token_count", 0)
+        ) + revised_token_count
+        trace_record["partial_prefix_total_recovered_token_count"] = int(
+            trace_record.get("partial_prefix_total_recovered_token_count", 0)
+        ) + committed_token_count
+
+        int_maps = (
+            ("partial_prefix_recovered_depth_by_proposal_id", proposal_id, depth),
+            ("partial_prefix_accepted_len_by_proposal_id", proposal_id, accepted_prefix_len),
+            ("partial_prefix_reject_index_by_proposal_id", proposal_id, int(reject_index)),
+            ("partial_prefix_revised_token_count_by_proposal_id", proposal_id, revised_token_count),
+            ("partial_prefix_committed_token_count_by_proposal_id", proposal_id, committed_token_count),
+            ("partial_prefix_descendant_cascade_discard_count_by_proposal_id", proposal_id, descendant_cascade_discard_count),
+            ("partial_prefix_recovery_frontier_before_by_seq_id", seq_id, int(frontier_before)),
+            ("partial_prefix_recovery_frontier_after_by_seq_id", seq_id, int(frontier_after)),
+            ("partial_recovery_target_seq_len_before_by_seq_id", seq_id, int(frontier_before)),
+            ("partial_recovery_target_seq_len_after_by_seq_id", seq_id, int(frontier_after)),
+            ("partial_recovery_draft_seq_len_before_by_seq_id", seq_id, int(frontier_before)),
+            ("partial_recovery_draft_seq_len_after_by_seq_id", seq_id, int(frontier_after)),
+        )
+        for field, key, value in int_maps:
+            current = {int(k): int(v) for k, v in (trace_record.get(field, {}) or {}).items()}
+            current[int(key)] = int(value)
+            trace_record[field] = self._trace_sorted_int_map(current)
+        bool_maps = (
+            "partial_recovery_target_draft_len_match_by_seq_id",
+            "partial_recovery_target_draft_token_match_by_seq_id",
+        )
+        for field in bool_maps:
+            current = {int(k): bool(v) for k, v in (trace_record.get(field, {}) or {}).items()}
+            current[seq_id] = True
+            trace_record[field] = self._trace_sorted_bool_map(current)
+
+        depth_recovered_ids = set(int(pid) for pid in trace_record.get(f"{prefix}_recovered_proposal_ids", []))
+        depth_recovered_ids.add(proposal_id)
+        trace_record[f"{prefix}_recovered_proposal_ids"] = sorted(depth_recovered_ids)
+        depth_seq_ids = set(int(sid) for sid in trace_record.get(f"{prefix}_recovered_seq_ids", []))
+        depth_seq_ids.add(seq_id)
+        trace_record[f"{prefix}_recovered_seq_ids"] = sorted(depth_seq_ids)
+        trace_record[f"{prefix}_attempt_count"] = int(trace_record.get(f"{prefix}_attempt_count", 0)) + 1
+        trace_record[f"{prefix}_success_count"] = int(trace_record.get(f"{prefix}_success_count", 0)) + 1
+        trace_record[f"{prefix}_committed_token_count"] = int(
+            trace_record.get(f"{prefix}_committed_token_count", 0)
+        ) + committed_token_count
 
     def _trace_commit_count_summary(
         self,
@@ -3420,6 +3599,7 @@ class ModelRunnerBase:
                     int(bool(result.get("rollback_ok", False))),
                     int(bool(result.get("mutation_detected", True))),
                     int(bool(result.get("checkpoint_failed", True))),
+                    int(result.get("revised_token", -1)),
                 ]
             )
         meta_values = [
@@ -3744,6 +3924,12 @@ class ModelRunnerBase:
             "reject_at_first_token": "discard_reject_no_mutation",
             "skipped_invalid": "skipped_invalid_no_mutation",
         }[verify_result]
+        if (
+            self._partial_prefix_recovery_enabled()
+            and verify_result in {"partial_accept", "reject_at_first_token"}
+            and apply_action == "partial_prefix_recovery"
+        ):
+            expected_action = apply_action
         if verify_result == "reject_at_first_token" and apply_action == "discard_partial_no_mutation":
             expected_action = apply_action
         if apply_action != expected_action:
@@ -7808,11 +7994,13 @@ class ModelRunnerBase:
         mutation_by_id: dict[int, bool] = {}
         checkpoint_failed_by_id: dict[int, bool] = {}
         result_items: list[dict] = []
+        partial_recovery_enabled = self._partial_prefix_recovery_enabled()
 
         for proposal, seq in zip(executed_proposals, executed_seqs):
             proposal_id = int(proposal.proposal_id)
             seq_id = int(seq.seq_id)
             accept_len = int(results["accepted_len_by_seq_id"].get(seq_id, 0))
+            revised_token = int(results["revised_token_by_seq_id"].get(seq_id, -1))
             verify_result = self._verify_result_from_accept_len(accept_len, gamma)
             accept_len_by_id[proposal_id] = accept_len
             verify_result_by_id[proposal_id] = verify_result
@@ -7830,22 +8018,61 @@ class ModelRunnerBase:
             checkpoint_ok = True
             rollback_ok = True
             mutation_remaining = False
+            proposal_tokens = [int(token_id) for token_id in proposal.proposal_token_ids]
             if verify_result == "full_accept":
                 checkpoint_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
-                for token_id in proposal.proposal_token_ids:
+                for token_id in proposal_tokens:
                     seq.append_token(int(token_id))
                 seq.pre_verify = False
-                appended_count = len(proposal.proposal_token_ids)
+                appended_count = len(proposal_tokens)
                 action = "append_full_accept_then_rollback"
                 apply_executed_ids.append(proposal_id)
                 rollback_ok, mutation_remaining = self._rollback_eager_apply_dry_run(seq, checkpoint, appended_count)
-            elif verify_result == "partial_accept":
-                action = "discard_partial_no_mutation"
             else:
-                action = "discard_reject_no_mutation"
+                recovery_possible = partial_recovery_enabled and revised_token >= 0
+                if recovery_possible:
+                    checkpoint_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                    recovery_tokens = proposal_tokens[:max(0, accept_len)] + [int(revised_token)]
+                    frontier_before = int(len(seq))
+                    for token_id in recovery_tokens:
+                        seq.append_token(int(token_id))
+                        self.scheduler.block_manager.may_append(seq)
+                    seq.pre_verify = True
+                    seq.record_accepted(max(0, accept_len))
+                    appended_count = len(recovery_tokens)
+                    action = "partial_prefix_recovery"
+                    rollback_ok = True
+                    mutation_remaining = False
+                    self._mark_eager_commit_finished_if_needed(seq, recovery_tokens)
+                    self._record_partial_prefix_recovery_success(
+                        trace_record,
+                        proposal_id=proposal_id,
+                        seq_id=seq_id,
+                        depth=1,
+                        accepted_prefix_len=max(0, accept_len),
+                        reject_index=max(0, accept_len),
+                        revised_token_id=int(revised_token),
+                        frontier_before=frontier_before,
+                        frontier_after=int(len(seq)),
+                    )
+                    apply_executed_ids.append(proposal_id)
+                else:
+                    if partial_recovery_enabled:
+                        self._increment_partial_recovery_skip(
+                            trace_record,
+                            depth=1,
+                            reason="partial_recovery_missing_revised_token",
+                        )
+                    action = (
+                        "discard_partial_no_mutation"
+                        if verify_result == "partial_accept"
+                        else "discard_reject_no_mutation"
+                    )
             action_by_id[proposal_id] = action
+            if action == "partial_prefix_recovery":
+                not_ready_reason_by_id[proposal_id] = "partial_prefix_recovered"
             append_by_id[proposal_id] = int(appended_count)
-            discard_by_id[proposal_id] = 0 if appended_count else gamma
+            discard_by_id[proposal_id] = 0 if verify_result == "full_accept" else max(0, gamma - accept_len)
             rollback_ok_by_id[proposal_id] = bool(rollback_ok)
             mutation_by_id[proposal_id] = bool(mutation_remaining)
             checkpoint_failed_by_id[proposal_id] = not bool(checkpoint_ok)
@@ -7873,7 +8100,7 @@ class ModelRunnerBase:
                     "full_accept": verify_result == "full_accept",
                     "reject_position": -1 if verify_result == "full_accept" else accept_len,
                     "invalidated_len": max(0, gamma - accept_len),
-                    "revised_token": -1,
+                    "revised_token": revised_token,
                     "proposal_len": gamma,
                     "to_verify_len": gamma,
                     "gamma": gamma,
@@ -8081,6 +8308,7 @@ class ModelRunnerBase:
                 rollback_ok,
                 mutation_detected,
                 checkpoint_failed,
+                revised_token,
             ) = payload_values[base:base + CONTINUOUS_EAGER_RESULT_TRANSFER_PAYLOAD_WIDTH]
             proposal = known_by_id.get(int(proposal_id))
             request_id = self._numeric_request_id(proposal.request_id) if proposal is not None else -1
@@ -8115,7 +8343,7 @@ class ModelRunnerBase:
                     "full_accept": bool(full_accept),
                     "reject_position": -1 if full_accept else max(0, accepted_len),
                     "invalidated_len": max(0, proposal_len - max(0, accepted_len)),
-                    "revised_token": -1,
+                    "revised_token": int(revised_token),
                     "proposal_len": proposal_len,
                     "to_verify_len": proposal_len,
                     "gamma": int(gamma),
@@ -8257,6 +8485,7 @@ class ModelRunnerBase:
         append_by_id: dict[int, int] = {}
         discard_by_id: dict[int, int] = {}
         reason_counts: dict[str, int] = {}
+        partial_recovery_enabled = self._partial_prefix_recovery_enabled()
 
         for result in validated_results:
             proposal_id = int(result["proposal_id"])
@@ -8292,7 +8521,47 @@ class ModelRunnerBase:
             elif verify_result == "full_accept" and target_action != "append_full_accept_then_rollback":
                 reason = "action_mismatch"
             elif verify_result != "full_accept":
-                reason = "continuous_not_full_accept"
+                revised_token = int(result.get("revised_token", -1))
+                if partial_recovery_enabled and revised_token >= 0 and target_action == "partial_prefix_recovery":
+                    checkpoint = self._make_eager_apply_checkpoint(seq)
+                    checkpoint_ok = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                    proposal_tokens = [int(token_id) for token_id in proposal.proposal_token_ids]
+                    recovery_tokens = proposal_tokens[:max(0, accept_len)] + [int(revised_token)]
+                    frontier_before = int(len(seq))
+                    for token_id in recovery_tokens:
+                        seq.append_token(int(token_id))
+                        self.scheduler.block_manager.may_append(seq)
+                    seq.pre_verify = True
+                    seq.record_accepted(max(0, accept_len))
+                    appended_count = len(recovery_tokens)
+                    append_by_id[proposal_id] = int(appended_count)
+                    discard_by_id[proposal_id] = max(0, gamma - accept_len)
+                    rollback_ok_by_id[proposal_id] = True
+                    mutation_by_id[proposal_id] = False
+                    checkpoint_failed_by_id[proposal_id] = not bool(checkpoint_ok)
+                    draft_action_by_id[proposal_id] = "partial_prefix_recovery"
+                    self._mark_eager_commit_finished_if_needed(seq, recovery_tokens)
+                    self._record_partial_prefix_recovery_success(
+                        trace_record,
+                        proposal_id=proposal_id,
+                        seq_id=seq_id,
+                        depth=1,
+                        accepted_prefix_len=max(0, accept_len),
+                        reject_index=max(0, accept_len),
+                        revised_token_id=int(revised_token),
+                        frontier_before=frontier_before,
+                        frontier_after=int(len(seq)),
+                    )
+                    executed_ids.append(proposal_id)
+                    reason = "partial_prefix_recovered"
+                else:
+                    if partial_recovery_enabled:
+                        self._increment_partial_recovery_skip(
+                            trace_record,
+                            depth=1,
+                            reason="partial_recovery_missing_revised_token",
+                        )
+                    reason = "continuous_not_full_accept"
             elif not bool(result.get("rollback_ok", False)):
                 reason = "target_rollback_failed"
             elif bool(result.get("mutation_detected", True)):

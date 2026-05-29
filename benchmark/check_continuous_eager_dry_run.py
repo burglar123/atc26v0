@@ -192,6 +192,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         verify_result_by_id = as_str_map(record.get("continuous_eager_verify_result_by_proposal_id"))
         accept_len_by_id = as_int_map(record.get("continuous_eager_accept_len_by_proposal_id"))
         apply_action_by_id = as_str_map(record.get("continuous_eager_apply_action_by_proposal_id"))
+        partial_recovery_enabled = bool(record.get("partial_prefix_recovery_enabled", False)) or bool(
+            record.get("enable_rolling_continuous_partial_prefix_recovery", False)
+        )
+        partial_recovered_ids = as_int_set(record.get("partial_prefix_recovered_proposal_ids"))
         apply_rollback_by_id = record.get("continuous_eager_apply_rollback_ok_by_proposal_id") or {}
         apply_mutation_by_id = record.get("continuous_eager_apply_mutation_detected_by_proposal_id") or {}
         apply_checkpoint_by_id = record.get("continuous_eager_apply_checkpoint_failed_by_proposal_id") or {}
@@ -253,8 +257,17 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(
                 f"record[{idx}] full-accept ids are not verified: {sorted(full_accept_ids - verified_ids)}"
             )
-        if verify_apply_enabled and apply_executed - full_accept_ids:
-            errors.append(f"record[{idx}] non-full-accept ids were apply-executed: {sorted(apply_executed - full_accept_ids)}")
+        if verify_apply_enabled:
+            legal_partial_apply_ids = set()
+            if partial_recovery_enabled:
+                legal_partial_apply_ids = {
+                    proposal_id
+                    for proposal_id in partial_recovered_ids
+                    if apply_action_by_id.get(proposal_id) == "partial_prefix_recovery"
+                }
+            illegal_apply_ids = apply_executed - full_accept_ids - legal_partial_apply_ids
+            if illegal_apply_ids:
+                errors.append(f"record[{idx}] non-full-accept ids were apply-executed: {sorted(illegal_apply_ids)}")
         for proposal_id in full_accept_ids:
             if int(accept_len_by_id.get(proposal_id, -1)) != int(token_by_id.get(proposal_id, 0)):
                 errors.append(f"record[{idx}] full-accept {proposal_id} accept_len/token_count mismatch")
