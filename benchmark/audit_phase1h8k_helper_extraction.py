@@ -14,6 +14,7 @@ RUNTIME_FILE = Path("nano_pearl/pearl_engine/pearl_model_runner.py")
 FORBIDDEN_FLAG_RE = re.compile(r"\benable_[a-zA-Z0-9_]*\b")
 SUSPICIOUS_RUNTIME_RE = re.compile(r"\b(depth4|depth_?4|unbounded|partial)\b", re.IGNORECASE)
 HELPER_DEF_RE = re.compile(r"^\+\s+def (_[a-zA-Z0-9_]+)\(")
+ADDED_DEF_RE = re.compile(r"^\+\s+def ([a-zA-Z0-9_]+)\(")
 
 
 def run_git_diff(repo_root: Path, path: Path) -> list[str]:
@@ -49,6 +50,17 @@ def audit_runtime_diff(repo_root: Path) -> tuple[list[str], dict[str, Any]]:
             if match is not None
         }
     )
+    added_function_names = sorted(
+        {
+            match.group(1)
+            for line in added_lines
+            for match in [ADDED_DEF_RE.match(line)]
+            if match is not None
+        }
+    )
+    non_helper_function_names = [
+        name for name in added_function_names if not name.startswith("_")
+    ]
     added_flags = sorted(
         {
             match.group(0)
@@ -66,11 +78,15 @@ def audit_runtime_diff(repo_root: Path) -> tuple[list[str], dict[str, Any]]:
         errors.append(f"new runtime flag-looking tokens added: {added_flags}")
     if suspicious_lines:
         errors.append(f"suspicious depth4/unbounded/partial runtime additions: {suspicious_lines}")
+    if non_helper_function_names:
+        errors.append(f"non-internal runtime functions added: {non_helper_function_names}")
     summary = {
         "runtime_file": str(RUNTIME_FILE),
         "runtime_diff_line_count": len(diff_lines),
         "runtime_added_line_count": len(added_lines),
         "helper_names_added": helper_names,
+        "runtime_function_names_added": added_function_names,
+        "helper_name_style_ok": not non_helper_function_names,
         "new_runtime_flag_tokens": added_flags,
         "suspicious_runtime_additions": suspicious_lines,
     }
@@ -120,7 +136,7 @@ def print_summary(summary: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Best-effort audit for Phase 1H-8k helper extraction.")
+    parser = argparse.ArgumentParser(description="Best-effort audit for Phase 1H-8k/8l helper extraction.")
     parser.add_argument("--repo-root", type=Path, default=Path("."))
     parser.add_argument("--before-trace", type=Path)
     parser.add_argument("--after-trace", type=Path)
@@ -141,7 +157,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("Phase 1H-8k helper extraction audit passed.")
+    print("Phase 1H-8k/8l helper extraction audit passed.")
     return 0
 
 
