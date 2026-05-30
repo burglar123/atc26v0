@@ -60,6 +60,8 @@ PROPOSAL_LEN_MAP_KEYS = [
     "rolling_depth3_real_committed_token_count_by_proposal_id",
     "rolling_depth4_child_token_count_by_proposal_id",
     "rolling_depth4_real_committed_token_count_by_proposal_id",
+    "generic_rolling_token_count_by_proposal_id",
+    "generic_rolling_real_committed_token_count_by_proposal_id",
 ]
 DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
 DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
@@ -120,6 +122,31 @@ def as_int_set(value: Any) -> set[int]:
 
 
 def as_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
+def as_depth_int_lists(value: Any) -> dict[int, list[int]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, list[int]] = {}
+    for key, items in value.items():
+        try:
+            depth = int(key)
+        except Exception:
+            continue
+        result[depth] = as_int_list(items)
+    return result
+
+
+def as_depth_int_map(value: Any) -> dict[int, int]:
     if not isinstance(value, dict):
         return {}
     result: dict[int, int] = {}
@@ -453,6 +480,14 @@ def aggregate_performance_accounting(
     rolling_depth2_commit_decision_payload_len_units = 0
     rolling_depth3_commit_decision_payload_len_units = 0
     rolling_depth4_commit_decision_payload_len_units = 0
+    generic_rolling_real_committed_ids_by_depth: dict[int, set[int]] = {}
+    generic_rolling_real_committed_token_by_id: dict[int, int] = {}
+    generic_rolling_real_committed_token_by_depth: dict[int, int] = {}
+    generic_rolling_target_verified_sum = 0
+    generic_rolling_target_accepted_sum = 0
+    generic_rolling_draft_verified_sum = 0
+    generic_rolling_draft_accepted_sum = 0
+    generic_rolling_commit_decision_payload_len_units = 0
     rolling_max_depth_observed = 0
     partial_prefix_recovery_enabled = False
     partial_prefix_recovered_ids: set[int] = set()
@@ -1068,6 +1103,56 @@ def aggregate_performance_accounting(
             if payload_len > 0 and event_key not in counted_payload_len_events:
                 counted_payload_len_events.add(event_key)
                 rolling_depth4_commit_decision_payload_len_units += payload_len
+        generic_token_by_id = as_int_map(record.get("generic_rolling_real_committed_token_count_by_proposal_id"))
+        generic_token_by_depth = as_depth_int_map(record.get("generic_rolling_real_committed_token_count_by_depth"))
+        generic_committed_by_depth = as_depth_int_lists(record.get("generic_rolling_real_committed_proposal_ids_by_depth"))
+        for depth, proposal_ids in generic_committed_by_depth.items():
+            if depth < 5:
+                continue
+            generic_rolling_real_committed_ids_by_depth.setdefault(depth, set()).update(proposal_ids)
+        for proposal_id, token_count in generic_token_by_id.items():
+            if token_count > 0:
+                generic_rolling_real_committed_token_by_id.setdefault(proposal_id, token_count)
+        for depth, token_count in generic_token_by_depth.items():
+            if depth >= 5 and token_count > 0:
+                generic_rolling_real_committed_token_by_depth[depth] = max(
+                    int(generic_rolling_real_committed_token_by_depth.get(depth, 0)),
+                    int(token_count),
+                )
+        generic_side = str(record.get("runner_role") or "")
+        generic_record_token_sum = sum(int(v) for d, v in generic_token_by_depth.items() if int(d) >= 5)
+        if generic_record_token_sum and generic_side in {"target", "draft"}:
+            if generic_side == "target":
+                generic_rolling_target_verified_sum = max(
+                    int(generic_rolling_target_verified_sum),
+                    int(generic_record_token_sum),
+                )
+                generic_rolling_target_accepted_sum = max(
+                    int(generic_rolling_target_accepted_sum),
+                    int(generic_record_token_sum),
+                )
+            else:
+                generic_rolling_draft_verified_sum = max(
+                    int(generic_rolling_draft_verified_sum),
+                    int(generic_record_token_sum),
+                )
+                generic_rolling_draft_accepted_sum = max(
+                    int(generic_rolling_draft_accepted_sum),
+                    int(generic_record_token_sum),
+                )
+        if "generic_rolling_commit_decision_payload_len_units" in record:
+            payload_len = int_value(record.get("generic_rolling_commit_decision_payload_len_units"), 0)
+            if payload_len < 0:
+                negative_payload_field_count += 1
+            event_key = (
+                "generic_rolling_commit_decision_payload_len_units",
+                key[0],
+                key[1],
+                payload_len,
+            )
+            if payload_len > 0 and event_key not in counted_payload_len_events:
+                counted_payload_len_events.add(event_key)
+                generic_rolling_commit_decision_payload_len_units += payload_len
         rolling_max_depth_observed = max(
             rolling_max_depth_observed,
             int_value(record.get("rolling_max_depth_observed"), 0),
@@ -1234,6 +1319,25 @@ def aggregate_performance_accounting(
         )
         for proposal_id in rolling_depth4_real_committed_ids
     )
+    generic_rolling_real_committed_token_count = sum(
+        int(value) for value in generic_rolling_real_committed_token_by_id.values()
+    )
+    generic_rolling_target_verified_sum = max(
+        int(generic_rolling_target_verified_sum),
+        int(generic_rolling_real_committed_token_count),
+    )
+    generic_rolling_target_accepted_sum = max(
+        int(generic_rolling_target_accepted_sum),
+        int(generic_rolling_real_committed_token_count),
+    )
+    generic_rolling_draft_verified_sum = max(
+        int(generic_rolling_draft_verified_sum),
+        int(generic_rolling_real_committed_token_count),
+    )
+    generic_rolling_draft_accepted_sum = max(
+        int(generic_rolling_draft_accepted_sum),
+        int(generic_rolling_real_committed_token_count),
+    )
     partial_prefix_accepted_token_count = sum(
         int(partial_prefix_accepted_len_by_id.get(proposal_id, 0))
         for proposal_id in partial_prefix_recovered_ids
@@ -1258,6 +1362,7 @@ def aggregate_performance_accounting(
         + rolling_depth2_real_committed_token_count
         + rolling_depth3_real_committed_token_count
         + rolling_depth4_real_committed_token_count
+        + generic_rolling_real_committed_token_count
     )
     combined_real_committed_token_count = (
         full_accept_combined_real_committed_token_count
@@ -1269,6 +1374,7 @@ def aggregate_performance_accounting(
         + rolling_depth2_target_accepted_sum
         + rolling_depth3_target_accepted_sum
         + rolling_depth4_target_accepted_sum
+        + generic_rolling_target_accepted_sum
         + partial_prefix_accepted_token_count
     )
     combined_actual_revised_token_increment_sum = partial_prefix_revised_token_count
@@ -1491,6 +1597,20 @@ def aggregate_performance_accounting(
             Counter(rolling_depth4_real_commit_skip_reason_by_id.values())
         ),
         "rolling_depth_gt4_real_commit_count": rolling_depth_gt4_real_commit_count,
+        "generic_rolling_real_committed_token_count": generic_rolling_real_committed_token_count,
+        "generic_rolling_real_committed_token_count_by_depth": {
+            str(depth): int(value)
+            for depth, value in sorted(generic_rolling_real_committed_token_by_depth.items())
+        },
+        "generic_rolling_real_committed_proposal_count_by_depth": {
+            str(depth): len(proposal_ids)
+            for depth, proposal_ids in sorted(generic_rolling_real_committed_ids_by_depth.items())
+        },
+        "generic_rolling_target_actual_verified_token_increment_sum": generic_rolling_target_verified_sum,
+        "generic_rolling_target_actual_accepted_token_increment_sum": generic_rolling_target_accepted_sum,
+        "generic_rolling_draft_actual_verified_token_increment_sum": generic_rolling_draft_verified_sum,
+        "generic_rolling_draft_actual_accepted_token_increment_sum": generic_rolling_draft_accepted_sum,
+        "generic_rolling_commit_decision_broadcast_payload_len_units": generic_rolling_commit_decision_payload_len_units,
         "rolling_depth4_drop_reason_counts": dict(Counter(rolling_depth4_drop_reason_by_id.values())),
         "rolling_depth4_max_depth_observed": rolling_depth4_max_depth_observed,
         "rolling_depth4_estimated_future_token_count": rolling_depth4_child_ready_shadow_token_count,
@@ -1523,6 +1643,7 @@ def aggregate_performance_accounting(
             + rolling_depth2_target_verified_sum
             + rolling_depth3_target_verified_sum
             + rolling_depth4_target_verified_sum
+            + generic_rolling_target_verified_sum
             + partial_prefix_accepted_token_count
             + partial_prefix_revised_token_count
         ),

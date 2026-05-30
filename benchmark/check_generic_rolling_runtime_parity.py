@@ -27,6 +27,7 @@ FULL_COMMIT_TOKEN_FIELDS = (
     "rolling_depth2_real_committed_token_count",
     "rolling_depth3_real_committed_token_count",
     "rolling_depth4_real_committed_token_count",
+    "generic_rolling_real_committed_token_count",
 )
 
 GENERIC_RUNTIME_INT_FIELDS = (

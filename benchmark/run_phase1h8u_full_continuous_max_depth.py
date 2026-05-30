@@ -49,6 +49,7 @@ class FullContinuousMaxDepthCase:
     full_continuous_enabled: bool
     max_depth: int
     description: str
+    require_depth_gt4_activity: bool = False
 
 
 CASE_PRESETS: dict[str, FullContinuousMaxDepthCase] = {
@@ -79,6 +80,14 @@ CASE_PRESETS: dict[str, FullContinuousMaxDepthCase] = {
         True,
         100,
         "Depth100 full continuous stress case using the partial-recovery workload preset.",
+    ),
+    "full_continuous_depth100_must_exceed4": FullContinuousMaxDepthCase(
+        "full_continuous_depth100_must_exceed4",
+        APPLY_CASE_PRESETS["generic_apply_baseline"],
+        True,
+        100,
+        "Depth100 full continuous case that fails unless real depth>4 activity is observed.",
+        True,
     ),
 }
 
@@ -220,6 +229,24 @@ def run_case(
             check_status = core_checker_chain_status
         else:
             core_chain_passed = True
+        if core_chain_passed and case.require_depth_gt4_activity:
+            strict_status = run_command(
+                [
+                    args.python,
+                    "benchmark/check_full_continuous_max_depth.py",
+                    str(engine_trace),
+                    str(result_json),
+                    "--require-depth-gt4-activity",
+                ],
+                env,
+                args.print_only,
+            )
+            if strict_status != 0:
+                status = strict_status
+                check_status = "failed:benchmark/check_full_continuous_max_depth.py:depth_gt4_activity"
+                core_checker_chain_status = check_status
+                core_checker_chain_failed_checker = "benchmark/check_full_continuous_max_depth.py"
+                core_chain_passed = False
         if core_chain_passed and legacy_depth_checker_chain_ran:
             legacy_status, legacy_depth_checker_chain_status, legacy_depth_checker_chain_failed_checker = (
                 run_checker_chain(
@@ -241,6 +268,7 @@ def run_case(
         "generic_rolling_apply_path_enabled": case.apply_case.generic_apply_enabled,
         "generic_full_continuous_enabled": case.full_continuous_enabled,
         "generic_full_continuous_max_depth": case.max_depth if case.full_continuous_enabled else 0,
+        "require_depth_gt4_activity": bool(case.require_depth_gt4_activity),
         "partial_prefix_recovery_enabled": case.apply_case.runtime_case.base_case.partial_recovery_enabled,
         "check_status": check_status,
         "core_checker_chain_status": core_checker_chain_status,
@@ -305,7 +333,8 @@ def parse_args() -> argparse.Namespace:
         "--cases",
         default=(
             "baseline_8t_generic_apply_depth4,full_continuous_depth100_baseline,"
-            "full_continuous_depth100_partial_recovery,full_continuous_depth100_stress"
+            "full_continuous_depth100_partial_recovery,full_continuous_depth100_stress,"
+            "full_continuous_depth100_must_exceed4"
         ),
     )
     parser.add_argument("--list-cases", action="store_true")

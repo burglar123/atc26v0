@@ -231,7 +231,13 @@ def validate_accounting(
 
 
 def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[str, int]:
-    issue_sets = registry_safety_issue_sets(registry, max_depth=MAX_LEGACY_REAL_DEPTH)
+    validation_max_depth = MAX_LEGACY_REAL_DEPTH
+    if registry.flags.get("generic_full_continuous_enabled", False):
+        validation_max_depth = max(
+            validation_max_depth,
+            min(100, int(registry.max_configured_depth or registry.max_real_committed_depth or validation_max_depth)),
+        )
+    issue_sets = registry_safety_issue_sets(registry, max_depth=validation_max_depth)
     invalid_committed_ids = set(issue_sets["invalid_committed_ids"])
     cascade_committed_ids = set(issue_sets["cascade_committed_ids"])
     parent_missing_ids = set(issue_sets["parent_missing_ids"])
@@ -239,7 +245,7 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
     non_full_ids = set(issue_sets["non_full_ids"])
     stale_committed_ids = set(issue_sets["stale_committed_ids"])
 
-    for depth in range(0, MAX_LEGACY_REAL_DEPTH + 1):
+    for depth in range(0, validation_max_depth + 1):
         expected_action = ROLLING_ACTION if depth >= 2 else ONE_SHOT_ACTION
         for proposal_id in sorted(registry.committed_by_depth[depth]):
             node = registry.nodes_by_id.get(proposal_id)
@@ -275,7 +281,7 @@ def validate_chain(registry: RollingChainRegistry, errors: list[str]) -> dict[st
             if node.root_id is not None and parent_root is not None and node.root_id != parent_root:
                 errors.append(f"proposal {proposal_id} root {node.root_id} differs from parent {node.parent_id} root {parent_root}")
 
-    if registry.higher_depth_commit_ids:
+    if registry.higher_depth_commit_ids and not registry.flags.get("generic_full_continuous_enabled", False):
         errors.append(f"depth>4 committed proposal ids present: {sorted(registry.higher_depth_commit_ids)}")
     if registry.depth4_real_commit_count and not registry.flags.get("rolling_depth4_commit_enabled", False):
         errors.append("rolling depth4 real commit count requires depth4 commit flag")

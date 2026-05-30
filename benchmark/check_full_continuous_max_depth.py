@@ -161,6 +161,8 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
 def validate_records(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
+    *,
+    require_depth_gt4_activity: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     summary = build_summary(records, result_payload)
     errors: list[str] = []
@@ -237,6 +239,28 @@ def validate_records(
         errors.append("stop reason counts must explain chains that stop before max depth")
     if not bool(summary.get("generic_full_continuous_parity_ok", False)):
         errors.append("generic_full_continuous_parity_ok must be true")
+    if require_depth_gt4_activity:
+        activity_depths: set[int] = set()
+        for field in (
+            "generic_full_continuous_depth_commit_token_counts",
+            "generic_full_continuous_depth_candidate_token_counts",
+            "generic_full_continuous_depth_ready_token_counts",
+            "generic_full_continuous_depth_partial_recovered_token_counts",
+            "generic_full_continuous_depth_revised_token_counts",
+        ):
+            raw = summary.get(field)
+            if not isinstance(raw, dict):
+                continue
+            for key, value in raw.items():
+                try:
+                    depth = int(key)
+                    count = int(value)
+                except Exception:
+                    continue
+                if depth > 4 and count > 0:
+                    activity_depths.add(depth)
+        if max(activity_depths or {0}) <= 4 and max_observed <= 4:
+            errors.append("full continuous mode must show real depth>4 candidate/ready/commit activity")
 
     return errors, summary
 
@@ -250,6 +274,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_max_observed_depth",
         "generic_full_continuous_max_real_committed_depth",
         "generic_full_continuous_depth_commit_token_counts",
+        "generic_full_continuous_depth_candidate_token_counts",
+        "generic_full_continuous_depth_ready_token_counts",
         "generic_full_continuous_depth_partial_recovered_token_counts",
         "generic_full_continuous_depth_revised_token_counts",
         "generic_full_continuous_stop_reason_counts",
@@ -422,6 +448,22 @@ def run_synthetic() -> None:
     disabled_leak[0]["enable_full_continuous_eager"] = False
     _assert_fail("disabled full continuous leakage", disabled_leak, "nonzero while disabled")
 
+    errors, summary = validate_records(
+        [_base_record(max_depth=100, max_observed=4, max_real=4)],
+        synthetic_result_payload(),
+        require_depth_gt4_activity=True,
+    )
+    if not any("depth>4" in error for error in errors):
+        raise SystemExit(f"synthetic require depth>4 should fail\nerrors={errors}\nsummary={summary}")
+
+    errors, summary = validate_records(
+        [_base_record(max_depth=100, max_observed=5, max_real=5, depth_commit_counts={"1": 8, "2": 8, "3": 8, "4": 8, "5": 4})],
+        synthetic_result_payload(),
+        require_depth_gt4_activity=True,
+    )
+    if errors:
+        raise SystemExit(f"synthetic require depth>4 should pass: {errors}\nsummary={summary}")
+
     print("Synthetic full continuous max-depth checks passed.")
 
 
@@ -430,6 +472,7 @@ def main() -> int:
     parser.add_argument("trace", nargs="?", type=Path)
     parser.add_argument("result", nargs="?", type=Path)
     parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--require-depth-gt4-activity", action="store_true")
     args = parser.parse_args()
 
     if args.synthetic or args.trace is None:
@@ -438,7 +481,11 @@ def main() -> int:
 
     records = load_trace(args.trace)
     result_payload = load_json(args.result) if args.result is not None else {}
-    errors, summary = validate_records(records, result_payload)
+    errors, summary = validate_records(
+        records,
+        result_payload,
+        require_depth_gt4_activity=bool(args.require_depth_gt4_activity),
+    )
     print_summary(summary)
     if errors:
         print("check_status=fail")

@@ -98,6 +98,31 @@ def as_int_map(value: Any) -> dict[int, int]:
     return result
 
 
+def as_depth_int_lists(value: Any) -> dict[int, list[int]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, list[int]] = {}
+    for key, items in value.items():
+        try:
+            depth = int(key)
+        except Exception:
+            continue
+        result[depth] = as_int_list(items)
+    return result
+
+
+def as_depth_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
 def as_str_map(value: Any) -> dict[int, str]:
     if not isinstance(value, dict):
         return {}
@@ -223,17 +248,25 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         "rolling_depth3_commit_enabled": False,
         "rolling_depth4_shadow_enabled": False,
         "rolling_depth4_commit_enabled": False,
+        "generic_full_continuous_enabled": False,
     }
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
-        max_configured_depth = max(max_configured_depth, int_value(record.get("max_rolling_continuous_depth"), 0))
+        max_configured_depth = max(
+            max_configured_depth,
+            int_value(record.get("max_rolling_continuous_depth"), 0),
+            int_value(record.get("generic_full_continuous_max_depth"), 0),
+            int_value(record.get("generic_rolling_max_depth"), 0),
+        )
         max_observed_depth = max(
             max_observed_depth,
             int_value(record.get("rolling_max_depth_observed"), 0),
             int_value(record.get("max_rolling_continuous_depth_observed"), 0),
             int_value(record.get("rolling_depth3_max_depth_observed"), 0),
             int_value(record.get("rolling_depth4_max_depth_observed"), 0),
+            int_value(record.get("generic_full_continuous_max_observed_depth"), 0),
+            int_value(record.get("generic_rolling_max_observed_depth"), 0),
         )
         flags["one_shot_commit_enabled"] = flags["one_shot_commit_enabled"] or bool(
             record.get("enable_eager_commit_ready_only", False)
@@ -256,6 +289,9 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
         flags["rolling_depth4_commit_enabled"] = flags["rolling_depth4_commit_enabled"] or bool(
             record.get("enable_rolling_continuous_depth4_commit_ready_only", False)
         ) or bool(record.get("rolling_depth4_commit_enabled", False))
+        flags["generic_full_continuous_enabled"] = flags["generic_full_continuous_enabled"] or bool(
+            record.get("enable_full_continuous_eager", False)
+        ) or bool(record.get("generic_full_continuous_enabled", False))
 
         missing_unexpected_count += int_value(record.get("missing_buffered_proposal_unexpected_count"), 0)
         missing_unexpected_count += len(as_int_set(record.get("missing_buffered_proposal_unexpected_seq_ids")))
@@ -477,6 +513,61 @@ def collect_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
             id_field="rolling_depth4_real_committed_proposal_ids",
         )
 
+        generic_candidate_by_depth = as_depth_int_lists(record.get("generic_rolling_candidate_proposal_ids_by_depth"))
+        generic_ready_by_depth = as_depth_int_lists(record.get("generic_rolling_ready_proposal_ids_by_depth"))
+        generic_committed_by_depth = as_depth_int_lists(
+            record.get("generic_rolling_real_committed_proposal_ids_by_depth")
+        )
+        generic_candidate_seq_by_depth = as_depth_int_lists(record.get("generic_rolling_candidate_seq_ids_by_depth"))
+        generic_ready_seq_by_depth = as_depth_int_lists(record.get("generic_rolling_ready_seq_ids_by_depth"))
+        generic_committed_seq_by_depth = as_depth_int_lists(
+            record.get("generic_rolling_real_committed_seq_ids_by_depth")
+        )
+        generic_parent_by_id = as_int_map(record.get("generic_rolling_parent_by_proposal_id"))
+        generic_parent_by_id.update(as_int_map(record.get("generic_rolling_real_commit_parent_by_proposal_id")))
+        generic_root_by_id = as_int_map(record.get("generic_rolling_root_by_proposal_id"))
+        generic_root_by_id.update(as_int_map(record.get("generic_rolling_real_commit_root_by_proposal_id")))
+        generic_depth_by_id = as_int_map(record.get("generic_rolling_depth_by_proposal_id"))
+        generic_depth_by_id.update(as_int_map(record.get("generic_rolling_real_commit_depth_by_proposal_id")))
+        generic_token_by_id = as_int_map(record.get("generic_rolling_token_count_by_proposal_id"))
+        generic_token_by_id.update(as_int_map(record.get("generic_rolling_real_committed_token_count_by_proposal_id")))
+        generic_accept_by_id = as_int_map(record.get("generic_rolling_real_committed_accept_len_by_proposal_id"))
+        generic_action_by_id = as_str_map(record.get("generic_rolling_real_commit_action_by_proposal_id"))
+        generic_result_by_id = as_str_map(record.get("generic_rolling_real_commit_verify_result_by_proposal_id"))
+        for depth, proposal_ids in generic_candidate_by_depth.items():
+            if depth < 5:
+                continue
+            generated_by_depth[depth].update(proposal_ids)
+            add_seq_map(seq_by_depth, depth, proposal_ids, generic_candidate_seq_by_depth.get(depth, []))
+        for depth, proposal_ids in generic_ready_by_depth.items():
+            if depth < 5:
+                continue
+            ready_by_depth[depth].update(proposal_ids)
+            add_seq_map(seq_by_depth, depth, proposal_ids, generic_ready_seq_by_depth.get(depth, []))
+        for depth, proposal_ids in generic_committed_by_depth.items():
+            if depth < 5:
+                continue
+            committed_by_depth[depth].update(proposal_ids)
+            add_seq_map(seq_by_depth, depth, proposal_ids, generic_committed_seq_by_depth.get(depth, []))
+            if not flags.get("generic_full_continuous_enabled", False):
+                higher_depth_commit_ids.update(proposal_ids)
+        for proposal_id, depth in generic_depth_by_id.items():
+            if depth < 5:
+                continue
+            declared_depth_by_id.setdefault(proposal_id, depth)
+            if proposal_id in generic_parent_by_id:
+                parent_by_depth[depth].setdefault(proposal_id, generic_parent_by_id[proposal_id])
+            if proposal_id in generic_root_by_id:
+                root_by_depth[depth].setdefault(proposal_id, generic_root_by_id[proposal_id])
+            if proposal_id in generic_token_by_id and generic_token_by_id[proposal_id] > 0:
+                token_by_depth[depth].setdefault(proposal_id, generic_token_by_id[proposal_id])
+            if proposal_id in generic_accept_by_id and generic_accept_by_id[proposal_id] > 0:
+                accept_by_depth[depth].setdefault(proposal_id, generic_accept_by_id[proposal_id])
+            if proposal_id in generic_action_by_id:
+                action_by_depth[depth].setdefault(proposal_id, generic_action_by_id[proposal_id])
+            if proposal_id in generic_result_by_id:
+                result_by_depth[depth].setdefault(proposal_id, generic_result_by_id[proposal_id])
+
         for field in (
             "ready_eager_proposal_stale_ids",
             "ready_eager_proposal_expired_ids",
@@ -628,6 +719,7 @@ def validate_accounting_by_depth(accounting: dict[str, Any], errors: list[str]) 
         + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
         + int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
+        + int_value(accounting.get("generic_rolling_real_committed_token_count"), 0)
         + int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
     )
     combined_ok = int_value(accounting.get("combined_real_committed_token_count"), 0) == combined_expected
@@ -669,6 +761,12 @@ def validate_chain(trace: dict[str, Any], errors: list[str]) -> dict[str, int]:
     explicit_cascade_committed: set[int] = trace["explicit_cascade_committed"]
     explicit_non_full: set[int] = trace["explicit_non_full"]
     gamma = int(trace["gamma"])
+    max_audited_depth = MAX_AUDITED_REAL_DEPTH
+    if bool(trace["flags"].get("generic_full_continuous_enabled", False)):
+        max_audited_depth = max(
+            max_audited_depth,
+            min(100, int_value(trace.get("max_configured_depth"), max_audited_depth)),
+        )
 
     invalid_committed_ids: set[int] = set(explicit_invalid_committed)
     cascade_committed_ids: set[int] = set(explicit_cascade_committed)
@@ -677,7 +775,7 @@ def validate_chain(trace: dict[str, Any], errors: list[str]) -> dict[str, int]:
     non_full_ids: set[int] = set(explicit_non_full)
     stale_committed_ids: set[int] = set()
 
-    for depth in range(0, MAX_AUDITED_REAL_DEPTH + 1):
+    for depth in range(0, max_audited_depth + 1):
         expected_action = ROLLING_ACTION if depth >= 2 else ONE_SHOT_ACTION
         for proposal_id in sorted(committed_by_depth[depth]):
             declared_depth = declared_depth_by_id.get(proposal_id, depth)
@@ -764,9 +862,15 @@ def validate_records(
     committed_by_depth: dict[int, set[int]] = trace["committed_by_depth"]
     token_by_depth: dict[int, dict[int, int]] = trace["token_by_depth"]
     gamma = int(trace["gamma"])
+    max_audited_depth = MAX_AUDITED_REAL_DEPTH
+    if bool(trace["flags"].get("generic_full_continuous_enabled", False)):
+        max_audited_depth = max(
+            max_audited_depth,
+            min(100, int_value(trace.get("max_configured_depth"), max_audited_depth)),
+        )
     derived_tokens = {
         depth: proposal_tokens(committed_by_depth[depth], token_by_depth, depth, gamma)
-        for depth in range(0, MAX_AUDITED_REAL_DEPTH + 1)
+        for depth in range(0, max_audited_depth + 1)
     }
     accounting_token_keys = {
         0: "eager_committed_token_count",
@@ -780,6 +884,12 @@ def validate_records(
         if committed_by_depth[depth] or accounting_tokens:
             if accounting_tokens != derived_tokens[depth]:
                 errors.append(f"depth {depth} committed token aggregate mismatch")
+    generic_tokens_by_depth = as_depth_int_map(accounting.get("generic_rolling_real_committed_token_count_by_depth"))
+    for depth in range(5, max_audited_depth + 1):
+        accounting_tokens = int_value(generic_tokens_by_depth.get(depth), 0)
+        if committed_by_depth[depth] or accounting_tokens:
+            if accounting_tokens != derived_tokens[depth]:
+                errors.append(f"depth {depth} generic committed token aggregate mismatch")
 
     duplicate_commit_count = (
         len(trace["explicit_duplicate_ids"])
@@ -795,7 +905,7 @@ def validate_records(
             errors.append("depth4 real commit appears while depth4 commit flag is disabled")
         if not bool(trace["flags"].get("rolling_depth4_shadow_enabled", False)):
             errors.append("depth4 real commit appears while depth4 shadow flag is disabled")
-    if trace["higher_depth_commit_ids"]:
+    if trace["higher_depth_commit_ids"] and not bool(trace["flags"].get("generic_full_continuous_enabled", False)):
         errors.append(f"depth>4 committed proposal ids present: {sorted(trace['higher_depth_commit_ids'])}")
     if trace["length_mismatch_count"]:
         errors.append("target/draft length mismatch evidence present")
@@ -820,8 +930,8 @@ def validate_records(
         2 if int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0) else 0,
         1 if int_value(accounting.get("continuous_eager_real_committed_token_count"), 0) else 0,
     )
-    if max_real_depth > MAX_AUDITED_REAL_DEPTH:
-        errors.append(f"max real committed depth {max_real_depth} exceeds {MAX_AUDITED_REAL_DEPTH}")
+    if max_real_depth > max_audited_depth:
+        errors.append(f"max real committed depth {max_real_depth} exceeds {max_audited_depth}")
 
     summary = {
         "total_trace_records": len(records),

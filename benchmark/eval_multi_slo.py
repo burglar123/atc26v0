@@ -1392,6 +1392,23 @@ def append_generic_rolling_runtime_aggregate_trace(
     if not (generic_runtime_enabled or generic_apply_enabled or full_continuous_enabled):
         return
 
+    generic_depth_tokens: Dict[int, int] = {}
+    raw_generic_depth_tokens = accounting.get("generic_rolling_real_committed_token_count_by_depth")
+    if isinstance(raw_generic_depth_tokens, dict):
+        for raw_depth, raw_tokens in raw_generic_depth_tokens.items():
+            depth = to_int(raw_depth, 0) or 0
+            tokens = to_int(raw_tokens, 0) or 0
+            if depth >= 5 and tokens > 0:
+                generic_depth_tokens[int(depth)] = int(tokens)
+    generic_depth_proposals: Dict[int, int] = {}
+    raw_generic_depth_proposals = accounting.get("generic_rolling_real_committed_proposal_count_by_depth")
+    if isinstance(raw_generic_depth_proposals, dict):
+        for raw_depth, raw_count in raw_generic_depth_proposals.items():
+            depth = to_int(raw_depth, 0) or 0
+            count = to_int(raw_count, 0) or 0
+            if depth >= 5 and count > 0:
+                generic_depth_proposals[int(depth)] = int(count)
+    generic_tail_tokens = sum(generic_depth_tokens.values())
     full_commit_tokens = sum(
         to_int(accounting.get(field), 0) or 0
         for field in (
@@ -1401,7 +1418,7 @@ def append_generic_rolling_runtime_aggregate_trace(
             "rolling_depth3_real_committed_token_count",
             "rolling_depth4_real_committed_token_count",
         )
-    )
+    ) + int(generic_tail_tokens)
     partial_total = to_int(accounting.get("partial_prefix_total_recovered_token_count"), 0) or 0
     revised_tokens = to_int(accounting.get("partial_prefix_revised_token_count"), 0) or 0
     output_tokens = full_commit_tokens + partial_total
@@ -1409,6 +1426,7 @@ def append_generic_rolling_runtime_aggregate_trace(
     max_observed_depth = max(
         to_int(accounting.get("rolling_depth3_max_depth_observed"), 0) or 0,
         to_int(accounting.get("rolling_depth4_max_depth_observed"), 0) or 0,
+        to_int(accounting.get("generic_rolling_max_observed_depth"), 0) or 0,
     )
     depth_tokens = {
         0: to_int(accounting.get("eager_committed_token_count"), 0) or 0,
@@ -1417,6 +1435,7 @@ def append_generic_rolling_runtime_aggregate_trace(
         3: to_int(accounting.get("rolling_depth3_real_committed_token_count"), 0) or 0,
         4: to_int(accounting.get("rolling_depth4_real_committed_token_count"), 0) or 0,
     }
+    depth_tokens.update(generic_depth_tokens)
     max_real_depth = max([depth for depth, tokens in depth_tokens.items() if tokens > 0] + [0])
     normal_lane_conflict_count = sum(
         to_int(accounting.get(field), 0) or 0
@@ -1424,6 +1443,7 @@ def append_generic_rolling_runtime_aggregate_trace(
             "rolling_normal_lane_conflict_count",
             "rolling_depth3_normal_lane_conflict_count",
             "rolling_depth4_normal_lane_conflict_count",
+            "generic_rolling_normal_lane_conflict_count",
         )
     )
     target_draft_mismatch_count = sum(
@@ -1443,7 +1463,7 @@ def append_generic_rolling_runtime_aggregate_trace(
             "rolling_depth4_real_committed_proposal_count",
             "partial_prefix_recovery_success_count",
         )
-    )
+    ) + sum(generic_depth_proposals.values())
     cascade_count = to_int(accounting.get("partial_recovery_cascade_discard_count"), 0) or 0
     max_depth_ok = bool(max_depth == 4 or (full_continuous_enabled and 4 <= max_depth <= 100))
     depth_commit_token_counts = {
@@ -1452,12 +1472,18 @@ def append_generic_rolling_runtime_aggregate_trace(
         "3": int(depth_tokens.get(3, 0)),
         "4": int(depth_tokens.get(4, 0)),
     }
+    depth_commit_token_counts.update(
+        {str(depth): int(tokens) for depth, tokens in sorted(generic_depth_tokens.items())}
+    )
     depth_commit_proposal_counts = {
         "1": to_int(accounting.get("continuous_eager_real_committed_proposal_count"), 0) or 0,
         "2": to_int(accounting.get("rolling_depth2_real_committed_proposal_count"), 0) or 0,
         "3": to_int(accounting.get("rolling_depth3_real_committed_proposal_count"), 0) or 0,
         "4": to_int(accounting.get("rolling_depth4_real_committed_proposal_count"), 0) or 0,
     }
+    depth_commit_proposal_counts.update(
+        {str(depth): int(count) for depth, count in sorted(generic_depth_proposals.items())}
+    )
     depth_candidate_token_counts = {
         "1": to_int(accounting.get("continuous_eager_candidate_token_count"), 0) or 0,
         "2": to_int(accounting.get("rolling_child_candidate_token_count"), 0) or 0,
@@ -1533,7 +1559,10 @@ def append_generic_rolling_runtime_aggregate_trace(
         "generic_rolling_normal_lane_conflict_count": int(normal_lane_conflict_count),
         "generic_rolling_target_draft_mismatch_count": int(target_draft_mismatch_count),
         "generic_rolling_parity_ok": parity_ok,
-        "generic_rolling_apply_depths": [2, 3, 4] if generic_apply_enabled else [],
+        "generic_rolling_apply_depths": (
+            [2, 3, 4] + sorted(generic_depth_tokens)
+            if generic_apply_enabled else []
+        ),
         "generic_rolling_apply_node_count": int(apply_node_count) if generic_apply_enabled else 0,
         "generic_rolling_apply_full_commit_token_count": int(full_commit_tokens) if generic_apply_enabled else 0,
         "generic_rolling_apply_partial_recovered_token_count": int(partial_total) if generic_apply_enabled else 0,

@@ -191,6 +191,31 @@ def as_int_map(value: Any) -> dict[int, int]:
     return result
 
 
+def as_depth_int_lists(value: Any) -> dict[int, list[int]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, list[int]] = {}
+    for key, items in value.items():
+        try:
+            depth = int(key)
+        except Exception:
+            continue
+        result[depth] = as_int_list(items)
+    return result
+
+
+def as_depth_int_map(value: Any) -> dict[int, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, int] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = int(item)
+        except Exception:
+            continue
+    return result
+
+
 def as_str_map(value: Any) -> dict[int, str]:
     if not isinstance(value, dict):
         return {}
@@ -321,6 +346,7 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             "rolling_depth3_commit_enabled": False,
             "rolling_depth4_shadow_enabled": False,
             "rolling_depth4_commit_enabled": False,
+            "generic_full_continuous_enabled": False,
         }
     )
     side_events: dict[tuple[int, str, int], set[tuple[int, int]]] = defaultdict(set)
@@ -332,6 +358,8 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.max_configured_depth = max(
             registry.max_configured_depth,
             int_value(record.get("max_rolling_continuous_depth"), 0),
+            int_value(record.get("generic_full_continuous_max_depth"), 0),
+            int_value(record.get("generic_rolling_max_depth"), 0),
         )
         registry.max_observed_depth = max(
             registry.max_observed_depth,
@@ -339,6 +367,8 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             int_value(record.get("max_rolling_continuous_depth_observed"), 0),
             int_value(record.get("rolling_depth3_max_depth_observed"), 0),
             int_value(record.get("rolling_depth4_max_depth_observed"), 0),
+            int_value(record.get("generic_full_continuous_max_observed_depth"), 0),
+            int_value(record.get("generic_rolling_max_observed_depth"), 0),
         )
         registry.flags["one_shot_commit_enabled"] = registry.flags["one_shot_commit_enabled"] or bool(
             record.get("enable_eager_commit_ready_only", False)
@@ -363,6 +393,9 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
         registry.flags["rolling_depth4_commit_enabled"] = registry.flags["rolling_depth4_commit_enabled"] or bool(
             record.get("enable_rolling_continuous_depth4_commit_ready_only", False)
         ) or bool(record.get("rolling_depth4_commit_enabled", False))
+        registry.flags["generic_full_continuous_enabled"] = registry.flags["generic_full_continuous_enabled"] or bool(
+            record.get("enable_full_continuous_eager", False)
+        ) or bool(record.get("generic_full_continuous_enabled", False))
         registry.partial_recovery_enabled = registry.partial_recovery_enabled or bool(
             record.get("partial_prefix_recovery_enabled", False)
         ) or bool(record.get("enable_rolling_continuous_partial_prefix_recovery", False))
@@ -761,6 +794,63 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             id_field="rolling_depth4_real_committed_proposal_ids",
         )
 
+        generic_candidate_by_depth = as_depth_int_lists(record.get("generic_rolling_candidate_proposal_ids_by_depth"))
+        generic_ready_by_depth = as_depth_int_lists(record.get("generic_rolling_ready_proposal_ids_by_depth"))
+        generic_committed_by_depth = as_depth_int_lists(
+            record.get("generic_rolling_real_committed_proposal_ids_by_depth")
+        )
+        generic_candidate_seq_by_depth = as_depth_int_lists(record.get("generic_rolling_candidate_seq_ids_by_depth"))
+        generic_ready_seq_by_depth = as_depth_int_lists(record.get("generic_rolling_ready_seq_ids_by_depth"))
+        generic_committed_seq_by_depth = as_depth_int_lists(
+            record.get("generic_rolling_real_committed_seq_ids_by_depth")
+        )
+        generic_parent_by_id = as_int_map(record.get("generic_rolling_parent_by_proposal_id"))
+        generic_parent_by_id.update(as_int_map(record.get("generic_rolling_real_commit_parent_by_proposal_id")))
+        generic_root_by_id = as_int_map(record.get("generic_rolling_root_by_proposal_id"))
+        generic_root_by_id.update(as_int_map(record.get("generic_rolling_real_commit_root_by_proposal_id")))
+        generic_depth_by_id = as_int_map(record.get("generic_rolling_depth_by_proposal_id"))
+        generic_depth_by_id.update(as_int_map(record.get("generic_rolling_real_commit_depth_by_proposal_id")))
+        generic_token_by_id = as_int_map(record.get("generic_rolling_token_count_by_proposal_id"))
+        generic_token_by_id.update(as_int_map(record.get("generic_rolling_real_committed_token_count_by_proposal_id")))
+        generic_accept_by_id = as_int_map(record.get("generic_rolling_real_committed_accept_len_by_proposal_id"))
+        generic_action_by_id = as_str_map(record.get("generic_rolling_real_commit_action_by_proposal_id"))
+        generic_result_by_id = as_str_map(record.get("generic_rolling_real_commit_verify_result_by_proposal_id"))
+        for depth, proposal_ids in generic_candidate_by_depth.items():
+            if depth < 5:
+                continue
+            add_id_set(registry, depth, set(proposal_ids), registry.generated_by_depth)
+            add_seq_map(registry, depth, proposal_ids, generic_candidate_seq_by_depth.get(depth, []))
+        for depth, proposal_ids in generic_ready_by_depth.items():
+            if depth < 5:
+                continue
+            add_id_set(registry, depth, set(proposal_ids), registry.ready_by_depth)
+            add_seq_map(registry, depth, proposal_ids, generic_ready_seq_by_depth.get(depth, []))
+        for depth, proposal_ids in generic_committed_by_depth.items():
+            if depth < 5:
+                continue
+            add_id_set(registry, depth, set(proposal_ids), registry.committed_by_depth)
+            add_seq_map(registry, depth, proposal_ids, generic_committed_seq_by_depth.get(depth, []))
+            if registry.flags.get("generic_full_continuous_enabled", False):
+                registry.max_real_committed_depth = max(registry.max_real_committed_depth, depth)
+            else:
+                registry.higher_depth_commit_ids.update(proposal_ids)
+        for proposal_id, depth in generic_depth_by_id.items():
+            if depth < 5:
+                continue
+            registry.declared_depth_by_id.setdefault(proposal_id, depth)
+            if proposal_id in generic_parent_by_id:
+                registry.parent_by_depth[depth].setdefault(proposal_id, generic_parent_by_id[proposal_id])
+            if proposal_id in generic_root_by_id:
+                registry.root_by_depth[depth].setdefault(proposal_id, generic_root_by_id[proposal_id])
+            if proposal_id in generic_token_by_id and generic_token_by_id[proposal_id] > 0:
+                registry.token_by_depth[depth].setdefault(proposal_id, generic_token_by_id[proposal_id])
+            if proposal_id in generic_accept_by_id and generic_accept_by_id[proposal_id] > 0:
+                registry.accept_len_by_depth[depth].setdefault(proposal_id, generic_accept_by_id[proposal_id])
+            if proposal_id in generic_action_by_id:
+                registry.action_by_depth[depth].setdefault(proposal_id, generic_action_by_id[proposal_id])
+            if proposal_id in generic_result_by_id:
+                registry.verify_result_by_depth[depth].setdefault(proposal_id, generic_result_by_id[proposal_id])
+
         for field_name in (
             "ready_eager_proposal_stale_ids",
             "ready_eager_proposal_expired_ids",
@@ -795,7 +885,23 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
 
 def build_nodes(registry: RollingChainRegistry) -> None:
     all_ids: set[int] = set(registry.declared_depth_by_id)
-    for depth in range(0, MAX_LEGACY_OBSERVED_DEPTH + 1):
+    depths = set(range(0, MAX_LEGACY_OBSERVED_DEPTH + 1))
+    for mapping in (
+        registry.committed_by_depth,
+        registry.ready_by_depth,
+        registry.generated_by_depth,
+        registry.invalidated_by_depth,
+        registry.cascade_by_depth,
+        registry.token_by_depth,
+        registry.seq_by_depth,
+        registry.parent_by_depth,
+        registry.root_by_depth,
+        registry.accept_len_by_depth,
+        registry.action_by_depth,
+        registry.verify_result_by_depth,
+    ):
+        depths.update(int(depth) for depth in mapping.keys())
+    for depth in sorted(depths):
         all_ids.update(registry.committed_by_depth[depth])
         all_ids.update(registry.ready_by_depth[depth])
         all_ids.update(registry.generated_by_depth[depth])
@@ -848,7 +954,23 @@ def build_nodes(registry: RollingChainRegistry) -> None:
 
 
 def inferred_depth_for_id(registry: RollingChainRegistry, proposal_id: int) -> int:
-    for depth in range(0, MAX_LEGACY_OBSERVED_DEPTH + 1):
+    depths = set(range(0, MAX_LEGACY_OBSERVED_DEPTH + 1))
+    for mapping in (
+        registry.committed_by_depth,
+        registry.ready_by_depth,
+        registry.generated_by_depth,
+        registry.invalidated_by_depth,
+        registry.cascade_by_depth,
+        registry.token_by_depth,
+        registry.seq_by_depth,
+        registry.parent_by_depth,
+        registry.root_by_depth,
+        registry.accept_len_by_depth,
+        registry.action_by_depth,
+        registry.verify_result_by_depth,
+    ):
+        depths.update(int(depth) for depth in mapping.keys())
+    for depth in sorted(depths):
         if (
             proposal_id in registry.committed_by_depth[depth]
             or proposal_id in registry.ready_by_depth[depth]
@@ -985,6 +1107,9 @@ def summarize_registry(
     max_depth: int = MAX_LEGACY_REAL_DEPTH,
     accounting: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if registry.flags.get("generic_full_continuous_enabled", False):
+        configured = registry.max_configured_depth or max(registry.committed_by_depth.keys() or [max_depth])
+        max_depth = max(max_depth, min(100, int(configured)))
     token_by_depth = committed_token_counts_by_depth(registry, max_depth)
     full_accept_combined_tokens = sum(token_by_depth.values())
     partial_accepted_tokens = sum(
