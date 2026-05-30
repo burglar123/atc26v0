@@ -619,13 +619,15 @@ class ModelRunnerBase:
             )
         dist.barrier()
 
-    def materialize_cached_request(self, request_id: str, admit_ts: float):
+    def materialize_cached_request(self, request_id: str, admit_ts: float, online_arrival_ts: float | None = None):
         assert request_id in self.cached_kv_store, (
             f"[Rank {self.rank}: {self.group_name}] missing cached request_id={request_id}"
         )
         cached = self.cached_kv_store[request_id]
         seq: Sequence = self._restore_sequence_from_snapshot(cached["snapshot"])
         assert hasattr(seq, "token_ids"), "restored sequence missing token_ids"
+        if online_arrival_ts is not None:
+            seq.arrival_ts = float(online_arrival_ts)
         seq.status = SequenceStatus.RUNNING
         seq.admit_ts = admit_ts
         seq.mark_decode_ready(admit_ts)
@@ -14381,9 +14383,10 @@ class ModelRunnerBase:
         self._finish_decode_ready_generation(output, end_time - start_time)
 
     def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
-        if self.active_execution_mode == "dual_batch_pearl" or self.global_config.execution_mode == "dual_batch_pearl":
-            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
-        self._set_execution_mode("parallel_pearl")
+        execution_mode = self.global_config.execution_mode
+        if execution_mode not in {"parallel_pearl", "dual_batch_pearl"}:
+            raise NotImplementedError("cached-admission supports parallel_pearl and dual_batch_pearl only")
+        self._set_execution_mode(execution_mode)
         self.active_decode_ready_mode = True
         if max_active_cached_seqs <= 0:
             max_active_cached_seqs = self.scheduler.max_num_seqs
@@ -14402,6 +14405,7 @@ class ModelRunnerBase:
         base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
         materialized_count = 0
         min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
+        cached_admission_step = 0
         last_logged_materialized_bucket = -1
         last_logged_pending_bucket = -1
         last_logged_running = -1
@@ -14417,10 +14421,14 @@ class ModelRunnerBase:
             gpu_free_before, gpu_total = torch.cuda.mem_get_info()
             guard_triggered = False
             eligible = 0
+            arrived_ids = []
+            admitted_ids = []
+            admitted_wait_ms_by_request = {}
             while eligible < len(pending):
                 seq = pending[eligible]
                 seq_arrival = serving_start_ts + (float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset)
                 if seq_arrival <= now:
+                    arrived_ids.append(seq.request_id)
                     eligible += 1
                 else:
                     break
@@ -14440,7 +14448,12 @@ class ModelRunnerBase:
                 guard_triggered = True
             for _ in range(global_k):
                 seq = pending.pop(0)
-                self.materialize_cached_request(seq.request_id, now)
+                online_arrival_ts = serving_start_ts + (
+                    float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset
+                )
+                self.materialize_cached_request(seq.request_id, now, online_arrival_ts)
+                admitted_ids.append(seq.request_id)
+                admitted_wait_ms_by_request[str(seq.request_id)] = max((now - online_arrival_ts) * 1000.0, 0.0)
                 materialized_count += 1
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
             min_free_blocks = min(min_free_blocks, free_blocks_after)
@@ -14475,12 +14488,41 @@ class ModelRunnerBase:
             if self.scheduler.running:
                 if self.gamma == -1:
                     self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+                if self.active_execution_mode == "dual_batch_pearl":
+                    self.dual_batch_manager.gamma = int(self.gamma)
                 for seq in self.scheduler.running:
                     seq.mark_decode_started()
-                self.pearl_step()
+                if self.active_execution_mode == "dual_batch_pearl":
+                    self.dual_batch_pearl_step()
+                else:
+                    self.pearl_step()
             elif pending:
                 next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
                 time.sleep(min(max(next_arrival - now, 0.0), 0.01))
+            self.trace_records.append(
+                {
+                    "trace_record_type": "cached_admission_step",
+                    "runner_role": self._runner_role(),
+                    "cached_admission_enabled": True,
+                    "cached_prefill_skipped": True,
+                    "cached_prefill_metadata_only": False,
+                    "cached_admission_policy": "fifo",
+                    "cached_admission_max_active": int(max_active_cached_seqs),
+                    "cached_admission_step": int(cached_admission_step),
+                    "cached_admission_arrived_request_ids": list(arrived_ids),
+                    "cached_admission_admitted_request_ids": list(admitted_ids),
+                    "cached_admission_active_request_ids": [
+                        seq.request_id for seq in self.scheduler.running
+                    ],
+                    "cached_admission_completed_request_ids": [
+                        seq.request_id for seq in self.scheduler.finished
+                    ],
+                    "cached_admission_pending_count": int(len(pending)),
+                    "cached_admission_active_count": int(len(self.scheduler.running)),
+                    "cached_admission_queue_wait_ms_by_request": admitted_wait_ms_by_request,
+                }
+            )
+            cached_admission_step += 1
         torch.cuda.synchronize()
         end_time = time.time()
         seqs = self.scheduler.finished

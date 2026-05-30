@@ -155,6 +155,12 @@ class PEARLConfig:
     enable_generic_rolling_runtime_loop: bool = False
     enable_generic_rolling_apply_path: bool = False
     enable_full_continuous_eager: bool = False
+    enable_cached_admission: bool = False
+    cached_admission_mode: str = "in_memory_kv"
+    cached_admission_policy: str = "fifo"
+    cached_admission_max_active: int = 0
+    cached_prefill_cache_path: str | None = None
+    cached_admission_arrival_field: str = "arrival_offset_sec"
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -214,6 +220,22 @@ class PEARLConfig:
         self.enable_generic_rolling_runtime_loop = bool(self.enable_generic_rolling_runtime_loop)
         self.enable_generic_rolling_apply_path = bool(self.enable_generic_rolling_apply_path)
         self.enable_full_continuous_eager = bool(self.enable_full_continuous_eager)
+        self.enable_cached_admission = bool(self.enable_cached_admission)
+        self.cached_admission_mode = str(self.cached_admission_mode)
+        self.cached_admission_policy = str(self.cached_admission_policy)
+        self.cached_admission_max_active = int(self.cached_admission_max_active or 0)
+        self.cached_admission_arrival_field = str(self.cached_admission_arrival_field)
+        if self.cached_admission_mode not in {"in_memory_kv", "metadata_only"}:
+            raise ValueError(
+                "cached_admission_mode must be one of ['in_memory_kv', 'metadata_only'], "
+                f"got {self.cached_admission_mode!r}"
+            )
+        if self.cached_admission_policy != "fifo":
+            raise ValueError("Phase 1H-8w cached admission supports only FIFO admission")
+        if self.cached_admission_max_active < 0:
+            raise ValueError("cached_admission_max_active must be non-negative")
+        if self.cached_admission_arrival_field not in {"arrival_offset_sec", "arrival_ts"}:
+            raise ValueError("cached_admission_arrival_field must be arrival_offset_sec or arrival_ts")
         if self.enable_full_continuous_eager:
             self.enable_generic_rolling_apply_path = True
         if self.enable_generic_rolling_apply_path:
@@ -438,6 +460,11 @@ class PEARLConfig:
         logger.info(f"Enable_Generic_Rolling_Runtime_Loop={self.enable_generic_rolling_runtime_loop}")
         logger.info(f"Enable_Generic_Rolling_Apply_Path={self.enable_generic_rolling_apply_path}")
         logger.info(f"Enable_Full_Continuous_Eager={self.enable_full_continuous_eager}")
+        logger.info(f"Enable_Cached_Admission={self.enable_cached_admission}")
+        logger.info(f"Cached_Admission_Mode={self.cached_admission_mode}")
+        logger.info(f"Cached_Admission_Policy={self.cached_admission_policy}")
+        logger.info(f"Cached_Admission_Max_Active={self.cached_admission_max_active}")
+        logger.info(f"Cached_Admission_Arrival_Field={self.cached_admission_arrival_field}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")

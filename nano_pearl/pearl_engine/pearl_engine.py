@@ -383,8 +383,6 @@ class PEARLEngine:
         self.control_event.clear()
 
     def cached_decode_ready_generate(self, max_active_cached_seqs: int):
-        if self.config.execution_mode == "dual_batch_pearl":
-            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
         self.controller.write_draft_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
         self.controller.write_target_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
         self.control_event.wait()
