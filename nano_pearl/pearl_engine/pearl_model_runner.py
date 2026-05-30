@@ -640,7 +640,11 @@ class ModelRunnerBase:
         kv_cpu = cached["kv_cpu"].to(self.kv_cache.device)
         assert kv_cpu.size(2) == int(cached["num_blocks"])
         self.kv_cache[:, :, new_block_ids] = kv_cpu
+        needs_dual_priming = self.active_execution_mode == "dual_batch_pearl"
+        seq.cached_admission_newly_admitted = bool(needs_dual_priming)
+        seq.needs_dual_batch_draft_priming = bool(needs_dual_priming)
         self.scheduler.running.append(seq)
+        return seq
 
     def _runner_role(self):
         return "draft" if self.is_draft else "verify"
@@ -2255,6 +2259,79 @@ class ModelRunnerBase:
             return [int(seq_id) for seq_id in plan.target_normal_verify_ids()]
         return [int(seq_id) for seq_id in (plan.target_normal_verify_seq_ids or plan.target_home_set)]
 
+    @staticmethod
+    def _ordered_unique_ints(values) -> list[int]:
+        seen = set()
+        ordered = []
+        for value in values:
+            int_value = int(value)
+            if int_value in seen:
+                continue
+            seen.add(int_value)
+            ordered.append(int_value)
+        return ordered
+
+    def _cached_admission_newly_admitted_seq_ids(self) -> list[int]:
+        return sorted(
+            int(seq.seq_id)
+            for seq in self.scheduler.running
+            if bool(getattr(seq, "cached_admission_newly_admitted", False))
+        )
+
+    def _cached_admission_draft_priming_seq_ids(self) -> list[int]:
+        if self.active_execution_mode != "dual_batch_pearl":
+            return []
+        return sorted(
+            int(seq.seq_id)
+            for seq in self.scheduler.running
+            if bool(getattr(seq, "needs_dual_batch_draft_priming", False))
+        )
+
+    def _apply_cached_admission_dual_batch_priming(self, plan: StepPlan) -> None:
+        priming_seq_ids = self._cached_admission_draft_priming_seq_ids()
+        newly_admitted_seq_ids = self._cached_admission_newly_admitted_seq_ids()
+        plan.cached_admission_newly_admitted_seq_ids = list(newly_admitted_seq_ids)
+        plan.cached_admission_draft_priming_seq_ids = list(priming_seq_ids)
+        plan.cached_admission_primed_seq_ids = []
+        plan.cached_admission_unprimed_target_filtered_seq_ids = []
+        plan.cached_admission_missing_proposal_after_filter_seq_ids = []
+        if not priming_seq_ids:
+            return
+
+        priming_set = set(priming_seq_ids)
+        target_normal = self._target_normal_verify_seq_ids(plan)
+        filtered_from_target = [seq_id for seq_id in target_normal if seq_id in priming_set]
+        plan.cached_admission_unprimed_target_filtered_seq_ids = list(filtered_from_target)
+        if filtered_from_target:
+            if not plan.raw_target_home_set_for_normal_verify:
+                plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
+            plan.target_normal_verify_seq_ids = [
+                int(seq_id) for seq_id in target_normal if int(seq_id) not in priming_set
+            ]
+
+        actual_draft = self._actual_normal_draft_seq_ids(plan)
+        plan.actual_draft_home_set_for_normal_draft = self._ordered_unique_ints(
+            list(actual_draft) + list(priming_seq_ids)
+        )
+
+    def _clear_cached_admission_priming_for_proposals(
+        self,
+        proposals: list[BufferedProposal],
+    ) -> list[int]:
+        proposal_seq_ids = {int(proposal.seq_id) for proposal in proposals if proposal.valid}
+        if not proposal_seq_ids:
+            return []
+        primed_seq_ids = []
+        for seq in self.scheduler.running:
+            seq_id = int(seq.seq_id)
+            if seq_id not in proposal_seq_ids:
+                continue
+            if bool(getattr(seq, "needs_dual_batch_draft_priming", False)):
+                primed_seq_ids.append(seq_id)
+            seq.needs_dual_batch_draft_priming = False
+            seq.cached_admission_newly_admitted = False
+        return sorted(primed_seq_ids)
+
     def _lane_exclusion_step_id_before_plan(self) -> int:
         return int(self.dual_batch_manager.step_id)
 
@@ -2590,6 +2667,7 @@ class ModelRunnerBase:
         self._apply_eager_plan_dry_run(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
+        self._apply_cached_admission_dual_batch_priming(plan)
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
@@ -2601,15 +2679,15 @@ class ModelRunnerBase:
         fallback_same_batch = (
             bool(target_normal_verify_seq_ids)
             and plan.plan_phase == "fallback"
-            and target_normal_verify_seq_ids == actual_normal_draft_seq_ids
+            and set(target_normal_verify_seq_ids).issubset(set(actual_normal_draft_seq_ids))
         )
         fallback_pending_receive = (
-            sorted(set(raw_buffer_inspect["miss_seq_ids"]) & set(target_normal_verify_seq_ids))
+            sorted(set(buffer_inspect["miss_seq_ids"]) & set(target_normal_verify_seq_ids))
             if fallback_same_batch
             else []
         )
         unexpected_missing = sorted(
-            set(raw_buffer_inspect["miss_seq_ids"])
+            set(buffer_inspect["miss_seq_ids"])
             - set(allowed_missing)
             - set(fallback_pending_receive)
         )
@@ -2623,6 +2701,9 @@ class ModelRunnerBase:
         plan.fallback_pending_receive_seq_ids = [int(seq_id) for seq_id in fallback_pending_receive]
         plan.fallback_received_seq_ids = []
         plan.fallback_missing_after_receive_seq_ids = []
+        plan.cached_admission_missing_proposal_after_filter_seq_ids = [
+            int(seq_id) for seq_id in unexpected_missing
+        ]
         plan.proposal_buffer_size_before = int(proposal_buffer_size_before)
         plan.proposal_buffer_size_after = self.dual_proposal_buffer.size()
         plan.proposal_buffer_requested_seq_ids = buffer_inspect["requested_seq_ids"]
@@ -2732,7 +2813,11 @@ class ModelRunnerBase:
             f"missing_buffered_proposal_allowed_by_eager_seq_ids="
             f"{getattr(plan, 'missing_buffered_proposal_allowed_by_eager_seq_ids', [])}, "
             f"missing_buffered_proposal_unexpected_seq_ids="
-            f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}"
+            f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}, "
+            f"cached_admission_draft_priming_seq_ids="
+            f"{getattr(plan, 'cached_admission_draft_priming_seq_ids', [])}, "
+            f"cached_admission_unprimed_target_filtered_seq_ids="
+            f"{getattr(plan, 'cached_admission_unprimed_target_filtered_seq_ids', [])}"
         )
 
     def _update_lane_exclusion_proposal_trace(
@@ -2792,6 +2877,21 @@ class ModelRunnerBase:
         )
         trace_record["missing_normal_proposal_allowed_seq_ids_dry_run"] = list(
             plan.missing_normal_proposal_allowed_seq_ids_dry_run
+        )
+        trace_record["cached_admission_newly_admitted_seq_ids"] = list(
+            plan.cached_admission_newly_admitted_seq_ids
+        )
+        trace_record["cached_admission_draft_priming_seq_ids"] = list(
+            plan.cached_admission_draft_priming_seq_ids
+        )
+        trace_record["cached_admission_primed_seq_ids"] = list(
+            plan.cached_admission_primed_seq_ids
+        )
+        trace_record["cached_admission_unprimed_target_filtered_seq_ids"] = list(
+            plan.cached_admission_unprimed_target_filtered_seq_ids
+        )
+        trace_record["cached_admission_missing_proposal_after_filter_seq_ids"] = list(
+            plan.cached_admission_missing_proposal_after_filter_seq_ids
         )
         trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
         trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
@@ -14423,6 +14523,7 @@ class ModelRunnerBase:
             eligible = 0
             arrived_ids = []
             admitted_ids = []
+            admitted_seq_ids = []
             admitted_wait_ms_by_request = {}
             while eligible < len(pending):
                 seq = pending[eligible]
@@ -14451,8 +14552,9 @@ class ModelRunnerBase:
                 online_arrival_ts = serving_start_ts + (
                     float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset
                 )
-                self.materialize_cached_request(seq.request_id, now, online_arrival_ts)
+                admitted_seq = self.materialize_cached_request(seq.request_id, now, online_arrival_ts)
                 admitted_ids.append(seq.request_id)
+                admitted_seq_ids.append(int(admitted_seq.seq_id))
                 admitted_wait_ms_by_request[str(seq.request_id)] = max((now - online_arrival_ts) * 1000.0, 0.0)
                 materialized_count += 1
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
@@ -14485,6 +14587,7 @@ class ModelRunnerBase:
             last_logged_materialized_bucket = mat_bucket
             last_logged_pending_bucket = pending_bucket
             last_logged_running = running_count
+            priming_seq_ids_before_step = self._cached_admission_draft_priming_seq_ids()
             if self.scheduler.running:
                 if self.gamma == -1:
                     self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
@@ -14499,6 +14602,8 @@ class ModelRunnerBase:
             elif pending:
                 next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
                 time.sleep(min(max(next_arrival - now, 0.0), 0.01))
+            priming_seq_ids_after_step = self._cached_admission_draft_priming_seq_ids()
+            primed_seq_ids = sorted(set(priming_seq_ids_before_step) - set(priming_seq_ids_after_step))
             self.trace_records.append(
                 {
                     "trace_record_type": "cached_admission_step",
@@ -14511,6 +14616,11 @@ class ModelRunnerBase:
                     "cached_admission_step": int(cached_admission_step),
                     "cached_admission_arrived_request_ids": list(arrived_ids),
                     "cached_admission_admitted_request_ids": list(admitted_ids),
+                    "cached_admission_newly_admitted_seq_ids": list(admitted_seq_ids),
+                    "cached_admission_draft_priming_seq_ids": list(priming_seq_ids_after_step),
+                    "cached_admission_primed_seq_ids": list(primed_seq_ids),
+                    "cached_admission_unprimed_target_filtered_seq_ids": [],
+                    "cached_admission_missing_proposal_after_filter_seq_ids": [],
                     "cached_admission_active_request_ids": [
                         seq.request_id for seq in self.scheduler.running
                     ],
@@ -15143,8 +15253,24 @@ class DraftModelRunner(ModelRunnerBase):
         target_trace_record = None
         if draft_seqs:
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
+            primed_seq_ids = []
             if plan.plan_phase in {"priming", "steady"}:
                 self.dual_proposal_buffer.store(proposals)
+                primed_seq_ids = self._clear_cached_admission_priming_for_proposals(proposals)
+                plan.cached_admission_primed_seq_ids = list(primed_seq_ids)
+            elif plan.plan_phase == "fallback":
+                target_normal_seq_ids = set(self._target_normal_verify_seq_ids(plan))
+                buffered_fallback_proposals = [
+                    proposal
+                    for proposal in proposals
+                    if int(proposal.seq_id) not in target_normal_seq_ids
+                ]
+                if buffered_fallback_proposals:
+                    self.dual_proposal_buffer.store(buffered_fallback_proposals)
+                    primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
+                        buffered_fallback_proposals
+                    )
+                    plan.cached_admission_primed_seq_ids = list(primed_seq_ids)
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
                 self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=proposals)
@@ -15356,7 +15482,11 @@ class TargetModelRunner(ModelRunnerBase):
         target_seqs = self._resolve_dual_seq_ids(target_normal_seq_ids, plan, "dual_verify")
         draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         target_seq_ids = [seq.seq_id for seq in target_seqs]
-        fallback_same_batch = bool(target_seq_ids) and target_seq_ids == draft_seq_ids and plan.plan_phase == "fallback"
+        fallback_same_batch = (
+            bool(target_seq_ids)
+            and plan.plan_phase == "fallback"
+            and set(target_seq_ids).issubset(set(draft_seq_ids))
+        )
 
         target_proposals = []
         if target_seqs and not fallback_same_batch:
@@ -15401,17 +15531,47 @@ class TargetModelRunner(ModelRunnerBase):
                     received_proposals=received_proposals,
                 )
             if fallback_same_batch:
-                target_proposals = received_proposals
                 assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
                     plan,
                     "fallback same-batch missing proposals after receive for target seq_ids="
                     f"{target_seq_ids}",
                 )
+                target_seq_id_set = {int(seq_id) for seq_id in target_seq_ids}
+                target_proposals = [
+                    proposal
+                    for proposal in received_proposals
+                    if int(proposal.seq_id) in target_seq_id_set
+                ]
+                buffered_fallback_proposals = [
+                    proposal
+                    for proposal in received_proposals
+                    if int(proposal.seq_id) not in target_seq_id_set
+                ]
+                if buffered_fallback_proposals:
+                    self.dual_proposal_buffer.store(buffered_fallback_proposals)
+                    plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
+                        buffered_fallback_proposals
+                    )
+                    if trace_record is not None:
+                        self._update_lane_exclusion_proposal_trace(
+                            trace_record,
+                            plan,
+                            received_proposals=received_proposals,
+                        )
                 if trace_record is not None:
                     trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
                     trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             else:
                 self.dual_proposal_buffer.store(received_proposals)
+                plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
+                    received_proposals
+                )
+                if trace_record is not None:
+                    self._update_lane_exclusion_proposal_trace(
+                        trace_record,
+                        plan,
+                        received_proposals=received_proposals,
+                    )
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)

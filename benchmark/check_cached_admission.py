@@ -31,6 +31,19 @@ def float_value(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        value = value.values()
+    if isinstance(value, (str, bytes)):
+        return []
+    try:
+        return [int(item) for item in value]
+    except Exception:
+        return []
+
+
 def load_trace_records(path: Path) -> list[dict[str, Any]]:
     payload = load_json(path)
     if isinstance(payload, dict):
@@ -73,6 +86,8 @@ def result_summary(result_payload: dict[str, Any]) -> dict[str, Any]:
         )
     if "cached_admission_policy" not in summary:
         summary["cached_admission_policy"] = args.get("cached_admission_policy", "fifo")
+    if "execution_mode" not in summary and args.get("execution_mode") is not None:
+        summary["execution_mode"] = args.get("execution_mode")
     return summary
 
 
@@ -177,6 +192,59 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         missing = sorted(seen_completed - seen_admitted)
         errors.append(f"completed request was never admitted: {missing}")
 
+    for idx, record in enumerate(records):
+        execution_mode = str(record.get("execution_mode") or summary.get("execution_mode") or "")
+        if execution_mode != "dual_batch_pearl":
+            continue
+        target_normal = set(int_list(record.get("target_normal_verify_seq_ids")))
+        priming = set(int_list(record.get("cached_admission_draft_priming_seq_ids")))
+        newly_admitted = set(int_list(record.get("cached_admission_newly_admitted_seq_ids")))
+        filtered = set(int_list(record.get("cached_admission_unprimed_target_filtered_seq_ids")))
+        primed = set(int_list(record.get("cached_admission_primed_seq_ids")))
+        missing_after_filter = set(
+            int_list(record.get("cached_admission_missing_proposal_after_filter_seq_ids"))
+        )
+        proposal_miss = set(int_list(record.get("proposal_buffer_miss_seq_ids")))
+        allowed_missing = set(
+            int_list(record.get("missing_buffered_proposal_allowed_by_eager_seq_ids"))
+        )
+        fallback_pending = set(int_list(record.get("fallback_pending_receive_seq_ids")))
+        actual_draft = set(
+            int_list(record.get("actual_draft_home_set_for_normal_draft") or record.get("draft_home_set"))
+        )
+
+        if priming & target_normal:
+            errors.append(
+                f"record[{idx}] cached-admission priming seqs entered target verify: "
+                f"{sorted(priming & target_normal)}"
+            )
+        if missing_after_filter:
+            errors.append(
+                f"record[{idx}] cached-admission missing proposal after filter: "
+                f"{sorted(missing_after_filter)}"
+            )
+        unexpected_missing = (proposal_miss & target_normal) - allowed_missing - fallback_pending
+        if unexpected_missing:
+            errors.append(
+                f"record[{idx}] target normal verify missing buffered proposals after cached filter: "
+                f"{sorted(unexpected_missing)}"
+            )
+        if filtered and not filtered <= (priming | newly_admitted):
+            errors.append(
+                f"record[{idx}] filtered cached-admission seqs are not newly admitted or priming: "
+                f"{sorted(filtered - (priming | newly_admitted))}"
+            )
+        if priming and not priming <= actual_draft:
+            errors.append(
+                f"record[{idx}] cached-admission priming seqs not routed to normal draft: "
+                f"{sorted(priming - actual_draft)}"
+            )
+        if primed and primed & target_normal:
+            errors.append(
+                f"record[{idx}] primed seqs should not target-verify in the same priming record: "
+                f"{sorted(primed & target_normal)}"
+            )
+
     return errors, summary
 
 
@@ -195,6 +263,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "cached_admission_p90_queue_wait_ms",
         "cached_admission_prefill_compute_skipped",
         "cached_admission_decode_only_elapsed_s",
+        "cached_admission_newly_admitted_seq_ids",
+        "cached_admission_draft_priming_seq_ids",
+        "cached_admission_primed_seq_ids",
+        "cached_admission_unprimed_target_filtered_seq_ids",
+        "cached_admission_missing_proposal_after_filter_seq_ids",
     )
     for field in fields:
         print(f"{field} = {summary.get(field)}")
@@ -276,6 +349,44 @@ def synthetic_payload(
     return records, result
 
 
+def synthetic_dual_payload(
+    *,
+    execution_mode: str = "dual_batch_pearl",
+    newly_admitted_seq_ids: list[int] | None = None,
+    priming_seq_ids: list[int] | None = None,
+    primed_seq_ids: list[int] | None = None,
+    filtered_seq_ids: list[int] | None = None,
+    target_normal_verify_seq_ids: list[int] | None = None,
+    actual_draft_seq_ids: list[int] | None = None,
+    proposal_hit_seq_ids: list[int] | None = None,
+    proposal_miss_seq_ids: list[int] | None = None,
+    missing_after_filter_seq_ids: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records, result = synthetic_payload()
+    result.setdefault("args", {})["execution_mode"] = execution_mode
+    records.append(
+        {
+            "execution_mode": execution_mode,
+            "cached_admission_enabled": True,
+            "runner_role": "verify",
+            "target_normal_verify_seq_ids": target_normal_verify_seq_ids or [],
+            "actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
+            "cached_admission_newly_admitted_seq_ids": newly_admitted_seq_ids or [],
+            "cached_admission_draft_priming_seq_ids": priming_seq_ids or [],
+            "cached_admission_primed_seq_ids": primed_seq_ids or [],
+            "cached_admission_unprimed_target_filtered_seq_ids": filtered_seq_ids or [],
+            "cached_admission_missing_proposal_after_filter_seq_ids": (
+                missing_after_filter_seq_ids or []
+            ),
+            "proposal_buffer_hit_seq_ids": proposal_hit_seq_ids or [],
+            "proposal_buffer_miss_seq_ids": proposal_miss_seq_ids or [],
+            "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
+            "fallback_pending_receive_seq_ids": [],
+        }
+    )
+    return records, result
+
+
 def run_synthetic() -> int:
     cases = [
         ("disabled", synthetic_payload(enabled=False), False),
@@ -286,6 +397,53 @@ def run_synthetic() -> int:
         ("duplicate_admit", synthetic_payload(duplicate_admit=True), True),
         ("completed_without_admit", synthetic_payload(completed_without_admit=True), True),
         ("prefill_not_skipped", synthetic_payload(prefill_not_skipped=True), True),
+        (
+            "dual_new_admit_filtered_until_primed",
+            synthetic_dual_payload(
+                newly_admitted_seq_ids=[6],
+                priming_seq_ids=[6],
+                primed_seq_ids=[6],
+                filtered_seq_ids=[6],
+                target_normal_verify_seq_ids=[4],
+                actual_draft_seq_ids=[6],
+                proposal_hit_seq_ids=[4],
+            ),
+            False,
+        ),
+        (
+            "dual_new_admit_unprimed_target_verify",
+            synthetic_dual_payload(
+                newly_admitted_seq_ids=[6],
+                priming_seq_ids=[6],
+                target_normal_verify_seq_ids=[4, 6],
+                actual_draft_seq_ids=[],
+                proposal_hit_seq_ids=[4],
+                proposal_miss_seq_ids=[6],
+                missing_after_filter_seq_ids=[6],
+            ),
+            True,
+        ),
+        (
+            "dual_target_verify_after_buffered",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[6],
+                actual_draft_seq_ids=[],
+                proposal_hit_seq_ids=[6],
+            ),
+            False,
+        ),
+        (
+            "non_dual_no_priming_requirement",
+            synthetic_dual_payload(
+                execution_mode="parallel_pearl",
+                newly_admitted_seq_ids=[6],
+                priming_seq_ids=[6],
+                target_normal_verify_seq_ids=[6],
+                proposal_miss_seq_ids=[6],
+                missing_after_filter_seq_ids=[6],
+            ),
+            False,
+        ),
     ]
     for name, (records, result), should_fail in cases:
         errors, _ = validate(records, result)

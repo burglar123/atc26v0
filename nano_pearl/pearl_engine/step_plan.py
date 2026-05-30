@@ -201,6 +201,11 @@ class StepPlan:
     proposal_buffer_consumed_count: int = 0
     proposal_buffer_dropped_count: int = 0
     proposal_buffer_invalid_count: int = 0
+    cached_admission_newly_admitted_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_draft_priming_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_primed_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_unprimed_target_filtered_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_missing_proposal_after_filter_seq_ids: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1019,6 +1024,21 @@ class StepPlan:
             "proposal_buffer_consumed_count": int(self.proposal_buffer_consumed_count),
             "proposal_buffer_dropped_count": int(self.proposal_buffer_dropped_count),
             "proposal_buffer_invalid_count": int(self.proposal_buffer_invalid_count),
+            "cached_admission_newly_admitted_seq_ids": _int_list(
+                self.cached_admission_newly_admitted_seq_ids
+            ),
+            "cached_admission_draft_priming_seq_ids": _int_list(
+                self.cached_admission_draft_priming_seq_ids
+            ),
+            "cached_admission_primed_seq_ids": _int_list(
+                self.cached_admission_primed_seq_ids
+            ),
+            "cached_admission_unprimed_target_filtered_seq_ids": _int_list(
+                self.cached_admission_unprimed_target_filtered_seq_ids
+            ),
+            "cached_admission_missing_proposal_after_filter_seq_ids": _int_list(
+                self.cached_admission_missing_proposal_after_filter_seq_ids
+            ),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

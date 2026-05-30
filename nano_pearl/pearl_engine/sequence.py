@@ -41,6 +41,8 @@ class Sequence:
         self.decode_start_ts = None
         self.decode_ready_mode = False
         self.num_decode_ready_prefill_tokens = 0
+        self.cached_admission_newly_admitted = False
+        self.needs_dual_batch_draft_priming = False
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
@@ -177,6 +179,12 @@ class Sequence:
             "decode_start_ts": self.decode_start_ts,
             "decode_ready_mode": self.decode_ready_mode,
             "num_decode_ready_prefill_tokens": self.num_decode_ready_prefill_tokens,
+            "cached_admission_newly_admitted": bool(
+                getattr(self, "cached_admission_newly_admitted", False)
+            ),
+            "needs_dual_batch_draft_priming": bool(
+                getattr(self, "needs_dual_batch_draft_priming", False)
+            ),
             "num_decode_output_tokens": num_decode_output_tokens,
             "decode_elapsed_ms": decode_elapsed_ms,
             "observed_tpot_ms": observed_tpot_ms,
@@ -220,6 +228,8 @@ class Sequence:
             self.token_ids = state[-1]
         else:
             self.last_token = state[-1]
+        self.cached_admission_newly_admitted = False
+        self.needs_dual_batch_draft_priming = False
 
 
 def _sequence_status_name(seq: Sequence) -> str:
