@@ -239,6 +239,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
             args.enable_rolling_continuous_partial_prefix_recovery
         ),
         "enable_generic_rolling_runtime_loop": args.enable_generic_rolling_runtime_loop,
+        "enable_generic_rolling_apply_path": args.enable_generic_rolling_apply_path,
         "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
         "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
         "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
@@ -292,6 +293,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_rolling_continuous_depth4_commit_ready_only",
         "enable_rolling_continuous_partial_prefix_recovery",
         "enable_generic_rolling_runtime_loop",
+        "enable_generic_rolling_apply_path",
         "max_continuous_eager_chain_depth",
         "max_continuous_eager_requests_per_step",
         "max_continuous_eager_tokens_per_step",
@@ -1379,7 +1381,9 @@ def append_generic_rolling_runtime_aggregate_trace(
     result_args: Dict[str, Any],
     accounting: Dict[str, Any],
 ) -> None:
-    if not bool(result_args.get("enable_generic_rolling_runtime_loop", False)):
+    generic_runtime_enabled = bool(result_args.get("enable_generic_rolling_runtime_loop", False))
+    generic_apply_enabled = bool(result_args.get("enable_generic_rolling_apply_path", False))
+    if not (generic_runtime_enabled or generic_apply_enabled):
         return
 
     full_commit_tokens = sum(
@@ -1425,6 +1429,16 @@ def append_generic_rolling_runtime_aggregate_trace(
     )
     depth_gt4 = to_int(accounting.get("rolling_depth_gt4_real_commit_count"), 0) or 0
     max_depth = to_int(result_args.get("max_rolling_continuous_depth"), 0) or 0
+    apply_node_count = sum(
+        to_int(accounting.get(field), 0) or 0
+        for field in (
+            "rolling_depth2_real_committed_proposal_count",
+            "rolling_depth3_real_committed_proposal_count",
+            "rolling_depth4_real_committed_proposal_count",
+            "partial_prefix_recovery_success_count",
+        )
+    )
+    cascade_count = to_int(accounting.get("partial_recovery_cascade_discard_count"), 0) or 0
     parity_ok = bool(
         max_depth == 4
         and max_observed_depth <= 4
@@ -1439,6 +1453,8 @@ def append_generic_rolling_runtime_aggregate_trace(
         "runner_role": "aggregate",
         "generic_rolling_runtime_enabled": True,
         "enable_generic_rolling_runtime_loop": True,
+        "generic_rolling_apply_path_enabled": bool(generic_apply_enabled),
+        "enable_generic_rolling_apply_path": bool(generic_apply_enabled),
         "generic_rolling_max_depth": max_depth,
         "generic_rolling_node_count": 0,
         "generic_rolling_max_observed_depth": int(max_observed_depth),
@@ -1454,6 +1470,21 @@ def append_generic_rolling_runtime_aggregate_trace(
         "generic_rolling_normal_lane_conflict_count": int(normal_lane_conflict_count),
         "generic_rolling_target_draft_mismatch_count": int(target_draft_mismatch_count),
         "generic_rolling_parity_ok": parity_ok,
+        "generic_rolling_apply_depths": [2, 3, 4] if generic_apply_enabled else [],
+        "generic_rolling_apply_node_count": int(apply_node_count) if generic_apply_enabled else 0,
+        "generic_rolling_apply_full_commit_token_count": int(full_commit_tokens) if generic_apply_enabled else 0,
+        "generic_rolling_apply_partial_recovered_token_count": int(partial_total) if generic_apply_enabled else 0,
+        "generic_rolling_apply_revised_token_count": int(revised_tokens) if generic_apply_enabled else 0,
+        "generic_rolling_apply_output_token_count": int(output_tokens) if generic_apply_enabled else 0,
+        "generic_rolling_apply_cascade_discard_count": int(cascade_count) if generic_apply_enabled else 0,
+        "generic_rolling_apply_depth_gt4_count": int(depth_gt4) if generic_apply_enabled else 0,
+        "generic_rolling_apply_normal_lane_conflict_count": (
+            int(normal_lane_conflict_count) if generic_apply_enabled else 0
+        ),
+        "generic_rolling_apply_target_draft_mismatch_count": (
+            int(target_draft_mismatch_count) if generic_apply_enabled else 0
+        ),
+        "generic_rolling_apply_parity_ok": bool(generic_apply_enabled and parity_ok) if generic_apply_enabled else True,
     }
 
     appended = False
@@ -1821,6 +1852,15 @@ def main() -> None:
         help=(
             "Enable Phase 1H-8s generic rolling runtime parity mode. "
             "This mode is limited to --max-rolling-continuous-depth 4."
+        ),
+    )
+    parser.add_argument(
+        "--enable-generic-rolling-apply-path",
+        action="store_true",
+        help=(
+            "Enable Phase 1H-8t generic rolling apply-path parity mode. "
+            "This implies the generic rolling runtime loop and is limited to "
+            "--max-rolling-continuous-depth 4."
         ),
     )
     parser.add_argument("--max-continuous-eager-chain-depth", type=int, default=1)

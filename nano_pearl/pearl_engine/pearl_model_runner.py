@@ -1186,6 +1186,12 @@ class ModelRunnerBase:
             "enable_generic_rolling_runtime_loop": bool(
                 getattr(self.global_config, "enable_generic_rolling_runtime_loop", False)
             ),
+            "generic_rolling_apply_path_enabled": bool(
+                getattr(self.global_config, "enable_generic_rolling_apply_path", False)
+            ),
+            "enable_generic_rolling_apply_path": bool(
+                getattr(self.global_config, "enable_generic_rolling_apply_path", False)
+            ),
             "generic_rolling_max_depth": int(
                 getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0
             ),
@@ -1200,6 +1206,17 @@ class ModelRunnerBase:
             "generic_rolling_normal_lane_conflict_count": 0,
             "generic_rolling_target_draft_mismatch_count": 0,
             "generic_rolling_parity_ok": True,
+            "generic_rolling_apply_depths": [],
+            "generic_rolling_apply_node_count": 0,
+            "generic_rolling_apply_full_commit_token_count": 0,
+            "generic_rolling_apply_partial_recovered_token_count": 0,
+            "generic_rolling_apply_revised_token_count": 0,
+            "generic_rolling_apply_output_token_count": 0,
+            "generic_rolling_apply_cascade_discard_count": 0,
+            "generic_rolling_apply_depth_gt4_count": 0,
+            "generic_rolling_apply_normal_lane_conflict_count": 0,
+            "generic_rolling_apply_target_draft_mismatch_count": 0,
+            "generic_rolling_apply_parity_ok": True,
             "partial_prefix_recovery_attempt_count": 0,
             "partial_prefix_recovery_success_count": 0,
             "partial_prefix_recovery_skip_reason_counts": {},
@@ -2064,6 +2081,9 @@ class ModelRunnerBase:
 
     def _generic_rolling_runtime_loop_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_generic_rolling_runtime_loop", False))
+
+    def _generic_rolling_apply_path_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_generic_rolling_apply_path", False))
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -9431,11 +9451,185 @@ class ModelRunnerBase:
         self._record_elapsed_ms(trace_record, "continuous_eager_commit_time_ms", timer_start)
 
 
+    def _record_generic_rolling_apply_decisions(
+        self,
+        trace_record: dict,
+        *,
+        depth: int,
+        decisions: list[dict],
+    ) -> None:
+        trace_record["generic_rolling_apply_path_enabled"] = True
+        trace_record["enable_generic_rolling_apply_path"] = True
+        trace_record["generic_rolling_runtime_enabled"] = True
+        trace_record["enable_generic_rolling_runtime_loop"] = True
+        trace_record["generic_rolling_max_depth"] = int(getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0)
+
+        apply_depths = set(self._trace_int_list(trace_record.get("generic_rolling_apply_depths")))
+        apply_depths.add(int(depth))
+        trace_record["generic_rolling_apply_depths"] = sorted(
+            depth_value for depth_value in apply_depths if 2 <= depth_value <= 4
+        )
+        trace_record["generic_rolling_apply_node_count"] = int(
+            trace_record.get("generic_rolling_apply_node_count") or 0
+        ) + len(decisions)
+        full_commit_tokens = sum(int(decision.get("token_count", 0) or 0) for decision in decisions)
+        trace_record["generic_rolling_apply_full_commit_token_count"] = int(
+            trace_record.get("generic_rolling_apply_full_commit_token_count") or 0
+        ) + int(full_commit_tokens)
+        partial_total = int(trace_record.get("partial_prefix_total_recovered_token_count") or 0)
+        partial_revised = int(trace_record.get("partial_prefix_revised_token_count") or 0)
+        trace_record["generic_rolling_apply_partial_recovered_token_count"] = int(partial_total)
+        trace_record["generic_rolling_apply_revised_token_count"] = int(partial_revised)
+        trace_record["generic_rolling_apply_output_token_count"] = int(
+            trace_record.get("generic_rolling_apply_full_commit_token_count") or 0
+        ) + int(partial_total)
+        trace_record["generic_rolling_apply_cascade_discard_count"] = int(
+            trace_record.get("partial_recovery_cascade_discard_count") or 0
+        )
+        trace_record["generic_rolling_apply_depth_gt4_count"] = int(
+            trace_record.get("rolling_depth_gt4_real_commit_count") or 0
+        )
+        normal_conflict = int(trace_record.get("rolling_normal_lane_conflict_count") or 0)
+        normal_conflict += int(trace_record.get("rolling_depth3_normal_lane_conflict_count") or 0)
+        normal_conflict += int(trace_record.get("rolling_depth4_normal_lane_conflict_count") or 0)
+        trace_record["generic_rolling_apply_normal_lane_conflict_count"] = int(normal_conflict)
+        target_draft_mismatch = self._trace_false_count(
+            trace_record.get("partial_recovery_target_draft_len_match_by_seq_id")
+        ) + self._trace_false_count(trace_record.get("partial_recovery_target_draft_token_match_by_seq_id"))
+        trace_record["generic_rolling_apply_target_draft_mismatch_count"] = int(target_draft_mismatch)
+        trace_record["generic_rolling_apply_parity_ok"] = bool(
+            int(trace_record["generic_rolling_max_depth"]) == 4
+            and int(trace_record["generic_rolling_apply_depth_gt4_count"]) == 0
+            and int(trace_record["generic_rolling_apply_normal_lane_conflict_count"]) == 0
+            and int(trace_record["generic_rolling_apply_target_draft_mismatch_count"]) == 0
+        )
+
+    def _generic_rolling_commit_decisions_from_trace(
+        self,
+        trace_record: dict,
+        known_by_id: dict[int, EagerProposal],
+        *,
+        depth: int,
+        ready_ids_field: str,
+        generated_ids_field: str,
+        generated_seq_ids_field: str,
+        parent_field: str,
+        root_field: str,
+        depth_field: str,
+        base_len_field: str,
+        token_count_field: str | None = None,
+        ready_seq_ids_field: str | None = None,
+        prefer_proposal_parent: bool = False,
+    ) -> list[dict]:
+        ready_ids = self._trace_int_list(trace_record.get(ready_ids_field))
+        generated_ids = self._trace_int_list(trace_record.get(generated_ids_field))
+        generated_seq_ids = self._trace_int_list(trace_record.get(generated_seq_ids_field))
+        child_seq_by_id = dict(zip(generated_ids, generated_seq_ids))
+        if ready_seq_ids_field:
+            child_seq_by_id.update(
+                dict(zip(ready_ids, self._trace_int_list(trace_record.get(ready_seq_ids_field))))
+            )
+
+        parent_by_id = trace_record.get(parent_field, {})
+        root_by_id = trace_record.get(root_field, {})
+        depth_by_id = trace_record.get(depth_field, {})
+        base_len_by_id = trace_record.get(base_len_field, {})
+        token_count_by_id = trace_record.get(token_count_field, {}) if token_count_field else {}
+        gamma = int(self.gamma)
+        nodes: list[RollingProposalNode] = []
+        proposal_tokens_by_id: dict[int, list[int]] = {}
+
+        for proposal_id in ready_ids:
+            proposal = known_by_id.get(int(proposal_id))
+            proposal_tokens = (
+                [int(token_id) for token_id in proposal.proposal_token_ids]
+                if proposal is not None
+                else [0 for _ in range(gamma)]
+            )
+            fallback_count = gamma if proposal is not None and len(proposal_tokens) == gamma else 0
+            token_count = int(self._trace_map_get(token_count_by_id, proposal_id, fallback_count))
+            seq_id = (
+                int(getattr(proposal, "seq_id", child_seq_by_id.get(proposal_id, -1)))
+                if proposal is not None
+                else int(child_seq_by_id.get(proposal_id, -1))
+            )
+            if prefer_proposal_parent and proposal is not None:
+                parent_id = int(
+                    getattr(
+                        proposal,
+                        "parent_proposal_id",
+                        self._trace_map_get(parent_by_id, proposal_id, -1),
+                    )
+                )
+            else:
+                parent_id = int(self._trace_map_get(parent_by_id, proposal_id, -1))
+            root_id = int(self._trace_map_get(root_by_id, proposal_id, parent_id))
+            node_depth = int(self._trace_map_get(depth_by_id, proposal_id, depth))
+            base_len = int(
+                getattr(
+                    proposal,
+                    "base_len",
+                    self._trace_map_get(base_len_by_id, proposal_id, -1),
+                )
+                if proposal is not None
+                else self._trace_map_get(base_len_by_id, proposal_id, -1)
+            )
+            nodes.append(
+                RollingProposalNode(
+                    proposal_id=int(proposal_id),
+                    seq_id=int(seq_id),
+                    depth=int(node_depth),
+                    parent_id=int(parent_id),
+                    root_id=int(root_id),
+                    base_len=int(base_len),
+                    proposal_len=int(token_count),
+                    token_count=int(token_count),
+                    status="ready_shadow",
+                    accepted_len=int(token_count),
+                    apply_action="append_full_accept_real_commit",
+                    full_committed=True,
+                )
+            )
+            proposal_tokens_by_id[int(proposal_id)] = proposal_tokens
+
+        decisions = [
+            {
+                "proposal_id": int(node.proposal_id),
+                "seq_id": int(node.seq_id),
+                "parent_id": int(node.parent_id if node.parent_id is not None else -1),
+                "root_id": int(node.root_id if node.root_id is not None else -1),
+                "depth": int(node.depth),
+                "base_len": int(node.base_len if node.base_len is not None else -1),
+                "token_count": int(node.token_count),
+                "accept_len": int(node.token_count),
+                "proposal_token_ids": proposal_tokens_by_id.get(node.proposal_id, [])[:gamma]
+                + [0 for _ in range(max(0, gamma - len(proposal_tokens_by_id.get(node.proposal_id, []))))],
+                "action": "append_full_accept_real_commit",
+                "verify_result": "full_accept",
+            }
+            for node in nodes
+        ]
+        self._record_generic_rolling_apply_decisions(trace_record, depth=depth, decisions=decisions)
+        return decisions
+
     def _rolling_depth2_commit_decisions_from_trace(
         self,
         trace_record: dict,
         known_by_id: dict[int, EagerProposal],
     ) -> list[dict]:
+        if self._generic_rolling_apply_path_enabled():
+            return self._generic_rolling_commit_decisions_from_trace(
+                trace_record,
+                known_by_id,
+                depth=2,
+                ready_ids_field="rolling_child_ready_after_parent_full_accept_proposal_ids",
+                generated_ids_field="draft_rolling_eager_draft_proposal_ids",
+                generated_seq_ids_field="draft_rolling_eager_draft_seq_ids",
+                parent_field="rolling_chain_parent_by_proposal_id",
+                root_field="rolling_chain_root_by_proposal_id",
+                depth_field="rolling_chain_depth_by_proposal_id",
+                base_len_field="rolling_chain_base_len_by_proposal_id",
+            )
         ready_ids = [
             int(proposal_id)
             for proposal_id in trace_record.get("rolling_child_ready_after_parent_full_accept_proposal_ids", [])
@@ -9640,6 +9834,22 @@ class ModelRunnerBase:
         trace_record: dict,
         known_by_id: dict[int, EagerProposal],
     ) -> list[dict]:
+        if self._generic_rolling_apply_path_enabled():
+            return self._generic_rolling_commit_decisions_from_trace(
+                trace_record,
+                known_by_id,
+                depth=3,
+                ready_ids_field="rolling_depth3_child_ready_shadow_proposal_ids",
+                ready_seq_ids_field="rolling_depth3_child_ready_shadow_seq_ids",
+                generated_ids_field="rolling_depth3_child_generated_proposal_ids",
+                generated_seq_ids_field="rolling_depth3_child_generated_seq_ids",
+                parent_field="rolling_depth3_child_parent_by_proposal_id",
+                root_field="rolling_depth3_child_root_by_proposal_id",
+                depth_field="rolling_depth3_child_depth_by_proposal_id",
+                base_len_field="rolling_depth3_child_base_len_by_proposal_id",
+                token_count_field="rolling_depth3_child_token_count_by_proposal_id",
+                prefer_proposal_parent=True,
+            )
         ready_ids = [
             int(proposal_id)
             for proposal_id in trace_record.get("rolling_depth3_child_ready_shadow_proposal_ids", [])
@@ -10276,6 +10486,22 @@ class ModelRunnerBase:
         trace_record: dict,
         known_by_id: dict[int, EagerProposal],
     ) -> list[dict]:
+        if self._generic_rolling_apply_path_enabled():
+            return self._generic_rolling_commit_decisions_from_trace(
+                trace_record,
+                known_by_id,
+                depth=4,
+                ready_ids_field="rolling_depth4_child_ready_shadow_proposal_ids",
+                ready_seq_ids_field="rolling_depth4_child_ready_shadow_seq_ids",
+                generated_ids_field="rolling_depth4_child_generated_proposal_ids",
+                generated_seq_ids_field="rolling_depth4_child_generated_seq_ids",
+                parent_field="rolling_depth4_child_parent_by_proposal_id",
+                root_field="rolling_depth4_child_root_by_proposal_id",
+                depth_field="rolling_depth4_child_depth_by_proposal_id",
+                base_len_field="rolling_depth4_child_base_len_by_proposal_id",
+                token_count_field="rolling_depth4_child_token_count_by_proposal_id",
+                prefer_proposal_parent=True,
+            )
         ready_ids = [
             int(proposal_id)
             for proposal_id in trace_record.get("rolling_depth4_child_ready_shadow_proposal_ids", [])
