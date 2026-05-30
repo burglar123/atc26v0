@@ -3599,7 +3599,6 @@ class ModelRunnerBase:
                     int(bool(result.get("rollback_ok", False))),
                     int(bool(result.get("mutation_detected", True))),
                     int(bool(result.get("checkpoint_failed", True))),
-                    int(result.get("revised_token", -1)),
                 ]
             )
         meta_values = [
