@@ -1374,6 +1374,104 @@ def build_eager_performance_accounting(
         }
 
 
+def append_generic_rolling_runtime_aggregate_trace(
+    engine: PEARLEngine,
+    result_args: Dict[str, Any],
+    accounting: Dict[str, Any],
+) -> None:
+    if not bool(result_args.get("enable_generic_rolling_runtime_loop", False)):
+        return
+
+    full_commit_tokens = sum(
+        to_int(accounting.get(field), 0) or 0
+        for field in (
+            "eager_committed_token_count",
+            "continuous_eager_real_committed_token_count",
+            "rolling_depth2_real_committed_token_count",
+            "rolling_depth3_real_committed_token_count",
+            "rolling_depth4_real_committed_token_count",
+        )
+    )
+    partial_total = to_int(accounting.get("partial_prefix_total_recovered_token_count"), 0) or 0
+    revised_tokens = to_int(accounting.get("partial_prefix_revised_token_count"), 0) or 0
+    output_tokens = full_commit_tokens + partial_total
+    combined_tokens = to_int(accounting.get("combined_real_committed_token_count"), output_tokens) or 0
+    max_observed_depth = max(
+        to_int(accounting.get("rolling_depth3_max_depth_observed"), 0) or 0,
+        to_int(accounting.get("rolling_depth4_max_depth_observed"), 0) or 0,
+    )
+    depth_tokens = {
+        0: to_int(accounting.get("eager_committed_token_count"), 0) or 0,
+        1: to_int(accounting.get("continuous_eager_real_committed_token_count"), 0) or 0,
+        2: to_int(accounting.get("rolling_depth2_real_committed_token_count"), 0) or 0,
+        3: to_int(accounting.get("rolling_depth3_real_committed_token_count"), 0) or 0,
+        4: to_int(accounting.get("rolling_depth4_real_committed_token_count"), 0) or 0,
+    }
+    max_real_depth = max([depth for depth, tokens in depth_tokens.items() if tokens > 0] + [0])
+    normal_lane_conflict_count = sum(
+        to_int(accounting.get(field), 0) or 0
+        for field in (
+            "rolling_normal_lane_conflict_count",
+            "rolling_depth3_normal_lane_conflict_count",
+            "rolling_depth4_normal_lane_conflict_count",
+        )
+    )
+    target_draft_mismatch_count = sum(
+        to_int(accounting.get(field), 0) or 0
+        for field in (
+            "partial_recovery_target_draft_length_mismatch_count",
+            "partial_recovery_target_draft_token_mismatch_count",
+        )
+    )
+    depth_gt4 = to_int(accounting.get("rolling_depth_gt4_real_commit_count"), 0) or 0
+    max_depth = to_int(result_args.get("max_rolling_continuous_depth"), 0) or 0
+    parity_ok = bool(
+        max_depth == 4
+        and max_observed_depth <= 4
+        and max_real_depth <= 4
+        and depth_gt4 == 0
+        and normal_lane_conflict_count == 0
+        and target_draft_mismatch_count == 0
+        and output_tokens == combined_tokens
+    )
+    record = {
+        "trace_record_type": "generic_rolling_runtime_aggregate_parity",
+        "runner_role": "aggregate",
+        "generic_rolling_runtime_enabled": True,
+        "enable_generic_rolling_runtime_loop": True,
+        "generic_rolling_max_depth": max_depth,
+        "generic_rolling_node_count": 0,
+        "generic_rolling_max_observed_depth": int(max_observed_depth),
+        "generic_rolling_max_real_committed_depth": int(max_real_depth),
+        "generic_rolling_full_commit_token_count": int(full_commit_tokens),
+        "generic_rolling_partial_recovered_token_count": int(partial_total),
+        "generic_rolling_revised_token_count": int(revised_tokens),
+        "generic_rolling_output_token_count": int(output_tokens),
+        "generic_rolling_descendant_cascade_discard_count": to_int(
+            accounting.get("partial_recovery_cascade_discard_count"), 0
+        )
+        or 0,
+        "generic_rolling_normal_lane_conflict_count": int(normal_lane_conflict_count),
+        "generic_rolling_target_draft_mismatch_count": int(target_draft_mismatch_count),
+        "generic_rolling_parity_ok": parity_ok,
+    }
+
+    appended = False
+    if hasattr(engine, "last_traces") and isinstance(getattr(engine, "last_traces"), list):
+        engine.last_traces.append(record)
+        appended = True
+    else:
+        trace_payload = try_get_traces(engine)
+        if isinstance(trace_payload, dict) and isinstance(trace_payload.get("traces"), list):
+            trace_payload["traces"].append(record)
+            appended = True
+        elif isinstance(trace_payload, list):
+            trace_payload.append(record)
+            appended = True
+    if not appended:
+        print("[WARN] Could not append generic rolling runtime aggregate parity trace record")
+
+
 def run_generation(
     engine: PEARLEngine,
     execution_mode: str,
@@ -1916,8 +2014,6 @@ def main() -> None:
         num_acc_tokens = None if args.execution_mode == "ar" else raw_num_acc_tokens
         merged_rows = all_merged_rows
 
-        maybe_dump_engine_trace(engine, args.engine_trace_out)
-
         metrics, evaluated_rows = compute_metrics(
             rows=merged_rows,
             engine_elapsed_s=elapsed_time,
@@ -1937,6 +2033,12 @@ def main() -> None:
             result_args=result_args,
             metrics=metrics,
         )
+        append_generic_rolling_runtime_aggregate_trace(
+            engine=engine,
+            result_args=result_args,
+            accounting=eager_performance_accounting,
+        )
+        maybe_dump_engine_trace(engine, args.engine_trace_out)
 
         result: Dict[str, Any] = {
             "args": result_args,
