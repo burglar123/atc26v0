@@ -58,11 +58,17 @@ CASE_PRESETS: dict[str, PartialRecoveryCase] = {
 }
 
 
-CHECKERS = [
-    *DEPTH4_CHECKERS[:9],
+LEGACY_DEPTH_CHECKERS = DEPTH4_CHECKERS[:9]
+
+CORE_CHECKERS = [
     ("benchmark/check_eager_partial_prefix_recovery.py", "trace_result", ()),
-    *DEPTH4_CHECKERS[9:],
+    ("benchmark/check_bounded_rolling_readiness_audit.py", "trace_result", ("--check-generic-parity",)),
+    ("benchmark/check_generic_bounded_rolling_chain.py", "trace_result", ()),
+    ("benchmark/check_eager_performance_accounting.py", "trace_result", ("--check-generic-chain",)),
+    ("benchmark/check_multislo_result.py", "result", ()),
 ]
+
+CHECKERS = CORE_CHECKERS
 
 
 def eval_command_8q(args: argparse.Namespace, case: PartialRecoveryCase, result_json: Path, engine_trace: Path) -> list[str]:
@@ -112,6 +118,12 @@ def load_case_summary(
             "partial_recovery_target_draft_token_mismatch_count": accounting.get(
                 "partial_recovery_target_draft_token_mismatch_count"
             ),
+            "combined_actual_verified_token_increment_sum": accounting.get(
+                "combined_actual_verified_token_increment_sum"
+            ),
+            "combined_actual_accepted_token_increment_sum": accounting.get(
+                "combined_actual_accepted_token_increment_sum"
+            ),
             "combined_actual_revised_token_increment_sum": accounting.get(
                 "combined_actual_revised_token_increment_sum"
             ),
@@ -123,6 +135,29 @@ def load_case_summary(
     return row
 
 
+def run_checker_chain(
+    args: argparse.Namespace,
+    checkers: list[tuple[str, str, tuple[str, ...]]],
+    *,
+    engine_trace: Path,
+    result_json: Path,
+    env: dict[str, str],
+    label: str,
+) -> tuple[int, str, str | None]:
+    for checker, input_kind, extra_args in checkers:
+        if input_kind == "trace":
+            command = checker_command(args, checker, engine_trace, extra_args=extra_args)
+        elif input_kind == "result":
+            command = checker_command(args, checker, result_json, extra_args=extra_args)
+        else:
+            command = checker_command(args, checker, engine_trace, result_json, extra_args=extra_args)
+        print(f"{label}_checker={checker}", flush=True)
+        checker_status = run_command(command, env, args.print_only)
+        if checker_status != 0:
+            return checker_status, f"failed:{checker}", checker
+    return 0, "pass", None
+
+
 def run_case(args: argparse.Namespace, case: PartialRecoveryCase, env: dict[str, str]) -> tuple[int, dict[str, Any]]:
     case_dir = Path(args.out_root) / case.name
     result_json = case_dir / "result.json"
@@ -132,20 +167,40 @@ def run_case(args: argparse.Namespace, case: PartialRecoveryCase, env: dict[str,
         case_dir.mkdir(parents=True, exist_ok=True)
     status = run_command(eval_command_8q(args, case, result_json, engine_trace), env, args.print_only)
     check_status = "eval_failed" if status else "pass"
+    core_checker_chain_status = "not_run:eval_failed" if status else "pass"
+    core_checker_chain_failed_checker: str | None = None
+    legacy_depth_checker_chain_ran = bool(args.run_legacy_depth_checkers or args.strict_legacy_depth_checkers)
+    legacy_depth_checker_chain_status = "not_run"
+    legacy_depth_checker_chain_failed_checker: str | None = None
+    core_chain_passed = False
     if status == 0:
-        for checker, input_kind, extra_args in CHECKERS:
-            if input_kind == "trace":
-                command = checker_command(args, checker, engine_trace, extra_args=extra_args)
-            elif input_kind == "result":
-                command = checker_command(args, checker, result_json, extra_args=extra_args)
-            else:
-                command = checker_command(args, checker, engine_trace, result_json, extra_args=extra_args)
-            print(f"checker={checker}", flush=True)
-            checker_status = run_command(command, env, args.print_only)
-            if checker_status != 0:
-                status = checker_status
-                check_status = f"failed:{checker}"
-                break
+        core_status, core_checker_chain_status, core_checker_chain_failed_checker = run_checker_chain(
+            args,
+            CORE_CHECKERS,
+            engine_trace=engine_trace,
+            result_json=result_json,
+            env=env,
+            label="core",
+        )
+        if core_status != 0:
+            status = core_status
+            check_status = core_checker_chain_status
+        else:
+            core_chain_passed = True
+        if core_chain_passed and legacy_depth_checker_chain_ran:
+            legacy_status, legacy_depth_checker_chain_status, legacy_depth_checker_chain_failed_checker = (
+                run_checker_chain(
+                    args,
+                    LEGACY_DEPTH_CHECKERS,
+                    engine_trace=engine_trace,
+                    result_json=result_json,
+                    env=env,
+                    label="legacy_depth",
+                )
+            )
+            if legacy_status != 0 and args.strict_legacy_depth_checkers:
+                status = legacy_status
+                check_status = legacy_depth_checker_chain_status
     row: dict[str, Any] = {
         "case_name": case.name,
         "depth2_commit_enabled": True,
@@ -155,11 +210,17 @@ def run_case(args: argparse.Namespace, case: PartialRecoveryCase, env: dict[str,
         "depth4_commit_enabled": case.base_case.depth4_commit_enabled,
         "partial_prefix_recovery_enabled": case.partial_recovery_enabled,
         "check_status": check_status,
+        "core_checker_chain_status": core_checker_chain_status,
+        "core_checker_chain_failed_checker": core_checker_chain_failed_checker,
+        "legacy_depth_checker_chain_status": legacy_depth_checker_chain_status,
+        "legacy_depth_checker_chain_failed_checker": legacy_depth_checker_chain_failed_checker,
+        "legacy_depth_checker_chain_ran": legacy_depth_checker_chain_ran,
+        "strict_legacy_depth_checkers": bool(args.strict_legacy_depth_checkers),
         "result_json": str(result_json),
         "engine_trace": str(engine_trace),
         "description": case.description,
     }
-    if status == 0 and not args.print_only:
+    if core_chain_passed and not args.print_only:
         row.update(
             load_case_summary(
                 engine_trace,
@@ -182,6 +243,8 @@ def run_case(args: argparse.Namespace, case: PartialRecoveryCase, env: dict[str,
         if not parity_ok:
             status = 1
             row["check_status"] = "failed:generic_legacy_parity"
+            row["core_checker_chain_status"] = "failed:generic_legacy_parity"
+            row["core_checker_chain_failed_checker"] = "generic_legacy_parity"
     return status, row
 
 
@@ -218,6 +281,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-visible-devices")
     parser.add_argument("--print-only", action="store_true")
     parser.add_argument("--keep-going", action="store_true")
+    parser.add_argument(
+        "--run-legacy-depth-checkers",
+        action="store_true",
+        help="Run old depth-specific checkers and report their status without failing cases unless strict mode is set.",
+    )
+    parser.add_argument(
+        "--strict-legacy-depth-checkers",
+        action="store_true",
+        help="Run old depth-specific checkers and fail the case on legacy checker failure.",
+    )
     parser.add_argument("--extra-eval-arg", action="append", default=[])
     return parser.parse_args()
 
