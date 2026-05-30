@@ -1192,6 +1192,12 @@ class ModelRunnerBase:
             "enable_generic_rolling_apply_path": bool(
                 getattr(self.global_config, "enable_generic_rolling_apply_path", False)
             ),
+            "generic_full_continuous_enabled": bool(
+                getattr(self.global_config, "enable_full_continuous_eager", False)
+            ),
+            "enable_full_continuous_eager": bool(
+                getattr(self.global_config, "enable_full_continuous_eager", False)
+            ),
             "generic_rolling_max_depth": int(
                 getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0
             ),
@@ -1217,6 +1223,25 @@ class ModelRunnerBase:
             "generic_rolling_apply_normal_lane_conflict_count": 0,
             "generic_rolling_apply_target_draft_mismatch_count": 0,
             "generic_rolling_apply_parity_ok": True,
+            "generic_full_continuous_max_depth": 0,
+            "generic_full_continuous_max_observed_depth": 0,
+            "generic_full_continuous_max_real_committed_depth": 0,
+            "generic_full_continuous_depth_commit_token_counts": {},
+            "generic_full_continuous_depth_commit_proposal_counts": {},
+            "generic_full_continuous_depth_candidate_token_counts": {},
+            "generic_full_continuous_depth_ready_token_counts": {},
+            "generic_full_continuous_depth_partial_recovered_token_counts": {},
+            "generic_full_continuous_depth_revised_token_counts": {},
+            "generic_full_continuous_depth_cascade_discard_counts": {},
+            "generic_full_continuous_stop_reason_counts": {},
+            "generic_full_continuous_total_full_commit_token_count": 0,
+            "generic_full_continuous_total_partial_recovered_token_count": 0,
+            "generic_full_continuous_total_revised_token_count": 0,
+            "generic_full_continuous_total_output_token_count": 0,
+            "generic_full_continuous_depth_gt_max_real_commit_count": 0,
+            "generic_full_continuous_normal_lane_conflict_count": 0,
+            "generic_full_continuous_target_draft_mismatch_count": 0,
+            "generic_full_continuous_parity_ok": True,
             "partial_prefix_recovery_attempt_count": 0,
             "partial_prefix_recovery_success_count": 0,
             "partial_prefix_recovery_skip_reason_counts": {},
@@ -2084,6 +2109,9 @@ class ModelRunnerBase:
 
     def _generic_rolling_apply_path_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_generic_rolling_apply_path", False))
+
+    def _full_continuous_eager_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "enable_full_continuous_eager", False))
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -3184,9 +3212,12 @@ class ModelRunnerBase:
 
     def _emit_generic_rolling_runtime_parity_trace(self, trace_record: dict, *, side: str) -> None:
         enabled = self._generic_rolling_runtime_loop_enabled()
+        full_continuous_enabled = self._full_continuous_eager_enabled()
         context = self._generic_rolling_runtime_context(trace_record, side=side)
         trace_record["generic_rolling_runtime_enabled"] = bool(enabled)
         trace_record["enable_generic_rolling_runtime_loop"] = bool(enabled)
+        trace_record["generic_full_continuous_enabled"] = bool(full_continuous_enabled)
+        trace_record["enable_full_continuous_eager"] = bool(full_continuous_enabled)
         trace_record["generic_rolling_max_depth"] = int(context.max_depth)
         if not enabled:
             return
@@ -3224,6 +3255,19 @@ class ModelRunnerBase:
         )
         partial_total = int(trace_record.get("partial_prefix_total_recovered_token_count") or 0)
         partial_revised = int(trace_record.get("partial_prefix_revised_token_count") or 0)
+        partial_depth_by_id = self._trace_int_map(trace_record.get("partial_prefix_recovered_depth_by_proposal_id"))
+        partial_token_by_id = self._trace_int_map(trace_record.get("partial_prefix_committed_token_count_by_proposal_id"))
+        partial_revised_by_id = self._trace_int_map(trace_record.get("partial_prefix_revised_token_count_by_proposal_id"))
+        full_continuous_partial_by_depth: dict[str, int] = {}
+        full_continuous_revised_by_depth: dict[str, int] = {}
+        for proposal_id, depth in partial_depth_by_id.items():
+            depth_key = str(int(depth))
+            full_continuous_partial_by_depth[depth_key] = int(
+                full_continuous_partial_by_depth.get(depth_key, 0)
+            ) + int(partial_token_by_id.get(proposal_id, 0))
+            full_continuous_revised_by_depth[depth_key] = int(
+                full_continuous_revised_by_depth.get(depth_key, 0)
+            ) + int(partial_revised_by_id.get(proposal_id, 0))
         observed_depth = max(
             [node.depth for node in nodes]
             + [
@@ -3256,6 +3300,39 @@ class ModelRunnerBase:
         cascade_count = int(trace_record.get("partial_recovery_cascade_discard_count") or 0)
         cascade_count += int(trace_record.get("rolling_cascade_discard_count") or 0)
         output_token_count = full_commit_tokens + partial_total
+        full_continuous_depth_tokens = {
+            "1": self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("continuous_eager_real_committed_token_count", "continuous_eager_tokens_committed"),
+                map_field="continuous_eager_real_committed_token_count_by_proposal_id",
+            ),
+            "2": self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth2_real_committed_token_count", "rolling_depth2_tokens_committed"),
+                map_field="rolling_depth2_real_committed_token_count_by_proposal_id",
+            ),
+            "3": self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth3_real_committed_token_count", "rolling_depth3_tokens_committed"),
+                map_field="rolling_depth3_real_committed_token_count_by_proposal_id",
+            ),
+            "4": self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth4_real_committed_token_count", "rolling_depth4_tokens_committed"),
+                map_field="rolling_depth4_real_committed_token_count_by_proposal_id",
+            ),
+        }
+        full_continuous_total_full = sum(int(value) for value in full_continuous_depth_tokens.values())
+        full_continuous_stop_reasons: dict[str, int] = {}
+        if full_continuous_enabled:
+            if observed_depth >= context.max_depth:
+                full_continuous_stop_reasons["max_depth_reached"] = 1
+            elif normal_lane_conflict_count:
+                full_continuous_stop_reasons["normal_lane_conflict"] = int(normal_lane_conflict_count)
+            elif target_draft_mismatch_count:
+                full_continuous_stop_reasons["target_draft_mismatch"] = int(target_draft_mismatch_count)
+            else:
+                full_continuous_stop_reasons["no_eligible_ready_child"] = 1
         trace_record["generic_rolling_node_count"] = len(nodes)
         trace_record["generic_rolling_max_observed_depth"] = int(observed_depth)
         trace_record["generic_rolling_max_real_committed_depth"] = int(real_depth)
@@ -3267,13 +3344,66 @@ class ModelRunnerBase:
         trace_record["generic_rolling_normal_lane_conflict_count"] = int(normal_lane_conflict_count)
         trace_record["generic_rolling_target_draft_mismatch_count"] = int(target_draft_mismatch_count)
         trace_record["generic_rolling_parity_ok"] = bool(
-            context.max_depth == 4
+            (context.max_depth == 4 or (full_continuous_enabled and 4 <= context.max_depth <= 100))
             and observed_depth <= context.max_depth
             and real_depth <= context.max_depth
             and int(trace_record.get("rolling_depth_gt4_real_commit_count") or 0) == 0
             and normal_lane_conflict_count == 0
             and target_draft_mismatch_count == 0
         )
+        if full_continuous_enabled:
+            trace_record["generic_full_continuous_max_depth"] = int(context.max_depth)
+            trace_record["generic_full_continuous_max_observed_depth"] = int(observed_depth)
+            trace_record["generic_full_continuous_max_real_committed_depth"] = int(real_depth)
+            trace_record["generic_full_continuous_depth_commit_token_counts"] = {
+                key: int(value) for key, value in sorted(full_continuous_depth_tokens.items())
+            }
+            trace_record["generic_full_continuous_depth_commit_proposal_counts"] = {
+                "1": len(self._trace_int_list(trace_record.get("continuous_eager_real_committed_proposal_ids"))),
+                "2": len(self._trace_int_list(trace_record.get("rolling_depth2_real_committed_proposal_ids"))),
+                "3": len(self._trace_int_list(trace_record.get("rolling_depth3_real_committed_proposal_ids"))),
+                "4": len(self._trace_int_list(trace_record.get("rolling_depth4_real_committed_proposal_ids"))),
+            }
+            trace_record["generic_full_continuous_depth_candidate_token_counts"] = {
+                "1": int(trace_record.get("continuous_eager_candidate_token_count") or 0),
+                "2": int(trace_record.get("rolling_child_candidate_token_count") or 0),
+                "3": int(trace_record.get("rolling_depth3_child_candidate_token_count") or 0),
+                "4": int(trace_record.get("rolling_depth4_child_candidate_token_count") or 0),
+            }
+            trace_record["generic_full_continuous_depth_ready_token_counts"] = {
+                "1": int(trace_record.get("continuous_eager_commit_ready_shadow_token_count") or 0),
+                "2": int(trace_record.get("rolling_child_ready_shadow_token_count") or 0),
+                "3": int(trace_record.get("rolling_depth3_child_ready_shadow_token_count") or 0),
+                "4": int(trace_record.get("rolling_depth4_child_ready_shadow_token_count") or 0),
+            }
+            trace_record["generic_full_continuous_depth_partial_recovered_token_counts"] = dict(
+                sorted(full_continuous_partial_by_depth.items(), key=lambda item: int(item[0]))
+            )
+            trace_record["generic_full_continuous_depth_revised_token_counts"] = dict(
+                sorted(full_continuous_revised_by_depth.items(), key=lambda item: int(item[0]))
+            )
+            trace_record["generic_full_continuous_depth_cascade_discard_counts"] = {
+                depth: int(trace_record.get("partial_recovery_cascade_discard_count") or 0)
+                for depth in full_continuous_partial_by_depth
+            }
+            trace_record["generic_full_continuous_stop_reason_counts"] = dict(sorted(full_continuous_stop_reasons.items()))
+            trace_record["generic_full_continuous_total_full_commit_token_count"] = int(full_continuous_total_full)
+            trace_record["generic_full_continuous_total_partial_recovered_token_count"] = int(partial_total)
+            trace_record["generic_full_continuous_total_revised_token_count"] = int(partial_revised)
+            trace_record["generic_full_continuous_total_output_token_count"] = int(
+                full_continuous_total_full + partial_total
+            )
+            trace_record["generic_full_continuous_depth_gt_max_real_commit_count"] = 0
+            trace_record["generic_full_continuous_normal_lane_conflict_count"] = int(normal_lane_conflict_count)
+            trace_record["generic_full_continuous_target_draft_mismatch_count"] = int(target_draft_mismatch_count)
+            trace_record["generic_full_continuous_parity_ok"] = bool(
+                4 <= context.max_depth <= 100
+                and observed_depth <= context.max_depth
+                and real_depth <= context.max_depth
+                and normal_lane_conflict_count == 0
+                and target_draft_mismatch_count == 0
+                and bool(full_continuous_stop_reasons)
+            )
 
     def _build_commit_trace_bundle(
         self,
@@ -9497,8 +9627,9 @@ class ModelRunnerBase:
             trace_record.get("partial_recovery_target_draft_len_match_by_seq_id")
         ) + self._trace_false_count(trace_record.get("partial_recovery_target_draft_token_match_by_seq_id"))
         trace_record["generic_rolling_apply_target_draft_mismatch_count"] = int(target_draft_mismatch)
+        max_depth = int(trace_record["generic_rolling_max_depth"])
         trace_record["generic_rolling_apply_parity_ok"] = bool(
-            int(trace_record["generic_rolling_max_depth"]) == 4
+            (max_depth == 4 or (self._full_continuous_eager_enabled() and 4 <= max_depth <= 100))
             and int(trace_record["generic_rolling_apply_depth_gt4_count"]) == 0
             and int(trace_record["generic_rolling_apply_normal_lane_conflict_count"]) == 0
             and int(trace_record["generic_rolling_apply_target_draft_mismatch_count"]) == 0

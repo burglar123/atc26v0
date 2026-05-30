@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.bounded_rolling_chain_parser import int_value  # noqa: E402
+from benchmark.check_bounded_rolling_readiness_audit import load_trace, synthetic_result_payload  # noqa: E402
+from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
+
+
+FULL_CONTINUOUS_INT_FIELDS = (
+    "generic_full_continuous_max_depth",
+    "generic_full_continuous_max_observed_depth",
+    "generic_full_continuous_max_real_committed_depth",
+    "generic_full_continuous_total_full_commit_token_count",
+    "generic_full_continuous_total_partial_recovered_token_count",
+    "generic_full_continuous_total_revised_token_count",
+    "generic_full_continuous_total_output_token_count",
+    "generic_full_continuous_depth_gt_max_real_commit_count",
+    "generic_full_continuous_normal_lane_conflict_count",
+    "generic_full_continuous_target_draft_mismatch_count",
+)
+
+
+def _bool_any(records: list[dict[str, Any]], *fields: str) -> bool:
+    return any(bool(record.get(field, False)) for record in records for field in fields)
+
+
+def _max_int(records: list[dict[str, Any]], field: str, default: int = 0) -> int:
+    values = [int_value(record.get(field), default) for record in records if field in record]
+    return max(values) if values else default
+
+
+def _merge_depth_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for record in records:
+        raw = record.get(field)
+        if not isinstance(raw, dict):
+            continue
+        for key, value in raw.items():
+            try:
+                depth = str(int(key))
+            except Exception:
+                continue
+            merged[depth] = max(int_value(value, 0), int_value(merged.get(depth), 0))
+    return dict(sorted(merged.items(), key=lambda item: int(item[0])))
+
+
+def _merge_reason_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for record in records:
+        raw = record.get(field)
+        if not isinstance(raw, dict):
+            continue
+        for key, value in raw.items():
+            merged[str(key)] = max(int_value(value, 0), int_value(merged.get(str(key)), 0))
+    return dict(sorted(merged.items()))
+
+
+def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    result_payload = result_payload or {}
+    result_args = result_payload.get("args", {}) if isinstance(result_payload, dict) else {}
+    if not isinstance(result_args, dict):
+        result_args = {}
+    accounting = aggregate_performance_accounting(records, result_payload)
+
+    summary: dict[str, Any] = {
+        "generic_full_continuous_enabled": _bool_any(
+            records,
+            "generic_full_continuous_enabled",
+            "enable_full_continuous_eager",
+        )
+        or bool(result_args.get("enable_full_continuous_eager", False)),
+        "generic_rolling_runtime_enabled": _bool_any(
+            records,
+            "generic_rolling_runtime_enabled",
+            "enable_generic_rolling_runtime_loop",
+        )
+        or bool(result_args.get("enable_generic_rolling_runtime_loop", False)),
+        "generic_rolling_apply_path_enabled": _bool_any(
+            records,
+            "generic_rolling_apply_path_enabled",
+            "enable_generic_rolling_apply_path",
+        )
+        or bool(result_args.get("enable_generic_rolling_apply_path", False)),
+        "generic_full_continuous_parity_ok": all(
+            bool(record.get("generic_full_continuous_parity_ok", True))
+            for record in records
+            if bool(record.get("generic_full_continuous_enabled", False))
+            or bool(record.get("enable_full_continuous_eager", False))
+        ),
+        "one_shot_committed_token_count": int_value(accounting.get("eager_committed_token_count"), 0)
+        or _max_int(records, "eager_committed_token_count"),
+        "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0)
+        or _max_int(records, "combined_real_committed_token_count"),
+        "partial_prefix_accepted_token_count": int_value(
+            accounting.get("partial_prefix_accepted_token_count"), 0
+        )
+        or _max_int(records, "partial_prefix_accepted_token_count"),
+        "partial_prefix_revised_token_count": int_value(
+            accounting.get("partial_prefix_revised_token_count"), 0
+        )
+        or _max_int(records, "partial_prefix_revised_token_count"),
+        "partial_prefix_total_recovered_token_count": int_value(
+            accounting.get("partial_prefix_total_recovered_token_count"), 0
+        )
+        or _max_int(records, "partial_prefix_total_recovered_token_count"),
+        "descendant_committed_after_partial_count": int_value(
+            accounting.get("descendant_committed_after_partial_count"), 0
+        )
+        or _max_int(records, "descendant_committed_after_partial_count"),
+    }
+    for field in FULL_CONTINUOUS_INT_FIELDS:
+        summary[field] = _max_int(records, field)
+
+    summary["generic_full_continuous_depth_commit_token_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_commit_token_counts",
+    )
+    summary["generic_full_continuous_depth_commit_proposal_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_commit_proposal_counts",
+    )
+    summary["generic_full_continuous_depth_candidate_token_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_candidate_token_counts",
+    )
+    summary["generic_full_continuous_depth_ready_token_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_ready_token_counts",
+    )
+    summary["generic_full_continuous_depth_partial_recovered_token_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_partial_recovered_token_counts",
+    )
+    summary["generic_full_continuous_depth_revised_token_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_revised_token_counts",
+    )
+    summary["generic_full_continuous_depth_cascade_discard_counts"] = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_cascade_discard_counts",
+    )
+    summary["generic_full_continuous_stop_reason_counts"] = _merge_reason_counts(
+        records,
+        "generic_full_continuous_stop_reason_counts",
+    )
+    return summary
+
+
+def validate_records(
+    records: list[dict[str, Any]],
+    result_payload: dict[str, Any] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    summary = build_summary(records, result_payload)
+    errors: list[str] = []
+    enabled = bool(summary.get("generic_full_continuous_enabled", False))
+
+    if not enabled:
+        leaked = [
+            field
+            for field in FULL_CONTINUOUS_INT_FIELDS
+            if field != "generic_full_continuous_max_depth" and int_value(summary.get(field), 0) != 0
+        ]
+        if leaked:
+            errors.append(f"generic full continuous fields nonzero while disabled: {leaked}")
+        return errors, summary
+
+    if not summary.get("generic_rolling_runtime_enabled", False):
+        errors.append("full continuous mode requires generic rolling runtime loop")
+    if not summary.get("generic_rolling_apply_path_enabled", False):
+        errors.append("full continuous mode requires generic rolling apply path")
+
+    max_depth = int_value(summary.get("generic_full_continuous_max_depth"), 0)
+    max_observed = int_value(summary.get("generic_full_continuous_max_observed_depth"), 0)
+    max_real = int_value(summary.get("generic_full_continuous_max_real_committed_depth"), 0)
+    if not (4 <= max_depth <= 100):
+        errors.append("full continuous max depth must be configurable in range 4..100")
+    if max_observed > max_depth:
+        errors.append("max observed depth must not exceed configured max depth")
+    if max_real > max_depth:
+        errors.append("max real committed depth must not exceed configured max depth")
+    if int_value(summary.get("generic_full_continuous_depth_gt_max_real_commit_count"), 0) != 0:
+        errors.append("depth_gt_max real commit count must remain zero")
+
+    depth_commit_counts = summary.get("generic_full_continuous_depth_commit_token_counts", {})
+    depth_partial_counts = summary.get("generic_full_continuous_depth_partial_recovered_token_counts", {})
+    depth_revised_counts = summary.get("generic_full_continuous_depth_revised_token_counts", {})
+    full_sum = sum(int_value(value, 0) for value in depth_commit_counts.values())
+    partial_sum = sum(int_value(value, 0) for value in depth_partial_counts.values())
+    revised_sum = sum(int_value(value, 0) for value in depth_revised_counts.values())
+    total_full = int_value(summary.get("generic_full_continuous_total_full_commit_token_count"), 0)
+    total_partial = int_value(summary.get("generic_full_continuous_total_partial_recovered_token_count"), 0)
+    total_revised = int_value(summary.get("generic_full_continuous_total_revised_token_count"), 0)
+    total_output = int_value(summary.get("generic_full_continuous_total_output_token_count"), 0)
+    if full_sum != total_full:
+        errors.append(f"depth-indexed full commit sum mismatch: sum={full_sum} total={total_full}")
+    if partial_sum != total_partial:
+        errors.append(f"depth-indexed partial recovery sum mismatch: sum={partial_sum} total={total_partial}")
+    if revised_sum != total_revised:
+        errors.append(f"depth-indexed revised token sum mismatch: sum={revised_sum} total={total_revised}")
+    if total_output != total_full + total_partial:
+        errors.append("full continuous output tokens must equal full commits plus partial recovered tokens")
+
+    partial_accepted = int_value(summary.get("partial_prefix_accepted_token_count"), 0)
+    partial_revised = int_value(summary.get("partial_prefix_revised_token_count"), 0)
+    partial_total = int_value(summary.get("partial_prefix_total_recovered_token_count"), 0)
+    if partial_total and partial_total != partial_accepted + partial_revised:
+        errors.append("partial recovered tokens must equal accepted prefix plus revised tokens")
+    if total_partial and total_partial != partial_total:
+        errors.append("full continuous partial total must match partial-prefix recovery total")
+    if total_revised and total_revised != partial_revised:
+        errors.append("full continuous revised total must match partial-prefix revised token count")
+
+    expected_combined = int_value(summary.get("one_shot_committed_token_count"), 0) + total_output
+    if int_value(summary.get("combined_real_committed_token_count"), 0) != expected_combined:
+        errors.append(
+            "combined real committed/output tokens must equal one-shot plus full continuous output"
+        )
+    if int_value(summary.get("generic_full_continuous_normal_lane_conflict_count"), 0) != 0:
+        errors.append("full continuous normal lane conflict count must remain zero")
+    if int_value(summary.get("generic_full_continuous_target_draft_mismatch_count"), 0) != 0:
+        errors.append("full continuous target/draft mismatch count must remain zero")
+    if int_value(summary.get("descendant_committed_after_partial_count"), 0) != 0:
+        errors.append("descendant committed after partial recovery must remain zero")
+    if max_observed < max_depth and not summary.get("generic_full_continuous_stop_reason_counts"):
+        errors.append("stop reason counts must explain chains that stop before max depth")
+    if not bool(summary.get("generic_full_continuous_parity_ok", False)):
+        errors.append("generic_full_continuous_parity_ok must be true")
+
+    return errors, summary
+
+
+def print_summary(summary: dict[str, Any]) -> None:
+    for key in (
+        "generic_full_continuous_enabled",
+        "generic_rolling_runtime_enabled",
+        "generic_rolling_apply_path_enabled",
+        "generic_full_continuous_max_depth",
+        "generic_full_continuous_max_observed_depth",
+        "generic_full_continuous_max_real_committed_depth",
+        "generic_full_continuous_depth_commit_token_counts",
+        "generic_full_continuous_depth_partial_recovered_token_counts",
+        "generic_full_continuous_depth_revised_token_counts",
+        "generic_full_continuous_stop_reason_counts",
+        "generic_full_continuous_total_full_commit_token_count",
+        "generic_full_continuous_total_partial_recovered_token_count",
+        "generic_full_continuous_total_revised_token_count",
+        "generic_full_continuous_total_output_token_count",
+        "generic_full_continuous_depth_gt_max_real_commit_count",
+        "generic_full_continuous_normal_lane_conflict_count",
+        "generic_full_continuous_target_draft_mismatch_count",
+        "generic_full_continuous_parity_ok",
+        "partial_prefix_accepted_token_count",
+        "partial_prefix_revised_token_count",
+        "partial_prefix_total_recovered_token_count",
+        "combined_real_committed_token_count",
+    ):
+        print(f"{key}={summary.get(key)}")
+
+
+def _base_record(
+    *,
+    max_depth: int = 100,
+    max_observed: int = 4,
+    max_real: int = 4,
+    depth_commit_counts: dict[str, int] | None = None,
+    partial_counts: dict[str, int] | None = None,
+    revised_counts: dict[str, int] | None = None,
+    stop_reasons: dict[str, int] | None = None,
+    one_shot: int = 12,
+    combined: int | None = None,
+    normal_conflict: int = 0,
+    target_draft_mismatch: int = 0,
+    depth_gt_max: int = 0,
+    parity_ok: bool = True,
+) -> dict[str, Any]:
+    depth_commit_counts = depth_commit_counts or {"1": 8, "2": 8, "3": 8, "4": 8}
+    partial_counts = partial_counts or {}
+    revised_counts = revised_counts or {}
+    total_full = sum(depth_commit_counts.values())
+    total_partial = sum(partial_counts.values())
+    total_revised = sum(revised_counts.values())
+    if combined is None:
+        combined = one_shot + total_full + total_partial
+    return {
+        "generic_full_continuous_enabled": True,
+        "enable_full_continuous_eager": True,
+        "generic_rolling_runtime_enabled": True,
+        "enable_generic_rolling_runtime_loop": True,
+        "generic_rolling_apply_path_enabled": True,
+        "enable_generic_rolling_apply_path": True,
+        "generic_full_continuous_max_depth": int(max_depth),
+        "generic_full_continuous_max_observed_depth": int(max_observed),
+        "generic_full_continuous_max_real_committed_depth": int(max_real),
+        "generic_full_continuous_depth_commit_token_counts": dict(depth_commit_counts),
+        "generic_full_continuous_depth_commit_proposal_counts": {
+            depth: max(1, tokens // 4) for depth, tokens in depth_commit_counts.items() if tokens > 0
+        },
+        "generic_full_continuous_depth_candidate_token_counts": dict(depth_commit_counts),
+        "generic_full_continuous_depth_ready_token_counts": dict(depth_commit_counts),
+        "generic_full_continuous_depth_partial_recovered_token_counts": dict(partial_counts),
+        "generic_full_continuous_depth_revised_token_counts": dict(revised_counts),
+        "generic_full_continuous_depth_cascade_discard_counts": {depth: 1 for depth in partial_counts},
+        "generic_full_continuous_stop_reason_counts": stop_reasons or {"no_eligible_ready_child": 1},
+        "generic_full_continuous_total_full_commit_token_count": int(total_full),
+        "generic_full_continuous_total_partial_recovered_token_count": int(total_partial),
+        "generic_full_continuous_total_revised_token_count": int(total_revised),
+        "generic_full_continuous_total_output_token_count": int(total_full + total_partial),
+        "generic_full_continuous_depth_gt_max_real_commit_count": int(depth_gt_max),
+        "generic_full_continuous_normal_lane_conflict_count": int(normal_conflict),
+        "generic_full_continuous_target_draft_mismatch_count": int(target_draft_mismatch),
+        "generic_full_continuous_parity_ok": bool(parity_ok),
+        "eager_committed_token_count": int(one_shot),
+        "combined_real_committed_token_count": int(combined),
+        "partial_prefix_accepted_token_count": max(0, int(total_partial - total_revised)),
+        "partial_prefix_revised_token_count": int(total_revised),
+        "partial_prefix_total_recovered_token_count": int(total_partial),
+        "descendant_committed_after_partial_count": 0,
+    }
+
+
+def _assert_pass(name: str, records: list[dict[str, Any]]) -> None:
+    errors, summary = validate_records(records, synthetic_result_payload())
+    if errors:
+        raise SystemExit(f"synthetic {name} failed: {errors}\nsummary={summary}")
+
+
+def _assert_fail(name: str, records: list[dict[str, Any]], needle: str) -> None:
+    errors, summary = validate_records(records, synthetic_result_payload())
+    if not errors:
+        raise SystemExit(f"synthetic {name} should fail\nsummary={summary}")
+    if not any(needle in error for error in errors):
+        raise SystemExit(f"synthetic {name} failed for wrong reason: {errors}\nsummary={summary}")
+
+
+def run_synthetic() -> None:
+    _assert_pass("max_depth=4 regression", [_base_record(max_depth=4, stop_reasons={"max_depth_reached": 1})])
+
+    depth10 = {"1": 8, "2": 8, "3": 8, "4": 8, "5": 4, "10": 4}
+    _assert_pass(
+        "max_depth=100 full accept chain",
+        [_base_record(max_depth=100, max_observed=10, max_real=10, depth_commit_counts=depth10)],
+    )
+
+    depth100 = dict(depth10)
+    depth100["100"] = 4
+    _assert_pass(
+        "stop at max_depth=100",
+        [
+            _base_record(
+                max_depth=100,
+                max_observed=100,
+                max_real=100,
+                depth_commit_counts=depth100,
+                stop_reasons={"max_depth_reached": 1},
+            )
+        ],
+    )
+
+    _assert_pass(
+        "partial at depth greater than 4",
+        [
+            _base_record(
+                max_depth=100,
+                max_observed=6,
+                max_real=4,
+                partial_counts={"5": 2},
+                revised_counts={"5": 1},
+                stop_reasons={"partial_recovery": 1},
+            )
+        ],
+    )
+
+    _assert_pass(
+        "reject at depth greater than 4",
+        [
+            _base_record(
+                max_depth=100,
+                max_observed=6,
+                max_real=4,
+                partial_counts={"5": 1},
+                revised_counts={"5": 1},
+                stop_reasons={"reject_recovery": 1},
+            )
+        ],
+    )
+
+    _assert_pass(
+        "missing revised token fallback",
+        [_base_record(max_depth=100, max_observed=5, max_real=4, stop_reasons={"partial_recovery_missing_revised_token": 1})],
+    )
+
+    bad_mismatch = [_base_record(max_depth=100, target_draft_mismatch=1, parity_ok=False)]
+    _assert_fail("target/draft mismatch", bad_mismatch, "target/draft mismatch")
+
+    bad_conflict = [_base_record(max_depth=100, normal_conflict=1, parity_ok=False)]
+    _assert_fail("normal lane conflict", bad_conflict, "normal lane conflict")
+
+    bad_depth = [_base_record(max_depth=100, max_observed=101, max_real=101, depth_gt_max=1, parity_ok=False)]
+    _assert_fail("depth beyond max", bad_depth, "max observed depth")
+
+    bad_combined = [_base_record(max_depth=100, partial_counts={"5": 2}, revised_counts={"5": 1}, combined=44)]
+    _assert_fail("bad combined", bad_combined, "combined real committed")
+
+    bad_descendant = [_base_record(max_depth=100, partial_counts={"5": 2}, revised_counts={"5": 1})]
+    bad_descendant[0]["descendant_committed_after_partial_count"] = 1
+    _assert_fail("descendant committed after partial", bad_descendant, "descendant committed")
+
+    disabled_leak = [deepcopy(_base_record())]
+    disabled_leak[0]["generic_full_continuous_enabled"] = False
+    disabled_leak[0]["enable_full_continuous_eager"] = False
+    _assert_fail("disabled full continuous leakage", disabled_leak, "nonzero while disabled")
+
+    print("Synthetic full continuous max-depth checks passed.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate Phase 1H-8u full continuous max-depth trace fields.")
+    parser.add_argument("trace", nargs="?", type=Path)
+    parser.add_argument("result", nargs="?", type=Path)
+    parser.add_argument("--synthetic", action="store_true")
+    args = parser.parse_args()
+
+    if args.synthetic or args.trace is None:
+        run_synthetic()
+        return 0
+
+    records = load_trace(args.trace)
+    result_payload = load_json(args.result) if args.result is not None else {}
+    errors, summary = validate_records(records, result_payload)
+    print_summary(summary)
+    if errors:
+        print("check_status=fail")
+        print(json.dumps({"errors": errors}, indent=2, sort_keys=True))
+        return 1
+    print("check_status=pass")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -102,6 +102,12 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     )
     summary = {
         **runtime,
+        "generic_full_continuous_enabled": _bool_any(
+            records,
+            "generic_full_continuous_enabled",
+            "enable_full_continuous_eager",
+        )
+        or bool(result_args.get("enable_full_continuous_eager", False)),
         "expected_generic_rolling_max_observed_depth": int_value(generic_chain.get("generic_max_observed_depth"), 0),
         "expected_generic_rolling_max_real_committed_depth": int_value(
             generic_chain.get("generic_max_real_committed_depth"), 0
@@ -133,9 +139,15 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "partial_prefix_revised_token_count": partial_revised,
         "depth_gt4_real_commit_count": int_value(generic_chain.get("generic_depth_gt4_real_commit_count"), 0),
     }
+    max_depth = int_value(summary.get("generic_rolling_max_depth"), 0)
+    max_depth_ok = bool(
+        max_depth == 4
+        or (bool(summary.get("generic_full_continuous_enabled", False)) and 4 <= max_depth <= 100)
+    )
     summary["expected_generic_rolling_parity_ok"] = bool(
-        summary["expected_generic_rolling_max_observed_depth"] <= 4
-        and summary["expected_generic_rolling_max_real_committed_depth"] <= 4
+        max_depth_ok
+        and summary["expected_generic_rolling_max_observed_depth"] <= max_depth
+        and summary["expected_generic_rolling_max_real_committed_depth"] <= max_depth
         and summary["depth_gt4_real_commit_count"] == 0
         and summary["expected_generic_rolling_normal_lane_conflict_count"] == 0
         and summary["expected_generic_rolling_target_draft_mismatch_count"] == 0
@@ -153,7 +165,10 @@ def validate_records(
     if summary["depth_gt4_real_commit_count"] != 0:
         errors.append("depth_gt4 real commit count must remain zero")
     if summary["generic_rolling_runtime_enabled"]:
-        if summary["generic_rolling_max_depth"] != 4:
+        if summary.get("generic_full_continuous_enabled", False):
+            if not (4 <= summary["generic_rolling_max_depth"] <= 100):
+                errors.append("generic rolling full continuous mode requires max depth in 4..100")
+        elif summary["generic_rolling_max_depth"] != 4:
             errors.append("generic rolling runtime parity mode requires max depth 4")
         comparisons = (
             ("generic_rolling_max_observed_depth", "expected_generic_rolling_max_observed_depth"),

@@ -84,6 +84,12 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     summary: dict[str, Any] = {
         **runtime,
         "generic_rolling_apply_path_enabled": bool(enabled),
+        "generic_full_continuous_enabled": _bool_any(
+            records,
+            "generic_full_continuous_enabled",
+            "enable_full_continuous_eager",
+        )
+        or bool(result_args.get("enable_full_continuous_eager", False)),
         "generic_rolling_apply_depths": _apply_depths(records),
         "generic_rolling_apply_parity_ok": _all_apply_parity_records_ok(records),
         "partial_prefix_accepted_token_count": int_value(
@@ -140,11 +146,16 @@ def validate_records(
     if summary["generic_rolling_apply_path_enabled"]:
         if not summary.get("generic_rolling_runtime_enabled", False):
             errors.append("generic apply path requires generic rolling runtime loop")
-        if int_value(summary.get("generic_rolling_max_depth"), 0) != 4:
+        max_depth = int_value(summary.get("generic_rolling_max_depth"), 0)
+        if summary.get("generic_full_continuous_enabled", False):
+            if not (4 <= max_depth <= 100):
+                errors.append("generic rolling apply full continuous mode requires max depth in 4..100")
+        elif max_depth != 4:
             errors.append("generic rolling apply path requires max depth 4")
         apply_depths = summary.get("generic_rolling_apply_depths") or []
-        if any(int(depth) > 4 or int(depth) < 2 for depth in apply_depths):
-            errors.append(f"generic rolling apply depths must stay within 2..4: {apply_depths}")
+        max_apply_depth = max_depth if summary.get("generic_full_continuous_enabled", False) else 4
+        if any(int(depth) > max_apply_depth or int(depth) < 2 for depth in apply_depths):
+            errors.append(f"generic rolling apply depths must stay within 2..{max_apply_depth}: {apply_depths}")
 
         comparisons = (
             (

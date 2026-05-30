@@ -240,6 +240,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         ),
         "enable_generic_rolling_runtime_loop": args.enable_generic_rolling_runtime_loop,
         "enable_generic_rolling_apply_path": args.enable_generic_rolling_apply_path,
+        "enable_full_continuous_eager": args.enable_full_continuous_eager,
         "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
         "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
         "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
@@ -294,6 +295,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_rolling_continuous_partial_prefix_recovery",
         "enable_generic_rolling_runtime_loop",
         "enable_generic_rolling_apply_path",
+        "enable_full_continuous_eager",
         "max_continuous_eager_chain_depth",
         "max_continuous_eager_requests_per_step",
         "max_continuous_eager_tokens_per_step",
@@ -1383,7 +1385,11 @@ def append_generic_rolling_runtime_aggregate_trace(
 ) -> None:
     generic_runtime_enabled = bool(result_args.get("enable_generic_rolling_runtime_loop", False))
     generic_apply_enabled = bool(result_args.get("enable_generic_rolling_apply_path", False))
-    if not (generic_runtime_enabled or generic_apply_enabled):
+    full_continuous_enabled = bool(result_args.get("enable_full_continuous_eager", False))
+    if full_continuous_enabled:
+        generic_runtime_enabled = True
+        generic_apply_enabled = True
+    if not (generic_runtime_enabled or generic_apply_enabled or full_continuous_enabled):
         return
 
     full_commit_tokens = sum(
@@ -1439,10 +1445,65 @@ def append_generic_rolling_runtime_aggregate_trace(
         )
     )
     cascade_count = to_int(accounting.get("partial_recovery_cascade_discard_count"), 0) or 0
+    max_depth_ok = bool(max_depth == 4 or (full_continuous_enabled and 4 <= max_depth <= 100))
+    depth_commit_token_counts = {
+        "1": int(depth_tokens.get(1, 0)),
+        "2": int(depth_tokens.get(2, 0)),
+        "3": int(depth_tokens.get(3, 0)),
+        "4": int(depth_tokens.get(4, 0)),
+    }
+    depth_commit_proposal_counts = {
+        "1": to_int(accounting.get("continuous_eager_real_committed_proposal_count"), 0) or 0,
+        "2": to_int(accounting.get("rolling_depth2_real_committed_proposal_count"), 0) or 0,
+        "3": to_int(accounting.get("rolling_depth3_real_committed_proposal_count"), 0) or 0,
+        "4": to_int(accounting.get("rolling_depth4_real_committed_proposal_count"), 0) or 0,
+    }
+    depth_candidate_token_counts = {
+        "1": to_int(accounting.get("continuous_eager_candidate_token_count"), 0) or 0,
+        "2": to_int(accounting.get("rolling_child_candidate_token_count"), 0) or 0,
+        "3": to_int(accounting.get("rolling_depth3_child_candidate_token_count"), 0) or 0,
+        "4": to_int(accounting.get("rolling_depth4_child_candidate_token_count"), 0) or 0,
+    }
+    depth_ready_token_counts = {
+        "1": to_int(accounting.get("continuous_eager_commit_ready_shadow_token_count"), 0) or 0,
+        "2": to_int(accounting.get("rolling_child_ready_shadow_token_count"), 0) or 0,
+        "3": to_int(accounting.get("rolling_depth3_child_ready_shadow_token_count"), 0) or 0,
+        "4": to_int(accounting.get("rolling_depth4_child_ready_shadow_token_count"), 0) or 0,
+    }
+    partial_depth = str(to_int(accounting.get("partial_prefix_recovery_max_depth"), 0) or 0)
+    depth_partial_counts = {}
+    depth_revised_counts = {}
+    if partial_total and partial_depth != "0":
+        depth_partial_counts[partial_depth] = int(partial_total)
+        depth_revised_counts[partial_depth] = int(revised_tokens)
+    stop_reason_counts = {}
+    if full_continuous_enabled:
+        if max_observed_depth >= max_depth:
+            stop_reason_counts["max_depth_reached"] = 1
+        elif normal_lane_conflict_count:
+            stop_reason_counts["normal_lane_conflict"] = int(normal_lane_conflict_count)
+        elif target_draft_mismatch_count:
+            stop_reason_counts["target_draft_mismatch"] = int(target_draft_mismatch_count)
+        else:
+            stop_reason_counts["no_eligible_ready_child"] = 1
+    full_continuous_total_full = sum(depth_commit_token_counts.values())
+    full_continuous_output = full_continuous_total_full + int(partial_total)
+    depth_gt_max = int(depth_gt4) if max_depth <= 4 else 0
+    full_continuous_parity_ok = bool(
+        full_continuous_enabled
+        and max_depth_ok
+        and max_observed_depth <= max_depth
+        and max_real_depth <= max_depth
+        and depth_gt_max == 0
+        and normal_lane_conflict_count == 0
+        and target_draft_mismatch_count == 0
+        and full_continuous_output + int(depth_tokens.get(0, 0)) == combined_tokens
+        and bool(stop_reason_counts)
+    )
     parity_ok = bool(
-        max_depth == 4
-        and max_observed_depth <= 4
-        and max_real_depth <= 4
+        max_depth_ok
+        and max_observed_depth <= max_depth
+        and max_real_depth <= max_depth
         and depth_gt4 == 0
         and normal_lane_conflict_count == 0
         and target_draft_mismatch_count == 0
@@ -1455,6 +1516,8 @@ def append_generic_rolling_runtime_aggregate_trace(
         "enable_generic_rolling_runtime_loop": True,
         "generic_rolling_apply_path_enabled": bool(generic_apply_enabled),
         "enable_generic_rolling_apply_path": bool(generic_apply_enabled),
+        "generic_full_continuous_enabled": bool(full_continuous_enabled),
+        "enable_full_continuous_eager": bool(full_continuous_enabled),
         "generic_rolling_max_depth": max_depth,
         "generic_rolling_node_count": 0,
         "generic_rolling_max_observed_depth": int(max_observed_depth),
@@ -1485,6 +1548,39 @@ def append_generic_rolling_runtime_aggregate_trace(
             int(target_draft_mismatch_count) if generic_apply_enabled else 0
         ),
         "generic_rolling_apply_parity_ok": bool(generic_apply_enabled and parity_ok) if generic_apply_enabled else True,
+        "generic_full_continuous_max_depth": int(max_depth) if full_continuous_enabled else 0,
+        "generic_full_continuous_max_observed_depth": int(max_observed_depth) if full_continuous_enabled else 0,
+        "generic_full_continuous_max_real_committed_depth": int(max_real_depth) if full_continuous_enabled else 0,
+        "generic_full_continuous_depth_commit_token_counts": depth_commit_token_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_commit_proposal_counts": depth_commit_proposal_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_candidate_token_counts": depth_candidate_token_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_ready_token_counts": depth_ready_token_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_partial_recovered_token_counts": depth_partial_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_revised_token_counts": depth_revised_counts
+        if full_continuous_enabled else {},
+        "generic_full_continuous_depth_cascade_discard_counts": {}
+        if not full_continuous_enabled else (dict.fromkeys(depth_partial_counts.keys(), int(cascade_count))),
+        "generic_full_continuous_stop_reason_counts": stop_reason_counts if full_continuous_enabled else {},
+        "generic_full_continuous_total_full_commit_token_count": int(full_continuous_total_full)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_total_partial_recovered_token_count": int(partial_total)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_total_revised_token_count": int(revised_tokens)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_total_output_token_count": int(full_continuous_output)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_depth_gt_max_real_commit_count": int(depth_gt_max)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_normal_lane_conflict_count": int(normal_lane_conflict_count)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_target_draft_mismatch_count": int(target_draft_mismatch_count)
+        if full_continuous_enabled else 0,
+        "generic_full_continuous_parity_ok": bool(full_continuous_parity_ok) if full_continuous_enabled else True,
     }
 
     appended = False
@@ -1861,6 +1957,15 @@ def main() -> None:
             "Enable Phase 1H-8t generic rolling apply-path parity mode. "
             "This implies the generic rolling runtime loop and is limited to "
             "--max-rolling-continuous-depth 4."
+        ),
+    )
+    parser.add_argument(
+        "--enable-full-continuous-eager",
+        action="store_true",
+        help=(
+            "Enable Phase 1H-8u bounded full continuous eager mode. "
+            "This implies generic rolling runtime/apply mode and supports "
+            "--max-rolling-continuous-depth up to 100."
         ),
     )
     parser.add_argument("--max-continuous-eager-chain-depth", type=int, default=1)
