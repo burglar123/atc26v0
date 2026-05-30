@@ -87,6 +87,90 @@ def generic_legacy_parity_ok(legacy_summary: dict[str, Any], generic_summary: di
     )
 
 
+def max_record_int(records: list[dict[str, Any]], key: str, default: int = 0) -> int:
+    values = [int_value(record.get(key), default) for record in records if key in record]
+    return max(values) if values else default
+
+
+def any_record_bool(records: list[dict[str, Any]], key: str) -> bool:
+    return any(bool(record.get(key, False)) for record in records)
+
+
+def generic_rolling_runtime_summary(
+    records: list[dict[str, Any]],
+    accounting: dict[str, Any],
+    generic_summary: dict[str, Any],
+    result_payload: dict[str, Any],
+) -> dict[str, Any]:
+    result_args = result_payload.get("args", {}) if isinstance(result_payload, dict) else {}
+    if not isinstance(result_args, dict):
+        result_args = {}
+    enabled = (
+        any_record_bool(records, "generic_rolling_runtime_enabled")
+        or any_record_bool(records, "enable_generic_rolling_runtime_loop")
+        or bool(result_args.get("enable_generic_rolling_runtime_loop", False))
+    )
+    full_commit_tokens = sum(
+        int_value(accounting.get(field), 0)
+        for field in (
+            "eager_committed_token_count",
+            "continuous_eager_real_committed_token_count",
+            "rolling_depth2_real_committed_token_count",
+            "rolling_depth3_real_committed_token_count",
+            "rolling_depth4_real_committed_token_count",
+        )
+    )
+    target_draft_mismatch_count = (
+        int_value(generic_summary.get("generic_target_draft_length_mismatch_count"), 0)
+        + int_value(generic_summary.get("generic_target_draft_token_mismatch_count"), 0)
+        + int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0)
+        + int_value(accounting.get("partial_recovery_target_draft_token_mismatch_count"), 0)
+    )
+    return {
+        "generic_rolling_runtime_enabled": bool(enabled),
+        "generic_rolling_max_depth": max_record_int(records, "generic_rolling_max_depth"),
+        "generic_rolling_node_count": max_record_int(records, "generic_rolling_node_count"),
+        "generic_rolling_max_observed_depth": max_record_int(records, "generic_rolling_max_observed_depth"),
+        "generic_rolling_max_real_committed_depth": max_record_int(
+            records, "generic_rolling_max_real_committed_depth"
+        ),
+        "generic_rolling_full_commit_token_count": max_record_int(
+            records, "generic_rolling_full_commit_token_count"
+        ),
+        "generic_rolling_partial_recovered_token_count": max_record_int(
+            records, "generic_rolling_partial_recovered_token_count"
+        ),
+        "generic_rolling_revised_token_count": max_record_int(records, "generic_rolling_revised_token_count"),
+        "generic_rolling_output_token_count": max_record_int(records, "generic_rolling_output_token_count"),
+        "generic_rolling_descendant_cascade_discard_count": max_record_int(
+            records, "generic_rolling_descendant_cascade_discard_count"
+        ),
+        "generic_rolling_normal_lane_conflict_count": max_record_int(
+            records, "generic_rolling_normal_lane_conflict_count"
+        ),
+        "generic_rolling_target_draft_mismatch_count": max_record_int(
+            records, "generic_rolling_target_draft_mismatch_count"
+        ),
+        "generic_rolling_parity_ok": all(
+            bool(record.get("generic_rolling_parity_ok"))
+            for record in records
+            if bool(record.get("generic_rolling_runtime_enabled", False))
+            or bool(record.get("enable_generic_rolling_runtime_loop", False))
+        ),
+        "expected_generic_rolling_full_commit_token_count": full_commit_tokens,
+        "expected_generic_rolling_partial_recovered_token_count": int_value(
+            accounting.get("partial_prefix_total_recovered_token_count"), 0
+        ),
+        "expected_generic_rolling_revised_token_count": int_value(
+            accounting.get("partial_prefix_revised_token_count"), 0
+        ),
+        "expected_generic_rolling_output_token_count": int_value(
+            accounting.get("combined_real_committed_token_count"), 0
+        ),
+        "expected_generic_rolling_target_draft_mismatch_count": target_draft_mismatch_count,
+    }
+
+
 def build_chain_summary(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
@@ -103,6 +187,7 @@ def build_chain_summary(
             int_value(result_args.get("max_rolling_continuous_depth"), 0),
         )
     generic_summary = summarize_registry(registry, accounting=accounting)
+    runtime_summary = generic_rolling_runtime_summary(records, accounting, generic_summary, result_payload)
     legacy_errors, legacy_summary = validate_legacy_records(records, result_payload)
     parity_ok = generic_legacy_parity_ok(legacy_summary, generic_summary)
     generic_chain_accounting_ok = bool(generic_summary.get("generic_combined_accounting_ok", False)) and bool(
@@ -144,6 +229,23 @@ def build_chain_summary(
             "legacy_audit_errors": legacy_errors,
         }
     )
+    for key in (
+        "generic_rolling_runtime_enabled",
+        "generic_rolling_max_depth",
+        "generic_rolling_node_count",
+        "generic_rolling_max_observed_depth",
+        "generic_rolling_max_real_committed_depth",
+        "generic_rolling_full_commit_token_count",
+        "generic_rolling_partial_recovered_token_count",
+        "generic_rolling_revised_token_count",
+        "generic_rolling_output_token_count",
+        "generic_rolling_descendant_cascade_discard_count",
+        "generic_rolling_normal_lane_conflict_count",
+        "generic_rolling_target_draft_mismatch_count",
+        "generic_rolling_parity_ok",
+        "expected_generic_rolling_output_token_count",
+    ):
+        summary[key] = runtime_summary.get(key)
     return summary
 
 
@@ -177,6 +279,9 @@ def print_compact(summary: dict[str, Any]) -> None:
         "target_draft_accounting_ok",
         "legacy_generic_parity_ok",
         "generic_chain_accounting_ok",
+        "generic_rolling_runtime_enabled",
+        "generic_rolling_output_token_count",
+        "generic_rolling_parity_ok",
     ):
         print(f"{key}={summary.get(key)}")
 

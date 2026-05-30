@@ -152,6 +152,7 @@ class PEARLConfig:
     enable_rolling_continuous_depth4_shadow_dry_run: bool = False
     enable_rolling_continuous_depth4_commit_ready_only: bool = False
     enable_rolling_continuous_partial_prefix_recovery: bool = False
+    enable_generic_rolling_runtime_loop: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -208,6 +209,7 @@ class PEARLConfig:
         self.enable_rolling_continuous_partial_prefix_recovery = bool(
             self.enable_rolling_continuous_partial_prefix_recovery
         )
+        self.enable_generic_rolling_runtime_loop = bool(self.enable_generic_rolling_runtime_loop)
         if self.enable_rolling_continuous_depth4_commit_ready_only:
             self.enable_rolling_continuous_depth4_shadow_dry_run = True
         if self.enable_rolling_continuous_depth4_shadow_dry_run:
@@ -218,6 +220,11 @@ class PEARLConfig:
             self.enable_rolling_continuous_depth2_commit_ready_only = True
         if self.enable_rolling_continuous_depth2_commit_ready_only:
             self.enable_rolling_continuous_eager_dry_run = True
+        if self.enable_generic_rolling_runtime_loop and self.max_rolling_continuous_depth != 4:
+            raise ValueError(
+                "enable_generic_rolling_runtime_loop is a Phase 1H-8s parity mode and requires "
+                "max_rolling_continuous_depth == 4"
+            )
         if self.enable_rolling_continuous_eager_dry_run:
             self.enable_continuous_eager_commit_depth1_ready_only = True
             self.enable_continuous_eager_verify_apply_dry_run = True
@@ -402,6 +409,7 @@ class PEARLConfig:
             "Enable_Rolling_Continuous_Partial_Prefix_Recovery="
             f"{self.enable_rolling_continuous_partial_prefix_recovery}"
         )
+        logger.info(f"Enable_Generic_Rolling_Runtime_Loop={self.enable_generic_rolling_runtime_loop}")
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")
