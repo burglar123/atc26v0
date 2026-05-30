@@ -1467,6 +1467,7 @@ def append_generic_rolling_runtime_aggregate_trace(
     cascade_count = to_int(accounting.get("partial_recovery_cascade_discard_count"), 0) or 0
     max_depth_ok = bool(max_depth == 4 or (full_continuous_enabled and 4 <= max_depth <= 100))
     depth_commit_token_counts = {
+        "0": int(depth_tokens.get(0, 0)),
         "1": int(depth_tokens.get(1, 0)),
         "2": int(depth_tokens.get(2, 0)),
         "3": int(depth_tokens.get(3, 0)),
@@ -1476,6 +1477,7 @@ def append_generic_rolling_runtime_aggregate_trace(
         {str(depth): int(tokens) for depth, tokens in sorted(generic_depth_tokens.items())}
     )
     depth_commit_proposal_counts = {
+        "0": to_int(accounting.get("eager_committed_proposal_count"), 0) or 0,
         "1": to_int(accounting.get("continuous_eager_real_committed_proposal_count"), 0) or 0,
         "2": to_int(accounting.get("rolling_depth2_real_committed_proposal_count"), 0) or 0,
         "3": to_int(accounting.get("rolling_depth3_real_committed_proposal_count"), 0) or 0,
@@ -1523,7 +1525,7 @@ def append_generic_rolling_runtime_aggregate_trace(
         and depth_gt_max == 0
         and normal_lane_conflict_count == 0
         and target_draft_mismatch_count == 0
-        and full_continuous_output + int(depth_tokens.get(0, 0)) == combined_tokens
+        and full_continuous_output == combined_tokens
         and bool(stop_reason_counts)
     )
     parity_ok = bool(

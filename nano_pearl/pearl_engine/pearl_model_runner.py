@@ -3310,43 +3310,98 @@ class ModelRunnerBase:
             return
 
         nodes = self._generic_rolling_nodes_from_trace(trace_record)
+        one_shot_full_commit_tokens = self._trace_token_count_from_fields(
+            trace_record,
+            scalar_fields=("eager_committed_token_count", "eager_tokens_committed"),
+            map_field="eager_committed_token_count_by_proposal_id",
+        )
+        depth1_full_commit_tokens = self._trace_token_count_from_fields(
+            trace_record,
+            scalar_fields=(
+                "continuous_eager_real_committed_token_count",
+                "continuous_eager_tokens_committed",
+            ),
+            map_field="continuous_eager_real_committed_token_count_by_proposal_id",
+        )
+        depth2_full_commit_tokens = self._trace_token_count_from_fields(
+            trace_record,
+            scalar_fields=("rolling_depth2_real_committed_token_count", "rolling_depth2_tokens_committed"),
+            map_field="rolling_depth2_real_committed_token_count_by_proposal_id",
+        )
+        depth3_full_commit_tokens = self._trace_token_count_from_fields(
+            trace_record,
+            scalar_fields=("rolling_depth3_real_committed_token_count", "rolling_depth3_tokens_committed"),
+            map_field="rolling_depth3_real_committed_token_count_by_proposal_id",
+        )
+        depth4_full_commit_tokens = self._trace_token_count_from_fields(
+            trace_record,
+            scalar_fields=("rolling_depth4_real_committed_token_count", "rolling_depth4_tokens_committed"),
+            map_field="rolling_depth4_real_committed_token_count_by_proposal_id",
+        )
+        generic_committed_by_depth = self._trace_depth_indexed_int_lists(
+            trace_record.get("generic_rolling_real_committed_proposal_ids_by_depth")
+        )
+        generic_committed_token_by_id = self._trace_int_map(
+            trace_record.get("generic_rolling_real_committed_token_count_by_proposal_id")
+        )
+        generic_committed_depth_by_id = self._trace_int_map(
+            trace_record.get("generic_rolling_real_commit_depth_by_proposal_id")
+        )
+        generic_token_by_id_for_commits = self._trace_int_map(
+            trace_record.get("generic_rolling_token_count_by_proposal_id")
+        )
+        generic_depth_commit_tokens: dict[int, int] = {}
+        generic_depth_commit_proposal_counts: dict[int, int] = {}
+        seen_generic_committed_ids: set[int] = set()
+        for depth, proposal_ids in sorted(generic_committed_by_depth.items()):
+            if int(depth) < 5:
+                continue
+            for proposal_id in sorted(int(item) for item in proposal_ids):
+                if proposal_id in seen_generic_committed_ids:
+                    continue
+                seen_generic_committed_ids.add(proposal_id)
+                proposal_depth = int(generic_committed_depth_by_id.get(proposal_id, depth))
+                if proposal_depth < 5:
+                    continue
+                token_count = int(
+                    generic_committed_token_by_id.get(
+                        proposal_id,
+                        generic_token_by_id_for_commits.get(proposal_id, self.gamma),
+                    )
+                )
+                if token_count <= 0:
+                    continue
+                generic_depth_commit_tokens[proposal_depth] = (
+                    int(generic_depth_commit_tokens.get(proposal_depth, 0)) + token_count
+                )
+                generic_depth_commit_proposal_counts[proposal_depth] = (
+                    int(generic_depth_commit_proposal_counts.get(proposal_depth, 0)) + 1
+                )
+        if not generic_depth_commit_tokens:
+            generic_depth_commit_tokens = self._trace_depth_indexed_int_map(
+                trace_record.get("generic_rolling_real_committed_token_count_by_depth")
+            )
+            generic_depth_commit_tokens = {
+                int(depth): int(value)
+                for depth, value in generic_depth_commit_tokens.items()
+                if int(depth) >= 5 and int(value) > 0
+            }
+            generic_depth_commit_proposal_counts = {
+                int(depth): int(value)
+                for depth, value in self._trace_depth_indexed_int_map(
+                    trace_record.get("generic_rolling_real_committed_proposal_count_by_depth")
+                ).items()
+                if int(depth) >= 5 and int(value) > 0
+            }
+        generic_tail_full_commit_tokens = sum(int(value) for value in generic_depth_commit_tokens.values())
         full_commit_tokens = (
-            self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("eager_committed_token_count", "eager_tokens_committed"),
-                map_field="eager_committed_token_count_by_proposal_id",
-            )
-            + self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=(
-                    "continuous_eager_real_committed_token_count",
-                    "continuous_eager_tokens_committed",
-                ),
-                map_field="continuous_eager_real_committed_token_count_by_proposal_id",
-            )
-            + self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth2_real_committed_token_count", "rolling_depth2_tokens_committed"),
-                map_field="rolling_depth2_real_committed_token_count_by_proposal_id",
-            )
-            + self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth3_real_committed_token_count", "rolling_depth3_tokens_committed"),
-                map_field="rolling_depth3_real_committed_token_count_by_proposal_id",
-            )
-            + self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth4_real_committed_token_count", "rolling_depth4_tokens_committed"),
-                map_field="rolling_depth4_real_committed_token_count_by_proposal_id",
-            )
+            one_shot_full_commit_tokens
+            + depth1_full_commit_tokens
+            + depth2_full_commit_tokens
+            + depth3_full_commit_tokens
+            + depth4_full_commit_tokens
+            + int(generic_tail_full_commit_tokens)
         )
-        generic_depth_commit_tokens = self._trace_depth_indexed_int_map(
-            trace_record.get("generic_rolling_real_committed_token_count_by_depth")
-        )
-        generic_tail_full_commit_tokens = sum(
-            int(value) for depth, value in generic_depth_commit_tokens.items() if int(depth) >= 5
-        )
-        full_commit_tokens += int(generic_tail_full_commit_tokens)
         partial_total = int(trace_record.get("partial_prefix_total_recovered_token_count") or 0)
         partial_revised = int(trace_record.get("partial_prefix_revised_token_count") or 0)
         partial_depth_by_id = self._trace_int_map(trace_record.get("partial_prefix_recovered_depth_by_proposal_id"))
@@ -3396,26 +3451,11 @@ class ModelRunnerBase:
         cascade_count += int(trace_record.get("rolling_cascade_discard_count") or 0)
         output_token_count = full_commit_tokens + partial_total
         full_continuous_depth_tokens = {
-            "1": self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("continuous_eager_real_committed_token_count", "continuous_eager_tokens_committed"),
-                map_field="continuous_eager_real_committed_token_count_by_proposal_id",
-            ),
-            "2": self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth2_real_committed_token_count", "rolling_depth2_tokens_committed"),
-                map_field="rolling_depth2_real_committed_token_count_by_proposal_id",
-            ),
-            "3": self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth3_real_committed_token_count", "rolling_depth3_tokens_committed"),
-                map_field="rolling_depth3_real_committed_token_count_by_proposal_id",
-            ),
-            "4": self._trace_token_count_from_fields(
-                trace_record,
-                scalar_fields=("rolling_depth4_real_committed_token_count", "rolling_depth4_tokens_committed"),
-                map_field="rolling_depth4_real_committed_token_count_by_proposal_id",
-            ),
+            "0": int(one_shot_full_commit_tokens),
+            "1": int(depth1_full_commit_tokens),
+            "2": int(depth2_full_commit_tokens),
+            "3": int(depth3_full_commit_tokens),
+            "4": int(depth4_full_commit_tokens),
         }
         for depth, token_count in generic_depth_commit_tokens.items():
             if int(depth) >= 5:
@@ -3484,6 +3524,7 @@ class ModelRunnerBase:
                 key: int(value) for key, value in sorted(full_continuous_depth_tokens.items())
             }
             trace_record["generic_full_continuous_depth_commit_proposal_counts"] = {
+                "0": len(self._trace_int_list(trace_record.get("eager_committed_proposal_ids"))),
                 "1": len(self._trace_int_list(trace_record.get("continuous_eager_real_committed_proposal_ids"))),
                 "2": len(self._trace_int_list(trace_record.get("rolling_depth2_real_committed_proposal_ids"))),
                 "3": len(self._trace_int_list(trace_record.get("rolling_depth3_real_committed_proposal_ids"))),
@@ -3492,9 +3533,7 @@ class ModelRunnerBase:
             trace_record["generic_full_continuous_depth_commit_proposal_counts"].update(
                 {
                     str(depth): int(count)
-                    for depth, count in self._trace_depth_indexed_int_map(
-                        trace_record.get("generic_rolling_real_committed_proposal_count_by_depth")
-                    ).items()
+                    for depth, count in sorted(generic_depth_commit_proposal_counts.items())
                     if int(depth) >= 5
                 }
             )

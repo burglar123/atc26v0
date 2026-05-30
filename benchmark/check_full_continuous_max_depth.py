@@ -224,10 +224,10 @@ def validate_records(
     if total_revised and total_revised != partial_revised:
         errors.append("full continuous revised total must match partial-prefix revised token count")
 
-    expected_combined = int_value(summary.get("one_shot_committed_token_count"), 0) + total_output
+    expected_combined = total_output
     if int_value(summary.get("combined_real_committed_token_count"), 0) != expected_combined:
         errors.append(
-            "combined real committed/output tokens must equal one-shot plus full continuous output"
+            "combined real committed/output tokens must equal full continuous output"
         )
     if int_value(summary.get("generic_full_continuous_normal_lane_conflict_count"), 0) != 0:
         errors.append("full continuous normal lane conflict count must remain zero")
@@ -311,14 +311,16 @@ def _base_record(
     depth_gt_max: int = 0,
     parity_ok: bool = True,
 ) -> dict[str, Any]:
-    depth_commit_counts = depth_commit_counts or {"1": 8, "2": 8, "3": 8, "4": 8}
+    depth_commit_counts = depth_commit_counts or {"0": one_shot, "1": 8, "2": 8, "3": 8, "4": 8}
+    if int(one_shot) > 0 and "0" not in depth_commit_counts:
+        depth_commit_counts = {"0": int(one_shot), **depth_commit_counts}
     partial_counts = partial_counts or {}
     revised_counts = revised_counts or {}
     total_full = sum(depth_commit_counts.values())
     total_partial = sum(partial_counts.values())
     total_revised = sum(revised_counts.values())
     if combined is None:
-        combined = one_shot + total_full + total_partial
+        combined = total_full + total_partial
     return {
         "generic_full_continuous_enabled": True,
         "enable_full_continuous_eager": True,
