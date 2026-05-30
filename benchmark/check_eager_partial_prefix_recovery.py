@@ -67,6 +67,31 @@ def _sum_reason_counts(records: list[dict[str, Any]], field: str) -> dict[str, i
     return dict(sorted(counts.items()))
 
 
+def _max_int(records: list[dict[str, Any]], field: str, default: int = 0) -> int:
+    values = [int_value(record.get(field), default) for record in records if field in record]
+    return max(values) if values else default
+
+
+def _merge_depth_counts(records: list[dict[str, Any]], field: str) -> dict[int, int]:
+    merged: dict[int, int] = {}
+    for record in records:
+        raw = record.get(field)
+        if not isinstance(raw, dict):
+            continue
+        for key, value in raw.items():
+            try:
+                depth = int(key)
+            except Exception:
+                continue
+            merged[depth] = max(int_value(value, 0), int_value(merged.get(depth), 0))
+    return dict(sorted(merged.items()))
+
+
+def _result_args(result_payload: dict[str, Any]) -> dict[str, Any]:
+    args = result_payload.get("args", {}) if isinstance(result_payload, dict) else {}
+    return args if isinstance(args, dict) else {}
+
+
 def _false_count(records: list[dict[str, Any]], field: str) -> int:
     count = 0
     for record in records:
@@ -77,7 +102,7 @@ def _false_count(records: list[dict[str, Any]], field: str) -> int:
 
 
 def _committed_ids_by_depth(registry) -> dict[int, set[int]]:
-    return {depth: set(registry.committed_by_depth.get(depth, set())) for depth in range(1, 5)}
+    return {depth: set(ids) for depth, ids in registry.committed_by_depth.items()}
 
 
 def _collect_descendants(registry, root_id: int) -> set[int]:
@@ -97,9 +122,41 @@ def validate_records(
     result_payload: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     result_payload = result_payload or {}
+    result_args = _result_args(result_payload)
     registry = parse_legacy_rolling_chain(records)
     accounting = aggregate_performance_accounting(records, result_payload)
     errors: list[str] = []
+
+    full_continuous_enabled = (
+        _bool_enabled(records, "generic_full_continuous_enabled", "enable_full_continuous_eager")
+        or bool(result_args.get("enable_full_continuous_eager", False))
+    )
+    full_continuous_max_depth = _max_int(records, "generic_full_continuous_max_depth")
+    full_continuous_max_observed_depth = _max_int(records, "generic_full_continuous_max_observed_depth")
+    full_continuous_max_real_committed_depth = _max_int(
+        records,
+        "generic_full_continuous_max_real_committed_depth",
+    )
+    full_continuous_depth_commit_counts = _merge_depth_counts(
+        records,
+        "generic_full_continuous_depth_commit_token_counts",
+    )
+    full_continuous_total_full_commit = _max_int(
+        records,
+        "generic_full_continuous_total_full_commit_token_count",
+    )
+    full_continuous_total_partial = _max_int(
+        records,
+        "generic_full_continuous_total_partial_recovered_token_count",
+    )
+    full_continuous_total_revised = _max_int(
+        records,
+        "generic_full_continuous_total_revised_token_count",
+    )
+    full_continuous_total_output = _max_int(
+        records,
+        "generic_full_continuous_total_output_token_count",
+    )
 
     enabled = _bool_enabled(
         records,
@@ -147,8 +204,13 @@ def validate_records(
         reject_index = int(reject_index_by_id.get(proposal_id, accepted_len))
         node = registry.nodes_by_id.get(proposal_id)
         proposal_len = node.token_count if node is not None and node.token_count > 0 else registry.gamma
+        max_valid_depth = (
+            max(4, int(full_continuous_max_depth))
+            if full_continuous_enabled
+            else 4
+        )
 
-        if depth not in {1, 2, 3, 4}:
+        if depth < 1 or depth > max_valid_depth:
             errors.append(f"partial recovered proposal {proposal_id} has invalid depth {depth}")
         if accepted_len < 0:
             errors.append(f"partial recovered proposal {proposal_id} has negative accepted prefix")
@@ -193,7 +255,11 @@ def validate_records(
         descendants = _collect_descendants(registry, proposal_id)
         committed_descendants.update(desc for desc in descendants if any(desc in ids for ids in committed_by_depth.values()))
         if descendants:
-            allowed_discard = cascade_descendant_ids | set(registry.invalidated_by_depth.get(2, set())) | set(registry.invalidated_by_depth.get(3, set())) | set(registry.invalidated_by_depth.get(4, set()))
+            allowed_discard = cascade_descendant_ids | {
+                invalidated_id
+                for ids in registry.invalidated_by_depth.values()
+                for invalidated_id in ids
+            }
             missing_cascade_descendants.update(desc for desc in descendants if desc not in allowed_discard)
     if committed_descendants:
         errors.append(f"descendant committed after partial recovery: {sorted(committed_descendants)}")
@@ -211,15 +277,38 @@ def validate_records(
     if partial_revised and partial_revised != len(recovered_ids):
         errors.append("each successful partial recovery must contribute exactly one revised token")
 
-    full_accept_combined = (
-        int_value(accounting.get("eager_committed_token_count"), 0)
-        + int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
-        + int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
-        + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
-        + int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
-    )
-    expected_combined = full_accept_combined + partial_total
-    expected_accepted = full_accept_combined + partial_accepted
+    one_shot_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    legacy_depth_tokens = {
+        1: int_value(accounting.get("continuous_eager_real_committed_token_count"), 0),
+        2: int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0),
+        3: int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0),
+        4: int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0),
+    }
+    bounded_full_accept_combined = one_shot_tokens + sum(legacy_depth_tokens.values())
+    if full_continuous_enabled:
+        if full_continuous_total_partial and full_continuous_total_partial != partial_total:
+            errors.append("full continuous partial total must match partial-prefix recovery total")
+        if full_continuous_total_revised and full_continuous_total_revised != partial_revised:
+            errors.append("full continuous revised total must match partial-prefix revised token count")
+
+        if full_continuous_total_output > 0:
+            expected_combined = full_continuous_total_output
+        else:
+            full_continuous_partial_total = (
+                full_continuous_total_partial
+                if full_continuous_total_partial > 0
+                else partial_total
+            )
+            expected_combined = sum(full_continuous_depth_commit_counts.values()) + full_continuous_partial_total
+            if int_value(full_continuous_depth_commit_counts.get(0), 0) <= 0:
+                expected_combined += one_shot_tokens
+            for depth, token_count in legacy_depth_tokens.items():
+                if depth not in full_continuous_depth_commit_counts and token_count > 0:
+                    expected_combined += token_count
+        expected_accepted = expected_combined - partial_total + partial_accepted
+    else:
+        expected_combined = bounded_full_accept_combined + partial_total
+        expected_accepted = bounded_full_accept_combined + partial_accepted
     if int_value(accounting.get("combined_real_committed_token_count"), 0) != expected_combined:
         errors.append("combined committed accounting must include partial recovery tokens exactly once")
     if int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0) != expected_combined:
@@ -240,6 +329,18 @@ def validate_records(
         errors.append("missing revised-token fallback must not create fake recovered tokens")
 
     summary = {
+        "generic_full_continuous_enabled": full_continuous_enabled,
+        "generic_full_continuous_max_depth": full_continuous_max_depth,
+        "generic_full_continuous_max_observed_depth": full_continuous_max_observed_depth,
+        "generic_full_continuous_max_real_committed_depth": full_continuous_max_real_committed_depth,
+        "generic_full_continuous_depth_commit_token_counts": {
+            str(depth): int(value)
+            for depth, value in sorted(full_continuous_depth_commit_counts.items())
+        },
+        "generic_full_continuous_total_full_commit_token_count": full_continuous_total_full_commit,
+        "generic_full_continuous_total_partial_recovered_token_count": full_continuous_total_partial,
+        "generic_full_continuous_total_revised_token_count": full_continuous_total_revised,
+        "generic_full_continuous_total_output_token_count": full_continuous_total_output,
         "partial_prefix_recovery_enabled": enabled,
         "partial_prefix_recovery_attempt_count": int_value(
             accounting.get("partial_prefix_recovery_attempt_count"), 0
@@ -278,6 +379,15 @@ def validate_records(
 
 def print_summary(summary: dict[str, Any]) -> None:
     for key in (
+        "generic_full_continuous_enabled",
+        "generic_full_continuous_max_depth",
+        "generic_full_continuous_max_observed_depth",
+        "generic_full_continuous_max_real_committed_depth",
+        "generic_full_continuous_depth_commit_token_counts",
+        "generic_full_continuous_total_full_commit_token_count",
+        "generic_full_continuous_total_partial_recovered_token_count",
+        "generic_full_continuous_total_revised_token_count",
+        "generic_full_continuous_total_output_token_count",
         "partial_prefix_recovery_enabled",
         "partial_prefix_recovery_attempt_count",
         "partial_prefix_recovery_success_count",
@@ -470,6 +580,116 @@ def _make_missing_revised_records() -> list[dict[str, Any]]:
     return records
 
 
+def _make_bounded_full_accept_records() -> list[dict[str, Any]]:
+    records = _base_records()
+    for record in records:
+        add_depth4_shadow(record)
+        add_depth4_commit(record)
+    return records
+
+
+def _make_bounded_partial_plus_full_records() -> list[dict[str, Any]]:
+    records = _make_bounded_full_accept_records()
+    _apply_partial_recovery(
+        records,
+        proposal_id=910000103,
+        depth=3,
+        accepted_len=1,
+        revised_count=1,
+        frontier_before=44,
+    )
+    return records
+
+
+def _add_full_continuous_fields(
+    records: list[dict[str, Any]],
+    *,
+    full_total: int = 484,
+    partial_total: int = 0,
+    revised_total: int = 0,
+    output_total: int | None = None,
+    include_generic_accounting: bool = True,
+    tail_token_count: int = 440,
+) -> None:
+    output = full_total + partial_total if output_total is None else output_total
+    depth_commit_counts = {
+        "0": 12,
+        "1": 8,
+        "2": 8,
+        "3": 8,
+        "4": 8,
+        "5": max(0, int(tail_token_count)),
+    }
+    for record in records:
+        record["generic_full_continuous_enabled"] = True
+        record["enable_full_continuous_eager"] = True
+        record["generic_rolling_runtime_enabled"] = True
+        record["enable_generic_rolling_runtime_loop"] = True
+        record["generic_rolling_apply_path_enabled"] = True
+        record["enable_generic_rolling_apply_path"] = True
+        record["generic_full_continuous_max_depth"] = 100
+        record["generic_full_continuous_max_observed_depth"] = 60
+        record["generic_full_continuous_max_real_committed_depth"] = 60
+        record["generic_full_continuous_depth_commit_token_counts"] = dict(depth_commit_counts)
+        record["generic_full_continuous_total_full_commit_token_count"] = int(full_total)
+        record["generic_full_continuous_total_partial_recovered_token_count"] = int(partial_total)
+        record["generic_full_continuous_total_revised_token_count"] = int(revised_total)
+        record["generic_full_continuous_total_output_token_count"] = int(output)
+        record["generic_full_continuous_normal_lane_conflict_count"] = 0
+        record["generic_full_continuous_target_draft_mismatch_count"] = 0
+        record["generic_full_continuous_depth_gt_max_real_commit_count"] = 0
+        record["generic_full_continuous_parity_ok"] = True
+        if include_generic_accounting:
+            record["generic_rolling_real_committed_proposal_ids_by_depth"] = {"5": [950000005]}
+            record["generic_rolling_real_committed_token_count_by_depth"] = {"5": int(tail_token_count)}
+            record["generic_rolling_real_committed_token_count_by_proposal_id"] = {
+                "950000005": int(tail_token_count)
+            }
+            record["generic_rolling_real_commit_depth_by_proposal_id"] = {"950000005": 5}
+            record["generic_rolling_real_commit_action_by_proposal_id"] = {"950000005": "commit"}
+            record["generic_rolling_real_commit_verify_result_by_proposal_id"] = {
+                "950000005": "full_accept"
+            }
+
+
+def _make_full_continuous_records(
+    *,
+    partial: bool = False,
+    include_generic_accounting: bool = True,
+    tail_token_count: int = 440,
+    full_total: int = 484,
+    partial_total_override: int | None = None,
+    revised_total_override: int | None = None,
+) -> list[dict[str, Any]]:
+    records = _make_bounded_full_accept_records()
+    partial_total = 0
+    revised_total = 0
+    if partial:
+        _apply_partial_recovery(
+            records,
+            proposal_id=950000006,
+            depth=6,
+            accepted_len=1,
+            revised_count=1,
+            frontier_before=484,
+        )
+        partial_total = 2
+        revised_total = 1
+    if partial_total_override is not None:
+        partial_total = int(partial_total_override)
+    if revised_total_override is not None:
+        revised_total = int(revised_total_override)
+    _add_full_continuous_fields(
+        records,
+        full_total=full_total,
+        partial_total=partial_total,
+        revised_total=revised_total,
+        include_generic_accounting=include_generic_accounting,
+        tail_token_count=tail_token_count,
+    )
+    return records
+
+
 def assert_pass(name: str, records: list[dict[str, Any]], expected: dict[str, Any]) -> None:
     errors, summary = validate_records(records, synthetic_result_payload())
     if errors:
@@ -488,18 +708,97 @@ def assert_fail(name: str, records: list[dict[str, Any]], needle: str) -> None:
 
 
 def run_synthetic() -> None:
-    full_accept = _base_records()
-    for record in full_accept:
-        add_depth4_shadow(record)
-        add_depth4_commit(record)
+    full_accept = _make_bounded_full_accept_records()
     assert_pass(
-        "full accept unchanged",
+        "bounded 8q/8t baseline",
         full_accept,
         {
             "partial_prefix_recovery_success_count": 0,
             "combined_real_committed_token_count": 44,
             "max_real_committed_depth": 4,
         },
+    )
+
+    bounded_partial = _make_bounded_partial_plus_full_records()
+    assert_pass(
+        "bounded partial recovery",
+        bounded_partial,
+        {
+            "partial_prefix_recovery_success_count": 1,
+            "partial_prefix_accepted_token_count": 1,
+            "partial_prefix_revised_token_count": 1,
+            "partial_prefix_total_recovered_token_count": 2,
+            "combined_real_committed_token_count": 46,
+            "combined_actual_accepted_token_increment_sum": 45,
+            "combined_actual_revised_token_increment_sum": 1,
+            "combined_actual_output_token_increment_sum": 46,
+        },
+    )
+
+    full_continuous_baseline = _make_full_continuous_records()
+    assert_pass(
+        "full continuous baseline depth60",
+        full_continuous_baseline,
+        {
+            "generic_full_continuous_enabled": True,
+            "generic_full_continuous_max_depth": 100,
+            "generic_full_continuous_max_observed_depth": 60,
+            "generic_full_continuous_max_real_committed_depth": 60,
+            "generic_full_continuous_total_full_commit_token_count": 484,
+            "generic_full_continuous_total_partial_recovered_token_count": 0,
+            "generic_full_continuous_total_revised_token_count": 0,
+            "generic_full_continuous_total_output_token_count": 484,
+            "combined_real_committed_token_count": 484,
+            "combined_actual_accepted_token_increment_sum": 484,
+            "combined_actual_revised_token_increment_sum": 0,
+            "combined_actual_output_token_increment_sum": 484,
+        },
+    )
+
+    full_continuous_partial = _make_full_continuous_records(partial=True)
+    assert_pass(
+        "full continuous partial recovery",
+        full_continuous_partial,
+        {
+            "generic_full_continuous_enabled": True,
+            "partial_prefix_recovery_success_count": 1,
+            "partial_prefix_accepted_token_count": 1,
+            "partial_prefix_revised_token_count": 1,
+            "partial_prefix_total_recovered_token_count": 2,
+            "generic_full_continuous_total_full_commit_token_count": 484,
+            "generic_full_continuous_total_partial_recovered_token_count": 2,
+            "generic_full_continuous_total_revised_token_count": 1,
+            "generic_full_continuous_total_output_token_count": 486,
+            "combined_real_committed_token_count": 486,
+            "combined_actual_accepted_token_increment_sum": 485,
+            "combined_actual_revised_token_increment_sum": 1,
+            "combined_actual_output_token_increment_sum": 486,
+        },
+    )
+
+    full_continuous_missing_depth_gt4 = _make_full_continuous_records(include_generic_accounting=False)
+    assert_fail(
+        "full continuous missing depth5+ from expected",
+        full_continuous_missing_depth_gt4,
+        "combined committed",
+    )
+
+    full_continuous_double_count = _make_full_continuous_records(tail_token_count=484)
+    assert_fail(
+        "full continuous double count",
+        full_continuous_double_count,
+        "combined committed",
+    )
+
+    full_continuous_bad_revised = _make_full_continuous_records(
+        partial=False,
+        partial_total_override=2,
+        revised_total_override=1,
+    )
+    assert_fail(
+        "full continuous bad revised accounting",
+        full_continuous_bad_revised,
+        "full continuous revised total",
     )
 
     depth1_partial = _make_depth1_partial_records()
