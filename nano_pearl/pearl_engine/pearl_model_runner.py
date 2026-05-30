@@ -869,18 +869,39 @@ class ModelRunnerBase:
     def ar_step(self):
         """Single AR decode step for cached admission.
 
-        Target side runs the full AR decode (prepare → model → sample →
-        postprocess), then broadcasts sampled tokens globally so the draft
-        side can update its scheduler state without running model computation.
+        Uses the normal scheduler decode path: schedule() calls
+        block_manager.may_append(seq) to allocate KV-cache blocks BEFORE
+        prepare_decode builds slot_mapping. Without schedule(), the
+        block_table may not cover the next token position, causing CUDA
+        illegal memory access in run_model.
+
+        Target does the full AR decode. Draft calls schedule() for block
+        consistency, then receives seq_ids + token_ids from the target
+        master via global broadcast so both sides stay in sync.
         """
         self._decode_iteration_group += 1
-        seqs = list(self.scheduler.running)
-        if not seqs:
-            return
+
         if not self.is_draft:
-            # --- Target side: actual AR decode ---
-            trace_record = self._trace_schedule(seqs, False, self._runner_role())
+            # ── Target side: full AR decode via scheduler ──
+            free_before = len(self.scheduler.block_manager.free_block_ids)
+            running_before = len(self.scheduler.running)
+            seqs, is_prefill = self.scheduler.schedule()
+            assert not is_prefill, "cached AR decode must not trigger prefill"
+            scheduled_ids = [s.seq_id for s in seqs]
+
+            trace_record = self._trace_schedule(seqs, is_prefill, self._runner_role())
             input_ids, positions = self.prepare_decode(seqs)
+
+            # Defensive assertions: block_table must cover current seq length.
+            assert len(input_ids) == len(positions), (
+                f"ar_step target: input_ids={len(input_ids)} != positions={len(positions)}"
+            )
+            for seq in seqs:
+                assert len(seq.block_table) >= seq.num_blocks, (
+                    f"ar_step target: seq {seq.seq_id} req={seq.request_id} "
+                    f"block_table_len={len(seq.block_table)} < num_blocks={seq.num_blocks}"
+                )
+
             temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
@@ -890,20 +911,62 @@ class ModelRunnerBase:
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
+
+            if self.tp_params.local_rank == 0:
+                logger.info(
+                    f"[Rank {self.rank}: {self.group_name}] cached AR step: "
+                    f"execution_mode=ar scheduled={len(seqs)} "
+                    f"running_before={running_before} free_before={free_before} "
+                    f"scheduled_seq_ids={scheduled_ids}",
+                    color="cyan",
+                )
+
             self.scheduler.postprocess(seqs, token_ids)
             accepted_lens = {seq.seq_id: 1 for seq in seqs}
             for seq in seqs:
                 seq.record_accepted(1)
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens)
-            # Global broadcast so draft side stays in sync.
+
+            if self.tp_params.local_rank == 0:
+                finished_ids = [s.seq_id for s in self.scheduler.finished
+                                if s.seq_id in scheduled_ids]
+                logger.info(
+                    f"[Rank {self.rank}: {self.group_name}] cached AR postprocess: "
+                    f"running_after={len(self.scheduler.running)} "
+                    f"finished_total={len(self.scheduler.finished)} "
+                    f"finished_this_step={finished_ids} "
+                    f"free_after={len(self.scheduler.block_manager.free_block_ids)}",
+                    color="cyan",
+                )
+
+            # Broadcast seq count + seq_ids + token_ids for draft sync.
+            n_seqs = torch.tensor([len(seqs)], dtype=torch.int64, device="cuda")
+            dist.broadcast(n_seqs, src=self.global_config.target_config.master_rank)
+            seq_ids_t = torch.tensor(scheduled_ids, dtype=torch.int64, device="cuda")
+            dist.broadcast(seq_ids_t, src=self.global_config.target_config.master_rank)
             dist.broadcast(sample_tokens, src=self.global_config.target_config.master_rank)
         else:
-            # --- Draft side: receive tokens from target ---
-            sample_tokens = torch.zeros(len(seqs), dtype=torch.int64, device="cuda")
+            # ── Draft side: schedule for block consistency, then sync ──
+            draft_seqs, is_prefill = self.scheduler.schedule()
+            assert not is_prefill, "cached AR decode must not trigger prefill"
+
+            # Receive seq count, seq_ids, and token_ids from target master.
+            n_seqs = torch.zeros(1, dtype=torch.int64, device="cuda")
+            dist.broadcast(n_seqs, src=self.global_config.target_config.master_rank)
+            num_scheduled = int(n_seqs.item())
+
+            seq_ids_t = torch.zeros(num_scheduled, dtype=torch.int64, device="cuda")
+            sample_tokens = torch.zeros(num_scheduled, dtype=torch.int64, device="cuda")
+            dist.broadcast(seq_ids_t, src=self.global_config.target_config.master_rank)
             dist.broadcast(sample_tokens, src=self.global_config.target_config.master_rank)
+            target_seq_ids = seq_ids_t.tolist()
             token_ids = sample_tokens.tolist()
-            self.scheduler.postprocess(seqs, token_ids)
-            for seq in seqs:
+
+            # Apply postprocess in target-determined order.
+            seq_by_id = {s.seq_id: s for s in draft_seqs}
+            ordered_seqs = [seq_by_id[sid] for sid in target_seq_ids]
+            self.scheduler.postprocess(ordered_seqs, token_ids)
+            for seq in ordered_seqs:
                 seq.record_accepted(1)
 
     def cached_decode_ready_ar_generate(self, max_active_cached_seqs: int = 0):
