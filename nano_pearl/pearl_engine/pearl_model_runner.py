@@ -3031,6 +3031,23 @@ class ModelRunnerBase:
     def _trace_token_sum(self, proposal_ids: list[int], token_count_by_id: dict[int, int]) -> int:
         return sum(int(token_count_by_id.get(int(proposal_id), 0)) for proposal_id in proposal_ids)
 
+    def _trace_token_count_from_fields(
+        self,
+        trace_record: dict,
+        *,
+        scalar_fields: tuple[str, ...],
+        map_field: str | None = None,
+    ) -> int:
+        values: list[int] = []
+        for field in scalar_fields:
+            try:
+                values.append(int(trace_record.get(field) or 0))
+            except Exception:
+                continue
+        if map_field is not None:
+            values.append(sum(self._trace_int_map(trace_record.get(map_field)).values()))
+        return max(values) if values else 0
+
     def _trace_int_list(self, value) -> list[int]:
         if not isinstance(value, list):
             return []
@@ -3156,11 +3173,34 @@ class ModelRunnerBase:
 
         nodes = self._generic_rolling_nodes_from_trace(trace_record)
         full_commit_tokens = (
-            int(trace_record.get("eager_tokens_committed") or 0)
-            + int(trace_record.get("continuous_eager_tokens_committed") or 0)
-            + int(trace_record.get("rolling_depth2_tokens_committed") or 0)
-            + int(trace_record.get("rolling_depth3_tokens_committed") or 0)
-            + int(trace_record.get("rolling_depth4_tokens_committed") or 0)
+            self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("eager_committed_token_count", "eager_tokens_committed"),
+                map_field="eager_committed_token_count_by_proposal_id",
+            )
+            + self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=(
+                    "continuous_eager_real_committed_token_count",
+                    "continuous_eager_tokens_committed",
+                ),
+                map_field="continuous_eager_real_committed_token_count_by_proposal_id",
+            )
+            + self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth2_real_committed_token_count", "rolling_depth2_tokens_committed"),
+                map_field="rolling_depth2_real_committed_token_count_by_proposal_id",
+            )
+            + self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth3_real_committed_token_count", "rolling_depth3_tokens_committed"),
+                map_field="rolling_depth3_real_committed_token_count_by_proposal_id",
+            )
+            + self._trace_token_count_from_fields(
+                trace_record,
+                scalar_fields=("rolling_depth4_real_committed_token_count", "rolling_depth4_tokens_committed"),
+                map_field="rolling_depth4_real_committed_token_count_by_proposal_id",
+            )
         )
         partial_total = int(trace_record.get("partial_prefix_total_recovered_token_count") or 0)
         partial_revised = int(trace_record.get("partial_prefix_revised_token_count") or 0)
