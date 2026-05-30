@@ -121,7 +121,13 @@ def validate_accounting(
     accounting: dict[str, Any],
     errors: list[str],
 ) -> tuple[dict[int, int], bool, bool]:
-    token_by_depth = committed_token_counts_by_depth(registry, MAX_LEGACY_REAL_DEPTH)
+    validation_max_depth = MAX_LEGACY_REAL_DEPTH
+    if registry.flags.get("generic_full_continuous_enabled", False):
+        validation_max_depth = max(
+            validation_max_depth,
+            min(100, int(registry.max_configured_depth or registry.max_real_committed_depth or validation_max_depth)),
+        )
+    token_by_depth = committed_token_counts_by_depth(registry, validation_max_depth)
     partial_total = sum(
         max(
             0,
@@ -144,7 +150,21 @@ def validate_accounting(
         for proposal_id in registry.partial_recovered_ids
     )
     full_accept_combined = sum(token_by_depth.values())
-    combined_from_registry = full_accept_combined + partial_total
+    full_continuous_enabled = bool(registry.flags.get("generic_full_continuous_enabled", False))
+    if full_continuous_enabled:
+        if registry.full_continuous_total_full_commit_token_count:
+            full_accept_combined = registry.full_continuous_total_full_commit_token_count
+        elif registry.full_continuous_depth_commit_token_counts:
+            full_accept_combined = sum(registry.full_continuous_depth_commit_token_counts.values())
+        if registry.full_continuous_total_partial_recovered_token_count:
+            partial_total = registry.full_continuous_total_partial_recovered_token_count
+        combined_from_registry = (
+            registry.full_continuous_total_output_token_count
+            if registry.full_continuous_total_output_token_count > 0
+            else full_accept_combined + partial_total
+        )
+    else:
+        combined_from_registry = full_accept_combined + partial_total
     combined_ok = True
     target_draft_ok = True
 
@@ -157,6 +177,18 @@ def validate_accounting(
                     f"depth {depth} committed token mismatch: "
                     f"generic={token_by_depth[depth]} accounting={accounting_tokens}"
                 )
+    if full_continuous_enabled:
+        accounting_generic_by_depth = accounting.get("generic_rolling_real_committed_token_count_by_depth")
+        if isinstance(accounting_generic_by_depth, dict):
+            for depth in range(5, validation_max_depth + 1):
+                accounting_tokens = int_value(accounting_generic_by_depth.get(str(depth), accounting_generic_by_depth.get(depth)), 0)
+                if registry.committed_by_depth[depth] or accounting_tokens:
+                    if accounting_tokens != token_by_depth.get(depth, 0):
+                        combined_ok = False
+                        errors.append(
+                            f"depth {depth} generic committed token mismatch: "
+                            f"generic={token_by_depth.get(depth, 0)} accounting={accounting_tokens}"
+                        )
 
     accounting_combined = int_value(accounting.get("combined_real_committed_token_count"), 0)
     accounting_verified = int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0)
@@ -379,8 +411,14 @@ def validate_records(
     generic_summary = summarize_registry(registry, accounting=accounting)
 
     max_real_depth = int(generic_summary["generic_max_real_committed_depth"])
-    if max_real_depth > MAX_LEGACY_REAL_DEPTH:
-        errors.append(f"max real committed depth {max_real_depth} exceeds {MAX_LEGACY_REAL_DEPTH}")
+    max_allowed_real_depth = MAX_LEGACY_REAL_DEPTH
+    if registry.flags.get("generic_full_continuous_enabled", False):
+        max_allowed_real_depth = max(
+            max_allowed_real_depth,
+            min(100, int(registry.max_configured_depth or max_real_depth or max_allowed_real_depth)),
+        )
+    if max_real_depth > max_allowed_real_depth:
+        errors.append(f"max real committed depth {max_real_depth} exceeds {max_allowed_real_depth}")
 
     performance_warnings = accounting.get("performance_warnings", [])
     if strict_performance and performance_warnings:
@@ -723,6 +761,135 @@ def add_depth4_shadow(record: dict[str, Any], *, token_count: int = 8) -> None:
     record["rolling_depth_gt4_real_commit_count"] = 0
 
 
+def add_depth4_commit(record: dict[str, Any], *, token_count: int = 8) -> None:
+    seq_id = 7
+    p0 = 900000100
+    p3 = 900000103
+    p4 = 900000104
+    record["enable_rolling_continuous_depth4_commit_ready_only"] = True
+    record["rolling_depth4_commit_enabled"] = True
+    record["rolling_depth4_commit_side"] = record.get("rolling_depth3_commit_side", "target")
+    record["rolling_depth4_commit_plan_id"] = 1
+    record["rolling_depth4_commit_step_id"] = 2
+    record["rolling_depth4_commit_candidate_proposal_ids"] = [p4]
+    record["rolling_depth4_commit_candidate_seq_ids"] = [seq_id]
+    record["rolling_depth4_commit_ready_source_proposal_ids"] = [p4]
+    record["rolling_depth4_commit_parent_by_proposal_id"] = {str(p4): p3}
+    record["rolling_depth4_real_committed_proposal_ids"] = [p4]
+    record["rolling_depth4_real_committed_seq_ids"] = [seq_id]
+    record["rolling_depth4_real_committed_token_count_by_proposal_id"] = {str(p4): token_count}
+    record["rolling_depth4_real_committed_accept_len_by_proposal_id"] = {str(p4): token_count}
+    record["rolling_depth4_real_commit_action_by_proposal_id"] = {str(p4): ROLLING_ACTION}
+    record["rolling_depth4_real_commit_verify_result_by_proposal_id"] = {str(p4): "full_accept"}
+    record["rolling_depth4_real_commit_parent_by_proposal_id"] = {str(p4): p3}
+    record["rolling_depth4_real_commit_root_by_proposal_id"] = {str(p4): p0}
+    record["rolling_depth4_real_commit_depth_by_proposal_id"] = {str(p4): 4}
+    record["rolling_depth4_target_draft_len_match_by_seq_id"] = {str(seq_id): True}
+    record["rolling_depth4_target_draft_token_match_by_seq_id"] = {str(seq_id): True}
+    record["rolling_depth4_tokens_verified"] = token_count
+    record["rolling_depth4_tokens_accepted"] = token_count
+    record["rolling_depth4_tokens_committed"] = token_count
+    record["rolling_depth4_tokens_rejected"] = 0
+    record["rolling_depth4_tokens_invalidated"] = 0
+    record["rolling_depth4_real_committed_proposal_count"] = 1
+    record["rolling_depth4_real_committed_token_count"] = token_count
+    record["rolling_depth4_real_commit_count"] = 1
+    record["rolling_depth_gt4_real_commit_count"] = 0
+
+
+def add_partial_recovery(record: dict[str, Any], *, token_count: int = 2, revised_count: int = 1) -> None:
+    proposal_id = 910000103
+    seq_id = 7
+    accepted_len = token_count - revised_count
+    record["partial_prefix_recovery_enabled"] = True
+    record["enable_rolling_continuous_partial_prefix_recovery"] = True
+    record["partial_prefix_recovered_proposal_ids"] = [proposal_id]
+    record["partial_prefix_recovered_seq_ids"] = [seq_id]
+    record["partial_prefix_recovered_depth_by_proposal_id"] = {str(proposal_id): 3}
+    record["partial_prefix_accepted_len_by_proposal_id"] = {str(proposal_id): accepted_len}
+    record["partial_prefix_reject_index_by_proposal_id"] = {str(proposal_id): accepted_len}
+    record["partial_prefix_revised_token_count_by_proposal_id"] = {str(proposal_id): revised_count}
+    record["partial_prefix_committed_token_count_by_proposal_id"] = {str(proposal_id): token_count}
+    record["partial_prefix_recovery_attempt_count"] = 1
+    record["partial_prefix_recovery_success_count"] = 1
+    record["partial_recovery_target_draft_len_match_by_seq_id"] = {str(seq_id): True}
+    record["partial_recovery_target_draft_token_match_by_seq_id"] = {str(seq_id): True}
+
+
+def add_full_continuous_depth60(record: dict[str, Any], *, total_output: int = 484) -> None:
+    p0 = 900000100
+    p4 = 900000104
+    generic_proposals_by_depth: dict[str, list[int]] = {}
+    generic_seq_by_depth: dict[str, list[int]] = {}
+    parent_by_id: dict[str, int] = {}
+    root_by_id: dict[str, int] = {}
+    depth_by_id: dict[str, int] = {}
+    token_by_id: dict[str, int] = {}
+    action_by_id: dict[str, str] = {}
+    result_by_id: dict[str, str] = {}
+    depth_counts = {"0": 12, "1": 8, "2": 8, "3": 8, "4": 8}
+    depth_proposal_counts = {"0": 1, "1": 1, "2": 1, "3": 1, "4": 1}
+    parent_id = p4
+    for depth in range(5, 61):
+        proposal_id = 950000000 + depth
+        token_count = 8 if depth <= 58 else 4
+        key = str(depth)
+        generic_proposals_by_depth[key] = [proposal_id]
+        generic_seq_by_depth[key] = [7]
+        parent_by_id[str(proposal_id)] = parent_id
+        root_by_id[str(proposal_id)] = p0
+        depth_by_id[str(proposal_id)] = depth
+        token_by_id[str(proposal_id)] = token_count
+        action_by_id[str(proposal_id)] = ROLLING_ACTION
+        result_by_id[str(proposal_id)] = "full_accept"
+        depth_counts[key] = token_count
+        depth_proposal_counts[key] = 1
+        parent_id = proposal_id
+    record["generic_full_continuous_enabled"] = True
+    record["enable_full_continuous_eager"] = True
+    record["enable_generic_rolling_runtime_loop"] = True
+    record["enable_generic_rolling_apply_path"] = True
+    record["max_rolling_continuous_depth"] = 100
+    record["generic_rolling_max_depth"] = 100
+    record["generic_full_continuous_max_depth"] = 100
+    record["generic_full_continuous_max_observed_depth"] = 60
+    record["generic_full_continuous_max_real_committed_depth"] = 60
+    record["generic_rolling_max_observed_depth"] = 60
+    record["generic_rolling_max_real_committed_depth"] = 60
+    record["generic_rolling_candidate_proposal_ids_by_depth"] = dict(generic_proposals_by_depth)
+    record["generic_rolling_candidate_seq_ids_by_depth"] = dict(generic_seq_by_depth)
+    record["generic_rolling_ready_proposal_ids_by_depth"] = dict(generic_proposals_by_depth)
+    record["generic_rolling_ready_seq_ids_by_depth"] = dict(generic_seq_by_depth)
+    record["generic_rolling_real_committed_proposal_ids_by_depth"] = dict(generic_proposals_by_depth)
+    record["generic_rolling_real_committed_seq_ids_by_depth"] = dict(generic_seq_by_depth)
+    record["generic_rolling_parent_by_proposal_id"] = dict(parent_by_id)
+    record["generic_rolling_root_by_proposal_id"] = dict(root_by_id)
+    record["generic_rolling_depth_by_proposal_id"] = dict(depth_by_id)
+    record["generic_rolling_token_count_by_proposal_id"] = dict(token_by_id)
+    record["generic_rolling_real_committed_token_count_by_proposal_id"] = dict(token_by_id)
+    record["generic_rolling_real_committed_accept_len_by_proposal_id"] = dict(token_by_id)
+    record["generic_rolling_real_commit_parent_by_proposal_id"] = dict(parent_by_id)
+    record["generic_rolling_real_commit_root_by_proposal_id"] = dict(root_by_id)
+    record["generic_rolling_real_commit_depth_by_proposal_id"] = dict(depth_by_id)
+    record["generic_rolling_real_commit_action_by_proposal_id"] = dict(action_by_id)
+    record["generic_rolling_real_commit_verify_result_by_proposal_id"] = dict(result_by_id)
+    record["generic_rolling_real_committed_token_count_by_depth"] = {
+        depth: count for depth, count in depth_counts.items() if int(depth) >= 5
+    }
+    record["generic_rolling_real_committed_proposal_count_by_depth"] = {
+        depth: count for depth, count in depth_proposal_counts.items() if int(depth) >= 5
+    }
+    record["generic_full_continuous_depth_commit_token_counts"] = dict(depth_counts)
+    record["generic_full_continuous_depth_commit_proposal_counts"] = dict(depth_proposal_counts)
+    record["generic_full_continuous_total_full_commit_token_count"] = total_output
+    record["generic_full_continuous_total_partial_recovered_token_count"] = 0
+    record["generic_full_continuous_total_revised_token_count"] = 0
+    record["generic_full_continuous_total_output_token_count"] = total_output
+    record["generic_full_continuous_depth_gt_max_real_commit_count"] = 0
+    record["generic_full_continuous_normal_lane_conflict_count"] = 0
+    record["generic_full_continuous_target_draft_mismatch_count"] = 0
+
+
 def assert_synthetic_pass(name: str, records: list[dict[str, Any]], expected: dict[str, Any]) -> None:
     errors, summary = validate_records(records, synthetic_result_payload())
     if errors:
@@ -810,6 +977,71 @@ def run_synthetic() -> None:
             "target_draft_accounting_ok": True,
         },
     )
+
+    depth4_baseline = deepcopy(records)
+    for record in depth4_baseline:
+        add_depth4_shadow(record)
+        add_depth4_commit(record)
+    assert_synthetic_pass(
+        "bounded depth4 baseline",
+        depth4_baseline,
+        {
+            "combined_real_committed_token_count": 44,
+            "max_real_committed_depth": 4,
+            "combined_accounting_ok": True,
+            "target_draft_accounting_ok": True,
+        },
+    )
+
+    depth4_partial = deepcopy(depth4_baseline)
+    for record in depth4_partial:
+        add_partial_recovery(record)
+    assert_synthetic_pass(
+        "bounded depth4 partial",
+        depth4_partial,
+        {
+            "combined_real_committed_token_count": 46,
+            "max_real_committed_depth": 4,
+            "partial_prefix_total_recovered_token_count": 2,
+            "combined_accounting_ok": True,
+        },
+    )
+
+    full_continuous = deepcopy(depth4_baseline)
+    for record in full_continuous:
+        add_full_continuous_depth60(record)
+    assert_synthetic_pass(
+        "full continuous depth60 baseline",
+        full_continuous,
+        {
+            "max_configured_depth": 100,
+            "max_observed_depth": 60,
+            "max_real_committed_depth": 60,
+            "combined_real_committed_token_count": 484,
+            "accounting_combined_real_committed_token_count": 484,
+            "combined_accounting_ok": True,
+            "target_draft_accounting_ok": True,
+        },
+    )
+
+    full_continuous_exceeds_max = deepcopy(full_continuous)
+    for record in full_continuous_exceeds_max:
+        record["generic_full_continuous_max_real_committed_depth"] = 101
+        record["generic_rolling_max_real_committed_depth"] = 101
+    assert_synthetic_fail("full continuous exceeds max", full_continuous_exceeds_max, "exceeds 100")
+
+    full_continuous_bad_accounting = deepcopy(full_continuous)
+    for record in full_continuous_bad_accounting:
+        record["generic_full_continuous_total_output_token_count"] = 480
+    assert_synthetic_fail("full continuous accounting mismatch", full_continuous_bad_accounting, "combined real")
+
+    full_continuous_conflict = deepcopy(full_continuous)
+    full_continuous_conflict[0]["rolling_normal_lane_conflict_count"] = 1
+    assert_synthetic_fail("full continuous normal lane conflict", full_continuous_conflict, "normal lane conflict")
+
+    full_continuous_mismatch = deepcopy(full_continuous)
+    full_continuous_mismatch[0]["continuous_eager_target_draft_len_match_by_seq_id"] = {"7": False}
+    assert_synthetic_fail("full continuous target/draft mismatch", full_continuous_mismatch, "length mismatch")
 
     bad_parent = deepcopy(records)
     for record in bad_parent:

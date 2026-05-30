@@ -152,6 +152,11 @@ class RollingChainRegistry:
     partial_revised_count_by_id: dict[int, int] = field(default_factory=dict)
     partial_committed_token_count_by_id: dict[int, int] = field(default_factory=dict)
     partial_cascade_descendant_ids: set[int] = field(default_factory=set)
+    full_continuous_depth_commit_token_counts: dict[int, int] = field(default_factory=dict)
+    full_continuous_total_full_commit_token_count: int = 0
+    full_continuous_total_partial_recovered_token_count: int = 0
+    full_continuous_total_revised_token_count: int = 0
+    full_continuous_total_output_token_count: int = 0
 
 
 def int_value(value: Any, default: int = 0) -> int:
@@ -369,6 +374,35 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
             int_value(record.get("rolling_depth4_max_depth_observed"), 0),
             int_value(record.get("generic_full_continuous_max_observed_depth"), 0),
             int_value(record.get("generic_rolling_max_observed_depth"), 0),
+        )
+        registry.max_real_committed_depth = max(
+            registry.max_real_committed_depth,
+            int_value(record.get("generic_full_continuous_max_real_committed_depth"), 0),
+            int_value(record.get("generic_rolling_max_real_committed_depth"), 0),
+        )
+        for depth, token_count in as_depth_int_map(
+            record.get("generic_full_continuous_depth_commit_token_counts")
+        ).items():
+            if token_count > 0:
+                registry.full_continuous_depth_commit_token_counts[int(depth)] = max(
+                    int(registry.full_continuous_depth_commit_token_counts.get(int(depth), 0)),
+                    int(token_count),
+                )
+        registry.full_continuous_total_full_commit_token_count = max(
+            registry.full_continuous_total_full_commit_token_count,
+            int_value(record.get("generic_full_continuous_total_full_commit_token_count"), 0),
+        )
+        registry.full_continuous_total_partial_recovered_token_count = max(
+            registry.full_continuous_total_partial_recovered_token_count,
+            int_value(record.get("generic_full_continuous_total_partial_recovered_token_count"), 0),
+        )
+        registry.full_continuous_total_revised_token_count = max(
+            registry.full_continuous_total_revised_token_count,
+            int_value(record.get("generic_full_continuous_total_revised_token_count"), 0),
+        )
+        registry.full_continuous_total_output_token_count = max(
+            registry.full_continuous_total_output_token_count,
+            int_value(record.get("generic_full_continuous_total_output_token_count"), 0),
         )
         registry.flags["one_shot_commit_enabled"] = registry.flags["one_shot_commit_enabled"] or bool(
             record.get("enable_eager_commit_ready_only", False)
@@ -830,6 +864,22 @@ def parse_legacy_rolling_chain(records: list[dict[str, Any]]) -> RollingChainReg
                 continue
             add_id_set(registry, depth, set(proposal_ids), registry.committed_by_depth)
             add_seq_map(registry, depth, proposal_ids, generic_committed_seq_by_depth.get(depth, []))
+            for proposal_id in proposal_ids:
+                registry.declared_depth_by_id.setdefault(proposal_id, depth)
+                if proposal_id in generic_token_by_id and generic_token_by_id[proposal_id] > 0:
+                    registry.token_by_depth[depth].setdefault(proposal_id, generic_token_by_id[proposal_id])
+                if proposal_id in generic_accept_by_id and generic_accept_by_id[proposal_id] > 0:
+                    registry.accept_len_by_depth[depth].setdefault(proposal_id, generic_accept_by_id[proposal_id])
+                elif proposal_id in generic_token_by_id and generic_token_by_id[proposal_id] > 0:
+                    registry.accept_len_by_depth[depth].setdefault(proposal_id, generic_token_by_id[proposal_id])
+                if proposal_id in generic_parent_by_id:
+                    registry.parent_by_depth[depth].setdefault(proposal_id, generic_parent_by_id[proposal_id])
+                if proposal_id in generic_root_by_id:
+                    registry.root_by_depth[depth].setdefault(proposal_id, generic_root_by_id[proposal_id])
+                if proposal_id in generic_action_by_id:
+                    registry.action_by_depth[depth].setdefault(proposal_id, generic_action_by_id[proposal_id])
+                if proposal_id in generic_result_by_id:
+                    registry.verify_result_by_depth[depth].setdefault(proposal_id, generic_result_by_id[proposal_id])
             if registry.flags.get("generic_full_continuous_enabled", False):
                 registry.max_real_committed_depth = max(registry.max_real_committed_depth, depth)
             else:
@@ -1133,7 +1183,25 @@ def summarize_registry(
         )
         for proposal_id in registry.partial_recovered_ids
     )
-    combined_tokens = full_accept_combined_tokens + partial_total_tokens
+    full_continuous_enabled = bool(registry.flags.get("generic_full_continuous_enabled", False))
+    if full_continuous_enabled:
+        if registry.full_continuous_total_partial_recovered_token_count:
+            partial_total_tokens = registry.full_continuous_total_partial_recovered_token_count
+        if registry.full_continuous_total_revised_token_count:
+            partial_revised_tokens = registry.full_continuous_total_revised_token_count
+        if registry.full_continuous_total_full_commit_token_count:
+            full_accept_combined_tokens = registry.full_continuous_total_full_commit_token_count
+        elif registry.full_continuous_depth_commit_token_counts:
+            full_accept_combined_tokens = sum(
+                max(0, int(value)) for value in registry.full_continuous_depth_commit_token_counts.values()
+            )
+        combined_tokens = (
+            registry.full_continuous_total_output_token_count
+            if registry.full_continuous_total_output_token_count > 0
+            else full_accept_combined_tokens + partial_total_tokens
+        )
+    else:
+        combined_tokens = full_accept_combined_tokens + partial_total_tokens
     max_real_depth = registry.max_real_committed_depth
     for depth, tokens in token_by_depth.items():
         if tokens:
@@ -1211,6 +1279,9 @@ def summarize_registry(
             combined_ok = combined_ok and int_value(
                 accounting.get("combined_actual_accepted_token_increment_sum"), 0
             ) == combined_tokens
+            combined_ok = combined_ok and int_value(
+                accounting.get("combined_actual_output_token_increment_sum"), 0
+            ) in (0, combined_tokens)
 
         target_draft_ok = (
             registry.target_draft_length_mismatch_count == 0
