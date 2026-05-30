@@ -19,6 +19,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+from benchmark.partial_recovery_checker_utils import (  # noqa: E402
+    assert_partial_recovery_checker_cases,
+    partial_recovery_accounting_errors,
+    partial_recovery_descendant_commit_count,
+    partial_recovery_print_fields,
+    partial_recovery_summary_fields,
+)
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
@@ -431,8 +438,15 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         + committed_token_count
         + int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
     )
+    descendant_committed_after_partial_count = partial_recovery_descendant_commit_count(records)
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
+    combined_expected += legal_partial_total
     if int_value(accounting.get("combined_real_committed_token_count"), 0) != combined_expected:
-        errors.append("combined real committed token count must equal one-shot + depth1 + depth2 + depth3 + optional depth4")
+        errors.append("combined real committed token count must equal one-shot + depth1 + depth2 + depth3 + optional depth4 + optional legal partial recovery tokens")
 
     summary = {
         "total_trace_records": len(records),
@@ -443,6 +457,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth3_real_committed_proposal_count": len(committed_ids),
         "rolling_depth3_real_committed_token_count": committed_token_count,
         "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
+        "expected_combined_real_committed_token_count": combined_expected,
+        **partial_recovery_summary_fields(
+            accounting,
+            descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+        ),
         "rolling_depth3_real_commit_count": real_commit_count,
         "rolling_depth4_real_commit_count": depth4_real_commit_count,
         "rolling_depth_gt3_real_commit_count": depth_gt3_real_commit_count,
@@ -468,7 +487,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth3_child_ready_shadow_proposal_count",
         "rolling_depth3_real_committed_proposal_count",
         "rolling_depth3_real_committed_token_count",
-        "combined_real_committed_token_count",
+        *partial_recovery_print_fields(),
         "rolling_depth3_real_commit_count",
         "rolling_depth4_real_commit_count",
         "rolling_depth_gt3_real_commit_count",
@@ -620,6 +639,30 @@ def run_synthetic() -> None:
         raise SystemExit(f"legal depth4: real commit count must be 2, got {summary.get('rolling_depth4_real_commit_count')}")
     if summary.get("depth4_commit_enabled") is not True:
         raise SystemExit("legal depth4: depth4_commit_enabled must be True")
+
+    def _make_partial_recovery_records() -> list[dict[str, Any]]:
+        partial_target = deepcopy(target)
+        partial_target["rolling_depth2_commit_side"] = "target"
+        partial_target["rolling_depth2_commit_plan_id"] = 1
+        partial_target["rolling_depth2_commit_step_id"] = 1
+        partial_target["rolling_depth2_tokens_verified"] = 4
+        partial_target["rolling_depth2_tokens_accepted"] = 4
+        add_depth4_commit_for_depth3(partial_target, depth4_tokens=8, enabled=True)
+        partial_draft = deepcopy(draft)
+        partial_draft["rolling_depth2_commit_side"] = "draft"
+        partial_draft["rolling_depth2_commit_plan_id"] = 1
+        partial_draft["rolling_depth2_commit_step_id"] = 1
+        partial_draft["rolling_depth2_tokens_verified"] = 4
+        partial_draft["rolling_depth2_tokens_accepted"] = 4
+        add_depth4_commit_for_depth3(partial_draft, depth4_tokens=8, enabled=True)
+        return [partial_target, partial_draft]
+
+    assert_partial_recovery_checker_cases(
+        "rolling depth3 commit ready-only",
+        _make_partial_recovery_records,
+        validate_records,
+        expected_full_accept_combined_token_count=None,
+    )
 
     # depth_gt4 > 0, should fail
     depth4_gt4_target = deepcopy(target)

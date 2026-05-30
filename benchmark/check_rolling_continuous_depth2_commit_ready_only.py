@@ -27,6 +27,13 @@ from benchmark.check_eager_commit_ready_only import (  # noqa: E402
     validate_records as validate_one_shot_records,
 )
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+from benchmark.partial_recovery_checker_utils import (  # noqa: E402
+    assert_partial_recovery_checker_cases,
+    partial_recovery_accounting_errors,
+    partial_recovery_descendant_commit_count,
+    partial_recovery_print_fields,
+    partial_recovery_summary_fields,
+)
 
 
 def as_int_map(value: Any) -> dict[int, int]:
@@ -82,7 +89,12 @@ def step_plan_key(record: dict[str, Any]) -> tuple[int, int]:
     return plan_id, step_id
 
 
-def combined_accounting_errors(accounting: dict[str, Any], *, rolling_depth2_tokens: int) -> list[str]:
+def combined_accounting_errors(
+    accounting: dict[str, Any],
+    *,
+    rolling_depth2_tokens: int,
+    legal_partial_prefix_total_recovered_token_count: int = 0,
+) -> list[str]:
     one_shot_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
     depth1_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
     depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
@@ -99,7 +111,7 @@ def combined_accounting_errors(accounting: dict[str, Any], *, rolling_depth2_tok
         or bool(accounting.get("rolling_depth4_commit_enabled", False))
     )
 
-    expected = lower_bound
+    expected = lower_bound + int(legal_partial_prefix_total_recovered_token_count)
     if depth3_tokens > 0:
         expected += depth3_tokens
     if depth4_tokens > 0:
@@ -107,11 +119,11 @@ def combined_accounting_errors(accounting: dict[str, Any], *, rolling_depth2_tok
             return ["depth4 real committed tokens present while depth4 commit flag is disabled"]
         expected += depth4_tokens
 
-    if depth3_tokens > 0 or depth4_tokens > 0:
+    if depth3_tokens > 0 or depth4_tokens > 0 or int(legal_partial_prefix_total_recovered_token_count) > 0:
         if combined_tokens != expected:
             return [
                 "combined real committed token count mismatch "
-                "(expected one-shot + depth1 + rolling depth2 + known depth3/depth4 tokens)"
+                "(expected one-shot + depth1 + rolling depth2 + known depth3/depth4 + legal partial recovery tokens)"
             ]
     elif depth3_enabled_or_present or depth4_commit_enabled:
         if combined_tokens < lower_bound:
@@ -342,7 +354,31 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     ):
         if int_value(accounting.get(field), 0) != 0:
             errors.append(f"{field} must remain zero")
-    errors.extend(combined_accounting_errors(accounting, rolling_depth2_tokens=rolling_tokens))
+    descendant_committed_after_partial_count = partial_recovery_descendant_commit_count(records)
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
+    expected_combined = (
+        int_value(accounting.get("eager_committed_token_count"), 0)
+        + int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
+        + rolling_tokens
+        + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+        + (
+            int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
+            if depth4_commit_enabled
+            else 0
+        )
+        + legal_partial_total
+    )
+    errors.extend(
+        combined_accounting_errors(
+            accounting,
+            rolling_depth2_tokens=rolling_tokens,
+            legal_partial_prefix_total_recovered_token_count=legal_partial_total,
+        )
+    )
 
     summary = {
         "total_trace_records": len(records),
@@ -352,6 +388,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth2_real_committed_token_count": rolling_tokens,
         "rolling_depth3_real_committed_token_count": accounting.get("rolling_depth3_real_committed_token_count", 0),
         "rolling_depth4_real_committed_token_count": accounting.get("rolling_depth4_real_committed_token_count", 0),
+        "expected_combined_real_committed_token_count": expected_combined,
         "rolling_depth2_target_actual_verified_token_increment_sum": accounting.get(
             "rolling_depth2_target_actual_verified_token_increment_sum", 0
         ),
@@ -359,6 +396,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             "rolling_depth2_draft_actual_verified_token_increment_sum", 0
         ),
         "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
+        **partial_recovery_summary_fields(
+            accounting,
+            descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+        ),
         "rolling_depth2_commit_skip_reason_counts": dict(Counter(skip_reason_by_id.values())),
         "rolling_depth2_repeated_commit_proposal_ids": sorted(repeated_commit_ids),
         "rolling_depth2_duplicate_seq_depth_event_count": len(duplicate_seq_depth_events),
@@ -387,9 +428,9 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth2_real_committed_token_count",
         "rolling_depth3_real_committed_token_count",
         "rolling_depth4_real_committed_token_count",
+        *partial_recovery_print_fields(),
         "rolling_depth2_target_actual_verified_token_increment_sum",
         "rolling_depth2_draft_actual_verified_token_increment_sum",
-        "combined_real_committed_token_count",
         "rolling_depth2_commit_skip_reason_counts",
         "rolling_depth2_repeated_commit_proposal_ids",
         "rolling_depth2_duplicate_seq_depth_event_count",
@@ -504,6 +545,14 @@ def retokenize_synthetic_depth2_chain(
 
         parent_id = int(record["continuous_eager_real_committed_proposal_ids"][0])
         record["continuous_eager_real_committed_token_count_by_proposal_id"] = {str(parent_id): depth1_tokens}
+        record["continuous_eager_commit_side"] = str(record.get("rolling_depth2_commit_side", "target"))
+        record["continuous_eager_commit_plan_id"] = record.get("rolling_depth2_commit_plan_id", 32)
+        record["continuous_eager_commit_step_id"] = 11
+        record["continuous_eager_tokens_verified"] = depth1_tokens
+        record["continuous_eager_tokens_accepted"] = depth1_tokens
+        record["continuous_eager_tokens_committed"] = depth1_tokens
+        record["continuous_eager_tokens_rejected"] = 0
+        record["continuous_eager_tokens_invalidated"] = 0
 
         child_id = int(record["rolling_depth2_real_committed_proposal_ids"][0])
         seq_id = str(record["rolling_depth2_real_committed_seq_ids"][0])
@@ -645,6 +694,18 @@ def run_synthetic() -> None:
         raise SystemExit(f"legal depth4: combined must be 44, got {summary['combined_real_committed_token_count']}")
     if summary.get("depth4_commit_enabled") is not True:
         raise SystemExit("legal depth4: depth4_commit_enabled must be True")
+
+    def _make_partial_recovery_records() -> list[dict[str, Any]]:
+        records = deepcopy(higher_depth_valid)
+        add_depth4_commit_for_depth2(records, depth4_tokens=8, enabled=True)
+        return records
+
+    assert_partial_recovery_checker_cases(
+        "rolling depth2 commit ready-only",
+        _make_partial_recovery_records,
+        validate_records,
+        expected_full_accept_combined_token_count=44,
+    )
 
     # C. illegal depth4 commit (tokens present, flag disabled), fail
     depth4_illegal = deepcopy(higher_depth_valid)

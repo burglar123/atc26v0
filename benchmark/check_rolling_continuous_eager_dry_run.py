@@ -15,6 +15,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting  # noqa: E402
+from benchmark.partial_recovery_checker_utils import (  # noqa: E402
+    assert_partial_recovery_checker_cases,
+    partial_recovery_accounting_errors,
+    partial_recovery_descendant_commit_count,
+    partial_recovery_print_fields,
+    partial_recovery_summary_fields,
+)
 
 ROLLING_SOURCE = "rolling_continuous_shadow"
 ROLLING_STAGE = "overlap_dry_run"
@@ -690,9 +697,16 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     depth1_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
     depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
     depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
+    descendant_committed_after_partial_count = partial_recovery_descendant_commit_count(records)
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
     expected_combined = one_shot_tokens + depth1_tokens + depth2_tokens + depth3_tokens
     if global_depth4_commit_enabled:
         expected_combined += depth4_committed_token_count
+    expected_combined += legal_partial_total
     if depth4_committed_token_count > 0 and not global_depth4_commit_enabled:
         errors.append("depth4 real committed tokens present while depth4 commit flag is disabled")
     if combined_tokens != expected_combined:
@@ -741,6 +755,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "max_real_committed_depth": max_real_committed_depth,
         "combined_real_committed_token_count": combined_tokens,
         "expected_combined_real_committed_token_count": expected_combined,
+        **partial_recovery_summary_fields(
+            accounting,
+            descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+        ),
         "rolling_child_verified_without_parent_full_accept_count": child_verified_without_parent_count,
         "rolling_child_committed_without_parent_full_accept_count": child_committed_without_parent_count,
         "rolling_child_drafted_without_valid_parent_count": drafted_without_parent_count,
@@ -830,8 +848,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth_gt4_real_commit_count",
         "max_observed_depth",
         "max_real_committed_depth",
-        "combined_real_committed_token_count",
-        "expected_combined_real_committed_token_count",
+        *partial_recovery_print_fields(),
         "rolling_max_depth_observed",
         "missing_buffered_proposal_unexpected_count",
         "rolling_drop_reason_counts",
@@ -1163,6 +1180,19 @@ def run_synthetic() -> None:
         raise SystemExit(f"synthetic C max_real_depth should be 4, got {summary['max_real_committed_depth']}")
     if summary["rolling_depth_gt4_real_commit_count"] != 0:
         raise SystemExit("synthetic C depth_gt4 should be 0")
+
+    def _make_partial_recovery_records() -> list[dict[str, Any]]:
+        rec = _make_depth4_test_record(depth4_tokens=8, depth4_commit_enabled=True)
+        rec["enable_rolling_continuous_depth4_shadow_dry_run"] = True
+        rec["rolling_depth4_shadow_enabled"] = True
+        return [rec]
+
+    assert_partial_recovery_checker_cases(
+        "rolling continuous eager dry-run",
+        _make_partial_recovery_records,
+        validate_records,
+        expected_full_accept_combined_token_count=44,
+    )
 
     # D. Illegal depth4 commit (flag disabled, tokens present) → fail
     rec_d = _make_depth4_test_record(depth4_tokens=8, depth4_commit_enabled=False)

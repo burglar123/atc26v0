@@ -31,6 +31,13 @@ from benchmark.check_generic_bounded_rolling_chain import (  # noqa: E402
     add_depth4_shadow,
     synthetic_records,
 )
+from benchmark.partial_recovery_checker_utils import (  # noqa: E402
+    assert_partial_recovery_checker_cases,
+    partial_recovery_accounting_errors,
+    partial_recovery_descendant_commit_count,
+    partial_recovery_print_fields,
+    partial_recovery_summary_fields,
+)
 
 
 def _depth4_shadow_enabled(records: list[dict[str, Any]]) -> bool:
@@ -138,10 +145,17 @@ def validate_records(
     expected_combined = lower_depth_sum + (
         int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0) if commit_enabled else 0
     )
+    descendant_committed_after_partial_count = partial_recovery_descendant_commit_count(records)
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
+    expected_combined += legal_partial_total
     combined = int_value(accounting.get("combined_real_committed_token_count"), 0)
     if combined != expected_combined:
         errors.append(
-            "combined real committed tokens must include only real commits: "
+            "combined real committed tokens must include real commits plus legal partial recovery output: "
             f"combined={combined} expected={expected_combined}"
         )
 
@@ -168,6 +182,11 @@ def validate_records(
         "rolling_depth_gt4_real_commit_count": registry.depth_gt4_real_commit_count,
         "rolling_depth_gt3_real_commit_count": registry.depth_gt3_real_commit_count,
         "combined_real_committed_token_count": combined,
+        "expected_combined_real_committed_token_count": expected_combined,
+        **partial_recovery_summary_fields(
+            accounting,
+            descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+        ),
         "max_observed_depth": max_observed_depth,
         "max_real_committed_depth": max_real_committed_depth,
         "normal_lane_conflict_count": registry.normal_lane_conflict_count,
@@ -188,7 +207,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth4_real_committed_token_count",
         "rolling_depth_gt4_real_commit_count",
         "rolling_depth_gt3_real_commit_count",
-        "combined_real_committed_token_count",
+        *partial_recovery_print_fields(),
         "max_observed_depth",
         "max_real_committed_depth",
         "normal_lane_conflict_count",
@@ -303,6 +322,37 @@ def run_synthetic() -> None:
             "combined_real_committed_token_count": 44,
             "max_real_committed_depth": 4,
         },
+    )
+
+    def _make_partial_recovery_records() -> list[dict[str, Any]]:
+        records = deepcopy(good)
+        for i, record in enumerate(records):
+            side = record.get("rolling_depth3_commit_side", "target")
+            seq_id = 7
+            record["enable_rolling_continuous_depth4_commit_ready_only"] = True
+            record["rolling_depth4_commit_enabled"] = True
+            record["rolling_depth4_commit_source"] = "rolling_depth4_ready_only"
+            record["rolling_depth4_commit_side"] = side
+            record["rolling_depth4_commit_plan_id"] = 42
+            record["rolling_depth4_commit_step_id"] = 22
+            record["rolling_depth4_real_committed_proposal_ids"] = [p4]
+            record["rolling_depth4_real_committed_seq_ids"] = [seq_id]
+            record["rolling_depth4_real_committed_token_count_by_proposal_id"] = {str(p4): 8}
+            record["rolling_depth4_real_committed_token_count"] = 8
+            record["rolling_depth4_tokens_verified"] = 8
+            record["rolling_depth4_tokens_accepted"] = 8
+            record["rolling_depth4_tokens_rejected"] = 0
+            record["rolling_depth4_tokens_invalidated"] = 0
+            record["rolling_depth4_real_commit_count"] = 1 if i == 0 else 0
+            record["rolling_depth_gt3_real_commit_count"] = 1 if i == 0 else 0
+            record["rolling_depth_gt4_real_commit_count"] = 0
+        return records
+
+    assert_partial_recovery_checker_cases(
+        "rolling depth4 shadow dry-run",
+        _make_partial_recovery_records,
+        lambda records: validate_records(records, synthetic_result_payload()),
+        expected_full_accept_combined_token_count=44,
     )
 
     # depth5 (depth_gt4) — always fail

@@ -31,6 +31,13 @@ from benchmark.check_generic_bounded_rolling_chain import (  # noqa: E402
     add_depth4_shadow,
     synthetic_records,
 )
+from benchmark.partial_recovery_checker_utils import (  # noqa: E402
+    assert_partial_recovery_checker_cases,
+    partial_recovery_accounting_errors,
+    partial_recovery_descendant_commit_count,
+    partial_recovery_print_fields,
+    partial_recovery_summary_fields,
+)
 
 
 def _enabled(records: list[dict[str, Any]], *fields: str) -> bool:
@@ -164,11 +171,22 @@ def validate_records(
         + int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
         + depth4_tokens
     )
+    descendant_committed_after_partial_count = partial_recovery_descendant_commit_count(records)
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
+    expected_combined += legal_partial_total
     if int_value(accounting.get("combined_real_committed_token_count"), 0) != expected_combined:
-        errors.append("combined accounting must include depth4 committed tokens exactly once")
+        errors.append("combined accounting must include depth4 committed tokens and legal partial recovery tokens exactly once")
     if int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0) != expected_combined:
-        errors.append("combined verified accounting must include depth4 committed tokens exactly once")
-    if int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) != expected_combined:
+        errors.append("combined verified accounting must include depth4 committed tokens and legal partial recovery output exactly once")
+    if legal_partial_total:
+        expected_accepted = expected_combined - int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+        if int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) != expected_accepted:
+            errors.append("combined accepted accounting must exclude revised partial-recovery tokens")
+    elif int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) != expected_combined:
         errors.append("combined accepted accounting must include depth4 committed tokens exactly once")
 
     summary = {
@@ -188,6 +206,11 @@ def validate_records(
         "rolling_depth4_real_commit_count": registry.depth4_real_commit_count,
         "rolling_depth_gt4_real_commit_count": registry.depth_gt4_real_commit_count,
         "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
+        "expected_combined_real_committed_token_count": expected_combined,
+        **partial_recovery_summary_fields(
+            accounting,
+            descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+        ),
         "max_observed_depth": registry.max_observed_depth,
         "max_real_committed_depth": registry.max_real_committed_depth,
         "normal_lane_conflict_count": registry.normal_lane_conflict_count,
@@ -205,7 +228,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth4_real_committed_token_count",
         "rolling_depth4_real_commit_count",
         "rolling_depth_gt4_real_commit_count",
-        "combined_real_committed_token_count",
+        *partial_recovery_print_fields(),
         "max_observed_depth",
         "max_real_committed_depth",
         "normal_lane_conflict_count",
@@ -308,6 +331,20 @@ def run_synthetic() -> None:
             "max_observed_depth": 4,
             "max_real_committed_depth": 4,
         },
+    )
+
+    def _make_partial_recovery_records() -> list[dict[str, Any]]:
+        records = deepcopy(shadow_only)
+        for record in records:
+            add_depth4_commit(record)
+        records[1]["rolling_depth4_commit_side"] = "draft"
+        return records
+
+    assert_partial_recovery_checker_cases(
+        "rolling depth4 commit ready-only",
+        _make_partial_recovery_records,
+        lambda records: validate_records(records, synthetic_result_payload()),
+        expected_full_accept_combined_token_count=44,
     )
 
     bad_parent = deepcopy(good)
