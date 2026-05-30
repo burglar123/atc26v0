@@ -95,13 +95,19 @@ def combined_accounting_errors(
     *,
     one_shot_tokens: int,
     continuous_tokens: int,
+    legal_partial_prefix_total_recovered_token_count: int = 0,
 ) -> list[str]:
     combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
     depth2_tokens = int_value(accounting.get("rolling_depth2_real_committed_token_count"), 0)
     depth3_tokens = int_value(accounting.get("rolling_depth3_real_committed_token_count"), 0)
     depth4_tokens = int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0)
     lower_bound = one_shot_tokens + continuous_tokens
-    expected_with_known_higher_depth = lower_bound + depth2_tokens + depth3_tokens
+    expected_with_known_higher_depth = (
+        lower_bound
+        + depth2_tokens
+        + depth3_tokens
+        + int(legal_partial_prefix_total_recovered_token_count)
+    )
     depth4_commit_enabled = (
         bool(accounting.get("enable_rolling_continuous_depth4_commit_ready_only", False))
         or bool(accounting.get("rolling_depth4_commit_enabled", False))
@@ -110,7 +116,12 @@ def combined_accounting_errors(
         if not depth4_commit_enabled:
             return ["depth4 real committed tokens present while depth4 commit flag is disabled"]
         expected_with_known_higher_depth += depth4_tokens
-    higher_depth_tokens_present = depth2_tokens > 0 or depth3_tokens > 0 or depth4_tokens > 0
+    higher_depth_tokens_present = (
+        depth2_tokens > 0
+        or depth3_tokens > 0
+        or depth4_tokens > 0
+        or int(legal_partial_prefix_total_recovered_token_count) > 0
+    )
     higher_depth_enabled_or_present = (
         higher_depth_tokens_present
         or bool(accounting.get("rolling_depth2_commit_enabled", False))
@@ -123,7 +134,7 @@ def combined_accounting_errors(
         if combined_tokens != expected_with_known_higher_depth:
             return [
                 "combined real committed token count mismatch "
-                "(expected one-shot + depth1 + known rolling depth2/depth3/depth4 tokens)"
+                "(expected one-shot + depth1 + known rolling depth2/depth3/depth4 + legal partial recovery tokens)"
             ]
     elif higher_depth_enabled_or_present:
         if combined_tokens < lower_bound:
@@ -131,6 +142,69 @@ def combined_accounting_errors(
     elif combined_tokens != lower_bound:
         return ["combined real committed token count mismatch"]
     return []
+
+
+def partial_recovery_accounting_errors(
+    accounting: dict[str, Any],
+    *,
+    descendant_committed_after_partial_count: int = 0,
+) -> tuple[list[str], int]:
+    errors: list[str] = []
+    enabled = bool(accounting.get("partial_prefix_recovery_enabled", False)) or bool(
+        accounting.get("enable_rolling_continuous_partial_prefix_recovery", False)
+    )
+    success_count = int_value(accounting.get("partial_prefix_recovery_success_count"), 0)
+    partial_accepted = int_value(accounting.get("partial_prefix_accepted_token_count"), 0)
+    partial_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+    partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+    len_mismatch = int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0)
+    token_mismatch = int_value(accounting.get("partial_recovery_target_draft_token_mismatch_count"), 0)
+
+    if partial_total and not enabled:
+        errors.append("partial recovery tokens present while partial-prefix recovery is disabled")
+    if partial_total < 0:
+        errors.append("partial recovery total token count must be nonnegative")
+    if partial_total and success_count <= 0:
+        errors.append("partial recovery tokens require successful partial recovery evidence")
+    if partial_total != partial_accepted + partial_revised:
+        errors.append("partial recovery total tokens must equal accepted prefix plus revised tokens")
+    if partial_revised and partial_revised != success_count:
+        errors.append("partial recovery revised token count must equal successful recovery count")
+    if len_mismatch:
+        errors.append("partial recovery target/draft length mismatch count must be zero")
+    if token_mismatch:
+        errors.append("partial recovery target/draft token mismatch count must be zero")
+    if descendant_committed_after_partial_count:
+        errors.append("descendant committed after partial recovery")
+
+    legal_partial_total = 0
+    if (
+        enabled
+        and success_count > 0
+        and partial_total >= 0
+        and partial_total == partial_accepted + partial_revised
+        and len_mismatch == 0
+        and token_mismatch == 0
+        and descendant_committed_after_partial_count == 0
+    ):
+        legal_partial_total = partial_total
+
+    if legal_partial_total:
+        combined_accepted = int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0)
+        combined_revised = int_value(accounting.get("combined_actual_revised_token_increment_sum"), 0)
+        combined_output = int_value(accounting.get("combined_actual_output_token_increment_sum"), 0)
+        combined_verified = int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0)
+        combined_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
+        if combined_output != combined_accepted + combined_revised:
+            errors.append("combined output increment must equal accepted plus revised increments in partial recovery mode")
+        if combined_revised != partial_revised:
+            errors.append("combined revised increment must equal partial revised token count")
+        if combined_output != combined_tokens:
+            errors.append("combined output increment must equal combined real committed token count")
+        if combined_verified != combined_tokens:
+            errors.append("combined verified increment must equal combined real committed token count")
+
+    return errors, legal_partial_total
 
 
 def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
@@ -175,6 +249,7 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     result_transfer_protocols: set[str] = set()
     result_transfer_payload_len_units = 0
     result_transfer_payload_len_units_before_compact = 0
+    descendant_committed_after_partial_count = 0
 
     for record in records:
         if not is_dual_record(record):
@@ -220,6 +295,10 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
             errors.append(f"record[{idx}] compact continuous result-transfer payload grew")
         result_transfer_payload_len_units += max(0, payload_len)
         result_transfer_payload_len_units_before_compact += max(0, payload_before)
+        descendant_committed_after_partial_count += int_value(
+            record.get("descendant_committed_after_partial_count"),
+            0,
+        )
 
         enabled = bool(record.get("enable_continuous_eager_commit_depth1_ready_only", False))
         if enabled:
@@ -353,6 +432,11 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         errors.append("rolling depth4 real commit count must be zero")
     if depth_gt4_real_commit_count:
         errors.append("rolling depth>4 real commit count must be zero")
+    partial_errors, legal_partial_total = partial_recovery_accounting_errors(
+        accounting,
+        descendant_committed_after_partial_count=descendant_committed_after_partial_count,
+    )
+    errors.extend(partial_errors)
 
     continuous_tokens = int_value(accounting.get("continuous_eager_real_committed_token_count"), 0)
     if continuous_tokens != int_value(accounting.get("continuous_target_actual_verified_token_increment_sum"), 0):
@@ -381,11 +465,13 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
     )
     if depth4_tokens > 0 and depth4_commit_enabled:
         expected_combined += depth4_tokens
+    expected_combined += legal_partial_total
     errors.extend(
         combined_accounting_errors(
             accounting,
             one_shot_tokens=one_shot_tokens,
             continuous_tokens=continuous_tokens,
+            legal_partial_prefix_total_recovered_token_count=legal_partial_total,
         )
     )
 
@@ -403,6 +489,26 @@ def validate_records(records: list[dict[str, Any]]) -> tuple[list[str], dict[str
         "rolling_depth4_real_commit_count": depth4_real_commit_count,
         "rolling_depth_gt4_real_commit_count": depth_gt4_real_commit_count,
         "depth4_commit_enabled": depth4_commit_enabled,
+        "partial_prefix_recovery_enabled": accounting.get("partial_prefix_recovery_enabled", False),
+        "partial_prefix_recovery_attempt_count": accounting.get("partial_prefix_recovery_attempt_count", 0),
+        "partial_prefix_recovery_success_count": accounting.get("partial_prefix_recovery_success_count", 0),
+        "partial_prefix_accepted_token_count": accounting.get("partial_prefix_accepted_token_count", 0),
+        "partial_prefix_revised_token_count": accounting.get("partial_prefix_revised_token_count", 0),
+        "partial_prefix_total_recovered_token_count": accounting.get("partial_prefix_total_recovered_token_count", 0),
+        "partial_recovery_cascade_discard_count": accounting.get("partial_recovery_cascade_discard_count", 0),
+        "descendant_committed_after_partial_count": descendant_committed_after_partial_count,
+        "combined_actual_verified_token_increment_sum": accounting.get(
+            "combined_actual_verified_token_increment_sum", 0
+        ),
+        "combined_actual_accepted_token_increment_sum": accounting.get(
+            "combined_actual_accepted_token_increment_sum", 0
+        ),
+        "combined_actual_revised_token_increment_sum": accounting.get(
+            "combined_actual_revised_token_increment_sum", 0
+        ),
+        "combined_actual_output_token_increment_sum": accounting.get(
+            "combined_actual_output_token_increment_sum", 0
+        ),
         "expected_combined_real_committed_token_count": expected_combined,
         "combined_real_committed_token_count": accounting.get("combined_real_committed_token_count", 0),
         "continuous_target_actual_verified_token_increment_sum": accounting.get(
@@ -450,6 +556,18 @@ def print_summary(summary: dict[str, Any]) -> None:
         "rolling_depth4_real_commit_count",
         "rolling_depth_gt4_real_commit_count",
         "depth4_commit_enabled",
+        "partial_prefix_recovery_enabled",
+        "partial_prefix_recovery_attempt_count",
+        "partial_prefix_recovery_success_count",
+        "partial_prefix_accepted_token_count",
+        "partial_prefix_revised_token_count",
+        "partial_prefix_total_recovered_token_count",
+        "partial_recovery_cascade_discard_count",
+        "descendant_committed_after_partial_count",
+        "combined_actual_verified_token_increment_sum",
+        "combined_actual_accepted_token_increment_sum",
+        "combined_actual_revised_token_increment_sum",
+        "combined_actual_output_token_increment_sum",
         "expected_combined_real_committed_token_count",
         "combined_real_committed_token_count",
         "continuous_target_actual_verified_token_increment_sum",
@@ -647,6 +765,50 @@ def add_depth4_commit_accounting(record: dict[str, Any], *, depth4_tokens: int, 
     record["rolling_depth_gt4_real_commit_count"] = 0
 
 
+def add_partial_recovery_accounting(
+    record: dict[str, Any],
+    *,
+    enabled: bool = True,
+    accepted_tokens: int = 1,
+    revised_tokens: int = 1,
+    total_tokens: int | None = None,
+    len_match: bool = True,
+    token_match: bool = True,
+    descendant_committed_after_partial_count: int = 0,
+) -> None:
+    proposal_id = 900000605
+    seq_id = int(record.get("continuous_eager_real_committed_seq_ids", [12])[0]) if record.get(
+        "continuous_eager_real_committed_seq_ids"
+    ) else 12
+    total = accepted_tokens + revised_tokens if total_tokens is None else int(total_tokens)
+    record["partial_prefix_recovery_enabled"] = bool(enabled)
+    record["enable_rolling_continuous_partial_prefix_recovery"] = bool(enabled)
+    record["partial_prefix_recovery_attempt_count"] = 1
+    record["partial_prefix_recovery_success_count"] = 1
+    record["partial_prefix_recovery_skip_reason_counts"] = {}
+    record["partial_prefix_recovered_proposal_ids"] = [proposal_id]
+    record["partial_prefix_recovered_seq_ids"] = [seq_id]
+    record["partial_prefix_recovered_depth_by_proposal_id"] = {str(proposal_id): 1}
+    record["partial_prefix_accepted_len_by_proposal_id"] = {str(proposal_id): accepted_tokens}
+    record["partial_prefix_reject_index_by_proposal_id"] = {str(proposal_id): accepted_tokens}
+    record["partial_prefix_revised_token_count_by_proposal_id"] = {str(proposal_id): revised_tokens}
+    record["partial_prefix_committed_token_count_by_proposal_id"] = {str(proposal_id): total}
+    record["partial_prefix_recovery_frontier_before_by_seq_id"] = {str(seq_id): 44}
+    record["partial_prefix_recovery_frontier_after_by_seq_id"] = {str(seq_id): 44 + total}
+    record["partial_prefix_descendant_cascade_discard_count_by_proposal_id"] = {str(proposal_id): 0}
+    record["partial_prefix_recovery_normal_release_seq_ids"] = [seq_id]
+    record["partial_recovery_target_seq_len_before_by_seq_id"] = {str(seq_id): 44}
+    record["partial_recovery_target_seq_len_after_by_seq_id"] = {str(seq_id): 44 + total}
+    record["partial_recovery_draft_seq_len_before_by_seq_id"] = {str(seq_id): 44}
+    record["partial_recovery_draft_seq_len_after_by_seq_id"] = {str(seq_id): 44 + total}
+    record["partial_recovery_target_draft_len_match_by_seq_id"] = {str(seq_id): bool(len_match)}
+    record["partial_recovery_target_draft_token_match_by_seq_id"] = {str(seq_id): bool(token_match)}
+    record["partial_recovery_cascade_discarded_descendant_proposal_ids"] = []
+    record["partial_recovery_cascade_discarded_descendant_depth_by_proposal_id"] = {}
+    record["partial_recovery_cascade_discarded_descendant_reason_by_proposal_id"] = {}
+    record["descendant_committed_after_partial_count"] = int(descendant_committed_after_partial_count)
+
+
 def run_synthetic_tests() -> None:
     valid = [
         synthetic_continuous_commit_record("target"),
@@ -746,10 +908,77 @@ def run_synthetic_tests() -> None:
     assert summary["expected_combined_real_committed_token_count"] == 44
     assert summary["combined_real_committed_token_count"] == 44
 
-    # D. combined accounting mismatch is structurally enforced:
-    # depth4 enabled with 8 tokens → combined must be 44, not 36 or 52.
-    # This is verified by the expected_combined == combined check above.
-    # In a trace bug, combined_accounting_errors would catch any mismatch.
+    # D. legal partial-prefix recovery, combined=44+2, accepted excludes revised token.
+    partial_legal = deepcopy(depth4_legal)
+    for record in partial_legal:
+        add_partial_recovery_accounting(record, enabled=True, accepted_tokens=1, revised_tokens=1)
+    errors, summary = validate_records(partial_legal)
+    assert not errors, f"legal partial recovery synthetic failed: {errors}"
+    assert summary["partial_prefix_recovery_enabled"] is True
+    assert summary["partial_prefix_recovery_success_count"] == 1
+    assert summary["partial_prefix_accepted_token_count"] == 1
+    assert summary["partial_prefix_revised_token_count"] == 1
+    assert summary["partial_prefix_total_recovered_token_count"] == 2
+    assert summary["combined_real_committed_token_count"] == 46
+    assert summary["expected_combined_real_committed_token_count"] == 46
+    assert summary["combined_actual_accepted_token_increment_sum"] == 45
+    assert summary["combined_actual_revised_token_increment_sum"] == 1
+    assert summary["combined_actual_output_token_increment_sum"] == 46
+
+    # E. partial tokens while flag disabled, fail.
+    partial_disabled = deepcopy(depth4_legal)
+    for record in partial_disabled:
+        add_partial_recovery_accounting(record, enabled=False, accepted_tokens=1, revised_tokens=1)
+    errors, _summary = validate_records(partial_disabled)
+    assert errors, "partial tokens while disabled should fail"
+    assert any("partial-prefix recovery is disabled" in error for error in errors), errors
+
+    # F/G. combined accounting mismatch is still caught if a summary under- or over-counts partial tokens.
+    partial_accounting = aggregate_performance_accounting(partial_legal, {})
+    bad_under = dict(partial_accounting)
+    bad_under["combined_real_committed_token_count"] = 44
+    errors = combined_accounting_errors(
+        bad_under,
+        one_shot_tokens=12,
+        continuous_tokens=8,
+        legal_partial_prefix_total_recovered_token_count=2,
+    )
+    assert errors, "combined missing partial tokens should fail"
+    bad_over = dict(partial_accounting)
+    bad_over["combined_real_committed_token_count"] = 48
+    errors = combined_accounting_errors(
+        bad_over,
+        one_shot_tokens=12,
+        continuous_tokens=8,
+        legal_partial_prefix_total_recovered_token_count=2,
+    )
+    assert errors, "combined double-counting partial tokens should fail"
+
+    # H. revised token accounting mismatch, fail.
+    bad_revised = dict(partial_accounting)
+    bad_revised["combined_actual_revised_token_increment_sum"] = 0
+    errors, _legal_partial = partial_recovery_accounting_errors(bad_revised)
+    assert any("revised increment" in error for error in errors), errors
+
+    # I. descendant commit after partial recovery, fail.
+    partial_descendant = deepcopy(depth4_legal)
+    for i, record in enumerate(partial_descendant):
+        add_partial_recovery_accounting(
+            record,
+            enabled=True,
+            accepted_tokens=1,
+            revised_tokens=1,
+            descendant_committed_after_partial_count=1 if i == 0 else 0,
+        )
+    errors, _summary = validate_records(partial_descendant)
+    assert any("descendant committed after partial recovery" in error for error in errors), errors
+
+    # J. partial target/draft mismatch, fail.
+    partial_mismatch = deepcopy(depth4_legal)
+    for record in partial_mismatch:
+        add_partial_recovery_accounting(record, enabled=True, accepted_tokens=1, revised_tokens=1, len_match=False)
+    errors, _summary = validate_records(partial_mismatch)
+    assert any("target/draft length mismatch" in error for error in errors), errors
 
     # E. depth_gt4 > 0, fail
     depth4_gt4 = deepcopy(higher_depth_valid)
