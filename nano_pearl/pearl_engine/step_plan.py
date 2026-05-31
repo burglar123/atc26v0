@@ -217,6 +217,7 @@ class StepPlan:
     target_normal_verify_seq_ids_after_buffer_filter: List[int] = field(default_factory=list)
     local_actual_draft_home_set_for_normal_draft: List[int] = field(default_factory=list)
     normal_draft_transfer_synced_expected_seq_ids: List[int] = field(default_factory=list)
+    normal_draft_transfer_sender_seq_ids: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -541,6 +542,7 @@ class StepPlan:
             self.target_normal_verify_seq_ids_after_buffer_filter,
             self.local_actual_draft_home_set_for_normal_draft,
             self.normal_draft_transfer_synced_expected_seq_ids,
+            self.normal_draft_transfer_sender_seq_ids,
             self.lane_exclusion_applied_proposal_ids,
             self.lane_exclusion_applied_seq_ids,
         ]
@@ -1085,6 +1087,9 @@ class StepPlan:
             ),
             "normal_draft_transfer_synced_expected_seq_ids": _int_list(
                 self.normal_draft_transfer_synced_expected_seq_ids
+            ),
+            "normal_draft_transfer_sender_seq_ids": _int_list(
+                self.normal_draft_transfer_sender_seq_ids
             ),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
