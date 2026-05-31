@@ -2159,12 +2159,15 @@ class ModelRunnerBase:
     def _full_continuous_eager_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_full_continuous_eager", False))
 
-    def _cached_full_continuous_stage_aligned_enabled(self) -> bool:
+    def _requires_framed_dual_verify_result_transfer(self) -> bool:
         return (
             self.active_execution_mode == "dual_batch_pearl"
             and bool(getattr(self.global_config, "enable_cached_admission", False))
             and self._full_continuous_eager_enabled()
         )
+
+    def _cached_full_continuous_stage_aligned_enabled(self) -> bool:
+        return self._requires_framed_dual_verify_result_transfer()
 
     def _record_dual_collective_stage(self, plan: StepPlan, stage: str, event: str) -> None:
         stage = str(stage)
@@ -15760,7 +15763,24 @@ class DraftModelRunner(ModelRunnerBase):
         trace_record["eager_tokens_discarded"] = discarded_tokens
         trace_record["eager_buffer_size_after"] = self.eager_proposal_buffer.size()
 
-    def _receive_verify_result(self, seqs: list[Sequence]) -> torch.Tensor:
+    def _receive_verify_result(
+        self,
+        seqs: list[Sequence],
+        trace_record: dict | None = None,
+        plan: StepPlan | None = None,
+    ) -> torch.Tensor:
+        if trace_record is not None:
+            trace_record["old_verify_result_transfer_used"] = True
+            if plan is not None:
+                self._update_dual_collective_stage_trace(trace_record, plan)
+        if self._requires_framed_dual_verify_result_transfer():
+            detail = (
+                "old _receive_verify_result is illegal under "
+                "cached_admission + full_continuous + dual_batch_pearl"
+            )
+            if plan is not None:
+                detail = self._proposal_assertion_message(plan, detail)
+            raise AssertionError(detail)
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
         return verify_res
@@ -15898,7 +15918,7 @@ class DraftModelRunner(ModelRunnerBase):
             eager_proposals = self._run_eager_draft_dry_run(eager_draft_seqs, plan, eager_trace_record)
             self._finalize_record_profile(eager_trace_record)
 
-        if self._cached_full_continuous_stage_aligned_enabled():
+        if self._requires_framed_dual_verify_result_transfer():
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
             target_trace_record = trace_record
             trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
@@ -15949,7 +15969,11 @@ class DraftModelRunner(ModelRunnerBase):
             trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
-            verify_res = self._receive_verify_result(target_seqs)
+            verify_res = self._receive_verify_result(
+                target_seqs,
+                trace_record=trace_record,
+                plan=plan,
+            )
             accepted_lens, invalidated_lens = self._apply_verify_result(target_seqs, verify_res)
             if self._eager_promotion_dry_run_enabled() and eager_proposals:
                 self._evaluate_eager_promotion_dry_run(

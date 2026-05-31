@@ -155,8 +155,10 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "eager_result_transfer_exit",
                     "generic_full_continuous_stage_enter",
                     "generic_full_continuous_stage_exit",
+                    "old_verify_result_transfer_used",
                     "full_continuous_enabled",
                     "generic_full_continuous_enabled",
+                    "plan_id",
                     "dual_step_id",
                     "normal_transfer_called",
                     "normal_transfer_meta_len",
@@ -233,7 +235,7 @@ def role_family(record: dict[str, Any]) -> str:
 
 def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    grouped: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    grouped: dict[tuple[int, int], list[tuple[int, dict[str, Any]]]] = {}
     for idx, record in enumerate(records):
         if not has_stage_trace(record):
             continue
@@ -241,7 +243,11 @@ def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[
             step_id = int(record.get("dual_step_id", record.get("iteration_id", -1)))
         except Exception:
             step_id = -1
-        grouped.setdefault(step_id, []).append((idx, record))
+        try:
+            plan_id = int(record.get("plan_id", -1))
+        except Exception:
+            plan_id = -1
+        grouped.setdefault((step_id, plan_id), []).append((idx, record))
 
         enter, exit_ = stage_indices(record)
         for stage in DUAL_COLLECTIVE_STAGE_ORDER:
@@ -279,12 +285,8 @@ def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[
                     f"record[{idx}] cached full-continuous first collective stage must be "
                     f"normal_proposal_transfer, got {first_stage}"
                 )
-            if not stage_called(record, "target_verify_result_transfer"):
-                errors.append(
-                    f"record[{idx}] cached full-continuous requires zero-safe target verify result stage"
-                )
 
-    for step_id, indexed_records in grouped.items():
+    for (step_id, plan_id), indexed_records in grouped.items():
         cached_full = any(
             bool_value(record.get("cached_admission_enabled"))
             and bool_value(
@@ -296,34 +298,24 @@ def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[
         )
         if not cached_full:
             continue
-        records_by_role: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        for idx, record in indexed_records:
-            records_by_role.setdefault(role_family(record), []).append((idx, record))
-        for role in ("draft", "verify"):
-            role_records = records_by_role.get(role, [])
-            if not role_records:
-                continue
-            if not any(stage_called(record, "target_verify_result_transfer") for _, record in role_records):
-                errors.append(
-                    f"dual_step_id={step_id} role={role} missing zero-safe target verify result stage"
-                )
-        first_by_role = {
-            role: next(
-                (
-                    first_enter_stage(record)
-                    for _, record in role_records
-                    if first_enter_stage(record) is not None
-                ),
-                None,
-            )
-            for role, role_records in records_by_role.items()
+        called_stages = {
+            stage
+            for _, record in indexed_records
+            for stage in DUAL_COLLECTIVE_STAGE_ORDER
+            if stage_called(record, stage)
         }
-        draft_first = first_by_role.get("draft")
-        verify_first = first_by_role.get("verify")
-        if draft_first and verify_first and draft_first != verify_first:
+        reached_post_normal_stage = bool(
+            called_stages
+            & {
+                "eager_transfer",
+                "eager_result_transfer",
+                "generic_full_continuous_stage",
+            }
+        )
+        if reached_post_normal_stage and "target_verify_result_transfer" not in called_stages:
             errors.append(
-                f"dual_step_id={step_id} collective first-stage mismatch: "
-                f"draft={draft_first}, verify={verify_first}"
+                f"dual_step_id={step_id} plan_id={plan_id} cached full-continuous reached "
+                "post-normal stages without zero-safe target verify result stage"
             )
     return errors
 
@@ -423,6 +415,15 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         execution_mode = str(record.get("execution_mode") or summary.get("execution_mode") or "")
         if execution_mode != "dual_batch_pearl":
             continue
+        cached_full_record = bool_value(record.get("cached_admission_enabled")) and bool_value(
+            record.get("full_continuous_enabled")
+            or record.get("generic_full_continuous_enabled")
+            or record.get("enable_full_continuous_eager")
+        )
+        if cached_full_record and bool_value(record.get("old_verify_result_transfer_used")):
+            errors.append(
+                f"record[{idx}] old verify-result transfer is illegal under cached full-continuous"
+            )
         target_normal = set(int_list(record.get("target_normal_verify_seq_ids")))
         priming = set(int_list(record.get("cached_admission_draft_priming_seq_ids")))
         newly_admitted = set(int_list(record.get("cached_admission_newly_admitted_seq_ids")))
@@ -665,8 +666,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "eager_result_transfer_exit",
         "generic_full_continuous_stage_enter",
         "generic_full_continuous_stage_exit",
+        "old_verify_result_transfer_used",
         "full_continuous_enabled",
         "generic_full_continuous_enabled",
+        "plan_id",
         "dual_step_id",
         "normal_transfer_called",
         "normal_transfer_meta_len",
@@ -890,12 +893,14 @@ def stage_trace_record(
     *,
     runner_role: str,
     dual_step_id: int = 0,
+    plan_id: int = 0,
     full_continuous_enabled: bool = True,
     order: list[str] | None = None,
     verify_payload_len: int = 0,
     verify_num_results: int = 0,
     verify_seq_ids: list[int] | None = None,
     normal_zero_payload: bool = True,
+    old_verify_result_transfer_used: bool = False,
 ) -> dict[str, Any]:
     order = order or []
     enter_stages = {
@@ -917,6 +922,7 @@ def stage_trace_record(
         "runner_role": runner_role,
         "normal_proposal_transfer_role": "draft" if "draft" in runner_role else "verify",
         "dual_step_id": int(dual_step_id),
+        "plan_id": int(plan_id),
         "target_normal_verify_seq_ids": [],
         "actual_draft_home_set_for_normal_draft": [],
         "proposal_buffer_hit_seq_ids": [],
@@ -935,6 +941,7 @@ def stage_trace_record(
         "target_verify_result_transfer_seq_ids": verify_seq_ids or [],
         "target_verify_result_transfer_zero_result_step": int(verify_num_results == 0),
         "verify_result_numel": int(4 * verify_num_results),
+        "old_verify_result_transfer_used": bool(old_verify_result_transfer_used),
         "dual_proposal_sent_seq_ids": [],
         "dual_proposal_expected_receive_seq_ids": [],
         "dual_proposal_received_seq_ids": [],
@@ -1255,6 +1262,21 @@ def run_synthetic() -> int:
             False,
         ),
         (
+            "cached_full_continuous_transfer_only_record",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="dual_draft_transfer",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                        ],
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
             "cached_full_continuous_legal_stage_order",
             synthetic_stage_payload(
                 [
@@ -1286,7 +1308,19 @@ def run_synthetic() -> int:
             "cached_full_continuous_missing_verify_stage_bad",
             synthetic_stage_payload(
                 [
-                    stage_trace_record(runner_role="draft", order=legal_full_order),
+                    stage_trace_record(
+                        runner_role="draft",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                            "eager_transfer:enter",
+                            "eager_transfer:exit",
+                            "eager_result_transfer:enter",
+                            "eager_result_transfer:exit",
+                            "generic_full_continuous_stage:enter",
+                            "generic_full_continuous_stage:exit",
+                        ],
+                    ),
                     stage_trace_record(
                         runner_role="verify",
                         order=[
@@ -1303,6 +1337,51 @@ def run_synthetic() -> int:
                 ]
             ),
             True,
+        ),
+        (
+            "cached_full_continuous_old_verify_result_path_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft_apply_verify",
+                        order=legal_full_order,
+                        old_verify_result_transfer_used=True,
+                    ),
+                ]
+            ),
+            True,
+        ),
+        (
+            "cached_full_continuous_tp1_mixed_records",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft_apply_verify",
+                        dual_step_id=17,
+                        plan_id=23,
+                        order=legal_full_order,
+                    ),
+                    stage_trace_record(
+                        runner_role="dual_draft_transfer",
+                        dual_step_id=17,
+                        plan_id=23,
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                        ],
+                    ),
+                    stage_trace_record(
+                        runner_role="dual_draft_transfer",
+                        dual_step_id=17,
+                        plan_id=23,
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                        ],
+                    ),
+                ]
+            ),
+            False,
         ),
         (
             "cached_full_continuous_zero_target_verify_stage",
