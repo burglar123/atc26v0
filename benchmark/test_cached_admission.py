@@ -189,6 +189,179 @@ def test_ar_cached_control_dispatch_uses_string_method_names():
         assert isinstance(call.args[0].value, str)
 
 
+def test_ar_cached_decode_dispatch_executes_with_string_method_names():
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    engine_cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "PEARLEngine")
+    cached_fn = next(
+        node
+        for node in engine_cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "cached_decode_ready_generate"
+    )
+    fake_cls = ast.ClassDef(
+        name="FakeEngine",
+        bases=[],
+        keywords=[],
+        body=[cached_fn],
+        decorator_list=[],
+    )
+    module_ast = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                fake_cls,
+            ],
+            type_ignores=[],
+        )
+    )
+    ns: dict = {}
+    exec(compile(module_ast, str(ROOT / "nano_pearl/pearl_engine/pearl_engine.py"), "exec"), ns)
+
+    class _Config:
+        execution_mode = "ar"
+        ALLOWED_EXECUTION_MODES = {"ar", "serialized_pearl", "parallel_pearl", "dual_batch_pearl"}
+
+    class _Event:
+        def wait(self):
+            pass
+
+        def clear(self):
+            pass
+
+    class _Tokenizer:
+        def decode(self, token_ids, skip_special_tokens=False):
+            return ",".join(str(token_id) for token_id in token_ids)
+
+    class _Controller:
+        def __init__(self):
+            self.calls = []
+
+        def write_draft_shm(self, method_name, *args):
+            assert isinstance(method_name, str)
+            self.calls.append(("draft", method_name, args))
+
+        def write_target_shm(self, method_name, *args):
+            assert isinstance(method_name, str)
+            self.calls.append(("target", method_name, args))
+
+        def read_output(self):
+            return [], 0.0, [], []
+
+        def read_all_traces(self):
+            raise AssertionError("AR cached decode must not read draft traces")
+
+    engine = ns["FakeEngine"]()
+    engine.config = _Config()
+    engine.controller = _Controller()
+    engine.control_event = _Event()
+    engine.tokenizer = _Tokenizer()
+
+    output_text, num_tokens, num_acc_tokens, elapsed = engine.cached_decode_ready_generate(
+        4,
+        execution_mode="ar",
+        arrival_field="arrival_offset_sec",
+    )
+
+    assert (output_text, num_tokens, num_acc_tokens, elapsed) == ([], [], None, 0.0)
+    assert engine.controller.calls == [
+        ("draft", "cached_decode_ready_generate", ("ar", 4, "arrival_offset_sec")),
+        ("target", "cached_decode_ready_generate", ("ar", 4, "arrival_offset_sec")),
+    ]
+
+
+def test_ar_draft_noop_does_not_write_result_payload_into_command_shm():
+    def _is_execution_mode_ar(node):
+        return (
+            isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name)
+            and node.left.id == "execution_mode"
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)
+            and len(node.comparators) == 1
+            and isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value == "ar"
+        )
+
+    def _is_self_is_draft(node):
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "is_draft"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        )
+
+    def _condition_has_ar_draft(test):
+        nodes = list(ast.walk(test))
+        return any(_is_execution_mode_ar(node) for node in nodes) and any(
+            _is_self_is_draft(node) for node in nodes
+        )
+
+    tree = ast.parse((ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8"))
+    cached_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "cached_decode_ready_generate"
+    )
+    ar_noop_if = next(
+        node
+        for node in ast.walk(cached_fn)
+        if isinstance(node, ast.If) and _condition_has_ar_draft(node.test)
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_write_payload"
+        for stmt in ar_noop_if.body
+        for node in ast.walk(stmt)
+    )
+
+
+def test_ar_draft_cached_decode_noop_runtime_does_not_write_payload():
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    runner_cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelRunnerBase"
+    )
+    cached_fn = next(
+        node
+        for node in runner_cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "cached_decode_ready_generate"
+    )
+    fake_cls = ast.ClassDef(
+        name="FakeRunner",
+        bases=[],
+        keywords=[],
+        body=[cached_fn],
+        decorator_list=[],
+    )
+    module_ast = ast.fix_missing_locations(ast.Module(body=[fake_cls], type_ignores=[]))
+
+    class _Dist:
+        def __init__(self):
+            self.barriers = 0
+
+        def barrier(self):
+            self.barriers += 1
+
+    dist = _Dist()
+    ns = {"dist": dist}
+    exec(compile(module_ast, str(ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py"), "exec"), ns)
+
+    class _Config:
+        ALLOWED_EXECUTION_MODES = {"ar", "serialized_pearl", "parallel_pearl", "dual_batch_pearl"}
+
+    runner = ns["FakeRunner"]()
+    runner.global_config = _Config()
+    runner.is_draft = True
+    runner._set_execution_mode = lambda mode: setattr(runner, "execution_mode", mode)
+    runner._write_payload = lambda *args: (_ for _ in ()).throw(AssertionError("unexpected payload write"))
+
+    assert runner.cached_decode_ready_generate("ar", 4, "arrival_offset_sec") is None
+    assert runner.execution_mode == "ar"
+    assert runner.active_decode_ready_mode is True
+    assert dist.barriers == 2
+
+
 def test_runner_malformed_method_guard_is_clear():
     src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
     assert "runner control method_name must be str" in src

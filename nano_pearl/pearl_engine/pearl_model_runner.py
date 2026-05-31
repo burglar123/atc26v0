@@ -653,26 +653,6 @@ class ModelRunnerBase:
                 dist.barrier()
                 dist.barrier()
                 dist.barrier()
-            if self.tp_params.local_rank == 0:
-                self._write_payload(
-                    [],
-                    0.0,
-                    [],
-                    [
-                        {
-                            "cache_build_stats": True,
-                            "runner_role": self._runner_role(),
-                            "execution_mode": execution_mode,
-                            "cached_kv_num_requests": 0,
-                            "cached_kv_total_cpu_bytes": 0,
-                            "cached_kv_avg_blocks_per_request": 0.0,
-                            "cached_kv_max_blocks_per_request": 0,
-                            "cached_cache_build_elapsed_s": 0.0,
-                            "cache_build_skipped": True,
-                            "cache_build_skip_reason": "ar_target_only",
-                        }
-                    ],
-                )
             dist.barrier()
             return
         total_cached_kv_cpu_bytes = 0
@@ -14666,8 +14646,6 @@ class ModelRunnerBase:
         self.active_decode_ready_mode = True
         if execution_mode == "ar" and self.is_draft:
             dist.barrier()
-            if self.tp_params.local_rank == 0:
-                self._write_payload([], 0.0, [], [])
             dist.barrier()
             return
         if max_active_cached_seqs <= 0:
