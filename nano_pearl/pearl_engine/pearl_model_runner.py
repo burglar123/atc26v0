@@ -2267,6 +2267,22 @@ class ModelRunnerBase:
         trace_record["received_proposal_seq_ids"] = [
             int(seq_id) for seq_id in plan.received_proposal_seq_ids
         ]
+        trace_record["cached_admission_priming_received_seq_ids"] = [
+            int(seq_id) for seq_id in plan.cached_admission_priming_received_seq_ids
+        ]
+        trace_record["cached_admission_priming_buffered_seq_ids"] = [
+            int(seq_id) for seq_id in plan.cached_admission_priming_buffered_seq_ids
+        ]
+        trace_record["cached_admission_priming_same_step_verify_suppressed_seq_ids"] = [
+            int(seq_id)
+            for seq_id in plan.cached_admission_priming_same_step_verify_suppressed_seq_ids
+        ]
+        trace_record["fallback_same_batch_received_seq_ids"] = [
+            int(seq_id) for seq_id in plan.fallback_same_batch_received_seq_ids
+        ]
+        trace_record["fallback_same_batch_verify_seq_ids"] = [
+            int(seq_id) for seq_id in plan.fallback_same_batch_verify_seq_ids
+        ]
         trace_record["next_collective_stage"] = plan.normal_proposal_transfer_next_collective_stage
 
     def _active_cached_stage_debug_enabled(self) -> bool:
@@ -16548,11 +16564,55 @@ class TargetModelRunner(ModelRunnerBase):
         )
         if plan.normal_proposal_transfer_called:
             if use_received_fallback_targets:
-                plan.target_verify_seq_ids_from_received_proposals = list(received_proposal_seq_ids)
-                plan.fallback_received_seq_ids = list(received_proposal_seq_ids)
+                priming_seq_ids = {
+                    int(seq_id) for seq_id in plan.cached_admission_draft_priming_seq_ids
+                }
+                unprimed_filtered_seq_ids = {
+                    int(seq_id) for seq_id in plan.cached_admission_unprimed_target_filtered_seq_ids
+                }
+                priming_received_proposals = [
+                    proposal
+                    for proposal in received_proposals
+                    if (
+                        int(proposal.seq_id) in priming_seq_ids
+                        or int(proposal.seq_id) in unprimed_filtered_seq_ids
+                    )
+                ]
+                same_batch_received_proposals = [
+                    proposal
+                    for proposal in received_proposals
+                    if (
+                        int(proposal.seq_id) not in priming_seq_ids
+                        and int(proposal.seq_id) not in unprimed_filtered_seq_ids
+                    )
+                ]
+                priming_received_seq_ids = [
+                    int(proposal.seq_id) for proposal in priming_received_proposals
+                ]
+                same_batch_received_seq_ids = [
+                    int(proposal.seq_id) for proposal in same_batch_received_proposals
+                ]
+                plan.cached_admission_priming_received_seq_ids = list(priming_received_seq_ids)
+                plan.cached_admission_priming_same_step_verify_suppressed_seq_ids = list(
+                    priming_received_seq_ids
+                )
+                plan.fallback_same_batch_received_seq_ids = list(same_batch_received_seq_ids)
+                plan.fallback_same_batch_verify_seq_ids = list(same_batch_received_seq_ids)
+                if priming_received_proposals:
+                    self.dual_proposal_buffer.store(priming_received_proposals)
+                    plan.cached_admission_priming_buffered_seq_ids = (
+                        self._clear_cached_admission_priming_for_proposals(
+                            priming_received_proposals
+                        )
+                    )
+                    plan.cached_admission_primed_seq_ids = list(
+                        plan.cached_admission_priming_buffered_seq_ids
+                    )
+                plan.target_verify_seq_ids_from_received_proposals = list(same_batch_received_seq_ids)
+                plan.fallback_received_seq_ids = list(same_batch_received_seq_ids)
                 plan.fallback_missing_after_receive_seq_ids = []
-                target_proposals = list(received_proposals)
-                target_seq_ids = list(received_proposal_seq_ids)
+                target_proposals = list(same_batch_received_proposals)
+                target_seq_ids = list(same_batch_received_seq_ids)
                 target_seqs = self._resolve_dual_seq_ids(
                     target_seq_ids,
                     plan,
@@ -16570,7 +16630,7 @@ class TargetModelRunner(ModelRunnerBase):
                 ]
                 plan.fallback_received_seq_ids = list(received_seq_ids)
                 plan.fallback_missing_after_receive_seq_ids = list(missing_after_receive)
-            if fallback_same_batch:
+            if (not use_received_fallback_targets) and fallback_same_batch:
                 assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
                     plan,
                     "fallback same-batch missing proposals after receive for target seq_ids="
@@ -16598,7 +16658,7 @@ class TargetModelRunner(ModelRunnerBase):
                             plan,
                             received_proposals=received_proposals,
                         )
-            else:
+            elif not use_received_fallback_targets:
                 self.dual_proposal_buffer.store(received_proposals)
                 plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                     received_proposals

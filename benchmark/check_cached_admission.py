@@ -147,6 +147,8 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "target_tp_verify_seq_agreement_ok",
                     "target_tp_verify_seq_agreement_signature",
                     "received_proposal_seq_ids",
+                    "fallback_same_batch_received_seq_ids",
+                    "fallback_same_batch_verify_seq_ids",
                     "local_actual_draft_home_set_for_normal_draft",
                     "normal_draft_transfer_synced_expected_seq_ids",
                     "normal_draft_transfer_sender_seq_ids",
@@ -416,16 +418,49 @@ def validate_target_tp_verify_seq_agreement(records: list[dict[str, Any]]) -> li
                 record.get("target_verify_seq_ids_after_received_proposal_override")
             )
             from_received = int_list(record.get("target_verify_seq_ids_from_received_proposals"))
+            priming_received = int_list(record.get("cached_admission_priming_received_seq_ids"))
+            priming_buffered = int_list(record.get("cached_admission_priming_buffered_seq_ids"))
+            suppressed = int_list(
+                record.get("cached_admission_priming_same_step_verify_suppressed_seq_ids")
+            )
+            same_batch_received = int_list(record.get("fallback_same_batch_received_seq_ids"))
+            same_batch_verify = int_list(record.get("fallback_same_batch_verify_seq_ids"))
             if plan_phase == "fallback" and received:
-                if from_received and from_received != received:
+                legal_verify = same_batch_verify or from_received
+                if same_batch_received and legal_verify and same_batch_received != legal_verify:
+                    errors.append(
+                        f"record[{idx}] fallback same-batch received seqs must match verify seqs: "
+                        f"same_batch_received={same_batch_received}, legal_verify={legal_verify}"
+                    )
+                partition = sorted(set(same_batch_received) | set(suppressed))
+                if partition and partition != sorted(set(received)):
+                    errors.append(
+                        f"record[{idx}] fallback received proposals must split into same-batch "
+                        f"or priming-suppressed proposals: received={received}, "
+                        f"same_batch={same_batch_received}, suppressed={suppressed}"
+                    )
+                if from_received and from_received != legal_verify:
                     errors.append(
                         f"record[{idx}] fallback target verify seq ids from received proposals "
-                        f"must match received proposals: from_received={from_received}, received={received}"
+                        f"must match legal same-batch proposals: from_received={from_received}, "
+                        f"legal_verify={legal_verify}"
                     )
-                if after_override != received:
+                if after_override != legal_verify:
                     errors.append(
-                        f"record[{idx}] fallback received proposals must be target verify source of truth: "
-                        f"after_override={after_override}, received={received}"
+                        f"record[{idx}] fallback final target verify seq ids must match legal "
+                        f"same-batch proposals: after_override={after_override}, "
+                        f"legal_verify={legal_verify}, received={received}"
+                    )
+                suppressed_still_verified = sorted(set(suppressed) & set(after_override))
+                if suppressed_still_verified:
+                    errors.append(
+                        f"record[{idx}] cached-admission priming proposals must not be "
+                        f"same-step target verified: {suppressed_still_verified}"
+                    )
+                if priming_received and sorted(set(priming_received)) != sorted(set(priming_buffered)):
+                    errors.append(
+                        f"record[{idx}] priming received proposals must be buffered: "
+                        f"received={priming_received}, buffered={priming_buffered}"
                     )
     return errors
 
@@ -774,6 +809,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "target_tp_verify_seq_agreement_ok",
         "target_tp_verify_seq_agreement_signature",
         "received_proposal_seq_ids",
+        "cached_admission_priming_received_seq_ids",
+        "cached_admission_priming_buffered_seq_ids",
+        "cached_admission_priming_same_step_verify_suppressed_seq_ids",
+        "fallback_same_batch_received_seq_ids",
+        "fallback_same_batch_verify_seq_ids",
         "local_actual_draft_home_set_for_normal_draft",
         "normal_draft_transfer_synced_expected_seq_ids",
         "normal_draft_transfer_sender_seq_ids",
@@ -1046,6 +1086,14 @@ def stage_trace_record(
     target_tp_agreement_ok: bool = True,
     target_tp_agreement_signature: list[list[int]] | None = None,
     received_proposal_seq_ids: list[int] | None = None,
+    cached_admission_draft_priming_seq_ids: list[int] | None = None,
+    cached_admission_unprimed_target_filtered_seq_ids: list[int] | None = None,
+    cached_admission_priming_received_seq_ids: list[int] | None = None,
+    cached_admission_priming_buffered_seq_ids: list[int] | None = None,
+    cached_admission_priming_same_step_verify_suppressed_seq_ids: list[int] | None = None,
+    fallback_same_batch_received_seq_ids: list[int] | None = None,
+    fallback_same_batch_verify_seq_ids: list[int] | None = None,
+    actual_draft_seq_ids: list[int] | None = None,
     dual_stage_rank: int = 0,
     dual_stage_tp_local_rank: int = 0,
     normal_zero_payload: bool = True,
@@ -1113,6 +1161,23 @@ def stage_trace_record(
         "target_tp_verify_seq_agreement_ok": bool(target_tp_agreement_ok),
         "target_tp_verify_seq_agreement_signature": target_tp_agreement_signature or [],
         "received_proposal_seq_ids": received_proposal_seq_ids or [],
+        "cached_admission_draft_priming_seq_ids": (
+            cached_admission_draft_priming_seq_ids or []
+        ),
+        "cached_admission_unprimed_target_filtered_seq_ids": (
+            cached_admission_unprimed_target_filtered_seq_ids or []
+        ),
+        "cached_admission_priming_received_seq_ids": (
+            cached_admission_priming_received_seq_ids or []
+        ),
+        "cached_admission_priming_buffered_seq_ids": (
+            cached_admission_priming_buffered_seq_ids or []
+        ),
+        "cached_admission_priming_same_step_verify_suppressed_seq_ids": (
+            cached_admission_priming_same_step_verify_suppressed_seq_ids or []
+        ),
+        "fallback_same_batch_received_seq_ids": fallback_same_batch_received_seq_ids or [],
+        "fallback_same_batch_verify_seq_ids": fallback_same_batch_verify_seq_ids or [],
         "full_continuous_enabled": bool(full_continuous_enabled),
         "generic_full_continuous_enabled": bool(full_continuous_enabled),
         "enable_full_continuous_eager": bool(full_continuous_enabled),
@@ -1122,7 +1187,7 @@ def stage_trace_record(
         "plan_id": int(plan_id),
         "plan_phase": str(plan_phase),
         "target_normal_verify_seq_ids": [],
-        "actual_draft_home_set_for_normal_draft": [],
+        "actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
         "proposal_buffer_hit_seq_ids": [],
         "proposal_buffer_miss_seq_ids": [],
         "normal_proposal_transfer_called": "normal_proposal_transfer" in enter_stages,
@@ -1597,6 +1662,153 @@ def run_synthetic() -> int:
                         target_seq_ids_after_override=[],
                         target_tp_agreement_signature=[[0, 0, 0], [0, 0, 0]],
                         received_proposal_seq_ids=[],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_fallback_priming_received_suppressed",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=1,
+                        plan_id=16,
+                        plan_phase="fallback",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_before_override=[4],
+                        target_seq_ids_from_received=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_signature=[[0, 0, 0], [0, 0, 0]],
+                        received_proposal_seq_ids=[4],
+                        cached_admission_draft_priming_seq_ids=[4],
+                        cached_admission_unprimed_target_filtered_seq_ids=[4],
+                        cached_admission_priming_received_seq_ids=[4],
+                        cached_admission_priming_buffered_seq_ids=[4],
+                        cached_admission_priming_same_step_verify_suppressed_seq_ids=[4],
+                        fallback_same_batch_received_seq_ids=[],
+                        fallback_same_batch_verify_seq_ids=[],
+                        actual_draft_seq_ids=[4],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=1,
+                        plan_id=16,
+                        plan_phase="fallback",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_before_override=[],
+                        target_seq_ids_from_received=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_signature=[[0, 0, 0], [0, 0, 0]],
+                        received_proposal_seq_ids=[4],
+                        cached_admission_draft_priming_seq_ids=[4],
+                        cached_admission_unprimed_target_filtered_seq_ids=[4],
+                        cached_admission_priming_received_seq_ids=[4],
+                        cached_admission_priming_buffered_seq_ids=[4],
+                        cached_admission_priming_same_step_verify_suppressed_seq_ids=[4],
+                        fallback_same_batch_received_seq_ids=[],
+                        fallback_same_batch_verify_seq_ids=[],
+                        actual_draft_seq_ids=[4],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_fallback_priming_same_step_verify_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=1,
+                        plan_id=16,
+                        plan_phase="fallback",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_before_override=[4],
+                        target_seq_ids_from_received=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [1, 4, 4]],
+                        received_proposal_seq_ids=[4],
+                        cached_admission_draft_priming_seq_ids=[4],
+                        cached_admission_unprimed_target_filtered_seq_ids=[4],
+                        cached_admission_priming_received_seq_ids=[4],
+                        cached_admission_priming_buffered_seq_ids=[4],
+                        cached_admission_priming_same_step_verify_suppressed_seq_ids=[4],
+                        fallback_same_batch_received_seq_ids=[],
+                        fallback_same_batch_verify_seq_ids=[],
+                        actual_draft_seq_ids=[4],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            True,
+        ),
+        (
+            "cached_full_continuous_fallback_legal_same_batch_received",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=1,
+                        plan_id=16,
+                        plan_phase="fallback",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[5],
+                        target_seq_ids_before_override=[5],
+                        target_seq_ids_from_received=[5],
+                        target_seq_ids_after_override=[5],
+                        target_tp_agreement_signature=[[1, 5, 5], [1, 5, 5]],
+                        received_proposal_seq_ids=[5],
+                        fallback_same_batch_received_seq_ids=[5],
+                        fallback_same_batch_verify_seq_ids=[5],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=1,
+                        plan_id=16,
+                        plan_phase="fallback",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[5],
+                        target_seq_ids_before_override=[],
+                        target_seq_ids_from_received=[5],
+                        target_seq_ids_after_override=[5],
+                        target_tp_agreement_signature=[[1, 5, 5], [1, 5, 5]],
+                        received_proposal_seq_ids=[5],
+                        fallback_same_batch_received_seq_ids=[5],
+                        fallback_same_batch_verify_seq_ids=[5],
                         dual_stage_rank=2,
                         dual_stage_tp_local_rank=1,
                         cached_admission_decode_loop_active=True,

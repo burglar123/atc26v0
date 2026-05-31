@@ -254,6 +254,11 @@ class StepPlan:
     target_tp_verify_seq_agreement_ok: bool = False
     target_tp_verify_seq_agreement_signature: List[List[int]] = field(default_factory=list)
     received_proposal_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_priming_received_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_priming_buffered_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_priming_same_step_verify_suppressed_seq_ids: List[int] = field(default_factory=list)
+    fallback_same_batch_received_seq_ids: List[int] = field(default_factory=list)
+    fallback_same_batch_verify_seq_ids: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1190,6 +1195,21 @@ class StepPlan:
                 for signature in self.target_tp_verify_seq_agreement_signature
             ],
             "received_proposal_seq_ids": _int_list(self.received_proposal_seq_ids),
+            "cached_admission_priming_received_seq_ids": _int_list(
+                self.cached_admission_priming_received_seq_ids
+            ),
+            "cached_admission_priming_buffered_seq_ids": _int_list(
+                self.cached_admission_priming_buffered_seq_ids
+            ),
+            "cached_admission_priming_same_step_verify_suppressed_seq_ids": _int_list(
+                self.cached_admission_priming_same_step_verify_suppressed_seq_ids
+            ),
+            "fallback_same_batch_received_seq_ids": _int_list(
+                self.fallback_same_batch_received_seq_ids
+            ),
+            "fallback_same_batch_verify_seq_ids": _int_list(
+                self.fallback_same_batch_verify_seq_ids
+            ),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),
