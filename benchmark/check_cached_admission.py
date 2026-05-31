@@ -212,6 +212,12 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         actual_draft = set(
             int_list(record.get("actual_draft_home_set_for_normal_draft") or record.get("draft_home_set"))
         )
+        actual_draft_ordered = int_list(
+            record.get("actual_draft_home_set_for_normal_draft") or record.get("draft_home_set")
+        )
+        sent_proposals = int_list(record.get("dual_proposal_sent_seq_ids"))
+        expected_receive = int_list(record.get("dual_proposal_expected_receive_seq_ids"))
+        received_proposals = int_list(record.get("dual_proposal_received_seq_ids"))
 
         if priming & target_normal:
             errors.append(
@@ -244,6 +250,21 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                 f"record[{idx}] primed seqs should not target-verify in the same priming record: "
                 f"{sorted(primed & target_normal)}"
             )
+        if sent_proposals and sent_proposals != actual_draft_ordered:
+            errors.append(
+                f"record[{idx}] dual proposal sent seqs must match actual draft seqs: "
+                f"sent={sent_proposals}, actual={actual_draft_ordered}"
+            )
+        if expected_receive and expected_receive != actual_draft_ordered:
+            errors.append(
+                f"record[{idx}] dual proposal expected receive seqs must match actual draft seqs: "
+                f"expected={expected_receive}, actual={actual_draft_ordered}"
+            )
+        if received_proposals and expected_receive and received_proposals != expected_receive:
+            errors.append(
+                f"record[{idx}] dual proposal received seqs must match expected receive seqs: "
+                f"received={received_proposals}, expected={expected_receive}"
+            )
 
     return errors, summary
 
@@ -268,6 +289,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "cached_admission_primed_seq_ids",
         "cached_admission_unprimed_target_filtered_seq_ids",
         "cached_admission_missing_proposal_after_filter_seq_ids",
+        "cached_admission_filtered_draft_seq_ids",
+        "dual_proposal_sent_seq_ids",
+        "dual_proposal_expected_receive_seq_ids",
+        "dual_proposal_received_seq_ids",
     )
     for field in fields:
         print(f"{field} = {summary.get(field)}")
@@ -361,6 +386,11 @@ def synthetic_dual_payload(
     proposal_hit_seq_ids: list[int] | None = None,
     proposal_miss_seq_ids: list[int] | None = None,
     missing_after_filter_seq_ids: list[int] | None = None,
+    original_draft_seq_ids: list[int] | None = None,
+    sent_proposal_seq_ids: list[int] | None = None,
+    expected_receive_seq_ids: list[int] | None = None,
+    received_proposal_seq_ids: list[int] | None = None,
+    filtered_draft_seq_ids: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     records, result = synthetic_payload()
     result.setdefault("args", {})["execution_mode"] = execution_mode
@@ -370,7 +400,9 @@ def synthetic_dual_payload(
             "cached_admission_enabled": True,
             "runner_role": "verify",
             "target_normal_verify_seq_ids": target_normal_verify_seq_ids or [],
+            "original_draft_home_set": original_draft_seq_ids or actual_draft_seq_ids or [],
             "actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
+            "cached_admission_filtered_draft_seq_ids": filtered_draft_seq_ids or [],
             "cached_admission_newly_admitted_seq_ids": newly_admitted_seq_ids or [],
             "cached_admission_draft_priming_seq_ids": priming_seq_ids or [],
             "cached_admission_primed_seq_ids": primed_seq_ids or [],
@@ -380,6 +412,9 @@ def synthetic_dual_payload(
             ),
             "proposal_buffer_hit_seq_ids": proposal_hit_seq_ids or [],
             "proposal_buffer_miss_seq_ids": proposal_miss_seq_ids or [],
+            "dual_proposal_sent_seq_ids": sent_proposal_seq_ids or [],
+            "dual_proposal_expected_receive_seq_ids": expected_receive_seq_ids or [],
+            "dual_proposal_received_seq_ids": received_proposal_seq_ids or [],
             "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
             "fallback_pending_receive_seq_ids": [],
         }
@@ -441,6 +476,30 @@ def run_synthetic() -> int:
                 target_normal_verify_seq_ids=[6],
                 proposal_miss_seq_ids=[6],
                 missing_after_filter_seq_ids=[6],
+            ),
+            False,
+        ),
+        (
+            "dual_sender_receiver_actual_draft_alignment_bad",
+            synthetic_dual_payload(
+                original_draft_seq_ids=[5, 7],
+                actual_draft_seq_ids=[7],
+                sent_proposal_seq_ids=[5, 7],
+                expected_receive_seq_ids=[7],
+                received_proposal_seq_ids=[5, 7],
+                filtered_draft_seq_ids=[5],
+            ),
+            True,
+        ),
+        (
+            "dual_sender_receiver_actual_draft_alignment_good",
+            synthetic_dual_payload(
+                original_draft_seq_ids=[5, 7],
+                actual_draft_seq_ids=[7],
+                sent_proposal_seq_ids=[7],
+                expected_receive_seq_ids=[7],
+                received_proposal_seq_ids=[7],
+                filtered_draft_seq_ids=[5],
             ),
             False,
         ),

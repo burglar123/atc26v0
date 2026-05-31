@@ -206,6 +206,10 @@ class StepPlan:
     cached_admission_primed_seq_ids: List[int] = field(default_factory=list)
     cached_admission_unprimed_target_filtered_seq_ids: List[int] = field(default_factory=list)
     cached_admission_missing_proposal_after_filter_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_filtered_draft_seq_ids: List[int] = field(default_factory=list)
+    dual_proposal_sent_seq_ids: List[int] = field(default_factory=list)
+    dual_proposal_expected_receive_seq_ids: List[int] = field(default_factory=list)
+    dual_proposal_received_seq_ids: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1039,6 +1043,14 @@ class StepPlan:
             "cached_admission_missing_proposal_after_filter_seq_ids": _int_list(
                 self.cached_admission_missing_proposal_after_filter_seq_ids
             ),
+            "cached_admission_filtered_draft_seq_ids": _int_list(
+                self.cached_admission_filtered_draft_seq_ids
+            ),
+            "dual_proposal_sent_seq_ids": _int_list(self.dual_proposal_sent_seq_ids),
+            "dual_proposal_expected_receive_seq_ids": _int_list(
+                self.dual_proposal_expected_receive_seq_ids
+            ),
+            "dual_proposal_received_seq_ids": _int_list(self.dual_proposal_received_seq_ids),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

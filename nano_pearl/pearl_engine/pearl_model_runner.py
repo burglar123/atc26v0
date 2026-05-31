@@ -2314,6 +2314,21 @@ class ModelRunnerBase:
             list(actual_draft) + list(priming_seq_ids)
         )
 
+    def _canonicalize_actual_normal_draft_seq_ids(self, plan: StepPlan) -> None:
+        actual_draft = self._actual_normal_draft_seq_ids(plan)
+        allowed_seq_ids = {
+            int(seq_id)
+            for seq_id in list(plan.draft_home_set) + list(plan.cached_admission_draft_priming_seq_ids)
+        }
+        if not actual_draft or not allowed_seq_ids:
+            plan.cached_admission_filtered_draft_seq_ids = []
+            return
+        canonical = [int(seq_id) for seq_id in actual_draft if int(seq_id) in allowed_seq_ids]
+        filtered = [int(seq_id) for seq_id in actual_draft if int(seq_id) not in allowed_seq_ids]
+        plan.cached_admission_filtered_draft_seq_ids = list(filtered)
+        if filtered:
+            plan.actual_draft_home_set_for_normal_draft = list(canonical)
+
     def _clear_cached_admission_priming_for_proposals(
         self,
         proposals: list[BufferedProposal],
@@ -2331,6 +2346,33 @@ class ModelRunnerBase:
             seq.needs_dual_batch_draft_priming = False
             seq.cached_admission_newly_admitted = False
         return sorted(primed_seq_ids)
+
+    def _normal_draft_proposals_for_actual_seq_ids(
+        self,
+        proposals: list[BufferedProposal],
+        plan: StepPlan,
+    ) -> list[BufferedProposal]:
+        expected_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        proposal_by_seq_id = {int(proposal.seq_id): proposal for proposal in proposals}
+        extra_seq_ids = [
+            int(proposal.seq_id)
+            for proposal in proposals
+            if int(proposal.seq_id) not in set(expected_seq_ids)
+        ]
+        if extra_seq_ids:
+            plan.cached_admission_filtered_draft_seq_ids = self._ordered_unique_ints(
+                list(plan.cached_admission_filtered_draft_seq_ids) + list(extra_seq_ids)
+            )
+        missing_seq_ids = [seq_id for seq_id in expected_seq_ids if seq_id not in proposal_by_seq_id]
+        assert not missing_seq_ids, self._proposal_assertion_message(
+            plan,
+            "missing generated normal draft proposals for actual draft seq_ids="
+            f"{missing_seq_ids}",
+        )
+        filtered = [proposal_by_seq_id[seq_id] for seq_id in expected_seq_ids]
+        plan.dual_proposal_sent_seq_ids = [int(proposal.seq_id) for proposal in filtered]
+        plan.dual_proposal_expected_receive_seq_ids = list(expected_seq_ids)
+        return filtered
 
     def _lane_exclusion_step_id_before_plan(self) -> int:
         return int(self.dual_batch_manager.step_id)
@@ -2668,6 +2710,7 @@ class ModelRunnerBase:
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
         self._apply_cached_admission_dual_batch_priming(plan)
+        self._canonicalize_actual_normal_draft_seq_ids(plan)
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
@@ -2893,6 +2936,14 @@ class ModelRunnerBase:
         trace_record["cached_admission_missing_proposal_after_filter_seq_ids"] = list(
             plan.cached_admission_missing_proposal_after_filter_seq_ids
         )
+        trace_record["cached_admission_filtered_draft_seq_ids"] = list(
+            plan.cached_admission_filtered_draft_seq_ids
+        )
+        trace_record["dual_proposal_sent_seq_ids"] = list(plan.dual_proposal_sent_seq_ids)
+        trace_record["dual_proposal_expected_receive_seq_ids"] = list(
+            plan.dual_proposal_expected_receive_seq_ids
+        )
+        trace_record["dual_proposal_received_seq_ids"] = list(plan.dual_proposal_received_seq_ids)
         trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
         trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
             plan.missing_buffered_proposal_allowed_by_eager_seq_ids
@@ -2986,6 +3037,8 @@ class ModelRunnerBase:
         return meta, payload_tensor
 
     def _send_dual_proposals(self, proposals: list[BufferedProposal], plan: StepPlan):
+        plan.dual_proposal_sent_seq_ids = [int(proposal.seq_id) for proposal in proposals]
+        plan.dual_proposal_expected_receive_seq_ids = self._actual_normal_draft_seq_ids(plan)
         if self.tp_params.local_rank != 0:
             return
         meta, payload = self._serialize_proposals(proposals, plan)
@@ -3033,6 +3086,8 @@ class ModelRunnerBase:
                 )
             )
         received_seq_ids = [proposal.seq_id for proposal in proposals]
+        plan.dual_proposal_expected_receive_seq_ids = [int(seq_id) for seq_id in expected_seq_ids]
+        plan.dual_proposal_received_seq_ids = [int(seq_id) for seq_id in received_seq_ids]
         assert received_seq_ids == list(expected_seq_ids), self._proposal_assertion_message(
             plan,
             f"proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, batch_id={batch_id}",
@@ -15253,6 +15308,7 @@ class DraftModelRunner(ModelRunnerBase):
         target_trace_record = None
         if draft_seqs:
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
+            proposals = self._normal_draft_proposals_for_actual_seq_ids(proposals, plan)
             primed_seq_ids = []
             if plan.plan_phase in {"priming", "steady"}:
                 self.dual_proposal_buffer.store(proposals)
