@@ -210,6 +210,11 @@ class StepPlan:
     dual_proposal_sent_seq_ids: List[int] = field(default_factory=list)
     dual_proposal_expected_receive_seq_ids: List[int] = field(default_factory=list)
     dual_proposal_received_seq_ids: List[int] = field(default_factory=list)
+    raw_target_normal_verify_seq_ids_before_buffer_filter: List[int] = field(default_factory=list)
+    cached_admission_target_filtered_missing_proposal_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_target_buffer_hit_seq_ids: List[int] = field(default_factory=list)
+    cached_admission_target_buffer_miss_seq_ids: List[int] = field(default_factory=list)
+    target_normal_verify_seq_ids_after_buffer_filter: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -527,6 +532,11 @@ class StepPlan:
             self.missing_normal_proposal_allowed_seq_ids_dry_run,
             self.missing_buffered_proposal_allowed_by_eager_seq_ids,
             self.missing_buffered_proposal_unexpected_seq_ids,
+            self.raw_target_normal_verify_seq_ids_before_buffer_filter,
+            self.cached_admission_target_filtered_missing_proposal_seq_ids,
+            self.cached_admission_target_buffer_hit_seq_ids,
+            self.cached_admission_target_buffer_miss_seq_ids,
+            self.target_normal_verify_seq_ids_after_buffer_filter,
             self.lane_exclusion_applied_proposal_ids,
             self.lane_exclusion_applied_seq_ids,
         ]
@@ -1051,6 +1061,21 @@ class StepPlan:
                 self.dual_proposal_expected_receive_seq_ids
             ),
             "dual_proposal_received_seq_ids": _int_list(self.dual_proposal_received_seq_ids),
+            "raw_target_normal_verify_seq_ids_before_buffer_filter": _int_list(
+                self.raw_target_normal_verify_seq_ids_before_buffer_filter
+            ),
+            "cached_admission_target_filtered_missing_proposal_seq_ids": _int_list(
+                self.cached_admission_target_filtered_missing_proposal_seq_ids
+            ),
+            "cached_admission_target_buffer_hit_seq_ids": _int_list(
+                self.cached_admission_target_buffer_hit_seq_ids
+            ),
+            "cached_admission_target_buffer_miss_seq_ids": _int_list(
+                self.cached_admission_target_buffer_miss_seq_ids
+            ),
+            "target_normal_verify_seq_ids_after_buffer_filter": _int_list(
+                self.target_normal_verify_seq_ids_after_buffer_filter
+            ),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

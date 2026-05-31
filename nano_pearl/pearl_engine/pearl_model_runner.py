@@ -2329,6 +2329,42 @@ class ModelRunnerBase:
         if filtered:
             plan.actual_draft_home_set_for_normal_draft = list(canonical)
 
+    def _canonicalize_target_normal_verify_seq_ids_for_buffer(
+        self,
+        plan: StepPlan,
+        *,
+        fallback_same_batch: bool,
+    ) -> None:
+        raw_target = self._target_normal_verify_seq_ids(plan)
+        plan.raw_target_normal_verify_seq_ids_before_buffer_filter = list(raw_target)
+        plan.cached_admission_target_filtered_missing_proposal_seq_ids = []
+        plan.cached_admission_target_buffer_hit_seq_ids = []
+        plan.cached_admission_target_buffer_miss_seq_ids = []
+        plan.target_normal_verify_seq_ids_after_buffer_filter = list(raw_target)
+        if fallback_same_batch:
+            return
+        cached_admission_active = bool(getattr(self.global_config, "enable_cached_admission", False)) or bool(
+            plan.cached_admission_newly_admitted_seq_ids
+            or plan.cached_admission_draft_priming_seq_ids
+            or plan.cached_admission_unprimed_target_filtered_seq_ids
+        )
+        if not cached_admission_active:
+            return
+
+        buffer_inspect = self.dual_proposal_buffer.inspect(raw_target)
+        hit_seq_ids = [int(seq_id) for seq_id in buffer_inspect["hit_seq_ids"]]
+        miss_seq_ids = [int(seq_id) for seq_id in buffer_inspect["miss_seq_ids"]]
+        invalid_seq_ids = [int(seq_id) for seq_id in buffer_inspect["invalid_seq_ids"]]
+        filtered_seq_ids = list(miss_seq_ids) + list(invalid_seq_ids)
+        plan.cached_admission_target_buffer_hit_seq_ids = list(hit_seq_ids)
+        plan.cached_admission_target_buffer_miss_seq_ids = list(miss_seq_ids)
+        plan.cached_admission_target_filtered_missing_proposal_seq_ids = list(filtered_seq_ids)
+        if filtered_seq_ids:
+            if not plan.raw_target_home_set_for_normal_verify:
+                plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
+            plan.target_normal_verify_seq_ids = list(hit_seq_ids)
+        plan.target_normal_verify_seq_ids_after_buffer_filter = self._target_normal_verify_seq_ids(plan)
+
     def _clear_cached_admission_priming_for_proposals(
         self,
         proposals: list[BufferedProposal],
@@ -2711,6 +2747,17 @@ class ModelRunnerBase:
             self._validate_phase1h_plan(plan)
         self._apply_cached_admission_dual_batch_priming(plan)
         self._canonicalize_actual_normal_draft_seq_ids(plan)
+        initial_target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        initial_actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        initial_fallback_same_batch = (
+            bool(initial_target_normal_verify_seq_ids)
+            and plan.plan_phase == "fallback"
+            and set(initial_target_normal_verify_seq_ids).issubset(set(initial_actual_normal_draft_seq_ids))
+        )
+        self._canonicalize_target_normal_verify_seq_ids_for_buffer(
+            plan,
+            fallback_same_batch=initial_fallback_same_batch,
+        )
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
@@ -2860,7 +2907,11 @@ class ModelRunnerBase:
             f"cached_admission_draft_priming_seq_ids="
             f"{getattr(plan, 'cached_admission_draft_priming_seq_ids', [])}, "
             f"cached_admission_unprimed_target_filtered_seq_ids="
-            f"{getattr(plan, 'cached_admission_unprimed_target_filtered_seq_ids', [])}"
+            f"{getattr(plan, 'cached_admission_unprimed_target_filtered_seq_ids', [])}, "
+            f"cached_admission_target_filtered_missing_proposal_seq_ids="
+            f"{getattr(plan, 'cached_admission_target_filtered_missing_proposal_seq_ids', [])}, "
+            f"cached_admission_target_buffer_hit_seq_ids="
+            f"{getattr(plan, 'cached_admission_target_buffer_hit_seq_ids', [])}"
         )
 
     def _update_lane_exclusion_proposal_trace(
@@ -2938,6 +2989,21 @@ class ModelRunnerBase:
         )
         trace_record["cached_admission_filtered_draft_seq_ids"] = list(
             plan.cached_admission_filtered_draft_seq_ids
+        )
+        trace_record["raw_target_normal_verify_seq_ids_before_buffer_filter"] = list(
+            plan.raw_target_normal_verify_seq_ids_before_buffer_filter
+        )
+        trace_record["cached_admission_target_filtered_missing_proposal_seq_ids"] = list(
+            plan.cached_admission_target_filtered_missing_proposal_seq_ids
+        )
+        trace_record["cached_admission_target_buffer_hit_seq_ids"] = list(
+            plan.cached_admission_target_buffer_hit_seq_ids
+        )
+        trace_record["cached_admission_target_buffer_miss_seq_ids"] = list(
+            plan.cached_admission_target_buffer_miss_seq_ids
+        )
+        trace_record["target_normal_verify_seq_ids_after_buffer_filter"] = list(
+            plan.target_normal_verify_seq_ids_after_buffer_filter
         )
         trace_record["dual_proposal_sent_seq_ids"] = list(plan.dual_proposal_sent_seq_ids)
         trace_record["dual_proposal_expected_receive_seq_ids"] = list(

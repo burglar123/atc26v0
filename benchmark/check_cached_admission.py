@@ -94,10 +94,19 @@ def result_summary(result_payload: dict[str, Any]) -> dict[str, Any]:
 def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for record in records:
-        if not bool_value(record.get("cached_admission_enabled")):
-            continue
         for key, value in record.items():
-            if str(key).startswith("cached_admission_") or str(key).startswith("cached_prefill_"):
+            if (
+                str(key).startswith("cached_admission_")
+                or str(key).startswith("cached_prefill_")
+                or key
+                in {
+                    "raw_target_normal_verify_seq_ids_before_buffer_filter",
+                    "target_normal_verify_seq_ids_after_buffer_filter",
+                    "proposal_buffer_hit_seq_ids",
+                    "proposal_buffer_miss_seq_ids",
+                    "missing_buffered_proposal_unexpected_seq_ids",
+                }
+            ):
                 if key not in summary or value not in (None, [], {}, ""):
                     summary[key] = value
     return summary
@@ -204,6 +213,18 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         missing_after_filter = set(
             int_list(record.get("cached_admission_missing_proposal_after_filter_seq_ids"))
         )
+        raw_target_before_filter = set(
+            int_list(record.get("raw_target_normal_verify_seq_ids_before_buffer_filter"))
+        )
+        target_after_filter = int_list(record.get("target_normal_verify_seq_ids_after_buffer_filter"))
+        target_filtered_missing = set(
+            int_list(record.get("cached_admission_target_filtered_missing_proposal_seq_ids"))
+        )
+        target_buffer_hits = set(int_list(record.get("cached_admission_target_buffer_hit_seq_ids")))
+        target_buffer_misses = set(int_list(record.get("cached_admission_target_buffer_miss_seq_ids")))
+        missing_buffered_unexpected = set(
+            int_list(record.get("missing_buffered_proposal_unexpected_seq_ids"))
+        )
         proposal_miss = set(int_list(record.get("proposal_buffer_miss_seq_ids")))
         allowed_missing = set(
             int_list(record.get("missing_buffered_proposal_allowed_by_eager_seq_ids"))
@@ -229,6 +250,35 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                 f"record[{idx}] cached-admission missing proposal after filter: "
                 f"{sorted(missing_after_filter)}"
             )
+        if missing_buffered_unexpected:
+            errors.append(
+                f"record[{idx}] unexpected missing buffered proposals after target filter: "
+                f"{sorted(missing_buffered_unexpected)}"
+            )
+        if target_filtered_missing & target_normal:
+            errors.append(
+                f"record[{idx}] filtered target proposal misses remained in target verify: "
+                f"{sorted(target_filtered_missing & target_normal)}"
+            )
+        if target_after_filter and target_after_filter != int_list(record.get("target_normal_verify_seq_ids")):
+            errors.append(
+                f"record[{idx}] target verify after buffer filter must match final target verify: "
+                f"after={target_after_filter}, final={int_list(record.get('target_normal_verify_seq_ids'))}"
+            )
+        target_miss_still_selected = (target_buffer_misses & target_normal) - allowed_missing - fallback_pending
+        if target_miss_still_selected:
+            errors.append(
+                f"record[{idx}] target normal verify kept proposal-buffer misses: "
+                f"{sorted(target_miss_still_selected)}"
+            )
+        if target_buffer_hits:
+            target_without_buffer_hit = target_normal - target_buffer_hits - allowed_missing - fallback_pending
+            if target_without_buffer_hit:
+                errors.append(
+                    f"record[{idx}] target normal verify must be backed by proposal-buffer hits: "
+                    f"target_without_hit={sorted(target_without_buffer_hit)}, "
+                    f"raw_target={sorted(raw_target_before_filter)}"
+                )
         unexpected_missing = (proposal_miss & target_normal) - allowed_missing - fallback_pending
         if unexpected_missing:
             errors.append(
@@ -290,6 +340,14 @@ def print_summary(summary: dict[str, Any]) -> None:
         "cached_admission_unprimed_target_filtered_seq_ids",
         "cached_admission_missing_proposal_after_filter_seq_ids",
         "cached_admission_filtered_draft_seq_ids",
+        "raw_target_normal_verify_seq_ids_before_buffer_filter",
+        "cached_admission_target_filtered_missing_proposal_seq_ids",
+        "cached_admission_target_buffer_hit_seq_ids",
+        "cached_admission_target_buffer_miss_seq_ids",
+        "target_normal_verify_seq_ids_after_buffer_filter",
+        "proposal_buffer_hit_seq_ids",
+        "proposal_buffer_miss_seq_ids",
+        "missing_buffered_proposal_unexpected_seq_ids",
         "dual_proposal_sent_seq_ids",
         "dual_proposal_expected_receive_seq_ids",
         "dual_proposal_received_seq_ids",
@@ -386,11 +444,18 @@ def synthetic_dual_payload(
     proposal_hit_seq_ids: list[int] | None = None,
     proposal_miss_seq_ids: list[int] | None = None,
     missing_after_filter_seq_ids: list[int] | None = None,
+    missing_buffered_unexpected_seq_ids: list[int] | None = None,
+    raw_target_before_filter_seq_ids: list[int] | None = None,
+    target_filtered_missing_seq_ids: list[int] | None = None,
+    target_buffer_hit_seq_ids: list[int] | None = None,
+    target_buffer_miss_seq_ids: list[int] | None = None,
+    target_after_filter_seq_ids: list[int] | None = None,
     original_draft_seq_ids: list[int] | None = None,
     sent_proposal_seq_ids: list[int] | None = None,
     expected_receive_seq_ids: list[int] | None = None,
     received_proposal_seq_ids: list[int] | None = None,
     filtered_draft_seq_ids: list[int] | None = None,
+    fallback_pending_receive_seq_ids: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     records, result = synthetic_payload()
     result.setdefault("args", {})["execution_mode"] = execution_mode
@@ -412,11 +477,23 @@ def synthetic_dual_payload(
             ),
             "proposal_buffer_hit_seq_ids": proposal_hit_seq_ids or [],
             "proposal_buffer_miss_seq_ids": proposal_miss_seq_ids or [],
+            "raw_target_normal_verify_seq_ids_before_buffer_filter": (
+                raw_target_before_filter_seq_ids or []
+            ),
+            "cached_admission_target_filtered_missing_proposal_seq_ids": (
+                target_filtered_missing_seq_ids or []
+            ),
+            "cached_admission_target_buffer_hit_seq_ids": target_buffer_hit_seq_ids or [],
+            "cached_admission_target_buffer_miss_seq_ids": target_buffer_miss_seq_ids or [],
+            "target_normal_verify_seq_ids_after_buffer_filter": target_after_filter_seq_ids or [],
             "dual_proposal_sent_seq_ids": sent_proposal_seq_ids or [],
             "dual_proposal_expected_receive_seq_ids": expected_receive_seq_ids or [],
             "dual_proposal_received_seq_ids": received_proposal_seq_ids or [],
             "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
-            "fallback_pending_receive_seq_ids": [],
+            "missing_buffered_proposal_unexpected_seq_ids": (
+                missing_buffered_unexpected_seq_ids or []
+            ),
+            "fallback_pending_receive_seq_ids": fallback_pending_receive_seq_ids or [],
         }
     )
     return records, result
@@ -464,6 +541,60 @@ def run_synthetic() -> int:
                 target_normal_verify_seq_ids=[6],
                 actual_draft_seq_ids=[],
                 proposal_hit_seq_ids=[6],
+            ),
+            False,
+        ),
+        (
+            "dual_target_filter_missing_proposal_good",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[6],
+                actual_draft_seq_ids=[5],
+                proposal_hit_seq_ids=[6],
+                raw_target_before_filter_seq_ids=[4, 6],
+                target_filtered_missing_seq_ids=[4],
+                target_buffer_hit_seq_ids=[6],
+                target_buffer_miss_seq_ids=[4],
+                target_after_filter_seq_ids=[6],
+            ),
+            False,
+        ),
+        (
+            "dual_target_filter_missing_proposal_bad_final_keeps_miss",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[4, 6],
+                actual_draft_seq_ids=[5],
+                proposal_hit_seq_ids=[6],
+                proposal_miss_seq_ids=[4],
+                missing_buffered_unexpected_seq_ids=[4],
+                raw_target_before_filter_seq_ids=[4, 6],
+                target_filtered_missing_seq_ids=[4],
+                target_buffer_hit_seq_ids=[6],
+                target_buffer_miss_seq_ids=[4],
+                target_after_filter_seq_ids=[4, 6],
+            ),
+            True,
+        ),
+        (
+            "dual_target_filter_all_missing_good",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[],
+                actual_draft_seq_ids=[5],
+                raw_target_before_filter_seq_ids=[4],
+                target_filtered_missing_seq_ids=[4],
+                target_buffer_miss_seq_ids=[4],
+                target_after_filter_seq_ids=[],
+            ),
+            False,
+        ),
+        (
+            "dual_fallback_same_batch_missing_proposal_allowed",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[4],
+                actual_draft_seq_ids=[4],
+                proposal_miss_seq_ids=[4],
+                raw_target_before_filter_seq_ids=[4],
+                target_after_filter_seq_ids=[4],
+                fallback_pending_receive_seq_ids=[4],
             ),
             False,
         ),
