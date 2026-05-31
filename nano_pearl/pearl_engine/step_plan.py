@@ -242,6 +242,12 @@ class StepPlan:
     eager_result_transfer_exit: bool = False
     generic_full_continuous_stage_enter: bool = False
     generic_full_continuous_stage_exit: bool = False
+    active_cached_verify_result_transfer_sent: bool = False
+    active_cached_verify_result_transfer_received: bool = False
+    active_cached_eager_transfer_sent: bool = False
+    active_cached_eager_transfer_received: bool = False
+    active_cached_eager_result_sent: bool = False
+    active_cached_eager_result_received: bool = False
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1149,6 +1155,20 @@ class StepPlan:
             "eager_result_transfer_exit": bool(self.eager_result_transfer_exit),
             "generic_full_continuous_stage_enter": bool(self.generic_full_continuous_stage_enter),
             "generic_full_continuous_stage_exit": bool(self.generic_full_continuous_stage_exit),
+            "active_cached_verify_result_transfer_sent": bool(
+                self.active_cached_verify_result_transfer_sent
+            ),
+            "active_cached_verify_result_transfer_received": bool(
+                self.active_cached_verify_result_transfer_received
+            ),
+            "active_cached_eager_transfer_sent": bool(self.active_cached_eager_transfer_sent),
+            "active_cached_eager_transfer_received": bool(
+                self.active_cached_eager_transfer_received
+            ),
+            "active_cached_eager_result_sent": bool(self.active_cached_eager_result_sent),
+            "active_cached_eager_result_received": bool(
+                self.active_cached_eager_result_received
+            ),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

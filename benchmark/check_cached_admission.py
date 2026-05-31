@@ -131,6 +131,16 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "warmup_mode",
                     "cached_admission_decode_loop_active",
                     "requires_framed_dual_verify_result_transfer",
+                    "cached_active_stage_debug_enabled",
+                    "dual_stage_rank",
+                    "dual_stage_tp_local_rank",
+                    "active_cached_stage_order",
+                    "active_cached_verify_result_transfer_sent",
+                    "active_cached_verify_result_transfer_received",
+                    "active_cached_eager_transfer_sent",
+                    "active_cached_eager_transfer_received",
+                    "active_cached_eager_result_sent",
+                    "active_cached_eager_result_received",
                     "local_actual_draft_home_set_for_normal_draft",
                     "normal_draft_transfer_synced_expected_seq_ids",
                     "normal_draft_transfer_sender_seq_ids",
@@ -653,6 +663,16 @@ def print_summary(summary: dict[str, Any]) -> None:
         "warmup_mode",
         "cached_admission_decode_loop_active",
         "requires_framed_dual_verify_result_transfer",
+        "cached_active_stage_debug_enabled",
+        "dual_stage_rank",
+        "dual_stage_tp_local_rank",
+        "active_cached_stage_order",
+        "active_cached_verify_result_transfer_sent",
+        "active_cached_verify_result_transfer_received",
+        "active_cached_eager_transfer_sent",
+        "active_cached_eager_transfer_received",
+        "active_cached_eager_result_sent",
+        "active_cached_eager_result_received",
         "local_actual_draft_home_set_for_normal_draft",
         "normal_draft_transfer_synced_expected_seq_ids",
         "normal_draft_transfer_sender_seq_ids",
@@ -940,6 +960,34 @@ def stage_trace_record(
         "cached_admission_decode_loop_active": bool(cached_admission_decode_loop_active),
         "requires_framed_dual_verify_result_transfer": bool(
             requires_framed_dual_verify_result_transfer
+        ),
+        "cached_active_stage_debug_enabled": False,
+        "dual_stage_rank": 0,
+        "dual_stage_tp_local_rank": 0,
+        "active_cached_stage_order": list(order),
+        "active_cached_verify_result_transfer_sent": (
+            runner_role == "target"
+            and "target_verify_result_transfer" in enter_stages
+        ),
+        "active_cached_verify_result_transfer_received": (
+            runner_role == "draft"
+            and "target_verify_result_transfer" in enter_stages
+        ),
+        "active_cached_eager_transfer_sent": (
+            runner_role == "draft"
+            and "eager_transfer" in enter_stages
+        ),
+        "active_cached_eager_transfer_received": (
+            runner_role == "target"
+            and "eager_transfer" in enter_stages
+        ),
+        "active_cached_eager_result_sent": (
+            runner_role == "target"
+            and "eager_result_transfer" in enter_stages
+        ),
+        "active_cached_eager_result_received": (
+            runner_role == "draft"
+            and "eager_result_transfer" in enter_stages
         ),
         "full_continuous_enabled": bool(full_continuous_enabled),
         "generic_full_continuous_enabled": bool(full_continuous_enabled),
