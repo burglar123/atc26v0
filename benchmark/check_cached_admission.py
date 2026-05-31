@@ -129,6 +129,8 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "pre_verify_stale_proposal_discarded_seq_ids",
                     "pre_verify_redraft_required_seq_ids",
                     "warmup_mode",
+                    "cached_admission_decode_loop_active",
+                    "requires_framed_dual_verify_result_transfer",
                     "local_actual_draft_home_set_for_normal_draft",
                     "normal_draft_transfer_synced_expected_seq_ids",
                     "normal_draft_transfer_sender_seq_ids",
@@ -296,7 +298,11 @@ def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[
             )
             for _, record in indexed_records
         )
-        if not cached_full:
+        decode_loop_active = any(
+            bool_value(record.get("cached_admission_decode_loop_active"))
+            for _, record in indexed_records
+        )
+        if not cached_full or not decode_loop_active:
             continue
         called_stages = {
             stage
@@ -420,9 +426,14 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
             or record.get("generic_full_continuous_enabled")
             or record.get("enable_full_continuous_eager")
         )
-        if cached_full_record and bool_value(record.get("old_verify_result_transfer_used")):
+        decode_loop_active = bool_value(record.get("cached_admission_decode_loop_active"))
+        if (
+            cached_full_record
+            and decode_loop_active
+            and bool_value(record.get("old_verify_result_transfer_used"))
+        ):
             errors.append(
-                f"record[{idx}] old verify-result transfer is illegal under cached full-continuous"
+                f"record[{idx}] old verify-result transfer is illegal under active cached full-continuous"
             )
         target_normal = set(int_list(record.get("target_normal_verify_seq_ids")))
         priming = set(int_list(record.get("cached_admission_draft_priming_seq_ids")))
@@ -640,6 +651,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "pre_verify_stale_proposal_discarded_seq_ids",
         "pre_verify_redraft_required_seq_ids",
         "warmup_mode",
+        "cached_admission_decode_loop_active",
+        "requires_framed_dual_verify_result_transfer",
         "local_actual_draft_home_set_for_normal_draft",
         "normal_draft_transfer_synced_expected_seq_ids",
         "normal_draft_transfer_sender_seq_ids",
@@ -786,6 +799,8 @@ def synthetic_dual_payload(
     pre_verify_stale_proposal_discarded_seq_ids: list[int] | None = None,
     pre_verify_redraft_required_seq_ids: list[int] | None = None,
     warmup_mode: bool = False,
+    cached_admission_decode_loop_active: bool = False,
+    requires_framed_dual_verify_result_transfer: bool = False,
     original_draft_seq_ids: list[int] | None = None,
     sent_proposal_seq_ids: list[int] | None = None,
     expected_receive_seq_ids: list[int] | None = None,
@@ -842,6 +857,10 @@ def synthetic_dual_payload(
             ),
             "pre_verify_redraft_required_seq_ids": pre_verify_redraft_required_seq_ids or [],
             "warmup_mode": bool(warmup_mode),
+            "cached_admission_decode_loop_active": bool(cached_admission_decode_loop_active),
+            "requires_framed_dual_verify_result_transfer": bool(
+                requires_framed_dual_verify_result_transfer
+            ),
             "local_actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
             "normal_draft_transfer_synced_expected_seq_ids": synced_expected_receive_seq_ids or [],
             "normal_draft_transfer_sender_seq_ids": sender_seq_ids or [],
@@ -901,6 +920,8 @@ def stage_trace_record(
     verify_seq_ids: list[int] | None = None,
     normal_zero_payload: bool = True,
     old_verify_result_transfer_used: bool = False,
+    cached_admission_decode_loop_active: bool = False,
+    requires_framed_dual_verify_result_transfer: bool = False,
 ) -> dict[str, Any]:
     order = order or []
     enter_stages = {
@@ -916,6 +937,10 @@ def stage_trace_record(
     record: dict[str, Any] = {
         "execution_mode": "dual_batch_pearl",
         "cached_admission_enabled": True,
+        "cached_admission_decode_loop_active": bool(cached_admission_decode_loop_active),
+        "requires_framed_dual_verify_result_transfer": bool(
+            requires_framed_dual_verify_result_transfer
+        ),
         "full_continuous_enabled": bool(full_continuous_enabled),
         "generic_full_continuous_enabled": bool(full_continuous_enabled),
         "enable_full_continuous_eager": bool(full_continuous_enabled),
@@ -1277,11 +1302,45 @@ def run_synthetic() -> int:
             False,
         ),
         (
+            "cached_full_continuous_warmup_old_verify_result_path_allowed",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft_apply_verify",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                            "eager_transfer:enter",
+                            "eager_transfer:exit",
+                            "eager_result_transfer:enter",
+                            "eager_result_transfer:exit",
+                            "generic_full_continuous_stage:enter",
+                            "generic_full_continuous_stage:exit",
+                        ],
+                        old_verify_result_transfer_used=True,
+                        cached_admission_decode_loop_active=False,
+                        requires_framed_dual_verify_result_transfer=False,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
             "cached_full_continuous_legal_stage_order",
             synthetic_stage_payload(
                 [
-                    stage_trace_record(runner_role="draft", order=legal_full_order),
-                    stage_trace_record(runner_role="verify", order=legal_full_order),
+                    stage_trace_record(
+                        runner_role="draft",
+                        order=legal_full_order,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="verify",
+                        order=legal_full_order,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
                 ]
             ),
             False,
@@ -1310,6 +1369,8 @@ def run_synthetic() -> int:
                 [
                     stage_trace_record(
                         runner_role="draft",
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                         order=[
                             "normal_proposal_transfer:enter",
                             "normal_proposal_transfer:exit",
@@ -1323,6 +1384,8 @@ def run_synthetic() -> int:
                     ),
                     stage_trace_record(
                         runner_role="verify",
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                         order=[
                             "normal_proposal_transfer:enter",
                             "normal_proposal_transfer:exit",
@@ -1346,6 +1409,8 @@ def run_synthetic() -> int:
                         runner_role="draft_apply_verify",
                         order=legal_full_order,
                         old_verify_result_transfer_used=True,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                     ),
                 ]
             ),
@@ -1360,11 +1425,15 @@ def run_synthetic() -> int:
                         dual_step_id=17,
                         plan_id=23,
                         order=legal_full_order,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                     ),
                     stage_trace_record(
                         runner_role="dual_draft_transfer",
                         dual_step_id=17,
                         plan_id=23,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                         order=[
                             "normal_proposal_transfer:enter",
                             "normal_proposal_transfer:exit",
@@ -1374,6 +1443,8 @@ def run_synthetic() -> int:
                         runner_role="dual_draft_transfer",
                         dual_step_id=17,
                         plan_id=23,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                         order=[
                             "normal_proposal_transfer:enter",
                             "normal_proposal_transfer:exit",
@@ -1397,6 +1468,8 @@ def run_synthetic() -> int:
                         ],
                         verify_payload_len=0,
                         verify_num_results=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                     ),
                     stage_trace_record(
                         runner_role="verify",
@@ -1408,6 +1481,8 @@ def run_synthetic() -> int:
                         ],
                         verify_payload_len=0,
                         verify_num_results=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
                     ),
                 ]
             ),

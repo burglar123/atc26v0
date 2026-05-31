@@ -294,6 +294,7 @@ class ModelRunnerBase:
         load_model(self.model, self.group_config.model)
         dist.barrier()
         self.sampler = Sampler()
+        self._cached_admission_decode_loop_active = False
         self.warmup_model()
         self.tokenizer = AutoTokenizer.from_pretrained(self.group_config.model)
         self.allocate_kv_cache()
@@ -302,6 +303,7 @@ class ModelRunnerBase:
         self._trace_plan_id = 0
         self.active_execution_mode = self.global_config.execution_mode
         self.active_decode_ready_mode = False
+        self._cached_admission_decode_loop_active = False
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
         self.eager_proposal_buffer = EagerProposalBuffer()
@@ -2161,9 +2163,10 @@ class ModelRunnerBase:
 
     def _requires_framed_dual_verify_result_transfer(self) -> bool:
         return (
-            self.active_execution_mode == "dual_batch_pearl"
+            getattr(self, "active_execution_mode", self.global_config.execution_mode) == "dual_batch_pearl"
             and bool(getattr(self.global_config, "enable_cached_admission", False))
             and self._full_continuous_eager_enabled()
+            and bool(getattr(self, "_cached_admission_decode_loop_active", False))
         )
 
     def _cached_full_continuous_stage_aligned_enabled(self) -> bool:
@@ -2188,10 +2191,16 @@ class ModelRunnerBase:
         trace_record["cached_admission_enabled"] = bool(
             getattr(self.global_config, "enable_cached_admission", False)
         )
+        trace_record["cached_admission_decode_loop_active"] = bool(
+            getattr(self, "_cached_admission_decode_loop_active", False)
+        )
         full_continuous_enabled = self._full_continuous_eager_enabled()
         trace_record["full_continuous_enabled"] = bool(full_continuous_enabled)
         trace_record["generic_full_continuous_enabled"] = bool(full_continuous_enabled)
         trace_record["enable_full_continuous_eager"] = bool(full_continuous_enabled)
+        trace_record["requires_framed_dual_verify_result_transfer"] = bool(
+            self._requires_framed_dual_verify_result_transfer()
+        )
         trace_record["dual_collective_stage_order"] = list(plan.dual_collective_stage_order)
         trace_record["normal_proposal_transfer_enter"] = bool(plan.normal_proposal_transfer_enter)
         trace_record["normal_proposal_transfer_exit"] = bool(plan.normal_proposal_transfer_exit)
@@ -14977,6 +14986,7 @@ class ModelRunnerBase:
         self.scheduler.clear()
         self.trace_records.clear()
         self.active_decode_ready_mode = False
+        self._cached_admission_decode_loop_active = False
         self.dual_batch_manager.reset()
         self.dual_proposal_buffer.clear()
         self.eager_proposal_buffer.clear()
@@ -15065,163 +15075,176 @@ class ModelRunnerBase:
             raise NotImplementedError("cached-admission supports parallel_pearl and dual_batch_pearl only")
         self._set_execution_mode(execution_mode)
         self.active_decode_ready_mode = True
+        previous_cached_decode_loop_active = bool(
+            getattr(self, "_cached_admission_decode_loop_active", False)
+        )
+        self._cached_admission_decode_loop_active = True
         if max_active_cached_seqs <= 0:
             max_active_cached_seqs = self.scheduler.max_num_seqs
-        pending = sorted(list(self.scheduler.pending_cached), key=lambda s: s.arrival_ts)
-        self.scheduler.pending_cached = deque()
-        dist.barrier()
-        torch.cuda.synchronize()
-        start_time = time.time()
-        serving_start_tensor = torch.tensor(
-            [start_time if self.rank == 0 else 0.0],
-            dtype=torch.float64,
-            device="cuda",
-        )
-        dist.broadcast(serving_start_tensor, src=0)
-        serving_start_ts = float(serving_start_tensor.item())
-        base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
-        materialized_count = 0
-        min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
-        cached_admission_step = 0
-        last_logged_materialized_bucket = -1
-        last_logged_pending_bucket = -1
-        last_logged_running = -1
-        while pending or self.scheduler.running:
-            now_tensor = torch.tensor(
-                [time.time() if self.rank == 0 else 0.0],
+        try:
+            pending = sorted(list(self.scheduler.pending_cached), key=lambda s: s.arrival_ts)
+            self.scheduler.pending_cached = deque()
+            dist.barrier()
+            torch.cuda.synchronize()
+            start_time = time.time()
+            serving_start_tensor = torch.tensor(
+                [start_time if self.rank == 0 else 0.0],
                 dtype=torch.float64,
                 device="cuda",
             )
-            dist.broadcast(now_tensor, src=0)
-            now = float(now_tensor.item())
-            free_blocks_before = len(self.scheduler.block_manager.free_block_ids)
-            gpu_free_before, gpu_total = torch.cuda.mem_get_info()
-            guard_triggered = False
-            eligible = 0
-            arrived_ids = []
-            admitted_ids = []
-            admitted_seq_ids = []
-            admitted_wait_ms_by_request = {}
-            while eligible < len(pending):
-                seq = pending[eligible]
-                seq_arrival = serving_start_ts + (float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset)
-                if seq_arrival <= now:
-                    arrived_ids.append(seq.request_id)
-                    eligible += 1
-                else:
-                    break
-            local_active_capacity = max(max_active_cached_seqs - len(self.scheduler.running), 0)
-            if eligible > 0 and local_active_capacity > 0:
-                first_need_blocks = int(self.cached_kv_store[pending[0].request_id]["num_blocks"])
-                local_block_capacity = len(self.scheduler.block_manager.free_block_ids) // max(first_need_blocks, 1)
-            else:
-                local_block_capacity = 0
-            gpu_free_now, _ = torch.cuda.mem_get_info()
-            local_mem_capacity = local_active_capacity if gpu_free_now >= 256 * 1024 * 1024 else 0
-            local_k = min(eligible, local_active_capacity, local_block_capacity, local_mem_capacity)
-            k_tensor = torch.tensor([local_k], dtype=torch.int64, device="cuda")
-            dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN)
-            global_k = int(k_tensor.item())
-            if global_k == 0 and eligible > 0 and local_active_capacity > 0:
-                guard_triggered = True
-            for _ in range(global_k):
-                seq = pending.pop(0)
-                online_arrival_ts = serving_start_ts + (
-                    float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset
+            dist.broadcast(serving_start_tensor, src=0)
+            serving_start_ts = float(serving_start_tensor.item())
+            base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
+            materialized_count = 0
+            min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
+            cached_admission_step = 0
+            last_logged_materialized_bucket = -1
+            last_logged_pending_bucket = -1
+            last_logged_running = -1
+            while pending or self.scheduler.running:
+                now_tensor = torch.tensor(
+                    [time.time() if self.rank == 0 else 0.0],
+                    dtype=torch.float64,
+                    device="cuda",
                 )
-                admitted_seq = self.materialize_cached_request(seq.request_id, now, online_arrival_ts)
-                admitted_ids.append(seq.request_id)
-                admitted_seq_ids.append(int(admitted_seq.seq_id))
-                admitted_wait_ms_by_request[str(seq.request_id)] = max((now - online_arrival_ts) * 1000.0, 0.0)
-                materialized_count += 1
-            free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
-            min_free_blocks = min(min_free_blocks, free_blocks_after)
-            running_count = len(self.scheduler.running)
-            pending_count = len(pending)
-            sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
-            gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered, sync_vec)
-            assert all(torch.equal(g, gathered[0]) for g in gathered), (
-                "cached admission divergence across ranks: "
-                + ", ".join(str(g.tolist()) for g in gathered)
-            )
-            mat_bucket = materialized_count // self.cached_admission_log_interval
-            pending_bucket = pending_count // self.cached_admission_log_interval
-            should_log = (
-                guard_triggered
-                or mat_bucket != last_logged_materialized_bucket
-                or pending_bucket != last_logged_pending_bucket
-                or running_count != last_logged_running
-            )
-            if self.tp_params.local_rank == 0 and should_log:
+                dist.broadcast(now_tensor, src=0)
+                now = float(now_tensor.item())
+                free_blocks_before = len(self.scheduler.block_manager.free_block_ids)
+                gpu_free_before, gpu_total = torch.cuda.mem_get_info()
+                guard_triggered = False
+                eligible = 0
+                arrived_ids = []
+                admitted_ids = []
+                admitted_seq_ids = []
+                admitted_wait_ms_by_request = {}
+                while eligible < len(pending):
+                    seq = pending[eligible]
+                    seq_arrival = serving_start_ts + (float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset)
+                    if seq_arrival <= now:
+                        arrived_ids.append(seq.request_id)
+                        eligible += 1
+                    else:
+                        break
+                local_active_capacity = max(max_active_cached_seqs - len(self.scheduler.running), 0)
+                if eligible > 0 and local_active_capacity > 0:
+                    first_need_blocks = int(self.cached_kv_store[pending[0].request_id]["num_blocks"])
+                    local_block_capacity = len(self.scheduler.block_manager.free_block_ids) // max(first_need_blocks, 1)
+                else:
+                    local_block_capacity = 0
+                gpu_free_now, _ = torch.cuda.mem_get_info()
+                local_mem_capacity = local_active_capacity if gpu_free_now >= 256 * 1024 * 1024 else 0
+                local_k = min(eligible, local_active_capacity, local_block_capacity, local_mem_capacity)
+                k_tensor = torch.tensor([local_k], dtype=torch.int64, device="cuda")
+                dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN)
+                global_k = int(k_tensor.item())
+                if global_k == 0 and eligible > 0 and local_active_capacity > 0:
+                    guard_triggered = True
+                for _ in range(global_k):
+                    seq = pending.pop(0)
+                    online_arrival_ts = serving_start_ts + (
+                        float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset
+                    )
+                    admitted_seq = self.materialize_cached_request(seq.request_id, now, online_arrival_ts)
+                    admitted_ids.append(seq.request_id)
+                    admitted_seq_ids.append(int(admitted_seq.seq_id))
+                    admitted_wait_ms_by_request[str(seq.request_id)] = max((now - online_arrival_ts) * 1000.0, 0.0)
+                    materialized_count += 1
+                free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
+                min_free_blocks = min(min_free_blocks, free_blocks_after)
+                running_count = len(self.scheduler.running)
+                pending_count = len(pending)
+                sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
+                gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered, sync_vec)
+                assert all(torch.equal(g, gathered[0]) for g in gathered), (
+                    "cached admission divergence across ranks: "
+                    + ", ".join(str(g.tolist()) for g in gathered)
+                )
+                mat_bucket = materialized_count // self.cached_admission_log_interval
+                pending_bucket = pending_count // self.cached_admission_log_interval
+                should_log = (
+                    guard_triggered
+                    or mat_bucket != last_logged_materialized_bucket
+                    or pending_bucket != last_logged_pending_bucket
+                    or running_count != last_logged_running
+                )
+                if self.tp_params.local_rank == 0 and should_log:
+                    logger.info(
+                        f"[Rank {self.rank}: {self.group_name}] cached loop: max_active={max_active_cached_seqs}, "
+                        f"running={running_count}, materialized={materialized_count}, pending={pending_count}, "
+                        f"free_blocks_before={free_blocks_before}, free_blocks_after={free_blocks_after}, "
+                        f"gpu_free_before={gpu_free_before}, gpu_total={gpu_total}",
+                        color="yellow",
+                    )
+                last_logged_materialized_bucket = mat_bucket
+                last_logged_pending_bucket = pending_bucket
+                last_logged_running = running_count
+                priming_seq_ids_before_step = self._cached_admission_draft_priming_seq_ids()
+                if self.scheduler.running:
+                    if self.gamma == -1:
+                        self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+                    if self.active_execution_mode == "dual_batch_pearl":
+                        self.dual_batch_manager.gamma = int(self.gamma)
+                    for seq in self.scheduler.running:
+                        seq.mark_decode_started()
+                    if self.active_execution_mode == "dual_batch_pearl":
+                        self.dual_batch_pearl_step()
+                    else:
+                        self.pearl_step()
+                elif pending:
+                    next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
+                    time.sleep(min(max(next_arrival - now, 0.0), 0.01))
+                priming_seq_ids_after_step = self._cached_admission_draft_priming_seq_ids()
+                primed_seq_ids = sorted(set(priming_seq_ids_before_step) - set(priming_seq_ids_after_step))
+                self.trace_records.append(
+                    {
+                        "trace_record_type": "cached_admission_step",
+                        "runner_role": self._runner_role(),
+                        "cached_admission_enabled": True,
+                        "cached_admission_decode_loop_active": bool(
+                            getattr(self, "_cached_admission_decode_loop_active", False)
+                        ),
+                        "requires_framed_dual_verify_result_transfer": bool(
+                            self._requires_framed_dual_verify_result_transfer()
+                        ),
+                        "cached_prefill_skipped": True,
+                        "cached_prefill_metadata_only": False,
+                        "cached_admission_policy": "fifo",
+                        "cached_admission_max_active": int(max_active_cached_seqs),
+                        "cached_admission_step": int(cached_admission_step),
+                        "cached_admission_arrived_request_ids": list(arrived_ids),
+                        "cached_admission_admitted_request_ids": list(admitted_ids),
+                        "cached_admission_newly_admitted_seq_ids": list(admitted_seq_ids),
+                        "cached_admission_draft_priming_seq_ids": list(priming_seq_ids_after_step),
+                        "cached_admission_primed_seq_ids": list(primed_seq_ids),
+                        "cached_admission_unprimed_target_filtered_seq_ids": [],
+                        "cached_admission_missing_proposal_after_filter_seq_ids": [],
+                        "cached_admission_active_request_ids": [
+                            seq.request_id for seq in self.scheduler.running
+                        ],
+                        "cached_admission_completed_request_ids": [
+                            seq.request_id for seq in self.scheduler.finished
+                        ],
+                        "cached_admission_pending_count": int(len(pending)),
+                        "cached_admission_active_count": int(len(self.scheduler.running)),
+                        "cached_admission_queue_wait_ms_by_request": admitted_wait_ms_by_request,
+                    }
+                )
+                cached_admission_step += 1
+            torch.cuda.synchronize()
+            end_time = time.time()
+            seqs = self.scheduler.finished
+            if self.tp_params.local_rank == 0:
                 logger.info(
-                    f"[Rank {self.rank}: {self.group_name}] cached loop: max_active={max_active_cached_seqs}, "
-                    f"running={running_count}, materialized={materialized_count}, pending={pending_count}, "
-                    f"free_blocks_before={free_blocks_before}, free_blocks_after={free_blocks_after}, "
-                    f"gpu_free_before={gpu_free_before}, gpu_total={gpu_total}",
-                    color="yellow",
+                    f"[Rank {self.rank}: {self.group_name}] cached final summary: "
+                    f"materialized={materialized_count}, finished={len(seqs)}, elapsed_s={end_time - start_time:.4f}, "
+                    f"min_free_blocks={min_free_blocks}, file_fallback_used={self.last_result_used_file_fallback}",
+                    color="green",
                 )
-            last_logged_materialized_bucket = mat_bucket
-            last_logged_pending_bucket = pending_bucket
-            last_logged_running = running_count
-            priming_seq_ids_before_step = self._cached_admission_draft_priming_seq_ids()
-            if self.scheduler.running:
-                if self.gamma == -1:
-                    self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
-                if self.active_execution_mode == "dual_batch_pearl":
-                    self.dual_batch_manager.gamma = int(self.gamma)
-                for seq in self.scheduler.running:
-                    seq.mark_decode_started()
-                if self.active_execution_mode == "dual_batch_pearl":
-                    self.dual_batch_pearl_step()
-                else:
-                    self.pearl_step()
-            elif pending:
-                next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
-                time.sleep(min(max(next_arrival - now, 0.0), 0.01))
-            priming_seq_ids_after_step = self._cached_admission_draft_priming_seq_ids()
-            primed_seq_ids = sorted(set(priming_seq_ids_before_step) - set(priming_seq_ids_after_step))
-            self.trace_records.append(
-                {
-                    "trace_record_type": "cached_admission_step",
-                    "runner_role": self._runner_role(),
-                    "cached_admission_enabled": True,
-                    "cached_prefill_skipped": True,
-                    "cached_prefill_metadata_only": False,
-                    "cached_admission_policy": "fifo",
-                    "cached_admission_max_active": int(max_active_cached_seqs),
-                    "cached_admission_step": int(cached_admission_step),
-                    "cached_admission_arrived_request_ids": list(arrived_ids),
-                    "cached_admission_admitted_request_ids": list(admitted_ids),
-                    "cached_admission_newly_admitted_seq_ids": list(admitted_seq_ids),
-                    "cached_admission_draft_priming_seq_ids": list(priming_seq_ids_after_step),
-                    "cached_admission_primed_seq_ids": list(primed_seq_ids),
-                    "cached_admission_unprimed_target_filtered_seq_ids": [],
-                    "cached_admission_missing_proposal_after_filter_seq_ids": [],
-                    "cached_admission_active_request_ids": [
-                        seq.request_id for seq in self.scheduler.running
-                    ],
-                    "cached_admission_completed_request_ids": [
-                        seq.request_id for seq in self.scheduler.finished
-                    ],
-                    "cached_admission_pending_count": int(len(pending)),
-                    "cached_admission_active_count": int(len(self.scheduler.running)),
-                    "cached_admission_queue_wait_ms_by_request": admitted_wait_ms_by_request,
-                }
-            )
-            cached_admission_step += 1
-        torch.cuda.synchronize()
-        end_time = time.time()
-        seqs = self.scheduler.finished
-        if self.tp_params.local_rank == 0:
-            logger.info(
-                f"[Rank {self.rank}: {self.group_name}] cached final summary: "
-                f"materialized={materialized_count}, finished={len(seqs)}, elapsed_s={end_time - start_time:.4f}, "
-                f"min_free_blocks={min_free_blocks}, file_fallback_used={self.last_result_used_file_fallback}",
-                color="green",
-            )
-        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
-        self._finish_decode_ready_generation(output, end_time - start_time)
+            output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+            self._finish_decode_ready_generation(output, end_time - start_time)
+        finally:
+            self._cached_admission_decode_loop_active = previous_cached_decode_loop_active
 
     def decode_ready_serialized_pearl_generate(self):
         """Decode-only serialized-PEARL approximation after prepare_decode_ready()."""
