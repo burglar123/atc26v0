@@ -102,6 +102,8 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 in {
                     "raw_target_normal_verify_seq_ids_before_buffer_filter",
                     "target_normal_verify_seq_ids_after_buffer_filter",
+                    "local_actual_draft_home_set_for_normal_draft",
+                    "normal_draft_transfer_synced_expected_seq_ids",
                     "proposal_buffer_hit_seq_ids",
                     "proposal_buffer_miss_seq_ids",
                     "missing_buffered_proposal_unexpected_seq_ids",
@@ -239,6 +241,7 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         sent_proposals = int_list(record.get("dual_proposal_sent_seq_ids"))
         expected_receive = int_list(record.get("dual_proposal_expected_receive_seq_ids"))
         received_proposals = int_list(record.get("dual_proposal_received_seq_ids"))
+        synced_expected_receive = int_list(record.get("normal_draft_transfer_synced_expected_seq_ids"))
 
         if priming & target_normal:
             errors.append(
@@ -300,20 +303,31 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                 f"record[{idx}] primed seqs should not target-verify in the same priming record: "
                 f"{sorted(primed & target_normal)}"
             )
-        if sent_proposals and sent_proposals != actual_draft_ordered:
+        transfer_contract = synced_expected_receive or expected_receive or actual_draft_ordered
+        if synced_expected_receive and expected_receive != synced_expected_receive:
             errors.append(
-                f"record[{idx}] dual proposal sent seqs must match actual draft seqs: "
-                f"sent={sent_proposals}, actual={actual_draft_ordered}"
+                f"record[{idx}] dual proposal expected receive seqs must match synced sender seqs: "
+                f"expected={expected_receive}, synced={synced_expected_receive}"
             )
-        if expected_receive and expected_receive != actual_draft_ordered:
+        if synced_expected_receive and sent_proposals != synced_expected_receive:
             errors.append(
-                f"record[{idx}] dual proposal expected receive seqs must match actual draft seqs: "
-                f"expected={expected_receive}, actual={actual_draft_ordered}"
+                f"record[{idx}] dual proposal sent seqs must match synced sender seqs: "
+                f"sent={sent_proposals}, synced={synced_expected_receive}"
             )
-        if received_proposals and expected_receive and received_proposals != expected_receive:
+        elif not synced_expected_receive and sent_proposals and sent_proposals != transfer_contract:
             errors.append(
-                f"record[{idx}] dual proposal received seqs must match expected receive seqs: "
-                f"received={received_proposals}, expected={expected_receive}"
+                f"record[{idx}] dual proposal sent seqs must match transfer contract: "
+                f"sent={sent_proposals}, contract={transfer_contract}"
+            )
+        if synced_expected_receive and received_proposals != synced_expected_receive:
+            errors.append(
+                f"record[{idx}] dual proposal received seqs must match synced sender seqs: "
+                f"received={received_proposals}, synced={synced_expected_receive}"
+            )
+        elif received_proposals and transfer_contract and received_proposals != transfer_contract:
+            errors.append(
+                f"record[{idx}] dual proposal received seqs must match transfer contract: "
+                f"received={received_proposals}, contract={transfer_contract}"
             )
 
     return errors, summary
@@ -345,6 +359,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "cached_admission_target_buffer_hit_seq_ids",
         "cached_admission_target_buffer_miss_seq_ids",
         "target_normal_verify_seq_ids_after_buffer_filter",
+        "local_actual_draft_home_set_for_normal_draft",
+        "normal_draft_transfer_synced_expected_seq_ids",
         "proposal_buffer_hit_seq_ids",
         "proposal_buffer_miss_seq_ids",
         "missing_buffered_proposal_unexpected_seq_ids",
@@ -454,6 +470,7 @@ def synthetic_dual_payload(
     sent_proposal_seq_ids: list[int] | None = None,
     expected_receive_seq_ids: list[int] | None = None,
     received_proposal_seq_ids: list[int] | None = None,
+    synced_expected_receive_seq_ids: list[int] | None = None,
     filtered_draft_seq_ids: list[int] | None = None,
     fallback_pending_receive_seq_ids: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -486,6 +503,8 @@ def synthetic_dual_payload(
             "cached_admission_target_buffer_hit_seq_ids": target_buffer_hit_seq_ids or [],
             "cached_admission_target_buffer_miss_seq_ids": target_buffer_miss_seq_ids or [],
             "target_normal_verify_seq_ids_after_buffer_filter": target_after_filter_seq_ids or [],
+            "local_actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
+            "normal_draft_transfer_synced_expected_seq_ids": synced_expected_receive_seq_ids or [],
             "dual_proposal_sent_seq_ids": sent_proposal_seq_ids or [],
             "dual_proposal_expected_receive_seq_ids": expected_receive_seq_ids or [],
             "dual_proposal_received_seq_ids": received_proposal_seq_ids or [],
@@ -595,6 +614,48 @@ def run_synthetic() -> int:
                 raw_target_before_filter_seq_ids=[4],
                 target_after_filter_seq_ids=[4],
                 fallback_pending_receive_seq_ids=[4],
+            ),
+            False,
+        ),
+        (
+            "dual_transfer_sender_synced_expected_legal_divergent_local_draft",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[4, 6],
+                proposal_hit_seq_ids=[4, 6],
+                target_buffer_hit_seq_ids=[4, 6],
+                actual_draft_seq_ids=[7],
+                original_draft_seq_ids=[5, 7],
+                sent_proposal_seq_ids=[5, 7],
+                synced_expected_receive_seq_ids=[5, 7],
+                expected_receive_seq_ids=[5, 7],
+                received_proposal_seq_ids=[5, 7],
+            ),
+            False,
+        ),
+        (
+            "dual_transfer_sender_synced_expected_mismatch_bad",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[4, 6],
+                proposal_hit_seq_ids=[4, 6],
+                target_buffer_hit_seq_ids=[4, 6],
+                actual_draft_seq_ids=[7],
+                original_draft_seq_ids=[5, 7],
+                sent_proposal_seq_ids=[5, 7],
+                synced_expected_receive_seq_ids=[7],
+                expected_receive_seq_ids=[7],
+                received_proposal_seq_ids=[5, 7],
+            ),
+            True,
+        ),
+        (
+            "dual_transfer_zero_proposal_step",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[],
+                actual_draft_seq_ids=[],
+                sent_proposal_seq_ids=[],
+                synced_expected_receive_seq_ids=[],
+                expected_receive_seq_ids=[],
+                received_proposal_seq_ids=[],
             ),
             False,
         ),
