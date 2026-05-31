@@ -2474,6 +2474,153 @@ class ModelRunnerBase:
             f"signatures={signatures}",
         )
 
+    def _tp_agree_target_verify_seq_ids(
+        self,
+        plan: StepPlan,
+        *,
+        raw_target_candidate_seq_ids: list[int],
+        active_cached_full_continuous: bool,
+        raw_fallback_same_batch: bool,
+    ) -> list[int]:
+        """Derive target_normal_verify_seq_ids from target-master buffer state.
+
+        The target TP master (tp_local_rank=0) inspects its local buffer for each
+        raw candidate seq_id.  The master's hit/miss decision is broadcast to all
+        target TP workers so that every rank uses the same ``target_normal_verify_seq_ids``.
+
+        This replaces per-rank local derivation from ``plan.target_normal_verify_seq_ids``
+        (which may already have been asymmetrically filtered by
+        ``_canonicalize_target_normal_verify_seq_ids_for_buffer``).
+        """
+        raw_candidates = [int(seq_id) for seq_id in raw_target_candidate_seq_ids]
+        if not raw_candidates:
+            return []
+
+        # Master inspects its buffer; workers receive the decision.
+        tp_local_rank = int(self.tp_params.local_rank)
+        tp_size = int(self.tensor_parallel_size)
+        master_hit_count = 0
+        master_hit_seq_ids: list[int] = []
+
+        if tp_local_rank == 0:
+            buf = self.dual_proposal_buffer
+            master_hit_seq_ids = [
+                int(seq_id) for seq_id in raw_candidates
+                if buf.has_all([int(seq_id)])
+            ]
+            master_hit_count = len(master_hit_seq_ids)
+
+        # Broadcast hit count from master → workers.
+        count_tensor = torch.tensor([master_hit_count], dtype=torch.int64, device="cuda")
+        dist.broadcast(count_tensor, src=0, group=self.group)
+        agreed_hit_count = int(count_tensor.item())
+
+        # Broadcast the hit seq_ids.
+        hit_tensor = torch.zeros(max(1, agreed_hit_count), dtype=torch.int64, device="cuda")
+        if tp_local_rank == 0 and agreed_hit_count > 0:
+            for i, seq_id in enumerate(master_hit_seq_ids[:agreed_hit_count]):
+                hit_tensor[i] = int(seq_id)
+        if agreed_hit_count > 0:
+            dist.broadcast(hit_tensor, src=0, group=self.group)
+        agreed_hit_seq_ids = [int(hit_tensor[i].item()) for i in range(agreed_hit_count)]
+
+        agreed_miss_seq_ids = [
+            int(seq_id) for seq_id in raw_candidates
+            if int(seq_id) not in set(agreed_hit_seq_ids)
+        ]
+
+        # Master broadcasts proposal metadata for every agreed-hit seq so that
+        # workers can install placeholders for any proposal they are missing.
+        # Protocol: [num_proposals] + per-proposal [8-header-ints, N to_verify tokens, M proposal tokens]
+        if tp_local_rank == 0:
+            broadcast_seq_ids = list(agreed_hit_seq_ids)
+        else:
+            broadcast_seq_ids = []
+        num_tensor = torch.tensor([len(broadcast_seq_ids)], dtype=torch.int64, device="cuda")
+        dist.broadcast(num_tensor, src=0, group=self.group)
+        total_broadcast = int(num_tensor.item())
+
+        for _ in range(total_broadcast):
+            header = torch.zeros(8, dtype=torch.int64, device="cuda")
+            if tp_local_rank == 0 and broadcast_seq_ids:
+                seq_id = broadcast_seq_ids.pop(0)
+                proposal = self.dual_proposal_buffer.get_many([seq_id])
+                if proposal:
+                    p = proposal[0]
+                    vt = [int(t) for t in p.to_be_verified_token_ids]
+                    pt = [int(t) for t in p.proposal_token_ids]
+                    header[0] = int(p.seq_id)
+                    header[1] = int(p.request_id)
+                    header[2] = int(p.home_batch_id)
+                    header[3] = int(p.proposal_len)
+                    header[4] = int(p.pre_verify)
+                    header[5] = int(p.plan_id)
+                    header[6] = len(vt)
+                    header[7] = len(pt)
+            dist.broadcast(header, src=0, group=self.group)
+            n_vt = int(header[6].item())
+            n_pt = int(header[7].item())
+            vt_tensor = torch.zeros(max(1, n_vt), dtype=torch.int64, device="cuda")
+            pt_tensor = torch.zeros(max(1, n_pt), dtype=torch.int64, device="cuda")
+            if tp_local_rank == 0 and n_vt > 0:
+                for i, t in enumerate(vt):
+                    vt_tensor[i] = t
+            if tp_local_rank == 0 and n_pt > 0:
+                for i, t in enumerate(pt):
+                    pt_tensor[i] = t
+            if n_vt > 0:
+                dist.broadcast(vt_tensor, src=0, group=self.group)
+            if n_pt > 0:
+                dist.broadcast(pt_tensor, src=0, group=self.group)
+            # Install placeholder on any rank missing this proposal.
+            bcast_seq_id = int(header[0].item())
+            if not self.dual_proposal_buffer.has_all([bcast_seq_id]):
+                placeholder = BufferedProposal(
+                    seq_id=bcast_seq_id,
+                    request_id=int(header[1].item()),
+                    home_batch_id=int(header[2].item()),
+                    proposal_len=int(header[3].item()),
+                    pre_verify=bool(header[4].item()),
+                    plan_id=int(header[5].item()),
+                    to_be_verified_token_ids=[int(vt_tensor[i].item()) for i in range(n_vt)],
+                    proposal_token_ids=[int(pt_tensor[i].item()) for i in range(n_pt)],
+                )
+                before = self.dual_proposal_buffer.pending_seq_ids()
+                self.dual_proposal_buffer.store([placeholder])
+                after = self.dual_proposal_buffer.pending_seq_ids()
+                self._record_dual_buffer_mutation(
+                    plan,
+                    kind="store_tp_placeholder",
+                    seq_ids=[placeholder.seq_id],
+                    before_seq_ids=before,
+                    after_seq_ids=after,
+                )
+
+        # Always update plan fields from the agreed decision.
+        plan.target_normal_verify_seq_ids = list(agreed_hit_seq_ids)
+        plan.target_normal_verify_seq_ids_after_buffer_filter = list(agreed_hit_seq_ids)
+        plan.cached_admission_target_buffer_hit_seq_ids = list(agreed_hit_seq_ids)
+        plan.cached_admission_target_buffer_miss_seq_ids = list(agreed_miss_seq_ids)
+        plan.cached_admission_target_filtered_missing_proposal_seq_ids = list(
+            agreed_miss_seq_ids
+        )
+        agreed_miss_set = {int(seq_id) for seq_id in agreed_miss_seq_ids}
+        plan.missing_buffered_proposal_unexpected_seq_ids = [
+            int(seq_id)
+            for seq_id in plan.missing_buffered_proposal_unexpected_seq_ids
+            if int(seq_id) not in agreed_miss_set
+        ]
+
+        # When active_cached_full_continuous is enabled, also run the signature-based
+        # agreement for extra cross-rank diagnostics (catches any residual asymmetry).
+        if active_cached_full_continuous and not raw_fallback_same_batch:
+            self._assert_target_tp_candidate_buffer_hit_agreement(
+                plan,
+                raw_target_candidate_seq_ids=raw_candidates,
+            )
+
+        return list(agreed_hit_seq_ids)
+
     def _assert_target_tp_candidate_buffer_symmetry(
         self,
         plan: StepPlan,
@@ -17026,33 +17173,15 @@ class TargetModelRunner(ModelRunnerBase):
             and plan.plan_phase == "fallback"
             and set(raw_target_candidate_seq_ids).issubset(set(draft_seq_ids))
         )
-        target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
         if not self.is_draft and self._requires_framed_dual_verify_result_transfer():
-            self._assert_target_tp_candidate_buffer_symmetry(
+            target_normal_seq_ids = self._tp_agree_target_verify_seq_ids(
                 plan,
                 raw_target_candidate_seq_ids=raw_target_candidate_seq_ids,
+                active_cached_full_continuous=active_cached_full_continuous,
+                raw_fallback_same_batch=raw_fallback_same_batch,
             )
-        if active_cached_full_continuous and not raw_fallback_same_batch:
-            agreed_hit_seq_ids, agreed_miss_seq_ids = (
-                self._assert_target_tp_candidate_buffer_hit_agreement(
-                    plan,
-                    raw_target_candidate_seq_ids=raw_target_candidate_seq_ids,
-                )
-            )
-            target_normal_seq_ids = list(agreed_hit_seq_ids)
-            plan.target_normal_verify_seq_ids = list(target_normal_seq_ids)
-            plan.target_normal_verify_seq_ids_after_buffer_filter = list(target_normal_seq_ids)
-            plan.cached_admission_target_buffer_hit_seq_ids = list(agreed_hit_seq_ids)
-            plan.cached_admission_target_buffer_miss_seq_ids = list(agreed_miss_seq_ids)
-            plan.cached_admission_target_filtered_missing_proposal_seq_ids = list(
-                agreed_miss_seq_ids
-            )
-            agreed_miss_set = {int(seq_id) for seq_id in agreed_miss_seq_ids}
-            plan.missing_buffered_proposal_unexpected_seq_ids = [
-                int(seq_id)
-                for seq_id in plan.missing_buffered_proposal_unexpected_seq_ids
-                if int(seq_id) not in agreed_miss_set
-            ]
+        else:
+            target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
         target_seqs = self._resolve_dual_seq_ids(target_normal_seq_ids, plan, "dual_verify")
         target_seq_ids = [seq.seq_id for seq in target_seqs]
         fallback_same_batch = (
