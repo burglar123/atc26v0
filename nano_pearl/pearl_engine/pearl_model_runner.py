@@ -2245,6 +2245,28 @@ class ModelRunnerBase:
         trace_record["active_cached_eager_result_received"] = bool(
             plan.active_cached_eager_result_received
         )
+        trace_record["target_verify_seq_ids_before_received_proposal_override"] = [
+            int(seq_id)
+            for seq_id in plan.target_verify_seq_ids_before_received_proposal_override
+        ]
+        trace_record["target_verify_seq_ids_from_received_proposals"] = [
+            int(seq_id)
+            for seq_id in plan.target_verify_seq_ids_from_received_proposals
+        ]
+        trace_record["target_verify_seq_ids_after_received_proposal_override"] = [
+            int(seq_id)
+            for seq_id in plan.target_verify_seq_ids_after_received_proposal_override
+        ]
+        trace_record["target_tp_verify_seq_agreement_ok"] = bool(
+            plan.target_tp_verify_seq_agreement_ok
+        )
+        trace_record["target_tp_verify_seq_agreement_signature"] = [
+            [int(value) for value in signature]
+            for signature in plan.target_tp_verify_seq_agreement_signature
+        ]
+        trace_record["received_proposal_seq_ids"] = [
+            int(seq_id) for seq_id in plan.received_proposal_seq_ids
+        ]
         trace_record["next_collective_stage"] = plan.normal_proposal_transfer_next_collective_stage
 
     def _active_cached_stage_debug_enabled(self) -> bool:
@@ -2304,6 +2326,51 @@ class ModelRunnerBase:
         assert bool(getattr(plan, attr_name, False)), self._proposal_assertion_message(
             plan,
             f"active cached full-continuous collective stage missing: {attr_name}",
+        )
+
+    @staticmethod
+    def _target_verify_seq_signature(seq_ids: list[int]) -> list[int]:
+        normalized = [int(seq_id) for seq_id in seq_ids]
+        weighted_sum = sum((index + 1) * int(seq_id) for index, seq_id in enumerate(normalized))
+        return [len(normalized), sum(normalized), weighted_sum]
+
+    def _assert_target_tp_verify_seq_agreement(
+        self,
+        plan: StepPlan,
+        *,
+        target_seq_ids: list[int],
+        received_proposal_seq_ids: list[int],
+    ) -> None:
+        if self.is_draft or not self._requires_framed_dual_verify_result_transfer():
+            return
+        local_signature = torch.tensor(
+            self._target_verify_seq_signature(target_seq_ids),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        gathered = [
+            torch.zeros_like(local_signature)
+            for _ in range(int(self.tensor_parallel_size))
+        ]
+        dist.all_gather(gathered, local_signature, group=self.group)
+        signatures = [
+            [int(value) for value in signature.tolist()]
+            for signature in gathered
+        ]
+        ok = all(signature == signatures[0] for signature in signatures)
+        plan.target_tp_verify_seq_agreement_ok = bool(ok)
+        plan.target_tp_verify_seq_agreement_signature = signatures
+        assert ok, self._proposal_assertion_message(
+            plan,
+            "target TP verify seq divergence: "
+            f"rank={int(self.rank)}, tp_local_rank={int(self.tp_params.local_rank)}, "
+            f"plan_id={int(plan.plan_id)}, dual_step_id={int(plan.iteration_id)}, "
+            f"plan_phase={plan.plan_phase}, "
+            f"local_target_seq_ids={[int(seq_id) for seq_id in target_seq_ids]}, "
+            f"received_proposal_seq_ids={[int(seq_id) for seq_id in received_proposal_seq_ids]}, "
+            f"plan_target_normal_verify_seq_ids={self._target_normal_verify_seq_ids(plan)}, "
+            f"normal_draft_transfer_sender_seq_ids={list(plan.normal_draft_transfer_sender_seq_ids)}, "
+            f"signatures={signatures}",
         )
 
     def _eager_trace_level(self) -> str:
@@ -16452,6 +16519,7 @@ class TargetModelRunner(ModelRunnerBase):
             and plan.plan_phase == "fallback"
             and set(target_seq_ids).issubset(set(draft_seq_ids))
         )
+        plan.target_verify_seq_ids_before_received_proposal_override = list(target_seq_ids)
 
         target_proposals = []
         if target_seqs and not fallback_same_batch:
@@ -16471,8 +16539,30 @@ class TargetModelRunner(ModelRunnerBase):
             expected_receive_seq_ids=draft_seq_ids,
             next_collective_stage="dual_verify_or_eager_transfer",
         )
+        received_proposal_seq_ids = [int(proposal.seq_id) for proposal in received_proposals]
+        plan.received_proposal_seq_ids = list(received_proposal_seq_ids)
+        use_received_fallback_targets = (
+            bool(active_cached_full_continuous)
+            and plan.plan_phase == "fallback"
+            and bool(plan.normal_proposal_transfer_called)
+        )
         if plan.normal_proposal_transfer_called:
-            if fallback_same_batch:
+            if use_received_fallback_targets:
+                plan.target_verify_seq_ids_from_received_proposals = list(received_proposal_seq_ids)
+                plan.fallback_received_seq_ids = list(received_proposal_seq_ids)
+                plan.fallback_missing_after_receive_seq_ids = []
+                target_proposals = list(received_proposals)
+                target_seq_ids = list(received_proposal_seq_ids)
+                target_seqs = self._resolve_dual_seq_ids(
+                    target_seq_ids,
+                    plan,
+                    "dual_verify_fallback_received",
+                )
+                fallback_same_batch = bool(target_seq_ids)
+                plan.fallback_same_batch = bool(fallback_same_batch)
+                plan.target_normal_verify_seq_ids = list(target_seq_ids)
+                plan.target_normal_verify_seq_ids_after_buffer_filter = list(target_seq_ids)
+            elif fallback_same_batch:
                 received_seq_ids = [int(proposal.seq_id) for proposal in received_proposals]
                 received_seq_id_set = set(received_seq_ids)
                 missing_after_receive = [
@@ -16513,6 +16603,9 @@ class TargetModelRunner(ModelRunnerBase):
                 plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                     received_proposals
                 )
+        plan.target_verify_seq_ids_after_received_proposal_override = [
+            int(seq.seq_id) for seq in target_seqs
+        ]
         if fallback_same_batch and target_seq_ids and plan.normal_proposal_transfer_called and not received_proposals:
             plan.fallback_received_seq_ids = []
             plan.fallback_missing_after_receive_seq_ids = list(target_seq_ids)
@@ -16528,6 +16621,13 @@ class TargetModelRunner(ModelRunnerBase):
             plan,
         )
         target_seq_ids = [int(seq.seq_id) for seq in target_seqs]
+        plan.target_verify_seq_ids_after_received_proposal_override = list(target_seq_ids)
+        if active_cached_full_continuous:
+            self._assert_target_tp_verify_seq_agreement(
+                plan,
+                target_seq_ids=target_seq_ids,
+                received_proposal_seq_ids=received_proposal_seq_ids,
+            )
 
         if target_seqs:
             self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")

@@ -248,6 +248,12 @@ class StepPlan:
     active_cached_eager_transfer_received: bool = False
     active_cached_eager_result_sent: bool = False
     active_cached_eager_result_received: bool = False
+    target_verify_seq_ids_before_received_proposal_override: List[int] = field(default_factory=list)
+    target_verify_seq_ids_from_received_proposals: List[int] = field(default_factory=list)
+    target_verify_seq_ids_after_received_proposal_override: List[int] = field(default_factory=list)
+    target_tp_verify_seq_agreement_ok: bool = False
+    target_tp_verify_seq_agreement_signature: List[List[int]] = field(default_factory=list)
+    received_proposal_seq_ids: List[int] = field(default_factory=list)
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1169,6 +1175,21 @@ class StepPlan:
             "active_cached_eager_result_received": bool(
                 self.active_cached_eager_result_received
             ),
+            "target_verify_seq_ids_before_received_proposal_override": _int_list(
+                self.target_verify_seq_ids_before_received_proposal_override
+            ),
+            "target_verify_seq_ids_from_received_proposals": _int_list(
+                self.target_verify_seq_ids_from_received_proposals
+            ),
+            "target_verify_seq_ids_after_received_proposal_override": _int_list(
+                self.target_verify_seq_ids_after_received_proposal_override
+            ),
+            "target_tp_verify_seq_agreement_ok": bool(self.target_tp_verify_seq_agreement_ok),
+            "target_tp_verify_seq_agreement_signature": [
+                _int_list(signature)
+                for signature in self.target_tp_verify_seq_agreement_signature
+            ],
+            "received_proposal_seq_ids": _int_list(self.received_proposal_seq_ids),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),
