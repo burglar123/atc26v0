@@ -25,6 +25,11 @@ class Controller:
         self.draft_shm = SharedMemory(name=config.draft_config.group_name, create=True, size=2**24)
         self.target_shm = SharedMemory(name=config.target_config.group_name, create=True, size=2**24)
 
+    def _validate_method_name(self, method_name, target: str) -> None:
+        if not isinstance(method_name, str):
+            args_summary = f"target={target}, method_type={type(method_name).__name__}, method_repr={method_name!r}"
+            raise TypeError(f"runner control method_name must be str: {args_summary}")
+
     def add_event(self, rank, event):
         if rank in self.config.draft_config.devices:
             self.draft_event.append(event)
@@ -32,6 +37,7 @@ class Controller:
             self.target_event.append(event)
 
     def write_draft_shm(self, method_name, *args):
+        self._validate_method_name(method_name, "draft")
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.draft_shm.buf[0:4] = n.to_bytes(4, "little")
@@ -40,6 +46,7 @@ class Controller:
             event.set()
         
     def write_target_shm(self, method_name, *args):
+        self._validate_method_name(method_name, "target")
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.target_shm.buf[0:4] = n.to_bytes(4, "little")

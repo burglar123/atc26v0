@@ -1048,9 +1048,14 @@ class DualBatchManager:
         self.step_id = 0
         self.ready_eager_proposals.clear()
 
-    def update_running(self, running_seqs: Iterable[Sequence]) -> None:
+    def update_running(
+        self,
+        running_seqs: Iterable[Sequence],
+        pending_batch_ids: Iterable[int] | None = None,
+    ) -> None:
         running = list(running_seqs)
         active_seq_ids = {int(seq.seq_id) for seq in running}
+        pending_batches = {int(batch_id) for batch_id in (pending_batch_ids or [])}
 
         for batch in self.batches.values():
             batch.seq_ids = [seq_id for seq_id in batch.seq_ids if seq_id in active_seq_ids]
@@ -1062,7 +1067,7 @@ class DualBatchManager:
             return
 
         for seq in sorted(unassigned, key=lambda s: s.seq_id):
-            self.assign(seq, self.smaller_batch_id())
+            self.assign(seq, self._assignment_batch_for_new_seq(pending_batches))
 
         for seq in running:
             home_batch_id = getattr(seq, "home_batch_id", None)
@@ -1081,6 +1086,19 @@ class DualBatchManager:
         if len0 <= len1:
             return 0
         return 1
+
+    def _assignment_batch_for_new_seq(self, pending_batches: set[int]) -> int:
+        """Prefer the next draft-side batch for newly admitted requests.
+
+        If a batch already has pending proposals, assigning a newly admitted
+        sequence to that batch would make target verification expect a proposal
+        that cannot exist yet. Put new work into a non-pending batch so it first
+        goes through the draft/proposal phase.
+        """
+        candidates = [batch_id for batch_id in self.batches if batch_id not in pending_batches]
+        if not candidates:
+            return self.smaller_batch_id()
+        return min(candidates, key=lambda batch_id: (len(self.batches[batch_id].seq_ids), batch_id))
 
     def batch_seq_ids(self, batch_id: Optional[int]) -> list[int]:
         if batch_id is None:

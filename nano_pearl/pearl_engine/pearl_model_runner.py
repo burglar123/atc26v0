@@ -107,6 +107,23 @@ GENERIC_ROLLING_COMMIT_META_LEN = 7
 GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH = 8
 
 
+def cached_seq_id_consistency_mismatches(gathered: list[dict]) -> list[tuple[str, list[tuple]]]:
+    by_request: dict[str, list[tuple]] = {}
+    for row in gathered:
+        if not isinstance(row, dict):
+            continue
+        for request_id, seq_id in row.get("request_seq_id", {}).items():
+            by_request.setdefault(str(request_id), []).append(
+                (row.get("rank"), row.get("group"), row.get("runner_role"), int(seq_id))
+            )
+    mismatches = []
+    for request_id, entries in sorted(by_request.items()):
+        seq_ids = {entry[3] for entry in entries}
+        if len(seq_ids) > 1 or -1 in seq_ids:
+            mismatches.append((request_id, entries))
+    return mismatches
+
+
 @dataclass
 class RollingProposalCommitRecord:
     proposal_id: int
@@ -371,7 +388,26 @@ class ModelRunnerBase:
         return method_name, args
 
     def call(self, method_name, *args):
+        if not isinstance(method_name, str):
+            args_summary = ", ".join(type(arg).__name__ for arg in args[:4])
+            if len(args) > 4:
+                args_summary += ", ..."
+            raise TypeError(
+                "runner control method_name must be str: "
+                f"rank={self.rank}, group={self.group_name}, "
+                f"method_type={type(method_name).__name__}, method_repr={method_name!r}, "
+                f"args_summary=[{args_summary}]"
+            )
         method = getattr(self, method_name, None)
+        if method is None:
+            args_summary = ", ".join(type(arg).__name__ for arg in args[:4])
+            if len(args) > 4:
+                args_summary += ", ..."
+            raise AttributeError(
+                "runner control method not found: "
+                f"rank={self.rank}, group={self.group_name}, method_name={method_name!r}, "
+                f"args_summary=[{args_summary}]"
+            )
         return method(*args)
 
     def exit(self):
@@ -524,6 +560,7 @@ class ModelRunnerBase:
 
     def _build_cached_seq_snapshot(self, seq: Sequence, arrival_offset_sec: float | None = None) -> dict:
         return {
+            "seq_id": int(seq.seq_id),
             "request_id": seq.request_id,
             "token_ids": list(seq.token_ids),
             "num_prompt_tokens": int(seq.num_prompt_tokens),
@@ -566,6 +603,7 @@ class ModelRunnerBase:
             slo_class=snapshot.get("slo_class"),
             per_request_gamma=snapshot.get("per_request_gamma"),
         )
+        seq.seq_id = int(snapshot.get("seq_id", seq.seq_id))
         seq.num_prompt_tokens = int(snapshot["num_prompt_tokens"])
         seq.num_tokens = int(snapshot["num_tokens"])
         seq.last_token = int(snapshot["last_token"])
@@ -738,6 +776,33 @@ class ModelRunnerBase:
         self.kv_cache[:, :, new_block_ids] = kv_cpu
         seq.mark_cached_materialized()
         self.scheduler.running.append(seq)
+
+    def _request_seq_id_map(self, seqs: list[Sequence] | None = None) -> dict[str, int]:
+        source = seqs if seqs is not None else list(self.scheduler.running)
+        return {str(seq.request_id): int(seq.seq_id) for seq in source}
+
+    def _seq_request_id_map(self) -> dict[int, str]:
+        return {int(seq.seq_id): str(seq.request_id) for seq in self.scheduler.running}
+
+    def _assert_cached_seq_id_consistency(self, admitted_request_ids: list[str]) -> None:
+        if not admitted_request_ids:
+            return
+        local_map = {
+            request_id: int(self._request_seq_id_map().get(request_id, -1))
+            for request_id in admitted_request_ids
+        }
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, {
+            "rank": int(self.rank),
+            "group": self.group_name,
+            "runner_role": self._runner_role(),
+            "request_seq_id": local_map,
+        })
+        mismatches = cached_seq_id_consistency_mismatches(gathered)
+        assert not mismatches, (
+            "cached admission request_id->seq_id mismatch across runners: "
+            + "; ".join(f"{request_id}: {entries}" for request_id, entries in mismatches)
+        )
 
     def _runner_role(self):
         return "draft" if self.is_draft else "verify"
@@ -2171,7 +2236,10 @@ class ModelRunnerBase:
 
     def _prepare_dual_batch_state(self):
         self.dual_batch_manager.gamma = int(self.gamma)
-        self.dual_batch_manager.update_running(self.scheduler.running)
+        self.dual_batch_manager.update_running(
+            self.scheduler.running,
+            pending_batch_ids=self.dual_proposal_buffer.pending_batch_ids(),
+        )
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
         return self.dual_proposal_buffer.discard_inactive(active_seq_ids)
 
@@ -2817,11 +2885,32 @@ class ModelRunnerBase:
             "total_accepted_tokens": 0,
         }
         record.update(plan.to_trace_dict())
+        seq_request_id_by_seq_id = self._seq_request_id_map()
+        def request_map(seq_ids):
+            return {
+                str(int(seq_id)): seq_request_id_by_seq_id.get(int(seq_id), "<missing>")
+                for seq_id in seq_ids
+            }
+        record["dual_batch_request_id_by_seq_id"] = {
+            str(seq_id): request_id for seq_id, request_id in sorted(seq_request_id_by_seq_id.items())
+        }
+        record["target_normal_verify_request_ids_by_seq_id"] = request_map(
+            self._target_normal_verify_seq_ids(plan)
+        )
+        record["draft_home_request_ids_by_seq_id"] = request_map(plan.draft_home_set)
+        record["target_home_request_ids_by_seq_id"] = request_map(plan.target_home_set)
+        record["buffered_proposal_request_ids_by_seq_id"] = request_map(
+            self.dual_proposal_buffer.pending_seq_ids()
+        )
         record.update(self._profile_defaults(seqs, plan))
         self.trace_records.append(record)
         return record
 
     def _proposal_assertion_message(self, plan: StepPlan, detail: str) -> str:
+        seq_to_request_id = self._seq_request_id_map()
+        def req_ids(seq_ids):
+            return {int(seq_id): seq_to_request_id.get(int(seq_id), "<missing>") for seq_id in seq_ids}
+
         return (
             f"{detail}: plan_id={plan.plan_id}, target_home_set={plan.target_home_set}, "
             f"draft_home_set={plan.draft_home_set}, original_draft_home_set="
@@ -2833,7 +2922,11 @@ class ModelRunnerBase:
             f"missing_buffered_proposal_allowed_by_eager_seq_ids="
             f"{getattr(plan, 'missing_buffered_proposal_allowed_by_eager_seq_ids', [])}, "
             f"missing_buffered_proposal_unexpected_seq_ids="
-            f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}"
+            f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}, "
+            f"target_home_request_ids={req_ids(plan.target_home_set)}, "
+            f"draft_home_request_ids={req_ids(plan.draft_home_set)}, "
+            f"target_normal_verify_request_ids={req_ids(self._target_normal_verify_seq_ids(plan))}, "
+            f"buffered_proposal_request_ids={req_ids(self.dual_proposal_buffer.pending_seq_ids())}"
         )
 
     def _update_lane_exclusion_proposal_trace(
@@ -14647,7 +14740,10 @@ class ModelRunnerBase:
             local_mem_capacity = local_active_capacity if gpu_free_now >= 256 * 1024 * 1024 else 0
             local_k = min(eligible, local_active_capacity, local_block_capacity, local_mem_capacity)
             k_tensor = torch.tensor([local_k], dtype=torch.int64, device="cuda")
-            dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN, group=self.group)
+            if execution_mode == "ar":
+                dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN, group=self.group)
+            else:
+                dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN)
             global_k = int(k_tensor.item())
             no_admission_reason = None
             if global_k == 0 and pending:
@@ -14673,19 +14769,29 @@ class ModelRunnerBase:
                 admitted_this_step.append(request_id)
                 queue_wait_by_request[request_id] = max(0.0, (admission_ts - arrival_ts) * 1000.0)
                 materialized_count += 1
-            gathered_admitted: list[list[str] | None] = [None for _ in range(self.tensor_parallel_size)]
-            dist.all_gather_object(gathered_admitted, admitted_this_step, group=self.group)
+            if execution_mode == "ar":
+                gathered_admitted: list[list[str] | None] = [None for _ in range(self.tensor_parallel_size)]
+                dist.all_gather_object(gathered_admitted, admitted_this_step, group=self.group)
+            else:
+                gathered_admitted = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gathered_admitted, admitted_this_step)
             assert all(g == admitted_this_step for g in gathered_admitted), (
-                "cached admission request-id divergence across TP ranks: "
+                "cached admission request-id divergence across ranks: "
                 + ", ".join(str(g) for g in gathered_admitted)
             )
+            if execution_mode != "ar":
+                self._assert_cached_seq_id_consistency(admitted_this_step)
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
             min_free_blocks = min(min_free_blocks, free_blocks_after)
             running_count = len(self.scheduler.running)
             pending_count = len(pending)
             sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
-            gathered = [torch.zeros_like(sync_vec) for _ in range(self.tensor_parallel_size)]
-            dist.all_gather(gathered, sync_vec, group=self.group)
+            if execution_mode == "ar":
+                gathered = [torch.zeros_like(sync_vec) for _ in range(self.tensor_parallel_size)]
+                dist.all_gather(gathered, sync_vec, group=self.group)
+            else:
+                gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered, sync_vec)
             assert all(torch.equal(g, gathered[0]) for g in gathered), (
                 "cached admission divergence across ranks: "
                 + ", ".join(str(g.tolist()) for g in gathered)
