@@ -16871,7 +16871,7 @@ class TargetModelRunner(ModelRunnerBase):
         active_cached_full_continuous = self._cached_full_continuous_stage_aligned_enabled()
         raw_target_candidate_seq_ids = (
             list(plan.raw_target_normal_verify_seq_ids_before_buffer_filter)
-            or self._target_normal_verify_seq_ids(plan)
+            or list(plan.target_home_set)
         )
         draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         raw_fallback_same_batch = (
