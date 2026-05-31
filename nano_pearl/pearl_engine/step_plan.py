@@ -256,6 +256,13 @@ class StepPlan:
     target_tp_buffer_seq_agreement_ok: bool = False
     target_tp_buffer_seq_agreement_signature: List[List[int]] = field(default_factory=list)
     target_tp_buffer_seq_ids: List[int] = field(default_factory=list)
+    target_candidate_seq_ids_before_buffer_hit_agreement: List[int] = field(default_factory=list)
+    target_candidate_buffer_hit_seq_ids: List[int] = field(default_factory=list)
+    target_candidate_buffer_miss_seq_ids: List[int] = field(default_factory=list)
+    target_tp_candidate_buffer_agreement_ok: bool = False
+    target_tp_candidate_buffer_agreement_signatures: List[List[int]] = field(default_factory=list)
+    target_candidate_buffer_hit_agreed_seq_ids: List[int] = field(default_factory=list)
+    target_candidate_buffer_miss_agreed_seq_ids: List[int] = field(default_factory=list)
     dual_buffer_mutation_events: List[Dict[str, Any]] = field(default_factory=list)
     received_proposal_seq_ids: List[int] = field(default_factory=list)
     cached_admission_priming_received_seq_ids: List[int] = field(default_factory=list)
@@ -1204,6 +1211,28 @@ class StepPlan:
                 for signature in self.target_tp_buffer_seq_agreement_signature
             ],
             "target_tp_buffer_seq_ids": _int_list(self.target_tp_buffer_seq_ids),
+            "target_candidate_seq_ids_before_buffer_hit_agreement": _int_list(
+                self.target_candidate_seq_ids_before_buffer_hit_agreement
+            ),
+            "target_candidate_buffer_hit_seq_ids": _int_list(
+                self.target_candidate_buffer_hit_seq_ids
+            ),
+            "target_candidate_buffer_miss_seq_ids": _int_list(
+                self.target_candidate_buffer_miss_seq_ids
+            ),
+            "target_tp_candidate_buffer_agreement_ok": bool(
+                self.target_tp_candidate_buffer_agreement_ok
+            ),
+            "target_tp_candidate_buffer_agreement_signatures": [
+                _int_list(signature)
+                for signature in self.target_tp_candidate_buffer_agreement_signatures
+            ],
+            "target_candidate_buffer_hit_agreed_seq_ids": _int_list(
+                self.target_candidate_buffer_hit_agreed_seq_ids
+            ),
+            "target_candidate_buffer_miss_agreed_seq_ids": _int_list(
+                self.target_candidate_buffer_miss_agreed_seq_ids
+            ),
             "dual_buffer_mutation_events": list(self.dual_buffer_mutation_events),
             "received_proposal_seq_ids": _int_list(self.received_proposal_seq_ids),
             "cached_admission_priming_received_seq_ids": _int_list(

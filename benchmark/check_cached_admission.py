@@ -149,6 +149,13 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "target_tp_buffer_seq_agreement_ok",
                     "target_tp_buffer_seq_agreement_signature",
                     "target_tp_buffer_seq_ids",
+                    "target_candidate_seq_ids_before_buffer_hit_agreement",
+                    "target_candidate_buffer_hit_seq_ids",
+                    "target_candidate_buffer_miss_seq_ids",
+                    "target_tp_candidate_buffer_agreement_ok",
+                    "target_tp_candidate_buffer_agreement_signatures",
+                    "target_candidate_buffer_hit_agreed_seq_ids",
+                    "target_candidate_buffer_miss_agreed_seq_ids",
                     "dual_buffer_mutation_events",
                     "received_proposal_seq_ids",
                     "fallback_same_batch_received_seq_ids",
@@ -437,11 +444,62 @@ def validate_target_tp_verify_seq_agreement(records: list[dict[str, Any]]) -> li
                         f"{normalized_buffer}"
                     )
 
+            if "target_tp_candidate_buffer_agreement_ok" in record and not bool_value(
+                record.get("target_tp_candidate_buffer_agreement_ok")
+            ):
+                errors.append(
+                    f"record[{idx}] target TP candidate buffer agreement flag is false"
+                )
+            candidate_signatures = record.get("target_tp_candidate_buffer_agreement_signatures")
+            if isinstance(candidate_signatures, list) and candidate_signatures:
+                normalized_candidate = [
+                    int_list(signature)
+                    for signature in candidate_signatures
+                    if isinstance(signature, (list, tuple))
+                ]
+                if normalized_candidate and any(
+                    signature != normalized_candidate[0]
+                    for signature in normalized_candidate
+                ):
+                    errors.append(
+                        f"record[{idx}] target TP candidate buffer agreement signatures diverge: "
+                        f"{normalized_candidate}"
+                    )
+
             plan_phase = str(record.get("plan_phase") or "")
             received = int_list(record.get("received_proposal_seq_ids"))
             after_override = int_list(
                 record.get("target_verify_seq_ids_after_received_proposal_override")
             )
+            raw_candidates = int_list(
+                record.get("target_candidate_seq_ids_before_buffer_hit_agreement")
+            )
+            candidate_hit = int_list(record.get("target_candidate_buffer_hit_seq_ids"))
+            candidate_miss = int_list(record.get("target_candidate_buffer_miss_seq_ids"))
+            agreed_hit = int_list(record.get("target_candidate_buffer_hit_agreed_seq_ids"))
+            agreed_miss = int_list(record.get("target_candidate_buffer_miss_agreed_seq_ids"))
+            if raw_candidates and (candidate_hit or candidate_miss):
+                partition = sorted(set(candidate_hit) | set(candidate_miss))
+                if partition != sorted(set(raw_candidates)):
+                    errors.append(
+                        f"record[{idx}] target candidate buffer hit/miss partition mismatch: "
+                        f"candidates={raw_candidates}, hit={candidate_hit}, miss={candidate_miss}"
+                    )
+            if agreed_hit or agreed_miss:
+                agreed_partition = sorted(set(agreed_hit) | set(agreed_miss))
+                if raw_candidates and agreed_partition != sorted(set(raw_candidates)):
+                    errors.append(
+                        f"record[{idx}] target agreed candidate hit/miss partition mismatch: "
+                        f"candidates={raw_candidates}, agreed_hit={agreed_hit}, "
+                        f"agreed_miss={agreed_miss}"
+                    )
+                final_not_agreed_hit = sorted(set(after_override) - set(agreed_hit))
+                if final_not_agreed_hit:
+                    errors.append(
+                        f"record[{idx}] final target verify seqs must come from agreed "
+                        f"candidate buffer hits: final={after_override}, "
+                        f"agreed_hit={agreed_hit}, agreed_miss={agreed_miss}"
+                    )
             from_received = int_list(record.get("target_verify_seq_ids_from_received_proposals"))
             priming_received = int_list(record.get("cached_admission_priming_received_seq_ids"))
             priming_buffered = int_list(record.get("cached_admission_priming_buffered_seq_ids"))
@@ -512,6 +570,38 @@ def validate_target_tp_verify_seq_agreement(records: list[dict[str, Any]]) -> li
                     errors.append(
                         f"dual_step_id={step_id} plan_id={plan_id} target verify seqs missing "
                         f"from agreed buffer: seq_ids={missing_from_buffer}, buffer={expected_buffer}"
+                    )
+
+        candidate_by_record: list[tuple[int, list[int], list[int], list[int]]] = []
+        for idx, record in indexed_records:
+            raw_candidates = int_list(
+                record.get("target_candidate_seq_ids_before_buffer_hit_agreement")
+            )
+            hit_seq_ids = int_list(record.get("target_candidate_buffer_hit_seq_ids"))
+            miss_seq_ids = int_list(record.get("target_candidate_buffer_miss_seq_ids"))
+            if raw_candidates or hit_seq_ids or miss_seq_ids:
+                candidate_by_record.append(
+                    (
+                        idx,
+                        list(raw_candidates),
+                        list(hit_seq_ids),
+                        list(miss_seq_ids),
+                    )
+                )
+        if candidate_by_record:
+            _, expected_candidates, expected_hit, expected_miss = candidate_by_record[0]
+            for idx, candidates, hit_seq_ids, miss_seq_ids in candidate_by_record:
+                if (
+                    candidates != expected_candidates
+                    or hit_seq_ids != expected_hit
+                    or miss_seq_ids != expected_miss
+                ):
+                    errors.append(
+                        f"dual_step_id={step_id} plan_id={plan_id} target TP candidate "
+                        f"buffer hit/miss divergence: record[{idx}] candidates={candidates}, "
+                        f"hit={hit_seq_ids}, miss={miss_seq_ids}, "
+                        f"expected_candidates={expected_candidates}, "
+                        f"expected_hit={expected_hit}, expected_miss={expected_miss}"
                     )
     return errors
 
@@ -862,6 +952,13 @@ def print_summary(summary: dict[str, Any]) -> None:
         "target_tp_buffer_seq_agreement_ok",
         "target_tp_buffer_seq_agreement_signature",
         "target_tp_buffer_seq_ids",
+        "target_candidate_seq_ids_before_buffer_hit_agreement",
+        "target_candidate_buffer_hit_seq_ids",
+        "target_candidate_buffer_miss_seq_ids",
+        "target_tp_candidate_buffer_agreement_ok",
+        "target_tp_candidate_buffer_agreement_signatures",
+        "target_candidate_buffer_hit_agreed_seq_ids",
+        "target_candidate_buffer_miss_agreed_seq_ids",
         "dual_buffer_mutation_events",
         "received_proposal_seq_ids",
         "cached_admission_priming_received_seq_ids",
@@ -1144,6 +1241,13 @@ def stage_trace_record(
     target_tp_buffer_agreement_signature: list[list[int]] | None = None,
     target_tp_buffer_seq_ids: list[int] | None = None,
     buffered_proposal_seq_ids: list[int] | None = None,
+    target_candidate_seq_ids_before_buffer_hit_agreement: list[int] | None = None,
+    target_candidate_buffer_hit_seq_ids: list[int] | None = None,
+    target_candidate_buffer_miss_seq_ids: list[int] | None = None,
+    target_tp_candidate_buffer_agreement_ok: bool = True,
+    target_tp_candidate_buffer_agreement_signatures: list[list[int]] | None = None,
+    target_candidate_buffer_hit_agreed_seq_ids: list[int] | None = None,
+    target_candidate_buffer_miss_agreed_seq_ids: list[int] | None = None,
     received_proposal_seq_ids: list[int] | None = None,
     cached_admission_draft_priming_seq_ids: list[int] | None = None,
     cached_admission_unprimed_target_filtered_seq_ids: list[int] | None = None,
@@ -1283,6 +1387,38 @@ def stage_trace_record(
         record["target_tp_buffer_seq_ids"] = target_tp_buffer_seq_ids
     if buffered_proposal_seq_ids is not None:
         record["buffered_proposal_seq_ids"] = buffered_proposal_seq_ids
+    if (
+        target_candidate_seq_ids_before_buffer_hit_agreement is not None
+        or target_candidate_buffer_hit_seq_ids is not None
+        or target_candidate_buffer_miss_seq_ids is not None
+        or target_tp_candidate_buffer_agreement_signatures is not None
+        or target_candidate_buffer_hit_agreed_seq_ids is not None
+        or target_candidate_buffer_miss_agreed_seq_ids is not None
+        or not target_tp_candidate_buffer_agreement_ok
+    ):
+        record["target_tp_candidate_buffer_agreement_ok"] = bool(
+            target_tp_candidate_buffer_agreement_ok
+        )
+    if target_candidate_seq_ids_before_buffer_hit_agreement is not None:
+        record["target_candidate_seq_ids_before_buffer_hit_agreement"] = (
+            target_candidate_seq_ids_before_buffer_hit_agreement
+        )
+    if target_candidate_buffer_hit_seq_ids is not None:
+        record["target_candidate_buffer_hit_seq_ids"] = target_candidate_buffer_hit_seq_ids
+    if target_candidate_buffer_miss_seq_ids is not None:
+        record["target_candidate_buffer_miss_seq_ids"] = target_candidate_buffer_miss_seq_ids
+    if target_tp_candidate_buffer_agreement_signatures is not None:
+        record["target_tp_candidate_buffer_agreement_signatures"] = (
+            target_tp_candidate_buffer_agreement_signatures
+        )
+    if target_candidate_buffer_hit_agreed_seq_ids is not None:
+        record["target_candidate_buffer_hit_agreed_seq_ids"] = (
+            target_candidate_buffer_hit_agreed_seq_ids
+        )
+    if target_candidate_buffer_miss_agreed_seq_ids is not None:
+        record["target_candidate_buffer_miss_agreed_seq_ids"] = (
+            target_candidate_buffer_miss_agreed_seq_ids
+        )
     for stage in DUAL_COLLECTIVE_STAGE_ORDER:
         record[f"{stage}_enter"] = stage in enter_stages
         record[f"{stage}_exit"] = stage in exit_stages
@@ -1935,6 +2071,298 @@ def run_synthetic() -> int:
                 ]
             ),
             False,
+        ),
+        (
+            "cached_full_continuous_target_candidate_buffer_hit_agree",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=65,
+                        plan_id=80,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [1, 4, 4]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=65,
+                        plan_id=80,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [1, 4, 4]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_target_candidate_buffer_hit_divergence_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=66,
+                        plan_id=81,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=66,
+                        plan_id=81,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_signature=[[1, 4, 4], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[],
+                        target_candidate_buffer_miss_seq_ids=[4],
+                        target_tp_candidate_buffer_agreement_ok=False,
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[],
+                        target_candidate_buffer_miss_agreed_seq_ids=[4],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            True,
+        ),
+        (
+            "cached_full_continuous_target_candidate_buffer_miss_agree_skip",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=67,
+                        plan_id=82,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_signature=[[0, 0, 0], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[],
+                        target_candidate_buffer_miss_seq_ids=[4],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[],
+                        target_candidate_buffer_miss_agreed_seq_ids=[4],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=67,
+                        plan_id=82,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_signature=[[0, 0, 0], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[],
+                        target_candidate_buffer_miss_seq_ids=[4],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                            [1, 4, 4, 0, 0, 0, 1, 4, 4],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[],
+                        target_candidate_buffer_miss_agreed_seq_ids=[4],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_target_candidate_buffer_hit_agree_verify_4",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=68,
+                        plan_id=83,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [1, 4, 4]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=68,
+                        plan_id=83,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [1, 4, 4]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_target_candidate_agree_final_diverge_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=69,
+                        plan_id=84,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=5,
+                        verify_num_results=1,
+                        verify_seq_ids=[4],
+                        target_seq_ids_after_override=[4],
+                        target_tp_agreement_signature=[[1, 4, 4], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=1,
+                        dual_stage_tp_local_rank=0,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                    stage_trace_record(
+                        runner_role="target",
+                        dual_step_id=69,
+                        plan_id=84,
+                        plan_phase="steady",
+                        order=legal_full_order,
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                        verify_seq_ids=[],
+                        target_seq_ids_after_override=[],
+                        target_tp_agreement_ok=False,
+                        target_tp_agreement_signature=[[1, 4, 4], [0, 0, 0]],
+                        target_candidate_seq_ids_before_buffer_hit_agreement=[4],
+                        target_candidate_buffer_hit_seq_ids=[4],
+                        target_candidate_buffer_miss_seq_ids=[],
+                        target_tp_candidate_buffer_agreement_signatures=[
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                            [1, 4, 4, 1, 4, 4, 0, 0, 0],
+                        ],
+                        target_candidate_buffer_hit_agreed_seq_ids=[4],
+                        target_candidate_buffer_miss_agreed_seq_ids=[],
+                        dual_stage_rank=2,
+                        dual_stage_tp_local_rank=1,
+                        cached_admission_decode_loop_active=True,
+                        requires_framed_dual_verify_result_transfer=True,
+                    ),
+                ]
+            ),
+            True,
         ),
         (
             "cached_full_continuous_fallback_priming_received_suppressed",

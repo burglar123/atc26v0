@@ -2274,6 +2274,29 @@ class ModelRunnerBase:
         trace_record["target_tp_buffer_seq_ids"] = [
             int(seq_id) for seq_id in plan.target_tp_buffer_seq_ids
         ]
+        trace_record["target_candidate_seq_ids_before_buffer_hit_agreement"] = [
+            int(seq_id)
+            for seq_id in plan.target_candidate_seq_ids_before_buffer_hit_agreement
+        ]
+        trace_record["target_candidate_buffer_hit_seq_ids"] = [
+            int(seq_id) for seq_id in plan.target_candidate_buffer_hit_seq_ids
+        ]
+        trace_record["target_candidate_buffer_miss_seq_ids"] = [
+            int(seq_id) for seq_id in plan.target_candidate_buffer_miss_seq_ids
+        ]
+        trace_record["target_tp_candidate_buffer_agreement_ok"] = bool(
+            plan.target_tp_candidate_buffer_agreement_ok
+        )
+        trace_record["target_tp_candidate_buffer_agreement_signatures"] = [
+            [int(value) for value in signature]
+            for signature in plan.target_tp_candidate_buffer_agreement_signatures
+        ]
+        trace_record["target_candidate_buffer_hit_agreed_seq_ids"] = [
+            int(seq_id) for seq_id in plan.target_candidate_buffer_hit_agreed_seq_ids
+        ]
+        trace_record["target_candidate_buffer_miss_agreed_seq_ids"] = [
+            int(seq_id) for seq_id in plan.target_candidate_buffer_miss_agreed_seq_ids
+        ]
         if plan.dual_buffer_mutation_events:
             trace_record["dual_buffer_mutation_events"] = list(plan.dual_buffer_mutation_events)
         trace_record["received_proposal_seq_ids"] = [
@@ -2368,6 +2391,19 @@ class ModelRunnerBase:
         weighted_sum = sum((index + 1) * int(seq_id) for index, seq_id in enumerate(normalized))
         return [len(normalized), sum(normalized), weighted_sum]
 
+    @staticmethod
+    def _candidate_buffer_hit_signature(
+        candidate_seq_ids: list[int],
+        hit_seq_ids: list[int],
+        miss_seq_ids: list[int],
+    ) -> list[int]:
+        signature: list[int] = []
+        for seq_ids in (candidate_seq_ids, hit_seq_ids, miss_seq_ids):
+            normalized = [int(seq_id) for seq_id in seq_ids]
+            weighted_sum = sum((index + 1) * int(seq_id) for index, seq_id in enumerate(normalized))
+            signature.extend([len(normalized), sum(normalized), weighted_sum])
+        return signature
+
     def _assert_target_tp_buffer_seq_agreement(
         self,
         plan: StepPlan,
@@ -2424,6 +2460,77 @@ class ModelRunnerBase:
             f"{list(plan.cached_admission_priming_same_step_verify_suppressed_seq_ids)}, "
             f"signatures={signatures}",
         )
+
+    def _assert_target_tp_candidate_buffer_hit_agreement(
+        self,
+        plan: StepPlan,
+        *,
+        raw_target_candidate_seq_ids: list[int],
+    ) -> tuple[list[int], list[int]]:
+        if self.is_draft or not self._requires_framed_dual_verify_result_transfer():
+            return [int(seq_id) for seq_id in raw_target_candidate_seq_ids], []
+        raw_candidates = [int(seq_id) for seq_id in raw_target_candidate_seq_ids]
+        local_buffer_seq_ids = self.dual_proposal_buffer.pending_seq_ids()
+        local_buffer_set = set(local_buffer_seq_ids)
+        local_hit_seq_ids = [
+            int(seq_id) for seq_id in raw_candidates if int(seq_id) in local_buffer_set
+        ]
+        local_miss_seq_ids = [
+            int(seq_id) for seq_id in raw_candidates if int(seq_id) not in local_buffer_set
+        ]
+        plan.target_candidate_seq_ids_before_buffer_hit_agreement = list(raw_candidates)
+        plan.target_candidate_buffer_hit_seq_ids = list(local_hit_seq_ids)
+        plan.target_candidate_buffer_miss_seq_ids = list(local_miss_seq_ids)
+        local_signature = torch.tensor(
+            self._candidate_buffer_hit_signature(
+                raw_candidates,
+                local_hit_seq_ids,
+                local_miss_seq_ids,
+            ),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        gathered = [
+            torch.zeros_like(local_signature)
+            for _ in range(int(self.tensor_parallel_size))
+        ]
+        dist.all_gather(gathered, local_signature, group=self.group)
+        signatures = [
+            [int(value) for value in signature.tolist()]
+            for signature in gathered
+        ]
+        ok = all(signature == signatures[0] for signature in signatures)
+        plan.target_tp_candidate_buffer_agreement_ok = bool(ok)
+        plan.target_tp_candidate_buffer_agreement_signatures = signatures
+        if ok:
+            plan.target_candidate_buffer_hit_agreed_seq_ids = list(local_hit_seq_ids)
+            plan.target_candidate_buffer_miss_agreed_seq_ids = list(local_miss_seq_ids)
+        assert ok, self._proposal_assertion_message(
+            plan,
+            "target TP candidate buffer-hit divergence: "
+            f"rank={int(self.rank)}, tp_local_rank={int(self.tp_params.local_rank)}, "
+            f"plan_id={int(plan.plan_id)}, dual_step_id={int(plan.iteration_id)}, "
+            f"plan_phase={plan.plan_phase}, "
+            f"raw_target_candidate_seq_ids={raw_candidates}, "
+            f"local_hit_seq_ids={local_hit_seq_ids}, "
+            f"local_miss_seq_ids={local_miss_seq_ids}, "
+            f"local_buffer_seq_ids={[int(seq_id) for seq_id in local_buffer_seq_ids]}, "
+            f"target_home_set={[int(seq_id) for seq_id in plan.target_home_set]}, "
+            f"draft_home_set={[int(seq_id) for seq_id in plan.draft_home_set]}, "
+            f"normal_draft_transfer_sender_seq_ids={list(plan.normal_draft_transfer_sender_seq_ids)}, "
+            f"cached_admission_draft_priming_seq_ids="
+            f"{list(plan.cached_admission_draft_priming_seq_ids)}, "
+            f"cached_admission_unprimed_target_filtered_seq_ids="
+            f"{list(plan.cached_admission_unprimed_target_filtered_seq_ids)}, "
+            f"cached_admission_priming_received_seq_ids="
+            f"{list(plan.cached_admission_priming_received_seq_ids)}, "
+            f"cached_admission_priming_buffered_seq_ids="
+            f"{list(plan.cached_admission_priming_buffered_seq_ids)}, "
+            f"cached_admission_priming_same_step_verify_suppressed_seq_ids="
+            f"{list(plan.cached_admission_priming_same_step_verify_suppressed_seq_ids)}, "
+            f"signatures={signatures}",
+        )
+        return list(local_hit_seq_ids), list(local_miss_seq_ids)
 
     def _assert_target_tp_verify_seq_agreement(
         self,
@@ -16762,9 +16869,39 @@ class TargetModelRunner(ModelRunnerBase):
     def dual_batch_pearl_step(self):
         plan = self._build_dual_batch_step_plan()
         active_cached_full_continuous = self._cached_full_continuous_stage_aligned_enabled()
-        target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
-        target_seqs = self._resolve_dual_seq_ids(target_normal_seq_ids, plan, "dual_verify")
+        raw_target_candidate_seq_ids = (
+            list(plan.raw_target_normal_verify_seq_ids_before_buffer_filter)
+            or self._target_normal_verify_seq_ids(plan)
+        )
         draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        raw_fallback_same_batch = (
+            bool(raw_target_candidate_seq_ids)
+            and plan.plan_phase == "fallback"
+            and set(raw_target_candidate_seq_ids).issubset(set(draft_seq_ids))
+        )
+        target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
+        if active_cached_full_continuous and not raw_fallback_same_batch:
+            agreed_hit_seq_ids, agreed_miss_seq_ids = (
+                self._assert_target_tp_candidate_buffer_hit_agreement(
+                    plan,
+                    raw_target_candidate_seq_ids=raw_target_candidate_seq_ids,
+                )
+            )
+            target_normal_seq_ids = list(agreed_hit_seq_ids)
+            plan.target_normal_verify_seq_ids = list(target_normal_seq_ids)
+            plan.target_normal_verify_seq_ids_after_buffer_filter = list(target_normal_seq_ids)
+            plan.cached_admission_target_buffer_hit_seq_ids = list(agreed_hit_seq_ids)
+            plan.cached_admission_target_buffer_miss_seq_ids = list(agreed_miss_seq_ids)
+            plan.cached_admission_target_filtered_missing_proposal_seq_ids = list(
+                agreed_miss_seq_ids
+            )
+            agreed_miss_set = {int(seq_id) for seq_id in agreed_miss_seq_ids}
+            plan.missing_buffered_proposal_unexpected_seq_ids = [
+                int(seq_id)
+                for seq_id in plan.missing_buffered_proposal_unexpected_seq_ids
+                if int(seq_id) not in agreed_miss_set
+            ]
+        target_seqs = self._resolve_dual_seq_ids(target_normal_seq_ids, plan, "dual_verify")
         target_seq_ids = [seq.seq_id for seq in target_seqs]
         fallback_same_batch = (
             bool(target_seq_ids)
