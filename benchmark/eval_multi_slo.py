@@ -43,6 +43,7 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
 from nano_pearl import PEARLConfig, PEARLEngine  # noqa: E402
+from nano_pearl.pearl_engine.sequence import Sequence  # noqa: E402
 
 try:
     from nano_pearl import SamplingParams  # type: ignore  # noqa: E402
@@ -1824,6 +1825,127 @@ def apply_cached_admission_metadata(
     return events
 
 
+def make_cached_sequence(
+    engine: PEARLEngine,
+    req: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Sequence:
+    prompt = get_request_prompt(req)
+    if isinstance(prompt, str):
+        prompt = engine.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        token_ids = engine.tokenizer.encode(prompt)
+    else:
+        token_ids = list(prompt)
+
+    seq = Sequence(
+        token_ids,
+        make_sampling_params(req, args),
+        request_id=req["request_id"],
+        arrival_ts=float(req["arrival_ts"]),
+        slo_tpot_ms=float(req["slo_tpot_ms"]),
+        slo_class=req["slo_class"],
+        per_request_gamma=int(req.get("per_request_gamma", 0)),
+    )
+    seq.arrival_offset_sec = to_float(req.get("arrival_offset_sec"))
+    seq.mark_cached_prefill_metadata(mode="in_memory_kv", cache_key=req["request_id"])
+    return seq
+
+
+def build_cached_sequences(
+    engine: PEARLEngine,
+    chunk: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> List[Sequence]:
+    return [make_cached_sequence(engine, req, args) for req in chunk]
+
+
+def record_cache_build_stats(
+    args: argparse.Namespace,
+    stats: Dict[str, Any],
+    cache_build_batch_size: int,
+) -> None:
+    acc = getattr(args, "_cached_cache_build_stats", None)
+    if acc is None:
+        acc = {
+            "cached_cache_build_elapsed_s": 0.0,
+            "cached_kv_total_cpu_bytes": 0,
+            "cached_kv_num_requests": 0,
+            "cached_kv_block_weighted_sum": 0.0,
+            "cached_kv_max_blocks_per_request": 0,
+            "cache_build_stats_by_runner": [],
+            "cached_cache_build_batch_size": int(cache_build_batch_size),
+            "cached_cache_build_batch_sizes": [],
+        }
+        setattr(args, "_cached_cache_build_stats", acc)
+
+    num_requests = int(to_int(stats.get("cached_kv_num_requests"), 0) or 0)
+    avg_blocks = float(to_float(stats.get("cached_kv_avg_blocks_per_request"), 0.0) or 0.0)
+    acc["cached_cache_build_elapsed_s"] += float(
+        to_float(stats.get("cached_cache_build_elapsed_s"), 0.0) or 0.0
+    )
+    acc["cached_kv_total_cpu_bytes"] += int(to_int(stats.get("cached_kv_total_cpu_bytes"), 0) or 0)
+    acc["cached_kv_num_requests"] += num_requests
+    acc["cached_kv_block_weighted_sum"] += avg_blocks * max(num_requests, 0)
+    acc["cached_kv_max_blocks_per_request"] = max(
+        int(acc.get("cached_kv_max_blocks_per_request", 0) or 0),
+        int(to_int(stats.get("cached_kv_max_blocks_per_request"), 0) or 0),
+    )
+    acc["cached_cache_build_batch_sizes"].append(int(cache_build_batch_size))
+    runner_rows = stats.get("cache_build_stats_by_runner")
+    if isinstance(runner_rows, list):
+        acc["cache_build_stats_by_runner"].extend(runner_rows)
+
+
+def final_cache_build_stats(args: argparse.Namespace) -> Dict[str, Any]:
+    acc = getattr(args, "_cached_cache_build_stats", {}) or {}
+    num_requests = int(acc.get("cached_kv_num_requests", 0) or 0)
+    weighted_sum = float(acc.get("cached_kv_block_weighted_sum", 0.0) or 0.0)
+    return {
+        "cached_cache_build_elapsed_s": float(acc.get("cached_cache_build_elapsed_s", 0.0) or 0.0),
+        "cached_cache_build_batch_size": acc.get("cached_cache_build_batch_size"),
+        "cached_cache_build_batch_sizes": list(acc.get("cached_cache_build_batch_sizes", []) or []),
+        "cached_kv_total_cpu_bytes": int(acc.get("cached_kv_total_cpu_bytes", 0) or 0),
+        "cached_kv_num_requests": num_requests,
+        "cached_kv_avg_blocks_per_request": (
+            weighted_sum / num_requests if num_requests > 0 else 0.0
+        ),
+        "cached_kv_max_blocks_per_request": int(acc.get("cached_kv_max_blocks_per_request", 0) or 0),
+        "cache_build_stats_by_runner": list(acc.get("cache_build_stats_by_runner", []) or []),
+    }
+
+
+def extract_cached_admission_events(trace_payload: Any) -> List[Dict[str, Any]]:
+    return [
+        row
+        for row in iter_low_level_trace_rows(trace_payload)
+        if row.get("trace_record_type") == "cached_admission_step"
+    ]
+
+
+def normalize_in_memory_cached_rows(
+    rows: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> None:
+    for row in rows:
+        admission_ts = to_float(first_present(row, ["admission_ts", "admit_ts"]))
+        if admission_ts is not None:
+            row.setdefault("admission_ts", admission_ts)
+            row.setdefault("admit_ts", admission_ts)
+        arrival_ts = to_float(row.get("arrival_ts"))
+        if row.get("queue_wait_ms") is None and admission_ts is not None and arrival_ts is not None:
+            row["queue_wait_ms"] = max(0.0, (admission_ts - arrival_ts) * 1000.0)
+        row["cached_admission_enabled"] = True
+        row.setdefault("cached_prefill_skipped", True)
+        row.setdefault("cached_prefill_mode", "in_memory_kv")
+        row.setdefault("cache_key", row.get("request_id"))
+        row.setdefault("cached_admission_policy", args.cached_admission_policy)
+        row.setdefault("cached_admission_max_active", args.cached_admission_max_active)
+
+
 def build_cached_admission_summary(
     rows: List[Dict[str, Any]],
     args: argparse.Namespace,
@@ -1851,12 +1973,17 @@ def build_cached_admission_summary(
         [to_int(event.get("cached_admission_active_count"), 0) or 0 for event in events] + [0]
     )
     total_admitted = sum(1 for row in rows if row.get("admission_ts") is not None)
-    total_completed = sum(1 for row in rows if row.get("cached_admission_status") == "completed")
+    total_completed = sum(
+        1
+        for row in rows
+        if row.get("cached_admission_status") == "completed"
+        or first_present(row, ["finish_ts", "finished_ts", "end_ts", "end_time"]) is not None
+    )
     decode_only_elapsed_s = 0.0
     if decode_starts and finishes:
         decode_only_elapsed_s = max(finishes) - min(decode_starts)
 
-    return {
+    summary = {
         "cached_admission_enabled": True,
         "cached_prefill_mode": args.cached_prefill_mode,
         "cached_admission_policy": args.cached_admission_policy,
@@ -1875,6 +2002,9 @@ def build_cached_admission_summary(
         "cached_admission_prefill_compute_skipped": True,
         "cached_admission_decode_only_elapsed_s": max(decode_only_elapsed_s, 0.0),
     }
+    if args.cached_prefill_mode == "in_memory_kv":
+        summary.update(final_cache_build_stats(args))
+    return summary
 
 
 def append_cached_admission_trace(
@@ -1888,9 +2018,10 @@ def append_cached_admission_trace(
         {
             "trace_record_type": "cached_admission_run_summary",
             **summary,
-        },
-        *events,
+        }
     ]
+    if summary.get("cached_prefill_mode") != "in_memory_kv":
+        records.extend(events)
     if hasattr(engine, "last_traces") and isinstance(getattr(engine, "last_traces"), list):
         engine.last_traces.extend(records)
 
@@ -1972,15 +2103,49 @@ def run_eval_chunk(
     chunk: List[Dict[str, Any]],
     args: argparse.Namespace,
 ) -> Tuple[List[str], List[int], Any, float, List[Dict[str, Any]]]:
-    print(f"[INFO] Adding {len(chunk)} request(s) to engine...")
-    add_workload_chunk(engine, chunk, args)
+    if args.enable_cached_admission and args.cached_prefill_mode == "in_memory_kv":
+        if not hasattr(engine, "cached_build_from_sequences") or not hasattr(engine, "cached_decode_ready_generate"):
+            raise RuntimeError(
+                "--cached-prefill-mode in_memory_kv requires engine cached KV build/materialize hooks"
+            )
+        seqs = build_cached_sequences(engine, chunk, args)
+        cache_build_batch_size = int(args.cache_build_batch_size or len(seqs) or 1)
+        print(
+            f"[INFO] Building in-memory cached KV for {len(seqs)} request(s): "
+            f"batch_size={cache_build_batch_size}, execution_mode={args.execution_mode}"
+        )
+        cache_stats = engine.cached_build_from_sequences(
+            seqs,
+            cache_build_batch_size,
+            execution_mode=args.execution_mode,
+        )
+        record_cache_build_stats(args, cache_stats, cache_build_batch_size)
+        for seq in sorted(
+            seqs,
+            key=lambda s: (
+                float(getattr(s, "arrival_offset_sec", 0.0) or 0.0),
+                str(s.request_id),
+            ),
+        ):
+            engine.add_cached_sequence(seq, execution_mode=args.execution_mode)
 
-    run_start_ts = time.time()
-    output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
-        engine=engine,
-        execution_mode=args.execution_mode,
-        decode_ready=args.decode_ready,
-    )
+        run_start_ts = time.time()
+        print(f"[INFO] Starting cached decode-ready generation: execution_mode={args.execution_mode}")
+        output_text, num_tokens, num_acc_tokens, elapsed_time = engine.cached_decode_ready_generate(
+            int(args.cached_admission_max_active),
+            execution_mode=args.execution_mode,
+            arrival_field=args.cached_admission_arrival_field,
+        )
+    else:
+        print(f"[INFO] Adding {len(chunk)} request(s) to engine...")
+        add_workload_chunk(engine, chunk, args)
+
+        run_start_ts = time.time()
+        output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
+            engine=engine,
+            execution_mode=args.execution_mode,
+            decode_ready=args.decode_ready,
+        )
     run_end_ts = time.time()
     print(f"[OK] Chunk generation finished. engine_elapsed_s={elapsed_time:.6f}")
 
@@ -2000,12 +2165,16 @@ def run_eval_chunk(
         row.setdefault("execution_mode", args.execution_mode)
         row.setdefault("decode_ready_mode", bool(args.decode_ready))
     if args.enable_cached_admission:
-        cached_events = apply_cached_admission_metadata(
-            merged_rows,
-            args,
-            serving_start_ts=run_start_ts,
-            engine_elapsed_s=elapsed_time,
-        )
+        if args.cached_prefill_mode == "metadata_only":
+            cached_events = apply_cached_admission_metadata(
+                merged_rows,
+                args,
+                serving_start_ts=run_start_ts,
+                engine_elapsed_s=elapsed_time,
+            )
+        else:
+            normalize_in_memory_cached_rows(merged_rows, args)
+            cached_events = extract_cached_admission_events(trace_payload)
         getattr(args, "_cached_admission_trace").extend(cached_events)
 
     return output_text, num_tokens, num_acc_tokens, elapsed_time, merged_rows
@@ -2052,6 +2221,7 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "cached_prefill_skipped": row.get("cached_prefill_skipped"),
         "cached_prefill_mode": row.get("cached_prefill_mode"),
         "cached_kv_ready": row.get("cached_kv_ready"),
+        "cached_kv_materialized": row.get("cached_kv_materialized"),
         "cache_key": row.get("cache_key"),
     }
 
@@ -2275,16 +2445,19 @@ def main() -> None:
         dest="enable_cached_admission",
         action="store_true",
         help=(
-            "Enable metadata-only cached admission. Prefill is labeled as "
-            "offline/skipped for online decode timing; this does not materialize "
-            "persistent KV cache."
+            "Enable cached admission. metadata_only simulates admission metadata; "
+            "in_memory_kv builds prompt KV before online decode and materializes it "
+            "from CPU-staged rank-local snapshots."
         ),
     )
     parser.add_argument(
         "--cached-prefill-mode",
-        choices=["metadata_only"],
+        choices=["metadata_only", "in_memory_kv"],
         default="metadata_only",
-        help="Cached-prefill mode for cached admission. Phase 1H-8w supports metadata_only only.",
+        help=(
+            "Cached-prefill mode for cached admission: metadata_only or in_memory_kv. "
+            "in_memory_kv does not persist KV to disk."
+        ),
     )
     parser.add_argument(
         "--cached-admission-policy",
@@ -2302,7 +2475,7 @@ def main() -> None:
         "--cache-build-batch-size",
         type=int,
         default=None,
-        help="Legacy physical cached-admission option; ignored by metadata_only mode.",
+        help="Offline cache-build chunk size for --cached-prefill-mode in_memory_kv.",
     )
     parser.add_argument(
         "--max-active-cached-seqs",
@@ -2398,8 +2571,10 @@ def main() -> None:
         if args.cached_admission_max_active <= 0:
             raise ValueError("--cached-admission-max-active must be positive when cached admission is enabled")
         if not args.decode_ready:
-            print("[INFO] Enabling --decode-ready because cached admission is decode-only metadata mode.")
+            print("[INFO] Enabling --decode-ready because cached admission serves decode-ready requests.")
             args.decode_ready = True
+        if args.cache_build_batch_size is not None and args.cache_build_batch_size <= 0:
+            raise ValueError("--cache-build-batch-size must be positive when set")
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)
     workload_meta = load_workload_meta(args.workload_in)
@@ -2434,6 +2609,7 @@ def main() -> None:
         setattr(args, "_first_arrival_offset", to_float(abs_workload[0].get("arrival_offset_sec"), 0.0) or 0.0)
         setattr(args, "_replay_wall_start", time.time())
         setattr(args, "_cached_admission_trace", [])
+        setattr(args, "_cached_cache_build_stats", None)
 
         chunks: List[List[Dict[str, Any]]]
         if args.eval_batch_size is None:

@@ -13,7 +13,7 @@ PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
 )
 EAGER_POLICIES = {"none", "tight_only"}
 EAGER_TRACE_LEVELS = {"full", "summary", "minimal"}
-CACHED_PREFILL_MODES = {"metadata_only"}
+CACHED_PREFILL_MODES = {"metadata_only", "in_memory_kv"}
 CACHED_ADMISSION_POLICIES = {"fifo"}
 
 

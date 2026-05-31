@@ -377,32 +377,111 @@ class PEARLEngine:
 
         return output_text, num_tokens, num_acc_tokens, time
 
-    def cached_build_from_sequences(self, seqs: list[Sequence], cache_build_batch_size: int):
-        self.controller.write_draft_shm("cache_build_prepare", seqs, cache_build_batch_size)
-        self.controller.write_target_shm("cache_build_prepare", seqs, cache_build_batch_size)
+    def _read_cache_build_stats(self, execution_mode: str) -> dict:
+        stats_rows = []
+        if execution_mode != "ar":
+            _, _, _, draft_stats = self.controller.read_payload(self.controller.draft_shm)
+            stats_rows.extend(draft_stats)
+        _, _, _, target_stats = self.controller.read_payload(self.controller.target_shm)
+        stats_rows.extend(target_stats)
+        stats_rows = [
+            row for row in stats_rows
+            if isinstance(row, dict) and row.get("cache_build_stats")
+        ]
+        active_rows = [row for row in stats_rows if not row.get("cache_build_skipped")]
+        if not active_rows:
+            return {
+                "cached_cache_build_elapsed_s": 0.0,
+                "cached_kv_total_cpu_bytes": 0,
+                "cached_kv_num_requests": 0,
+                "cached_kv_avg_blocks_per_request": 0.0,
+                "cached_kv_max_blocks_per_request": 0,
+                "cache_build_stats_by_runner": stats_rows,
+            }
+        return {
+            "cached_cache_build_elapsed_s": max(
+                float(row.get("cached_cache_build_elapsed_s", 0.0) or 0.0)
+                for row in active_rows
+            ),
+            "cached_kv_total_cpu_bytes": sum(
+                int(row.get("cached_kv_total_cpu_bytes", 0) or 0)
+                for row in active_rows
+            ),
+            "cached_kv_num_requests": max(
+                int(row.get("cached_kv_num_requests", 0) or 0)
+                for row in active_rows
+            ),
+            "cached_kv_avg_blocks_per_request": max(
+                float(row.get("cached_kv_avg_blocks_per_request", 0.0) or 0.0)
+                for row in active_rows
+            ),
+            "cached_kv_max_blocks_per_request": max(
+                int(row.get("cached_kv_max_blocks_per_request", 0) or 0)
+                for row in active_rows
+            ),
+            "cache_build_stats_by_runner": stats_rows,
+        }
+
+    def cached_build_from_sequences(
+        self,
+        seqs: list[Sequence],
+        cache_build_batch_size: int,
+        execution_mode: str | None = None,
+    ) -> dict:
+        execution_mode = self.config.execution_mode if execution_mode is None else execution_mode
+        if execution_mode not in self.config.ALLOWED_EXECUTION_MODES:
+            raise ValueError(
+                f"cached-prefill-mode=in_memory_kv is not yet supported for execution_mode={execution_mode}"
+            )
+        self.controller.write_draft_shm("cache_build_prepare", seqs, cache_build_batch_size, execution_mode)
+        self.controller.write_target_shm("cache_build_prepare", seqs, cache_build_batch_size, execution_mode)
+        self.control_event.wait()
+        self.control_event.clear()
+        return self._read_cache_build_stats(execution_mode)
+
+    def add_cached_sequence(self, seq: Sequence, execution_mode: str | None = None):
+        execution_mode = self.config.execution_mode if execution_mode is None else execution_mode
+        self.controller.write_draft_shm("add_cached_request", seq, execution_mode)
+        self.controller.write_target_shm("add_cached_request", seq, execution_mode)
         self.control_event.wait()
         self.control_event.clear()
 
-    def add_cached_sequence(self, seq: Sequence):
-        self.controller.write_draft_shm("add_cached_request", seq)
-        self.controller.write_target_shm("add_cached_request", seq)
-        self.control_event.wait()
-        self.control_event.clear()
-
-    def cached_decode_ready_generate(self, max_active_cached_seqs: int):
-        if self.config.execution_mode == "dual_batch_pearl":
-            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
-        self.controller.write_draft_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
-        self.controller.write_target_shm("cached_decode_ready_pearl_generate", max_active_cached_seqs)
+    def cached_decode_ready_generate(
+        self,
+        max_active_cached_seqs: int,
+        execution_mode: str | None = None,
+        arrival_field: str = "arrival_offset_sec",
+    ):
+        execution_mode = self.config.execution_mode if execution_mode is None else execution_mode
+        if execution_mode not in self.config.ALLOWED_EXECUTION_MODES:
+            raise ValueError(
+                f"cached-prefill-mode=in_memory_kv is not yet supported for execution_mode={execution_mode}"
+            )
+        self.controller.write_draft_shm(
+            "cached_decode_ready_generate",
+            execution_mode,
+            max_active_cached_seqs,
+            arrival_field,
+        )
+        self.controller.write_target_shm(
+            "cached_decode_ready_generate",
+            execution_mode,
+            max_active_cached_seqs,
+            arrival_field,
+        )
         self.control_event.wait()
         self.control_event.clear()
         output, time, target_traces, target_request_metadata = self.controller.read_output()
         try:
+            if execution_mode == "ar":
+                raise RuntimeError("target-only cached AR")
             self.last_traces, self.last_request_metadata = self.controller.read_all_traces()
         except Exception:
             self.last_traces = target_traces
             self.last_request_metadata = target_request_metadata
         output = sorted(output, key=lambda x: x[0])
+        if not output:
+            return [], [], None if execution_mode == "ar" else [], time
         seq_id, token_ids, num_acc_tokens = zip(*output)
         output_text = [self.tokenizer.decode(token_ids, skip_special_tokens=False) for token_ids in token_ids]
         prefill_tokens = {
@@ -410,6 +489,8 @@ class PEARLEngine:
             for req in self.last_request_metadata
         }
         num_tokens = [max(len(t) - prefill_tokens.get(seq, 0), 0) for seq, t in zip(seq_id, token_ids)]
+        if execution_mode == "ar":
+            num_acc_tokens = None
         return output_text, num_tokens, num_acc_tokens, time
 
     def get_traces(self):

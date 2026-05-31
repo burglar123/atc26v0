@@ -13,6 +13,14 @@ class CachedAdmissionError(AssertionError):
     pass
 
 
+SUPPORTED_IN_MEMORY_EXECUTION_MODES = {
+    "ar",
+    "serialized_pearl",
+    "parallel_pearl",
+    "dual_batch_pearl",
+}
+
+
 def load_json(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -69,7 +77,10 @@ def cached_summary(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 key: value
                 for key, value in metrics.items()
-                if key.startswith("cached_admission_") or key == "cached_prefill_mode"
+                if key.startswith("cached_admission_")
+                or key.startswith("cached_cache_build_")
+                or key.startswith("cached_kv_")
+                or key == "cached_prefill_mode"
             }
         )
         nested = metrics.get("cached_admission")
@@ -101,6 +112,14 @@ def trace_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def require(condition: bool, errors: list[str], message: str) -> None:
     if not condition:
         errors.append(message)
+
+
+def result_execution_mode(payload: dict[str, Any]) -> str | None:
+    for container_name in ("args", "metrics"):
+        container = payload.get(container_name)
+        if isinstance(container, dict) and container.get("execution_mode") is not None:
+            return str(container.get("execution_mode"))
+    return None
 
 
 def validate_disabled(payload: dict[str, Any]) -> list[str]:
@@ -138,6 +157,7 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
     total_completed = int_value(summary.get("cached_admission_total_completed"), 0)
     cap = int_value(summary.get("cached_admission_max_active"), 0)
     peak_active = int_value(summary.get("cached_admission_peak_active"), 0)
+    mode = summary.get("cached_prefill_mode")
 
     require(total_arrived <= total_requests, errors, "total_arrived exceeds total_requests")
     require(total_admitted <= total_arrived, errors, "total_admitted exceeds total_arrived")
@@ -155,13 +175,43 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
         "cached_admission_enabled run-level field must be true",
     )
     require(
-        summary.get("cached_prefill_mode") is not None,
+        mode is not None,
         errors,
         "cached_prefill_mode is missing from run-level fields",
     )
+    require(
+        mode in {"metadata_only", "in_memory_kv"},
+        errors,
+        f"unsupported cached_prefill_mode={mode!r}",
+    )
+
+    if mode == "in_memory_kv":
+        execution_mode = result_execution_mode(payload)
+        if execution_mode is not None:
+            require(
+                execution_mode in SUPPORTED_IN_MEMORY_EXECUTION_MODES,
+                errors,
+                (
+                    "cached-prefill-mode=in_memory_kv is not yet supported "
+                    f"for execution_mode={execution_mode}"
+                ),
+            )
+        require(
+            summary.get("cached_cache_build_elapsed_s") is not None,
+            errors,
+            "cached_cache_build_elapsed_s must exist for in_memory_kv",
+        )
+        cached_kv_num_requests = int_value(summary.get("cached_kv_num_requests"), -1)
+        require(
+            cached_kv_num_requests == total_requests
+            or summary.get("cached_kv_num_requests_explanation") is not None,
+            errors,
+            "cached_kv_num_requests must equal total_requests or explain filtered count",
+        )
 
     admitted: set[str] = set()
     completed: set[str] = set()
+    materialized: set[str] = set()
     for row in rows:
         request_id = str(row.get("request_id"))
         arrival_ts = float_value(row.get("arrival_ts"))
@@ -179,6 +229,32 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
         if is_completed:
             require(admission_ts is not None, errors, f"completed request_id={request_id} has no admission")
             completed.add(request_id)
+        if mode == "in_memory_kv":
+            materialized_value = bool_value(row.get("cached_kv_materialized"))
+            admitted_or_completed = admission_ts is not None or is_completed
+            if admitted_or_completed:
+                require(
+                    bool_value(row.get("cached_kv_ready")),
+                    errors,
+                    f"request_id={request_id} cached_kv_ready must be true for in_memory_kv",
+                )
+                require(
+                    materialized_value,
+                    errors,
+                    f"request_id={request_id} cached_kv_materialized must be true for in_memory_kv",
+                )
+            if materialized_value:
+                require(
+                    admission_ts is not None,
+                    errors,
+                    f"request_id={request_id} materialized without admission",
+                )
+                require(
+                    request_id not in materialized,
+                    errors,
+                    f"duplicate materialization for request_id={request_id}",
+                )
+                materialized.add(request_id)
         if arrival_ts is not None and admission_ts is not None:
             require(
                 admission_ts + 1e-9 >= arrival_ts,
@@ -314,6 +390,29 @@ def valid_enabled_payload() -> dict[str, Any]:
     }
 
 
+def valid_in_memory_payload() -> dict[str, Any]:
+    payload = copy.deepcopy(valid_enabled_payload())
+    payload["args"]["execution_mode"] = "parallel_pearl"
+    payload["cached_admission"].update(
+        {
+            "cached_prefill_mode": "in_memory_kv",
+            "cached_cache_build_elapsed_s": 0.25,
+            "cached_cache_build_batch_size": 2,
+            "cached_kv_total_cpu_bytes": 4096,
+            "cached_kv_num_requests": 2,
+            "cached_kv_avg_blocks_per_request": 1.0,
+            "cached_kv_max_blocks_per_request": 1,
+        }
+    )
+    for row in payload["traces"]:
+        row["cached_prefill_mode"] = "in_memory_kv"
+        row["cached_kv_ready"] = True
+        row["cached_kv_materialized"] = True
+    for event in payload["cached_admission_trace"]:
+        event["cached_prefill_mode"] = "in_memory_kv"
+    return payload
+
+
 def disabled_payload() -> dict[str, Any]:
     return {
         "args": {"enable_cached_admission": False},
@@ -326,6 +425,7 @@ def run_synthetic() -> int:
     cases: list[tuple[str, dict[str, Any], bool]] = [
         ("disabled mode pass", disabled_payload(), True),
         ("FIFO admission pass", valid_enabled_payload(), True),
+        ("in_memory_kv summary schema pass", valid_in_memory_payload(), True),
     ]
 
     payload = valid_enabled_payload()
@@ -351,6 +451,30 @@ def run_synthetic() -> int:
     payload = valid_enabled_payload()
     payload["traces"][0]["cached_prefill_skipped"] = False
     cases.append(("cached enabled but prefill skipped false fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    payload["traces"][0]["cached_kv_ready"] = False
+    cases.append(("in_memory_kv missing cached_kv_ready fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    payload["traces"][0]["cached_kv_materialized"] = False
+    cases.append(("in_memory_kv missing cached_kv_materialized fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    duplicate = copy.deepcopy(payload["traces"][0])
+    payload["traces"].append(duplicate)
+    payload["cached_admission"]["cached_admission_total_requests"] = 3
+    payload["cached_admission"]["cached_kv_num_requests"] = 3
+    cases.append(("duplicate materialization fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    payload["traces"][0].pop("admission_ts")
+    payload["traces"][0].pop("admit_ts", None)
+    cases.append(("materialized without admission fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    payload["args"]["execution_mode"] = "unsupported_mode"
+    cases.append(("unsupported in_memory_kv execution_mode fail", payload, False))
 
     failures = 0
     for name, payload, expect_ok in cases:

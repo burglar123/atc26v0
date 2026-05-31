@@ -123,6 +123,17 @@ def test_sequence_admit_ts_pickle_roundtrip():
     assert cloned.admit_ts == seq.admit_ts
 
 
+def test_sequence_cached_kv_materialized_pickle_roundtrip():
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True))
+    seq.mark_cached_prefill_metadata(mode="in_memory_kv", cache_key="r0")
+    seq.mark_cached_materialized()
+    cloned = pickle.loads(pickle.dumps(seq))
+    assert cloned.cached_admission_enabled is True
+    assert cloned.cached_prefill_mode == "in_memory_kv"
+    assert cloned.cached_kv_ready is True
+    assert cloned.cached_kv_materialized is True
+
+
 def test_add_cached_sets_pending_cached_status():
     scheduler = Scheduler(_FakeConfig())
     seq = Sequence([1, 2], SamplingParams())

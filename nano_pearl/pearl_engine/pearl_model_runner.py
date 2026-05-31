@@ -515,7 +515,10 @@ class ModelRunnerBase:
         self.scheduler.add(seq)
         dist.barrier()
 
-    def add_cached_request(self, seq: Sequence):
+    def add_cached_request(self, seq: Sequence, execution_mode: str = "parallel_pearl"):
+        if execution_mode == "ar" and self.is_draft:
+            dist.barrier()
+            return
         self.scheduler.add_cached(seq)
         dist.barrier()
 
@@ -538,6 +541,13 @@ class ModelRunnerBase:
             "home_batch_id": seq.home_batch_id,
             "num_decode_ready_prefill_tokens": int(seq.num_decode_ready_prefill_tokens),
             "decode_ready_mode": bool(seq.decode_ready_mode),
+            "cached_admission_enabled": bool(getattr(seq, "cached_admission_enabled", False)),
+            "cached_kv_ready": bool(getattr(seq, "cached_kv_ready", False)),
+            "cached_prefill_mode": getattr(seq, "cached_prefill_mode", None),
+            "cache_key": getattr(seq, "cache_key", seq.request_id),
+            "cached_prefill_skipped": bool(getattr(seq, "cached_prefill_skipped", False)),
+            "cached_admission_status": getattr(seq, "cached_admission_status", None),
+            "cached_kv_materialized": bool(getattr(seq, "cached_kv_materialized", False)),
             "trace_stats": seq.trace_stats,
         }
 
@@ -565,6 +575,15 @@ class ModelRunnerBase:
         seq.home_batch_id = snapshot.get("home_batch_id")
         seq.trace_stats = snapshot.get("trace_stats", seq.trace_stats)
         seq.arrival_offset_sec = snapshot.get("arrival_offset_sec")
+        if snapshot.get("cached_admission_enabled"):
+            seq.mark_cached_prefill_metadata(
+                mode=snapshot.get("cached_prefill_mode") or "in_memory_kv",
+                cache_key=snapshot.get("cache_key", snapshot.get("request_id")),
+            )
+            seq.cached_admission_status = snapshot.get("cached_admission_status")
+            seq.cached_kv_ready = bool(snapshot.get("cached_kv_ready", True))
+            seq.cached_prefill_skipped = bool(snapshot.get("cached_prefill_skipped", True))
+            seq.cached_kv_materialized = bool(snapshot.get("cached_kv_materialized", False))
         return seq
 
     def _allocate_cached_blocks(self, seq: Sequence, num_blocks: int) -> list[int]:
@@ -578,13 +597,56 @@ class ModelRunnerBase:
             seq.block_table.append(block_id)
         return list(seq.block_table)
 
-    def cache_build_prepare(self, seqs: list[Sequence], cache_build_batch_size: int):
+    def cache_build_prepare(
+        self,
+        seqs: list[Sequence],
+        cache_build_batch_size: int,
+        execution_mode: str = "parallel_pearl",
+    ):
+        start_time = time.time()
         self.cached_kv_store = {}
+        if execution_mode == "ar" and self.is_draft:
+            cache_build_batch_size = max(int(cache_build_batch_size), 1)
+            for i in range(0, len(seqs), cache_build_batch_size):
+                # Mirror target-side global barriers while skipping draft KV work.
+                # Target cache_build_prepare executes: outer chunk barrier,
+                # prepare_decode_ready entry/exit barriers, and snapshot barrier.
+                dist.barrier()
+                dist.barrier()
+                dist.barrier()
+                dist.barrier()
+            if self.tp_params.local_rank == 0:
+                self._write_payload(
+                    [],
+                    0.0,
+                    [],
+                    [
+                        {
+                            "cache_build_stats": True,
+                            "runner_role": self._runner_role(),
+                            "execution_mode": execution_mode,
+                            "cached_kv_num_requests": 0,
+                            "cached_kv_total_cpu_bytes": 0,
+                            "cached_kv_avg_blocks_per_request": 0.0,
+                            "cached_kv_max_blocks_per_request": 0,
+                            "cached_cache_build_elapsed_s": 0.0,
+                            "cache_build_skipped": True,
+                            "cache_build_skip_reason": "ar_target_only",
+                        }
+                    ],
+                )
+            dist.barrier()
+            return
         total_cached_kv_cpu_bytes = 0
         num_blocks_list = []
+        cache_build_batch_size = max(int(cache_build_batch_size), 1)
         for i in range(0, len(seqs), cache_build_batch_size):
             chunk = seqs[i:i+cache_build_batch_size]
             for seq in chunk:
+                seq.mark_cached_prefill_metadata(
+                    mode="in_memory_kv",
+                    cache_key=seq.request_id,
+                )
                 self.scheduler.add(seq)
             dist.barrier()
             # TODO: refactor to a narrower cache_build_prefill_chunk() helper to
@@ -609,17 +671,48 @@ class ModelRunnerBase:
         gathered = [None for _ in range(self.tensor_parallel_size)]
         dist.all_gather_object(gathered, key_set, group=self.group)
         assert all(g == key_set for g in gathered), "cached_kv_store key-set mismatch across TP ranks"
+        total_bytes_tensor = torch.tensor(
+            [float(total_cached_kv_cpu_bytes)],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        dist.all_reduce(total_bytes_tensor, op=dist.ReduceOp.SUM, group=self.group)
+        group_cached_kv_cpu_bytes = int(total_bytes_tensor.item())
+        elapsed_time = time.time() - start_time
         if self.tp_params.local_rank == 0:
             avg_blocks = (sum(num_blocks_list) / len(num_blocks_list)) if num_blocks_list else 0.0
             max_blocks = max(num_blocks_list) if num_blocks_list else 0
             logger.info(
                 f"[Rank {self.rank}: {self.group_name}] cache_build_prepare stored {len(key_set)} requests, "
-                f"cached_kv_cpu_bytes={total_cached_kv_cpu_bytes}, avg_blocks={avg_blocks:.2f}, max_blocks={max_blocks}",
+                f"cached_kv_cpu_bytes={group_cached_kv_cpu_bytes}, avg_blocks={avg_blocks:.2f}, max_blocks={max_blocks}",
                 color="green",
+            )
+            self._write_payload(
+                [],
+                elapsed_time,
+                [],
+                [
+                    {
+                        "cache_build_stats": True,
+                        "runner_role": self._runner_role(),
+                        "execution_mode": execution_mode,
+                        "cached_kv_num_requests": len(key_set),
+                        "cached_kv_total_cpu_bytes": group_cached_kv_cpu_bytes,
+                        "cached_kv_avg_blocks_per_request": avg_blocks,
+                        "cached_kv_max_blocks_per_request": max_blocks,
+                        "cached_cache_build_elapsed_s": elapsed_time,
+                        "cache_build_skipped": False,
+                    }
+                ],
             )
         dist.barrier()
 
-    def materialize_cached_request(self, request_id: str, admit_ts: float):
+    def materialize_cached_request(
+        self,
+        request_id: str,
+        admit_ts: float,
+        arrival_ts: float | None = None,
+    ):
         assert request_id in self.cached_kv_store, (
             f"[Rank {self.rank}: {self.group_name}] missing cached request_id={request_id}"
         )
@@ -627,8 +720,13 @@ class ModelRunnerBase:
         seq: Sequence = self._restore_sequence_from_snapshot(cached["snapshot"])
         assert hasattr(seq, "token_ids"), "restored sequence missing token_ids"
         seq.status = SequenceStatus.RUNNING
-        seq.admit_ts = admit_ts
-        seq.mark_decode_ready(admit_ts)
+        if arrival_ts is not None:
+            seq.arrival_ts = arrival_ts
+        seq.mark_cached_prefill_metadata(
+            mode="in_memory_kv",
+            cache_key=seq.request_id,
+        )
+        seq.mark_cached_admitted(admit_ts)
         seq.decode_start_ts = None
         seq.block_table = []
         seq.num_cached_tokens = 0
@@ -638,6 +736,7 @@ class ModelRunnerBase:
         kv_cpu = cached["kv_cpu"].to(self.kv_cache.device)
         assert kv_cpu.size(2) == int(cached["num_blocks"])
         self.kv_cache[:, :, new_block_ids] = kv_cpu
+        seq.mark_cached_materialized()
         self.scheduler.running.append(seq)
 
     def _runner_role(self):
@@ -2036,6 +2135,8 @@ class ModelRunnerBase:
         self._trace_plan_id += 1
         for seq in seqs:
             seq.mark_scheduled(iteration_id, batch_id, is_prefill, runner_role)
+            if self.active_decode_ready_mode and not is_prefill:
+                seq.mark_decode_started()
         seq_ids = [seq.seq_id for seq in seqs]
         step_plan = self._build_step_plan_from_scheduled_batch(seqs, is_prefill, runner_role, batch_id, iteration_id)
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
@@ -2686,6 +2787,8 @@ class ModelRunnerBase:
         batch_id = f"{runner_role}-{plan.iteration_id}"
         for seq in seqs:
             seq.mark_scheduled(plan.iteration_id, batch_id, False, runner_role)
+            if self.active_decode_ready_mode:
+                seq.mark_decode_started()
         seq_ids = [seq.seq_id for seq in seqs]
         per_seq_zeros = {seq.seq_id: 0 for seq in seqs}
         record = {
@@ -14158,8 +14261,8 @@ class ModelRunnerBase:
         for seq in self.scheduler.running:
             seq.mark_decode_started(ts)
 
-    def _write_generation_result(self, output, elapsed_time):
-        data = pickle.dumps([output, elapsed_time, self.trace_records, self._service_metadata()])
+    def _write_payload(self, output, elapsed_time, traces, service_metadata):
+        data = pickle.dumps([output, elapsed_time, traces, service_metadata])
         n = len(data)
         shm_capacity = self.shm.size
         total_output_tokens = sum(len(tokens) for _, tokens, _ in output) if output else 0
@@ -14191,6 +14294,9 @@ class ModelRunnerBase:
         self.last_result_used_file_fallback = True
         self.shm.buf[0:4] = ctrl_n.to_bytes(4, "little")
         self.shm.buf[4:ctrl_n+4] = ctrl
+
+    def _write_generation_result(self, output, elapsed_time):
+        self._write_payload(output, elapsed_time, self.trace_records, self._service_metadata())
 
     def prefill(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -14380,14 +14486,106 @@ class ModelRunnerBase:
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
         self._finish_decode_ready_generation(output, end_time - start_time)
 
-    def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
-        if self.active_execution_mode == "dual_batch_pearl" or self.global_config.execution_mode == "dual_batch_pearl":
-            raise NotImplementedError("cached-admission is not yet supported for dual_batch_pearl")
-        self._set_execution_mode("parallel_pearl")
+    def _cached_arrival_ts(self, seq: Sequence, serving_start_ts: float, arrival_field: str) -> float:
+        if arrival_field == "arrival_offset_sec" or arrival_field.endswith("_offset_sec"):
+            offset = getattr(seq, arrival_field, None)
+            if offset is None:
+                offset = getattr(seq, "arrival_offset_sec", None)
+            if offset is not None:
+                return serving_start_ts + float(offset)
+        value = getattr(seq, arrival_field, None)
+        if value is not None:
+            return float(value)
+        offset = getattr(seq, "arrival_offset_sec", None)
+        if offset is not None:
+            return serving_start_ts + float(offset)
+        return float(getattr(seq, "arrival_ts", serving_start_ts))
+
+    def _cached_need_blocks(self, seq: Sequence) -> int:
+        cached = self.cached_kv_store.get(seq.request_id)
+        if cached is None:
+            raise RuntimeError(
+                f"[Rank {self.rank}: {self.group_name}] cached KV missing for request_id={seq.request_id}"
+            )
+        return int(cached["num_blocks"])
+
+    def _cached_decode_step(self, execution_mode: str) -> None:
+        if self.gamma == -1 and self.scheduler.running:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+        if execution_mode == "ar":
+            self.step()
+        elif execution_mode == "parallel_pearl":
+            self.pearl_step()
+        elif execution_mode == "serialized_pearl":
+            self.serialized_pearl_step()
+        elif execution_mode == "dual_batch_pearl":
+            self.dual_batch_manager.gamma = int(self.gamma)
+            self.dual_batch_pearl_step()
+        else:
+            raise NotImplementedError(
+                f"cached-prefill-mode=in_memory_kv is not yet supported for execution_mode={execution_mode}"
+            )
+
+    def _append_cached_admission_trace(
+        self,
+        step: int,
+        arrived_ids: list[str],
+        admitted_ids: list[str],
+        queue_wait_by_request: dict[str, float],
+        no_admission_reason: str | None,
+        peak_active: int,
+    ) -> None:
+        if self.is_draft or self.tp_params.local_rank != 0:
+            return
+        self.trace_records.append(
+            {
+                "trace_record_type": "cached_admission_step",
+                "cached_admission_enabled": True,
+                "cached_prefill_mode": "in_memory_kv",
+                "cached_admission_step": int(step),
+                "cached_admission_arrived_request_ids": list(arrived_ids),
+                "cached_admission_admitted_request_ids": list(admitted_ids),
+                "cached_admission_active_request_ids": [
+                    str(seq.request_id) for seq in self.scheduler.running
+                ],
+                "cached_admission_completed_request_ids": [
+                    str(seq.request_id) for seq in self.scheduler.finished
+                ],
+                "cached_admission_pending_count": int(len(self.scheduler.pending_cached)),
+                "cached_admission_active_count": int(len(self.scheduler.running)),
+                "cached_admission_queue_wait_ms_by_request": dict(queue_wait_by_request),
+                "cached_admission_no_admission_reason": no_admission_reason,
+                "cached_admission_peak_active_so_far": int(peak_active),
+            }
+        )
+
+    def cached_decode_ready_generate(
+        self,
+        execution_mode: str,
+        max_active_cached_seqs: int = 0,
+        arrival_field: str = "arrival_offset_sec",
+    ):
+        if execution_mode not in self.global_config.ALLOWED_EXECUTION_MODES:
+            raise NotImplementedError(
+                f"cached-prefill-mode=in_memory_kv is not yet supported for execution_mode={execution_mode}"
+            )
+        self._set_execution_mode(execution_mode)
         self.active_decode_ready_mode = True
+        if execution_mode == "ar" and self.is_draft:
+            dist.barrier()
+            if self.tp_params.local_rank == 0:
+                self._write_payload([], 0.0, [], [])
+            dist.barrier()
+            return
         if max_active_cached_seqs <= 0:
             max_active_cached_seqs = self.scheduler.max_num_seqs
-        pending = sorted(list(self.scheduler.pending_cached), key=lambda s: s.arrival_ts)
+        pending = sorted(
+            list(self.scheduler.pending_cached),
+            key=lambda s: (
+                float(getattr(s, "arrival_offset_sec", 0.0) or 0.0),
+                str(s.request_id),
+            ),
+        )
         self.scheduler.pending_cached = deque()
         dist.barrier()
         torch.cuda.synchronize()
@@ -14399,12 +14597,16 @@ class ModelRunnerBase:
         )
         dist.broadcast(serving_start_tensor, src=0)
         serving_start_ts = float(serving_start_tensor.item())
-        base_offset = min([float(getattr(s, "arrival_offset_sec", 0.0) or 0.0) for s in pending], default=0.0)
         materialized_count = 0
         min_free_blocks = len(self.scheduler.block_manager.free_block_ids)
         last_logged_materialized_bucket = -1
         last_logged_pending_bucket = -1
         last_logged_running = -1
+        cached_step = 0
+        peak_active = 0
+        queue_wait_by_request: dict[str, float] = {}
+        arrived_seen: set[str] = set()
+        blocked_without_progress = 0
         while pending or self.scheduler.running:
             now_tensor = torch.tensor(
                 [time.time() if self.rank == 0 else 0.0],
@@ -14417,42 +14619,87 @@ class ModelRunnerBase:
             gpu_free_before, gpu_total = torch.cuda.mem_get_info()
             guard_triggered = False
             eligible = 0
+            arrived_ids = []
             while eligible < len(pending):
                 seq = pending[eligible]
-                seq_arrival = serving_start_ts + (float(getattr(seq, "arrival_offset_sec", 0.0) or 0.0) - base_offset)
+                seq_arrival = self._cached_arrival_ts(seq, serving_start_ts, arrival_field)
                 if seq_arrival <= now:
+                    request_id = str(seq.request_id)
+                    if request_id not in arrived_seen:
+                        arrived_seen.add(request_id)
+                        arrived_ids.append(request_id)
                     eligible += 1
                 else:
                     break
             local_active_capacity = max(max_active_cached_seqs - len(self.scheduler.running), 0)
             if eligible > 0 and local_active_capacity > 0:
-                first_need_blocks = int(self.cached_kv_store[pending[0].request_id]["num_blocks"])
-                local_block_capacity = len(self.scheduler.block_manager.free_block_ids) // max(first_need_blocks, 1)
+                remaining_blocks = len(self.scheduler.block_manager.free_block_ids)
+                local_block_capacity = 0
+                for seq in pending[:eligible]:
+                    need_blocks = max(self._cached_need_blocks(seq), 1)
+                    if remaining_blocks < need_blocks:
+                        break
+                    remaining_blocks -= need_blocks
+                    local_block_capacity += 1
             else:
                 local_block_capacity = 0
             gpu_free_now, _ = torch.cuda.mem_get_info()
             local_mem_capacity = local_active_capacity if gpu_free_now >= 256 * 1024 * 1024 else 0
             local_k = min(eligible, local_active_capacity, local_block_capacity, local_mem_capacity)
             k_tensor = torch.tensor([local_k], dtype=torch.int64, device="cuda")
-            dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(k_tensor, op=dist.ReduceOp.MIN, group=self.group)
             global_k = int(k_tensor.item())
+            no_admission_reason = None
+            if global_k == 0 and pending:
+                if eligible <= 0:
+                    no_admission_reason = "future_arrival"
+                elif local_active_capacity <= 0:
+                    no_admission_reason = "max_active_limit"
+                elif local_block_capacity <= 0:
+                    no_admission_reason = "insufficient_kv_blocks"
+                elif local_mem_capacity <= 0:
+                    no_admission_reason = "low_gpu_memory"
+                else:
+                    no_admission_reason = "unsupported_mode"
             if global_k == 0 and eligible > 0 and local_active_capacity > 0:
                 guard_triggered = True
+            admitted_this_step: list[str] = []
             for _ in range(global_k):
                 seq = pending.pop(0)
-                self.materialize_cached_request(seq.request_id, now)
+                arrival_ts = self._cached_arrival_ts(seq, serving_start_ts, arrival_field)
+                admission_ts = max(now, arrival_ts)
+                self.materialize_cached_request(seq.request_id, admission_ts, arrival_ts=arrival_ts)
+                request_id = str(seq.request_id)
+                admitted_this_step.append(request_id)
+                queue_wait_by_request[request_id] = max(0.0, (admission_ts - arrival_ts) * 1000.0)
                 materialized_count += 1
+            gathered_admitted: list[list[str] | None] = [None for _ in range(self.tensor_parallel_size)]
+            dist.all_gather_object(gathered_admitted, admitted_this_step, group=self.group)
+            assert all(g == admitted_this_step for g in gathered_admitted), (
+                "cached admission request-id divergence across TP ranks: "
+                + ", ".join(str(g) for g in gathered_admitted)
+            )
             free_blocks_after = len(self.scheduler.block_manager.free_block_ids)
             min_free_blocks = min(min_free_blocks, free_blocks_after)
             running_count = len(self.scheduler.running)
             pending_count = len(pending)
             sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
-            gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered, sync_vec)
+            gathered = [torch.zeros_like(sync_vec) for _ in range(self.tensor_parallel_size)]
+            dist.all_gather(gathered, sync_vec, group=self.group)
             assert all(torch.equal(g, gathered[0]) for g in gathered), (
                 "cached admission divergence across ranks: "
                 + ", ".join(str(g.tolist()) for g in gathered)
             )
+            peak_active = max(peak_active, len(self.scheduler.running))
+            self._append_cached_admission_trace(
+                cached_step,
+                arrived_ids,
+                admitted_this_step,
+                queue_wait_by_request,
+                no_admission_reason,
+                peak_active,
+            )
+            cached_step += 1
             mat_bucket = materialized_count // self.cached_admission_log_interval
             pending_bucket = pending_count // self.cached_admission_log_interval
             should_log = (
@@ -14473,14 +14720,31 @@ class ModelRunnerBase:
             last_logged_pending_bucket = pending_bucket
             last_logged_running = running_count
             if self.scheduler.running:
-                if self.gamma == -1:
-                    self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
-                for seq in self.scheduler.running:
-                    seq.mark_decode_started()
-                self.pearl_step()
+                blocked_without_progress = 0
+                self._cached_decode_step(execution_mode)
             elif pending:
-                next_arrival = serving_start_ts + (float(getattr(pending[0], "arrival_offset_sec", 0.0) or 0.0) - base_offset)
-                time.sleep(min(max(next_arrival - now, 0.0), 0.01))
+                if eligible > 0 and global_k == 0:
+                    blocked_without_progress += 1
+                    if blocked_without_progress > 200:
+                        raise RuntimeError(
+                            "cached admission cannot materialize eligible requests: "
+                            f"reason={no_admission_reason}, pending={len(pending)}, "
+                            f"free_blocks={len(self.scheduler.block_manager.free_block_ids)}, "
+                            f"max_active={max_active_cached_seqs}"
+                        )
+                else:
+                    blocked_without_progress = 0
+                next_arrival = self._cached_arrival_ts(pending[0], serving_start_ts, arrival_field)
+                sleep_s = max(next_arrival - now, 0.0) if no_admission_reason == "future_arrival" else 0.01
+                time.sleep(min(sleep_s, 0.01))
+        self._append_cached_admission_trace(
+            cached_step,
+            [],
+            [],
+            queue_wait_by_request,
+            None,
+            peak_active,
+        )
         torch.cuda.synchronize()
         end_time = time.time()
         seqs = self.scheduler.finished
@@ -14492,7 +14756,17 @@ class ModelRunnerBase:
                 color="green",
             )
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
-        self._finish_decode_ready_generation(output, end_time - start_time)
+        if self.tp_params.local_rank == 0:
+            self._write_generation_result(output, end_time - start_time)
+        dist.barrier()
+        self.clear_requests()
+
+    def cached_decode_ready_pearl_generate(self, max_active_cached_seqs: int = 0):
+        self.cached_decode_ready_generate(
+            "parallel_pearl",
+            max_active_cached_seqs=max_active_cached_seqs,
+            arrival_field="arrival_offset_sec",
+        )
 
     def decode_ready_serialized_pearl_generate(self):
         """Decode-only serialized-PEARL approximation after prepare_decode_ready()."""

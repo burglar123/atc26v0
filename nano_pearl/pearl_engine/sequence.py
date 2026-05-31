@@ -47,6 +47,7 @@ class Sequence:
         self.cache_key = None
         self.cached_prefill_skipped = False
         self.cached_admission_status = None
+        self.cached_kv_materialized = False
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
@@ -170,8 +171,12 @@ class Sequence:
     def mark_cached_admitted(self, ts: float | None = None):
         admit_ts = time.time() if ts is None else ts
         self.admit_ts = admit_ts
-        self.cached_admission_status = "admitted"
+        self.cached_admission_status = "running"
         self.mark_decode_ready(admit_ts)
+
+    def mark_cached_materialized(self):
+        self.cached_kv_ready = True
+        self.cached_kv_materialized = True
 
     def mark_finished(self, record_finish_ts: bool = True):
         self.status = SequenceStatus.FINISHED
@@ -223,6 +228,7 @@ class Sequence:
                     "admission_ts": self.admit_ts,
                     "queue_wait_ms": queue_wait_ms,
                     "cached_kv_ready": self.cached_kv_ready,
+                    "cached_kv_materialized": self.cached_kv_materialized,
                     "cached_prefill_mode": self.cached_prefill_mode,
                     "cache_key": self.cache_key,
                     "cached_prefill_skipped": self.cached_prefill_skipped,
@@ -240,6 +246,7 @@ class Sequence:
                 self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
                 self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
                 self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
+                self.cached_kv_materialized,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
@@ -250,6 +257,7 @@ class Sequence:
         self.cache_key = None
         self.cached_prefill_skipped = False
         self.cached_admission_status = None
+        self.cached_kv_materialized = False
         if len(fields) == 25:
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
@@ -276,7 +284,10 @@ class Sequence:
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
              self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
-             self.cache_key, self.cached_prefill_skipped, self.cached_admission_status) = fields
+             self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
+             *rest_cached_fields) = fields
+            if rest_cached_fields:
+                self.cached_kv_materialized = bool(rest_cached_fields[0])
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:
