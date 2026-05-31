@@ -306,6 +306,7 @@ class ModelRunnerBase:
         self._cached_admission_decode_loop_active = False
         self.dual_batch_manager = DualBatchManager(self.gamma)
         self.dual_proposal_buffer = ProposalBuffer()
+        self._dual_buffer_last_mutation_by_seq_id: dict[int, dict[str, Any]] = {}
         self.eager_proposal_buffer = EagerProposalBuffer()
         self._eager_proposal_id = 0
         self._draft_sent_eager_proposals_by_id = {}
@@ -2084,7 +2085,11 @@ class ModelRunnerBase:
         self.dual_batch_manager.gamma = int(self.gamma)
         self.dual_batch_manager.update_running(self.scheduler.running)
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
-        return self.dual_proposal_buffer.discard_inactive(active_seq_ids)
+        pending_batch_ids = list(self.dual_batch_manager.pending_batch_ids)
+        return self.dual_proposal_buffer.discard_inactive(
+            active_seq_ids,
+            pending_batch_ids=pending_batch_ids,
+        )
 
     def _eager_plan_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_plan_dry_run", False))
@@ -2461,6 +2466,84 @@ class ModelRunnerBase:
             f"signatures={signatures}",
         )
 
+    def _assert_target_tp_candidate_buffer_symmetry(
+        self,
+        plan: StepPlan,
+        *,
+        raw_target_candidate_seq_ids: list[int],
+    ) -> None:
+        """Always-on lightweight guard: detect buffer asymmetry before verify seq derivation.
+
+        Unlike _assert_target_tp_candidate_buffer_hit_agreement, this runs even when
+        active_cached_full_continuous is False. It only checks divergence — it does not
+        modify target_normal_verify_seq_ids.
+        """
+        raw_candidates = [int(seq_id) for seq_id in raw_target_candidate_seq_ids]
+        if not raw_candidates:
+            return
+        local_buffer_seq_ids = self.dual_proposal_buffer.pending_seq_ids()
+        local_buffer_set = set(local_buffer_seq_ids)
+        local_hit_seq_ids = [
+            int(seq_id) for seq_id in raw_candidates if int(seq_id) in local_buffer_set
+        ]
+        local_miss_seq_ids = [
+            int(seq_id) for seq_id in raw_candidates if int(seq_id) not in local_buffer_set
+        ]
+        local_signature = torch.tensor(
+            self._candidate_buffer_hit_signature(
+                raw_candidates,
+                local_hit_seq_ids,
+                local_miss_seq_ids,
+            ),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        gathered = [
+            torch.zeros_like(local_signature)
+            for _ in range(int(self.tensor_parallel_size))
+        ]
+        dist.all_gather(gathered, local_signature, group=self.group)
+        signatures = [
+            [int(value) for value in signature.tolist()]
+            for signature in gathered
+        ]
+        ok = all(signature == signatures[0] for signature in signatures)
+        if ok:
+            return
+        # Build per-seq last-mutation diagnostics for divergent candidates
+        last_mutation_lines: list[str] = []
+        for seq_id in sorted(set(raw_candidates)):
+            mutation = self._dual_buffer_last_mutation_by_seq_id.get(seq_id)
+            if mutation is not None:
+                last_mutation_lines.append(
+                    f"  seq_id={seq_id} last_mutation: "
+                    f"kind={mutation['kind']} "
+                    f"rank={mutation['rank']} tp_local_rank={mutation['tp_local_rank']} "
+                    f"plan_id={mutation['plan_id']} dual_step_id={mutation['dual_step_id']} "
+                    f"phase={mutation['plan_phase']} "
+                    f"before={mutation['before']} after={mutation['after']}"
+                )
+            else:
+                last_mutation_lines.append(
+                    f"  seq_id={seq_id} last_mutation: (none recorded)"
+                )
+        last_mutation_report = "\n".join(last_mutation_lines) if last_mutation_lines else "  (none)"
+        assert ok, self._proposal_assertion_message(
+            plan,
+            "target TP candidate buffer-hit divergence (always-on symmetry guard): "
+            f"rank={int(self.rank)}, tp_local_rank={int(self.tp_params.local_rank)}, "
+            f"plan_id={int(plan.plan_id)}, dual_step_id={int(plan.iteration_id)}, "
+            f"plan_phase={plan.plan_phase}, "
+            f"raw_target_candidate_seq_ids={raw_candidates}, "
+            f"local_hit_seq_ids={local_hit_seq_ids}, "
+            f"local_miss_seq_ids={local_miss_seq_ids}, "
+            f"local_buffer_seq_ids={[int(s) for s in local_buffer_seq_ids]}, "
+            f"target_home_set={[int(s) for s in plan.target_home_set]}, "
+            f"draft_home_set={[int(s) for s in plan.draft_home_set]}, "
+            f"signatures={signatures}\n"
+            f"last_mutations_per_seq_id:\n{last_mutation_report}",
+        )
+
     def _assert_target_tp_candidate_buffer_hit_agreement(
         self,
         plan: StepPlan,
@@ -2588,19 +2671,47 @@ class ModelRunnerBase:
         after_seq_ids: list[int],
     ) -> None:
         plan.buffered_proposal_seq_ids = [int(seq_id) for seq_id in after_seq_ids]
-        if not self._dual_buffer_debug_enabled():
-            return
-        event = {
-            "buffer_mutation_kind": str(kind),
-            "buffer_mutation_seq_ids": [int(seq_id) for seq_id in seq_ids],
-            "buffer_seq_ids_before": [int(seq_id) for seq_id in before_seq_ids],
-            "buffer_seq_ids_after": [int(seq_id) for seq_id in after_seq_ids],
+        mutation_event = {
+            "kind": str(kind),
+            "seq_ids": [int(seq_id) for seq_id in seq_ids],
+            "before": [int(seq_id) for seq_id in before_seq_ids],
+            "after": [int(seq_id) for seq_id in after_seq_ids],
             "rank": int(self.rank),
             "tp_local_rank": int(self.tp_params.local_rank),
             "plan_id": int(plan.plan_id),
             "dual_step_id": int(plan.iteration_id),
             "plan_phase": str(plan.plan_phase),
             "runner_role": self._runner_role(),
+            "target_home_set": [int(s) for s in getattr(plan, "target_home_set", [])],
+            "draft_home_set": [int(s) for s in getattr(plan, "draft_home_set", [])],
+            "target_normal_verify_seq_ids": [
+                int(s) for s in getattr(plan, "target_normal_verify_seq_ids", [])
+            ],
+            "received_proposal_seq_ids": [
+                int(s) for s in getattr(plan, "dual_proposal_received_seq_ids", [])
+            ],
+            "cached_admission_draft_priming_seq_ids": [
+                int(s) for s in getattr(plan, "cached_admission_draft_priming_seq_ids", [])
+            ],
+            "cached_admission_unprimed_target_filtered_seq_ids": [
+                int(s) for s in getattr(plan, "cached_admission_unprimed_target_filtered_seq_ids", [])
+            ],
+        }
+        for seq_id in [int(s) for s in seq_ids]:
+            self._dual_buffer_last_mutation_by_seq_id[seq_id] = dict(mutation_event)
+        if not self._dual_buffer_debug_enabled():
+            return
+        event = {
+            "buffer_mutation_kind": mutation_event["kind"],
+            "buffer_mutation_seq_ids": mutation_event["seq_ids"],
+            "buffer_seq_ids_before": mutation_event["before"],
+            "buffer_seq_ids_after": mutation_event["after"],
+            "rank": mutation_event["rank"],
+            "tp_local_rank": mutation_event["tp_local_rank"],
+            "plan_id": mutation_event["plan_id"],
+            "dual_step_id": mutation_event["dual_step_id"],
+            "plan_phase": mutation_event["plan_phase"],
+            "runner_role": mutation_event["runner_role"],
         }
         plan.dual_buffer_mutation_events.append(event)
         print(
@@ -2609,7 +2720,11 @@ class ModelRunnerBase:
             f"role={event['runner_role']} plan_id={event['plan_id']} "
             f"dual_step_id={event['dual_step_id']} phase={event['plan_phase']} "
             f"kind={event['buffer_mutation_kind']} seq_ids={event['buffer_mutation_seq_ids']} "
-            f"before={event['buffer_seq_ids_before']} after={event['buffer_seq_ids_after']}",
+            f"before={event['buffer_seq_ids_before']} after={event['buffer_seq_ids_after']} "
+            f"target_home={mutation_event['target_home_set']} "
+            f"draft_home={mutation_event['draft_home_set']} "
+            f"target_normal_verify={mutation_event['target_normal_verify_seq_ids']} "
+            f"received={mutation_event['received_proposal_seq_ids']}",
             flush=True,
         )
 
@@ -16880,6 +16995,11 @@ class TargetModelRunner(ModelRunnerBase):
             and set(raw_target_candidate_seq_ids).issubset(set(draft_seq_ids))
         )
         target_normal_seq_ids = self._target_normal_verify_seq_ids(plan)
+        if not self.is_draft and self._requires_framed_dual_verify_result_transfer():
+            self._assert_target_tp_candidate_buffer_symmetry(
+                plan,
+                raw_target_candidate_seq_ids=raw_target_candidate_seq_ids,
+            )
         if active_cached_full_continuous and not raw_fallback_same_batch:
             agreed_hit_seq_ids, agreed_miss_seq_ids = (
                 self._assert_target_tp_candidate_buffer_hit_agreement(

@@ -377,11 +377,21 @@ class ProposalBuffer:
                 dropped.append(seq_id)
         return dropped
 
-    def discard_inactive(self, active_seq_ids: Iterable[int]) -> list[int]:
+    def discard_inactive(
+        self,
+        active_seq_ids: Iterable[int],
+        pending_batch_ids: Iterable[int] | None = None,
+    ) -> list[int]:
         active = {int(seq_id) for seq_id in active_seq_ids}
+        protected: set[int] = set()
+        if pending_batch_ids is not None:
+            pending = {int(b) for b in pending_batch_ids}
+            for seq_id, proposal in self._proposals.items():
+                if int(proposal.home_batch_id) in pending:
+                    protected.add(int(seq_id))
         dropped = []
         for seq_id in list(self._proposals):
-            if seq_id not in active:
+            if seq_id not in active and seq_id not in protected:
                 self._proposals.pop(seq_id, None)
                 dropped.append(seq_id)
         return dropped
