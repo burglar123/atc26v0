@@ -224,6 +224,18 @@ class StepPlan:
     normal_proposal_transfer_meta_len: int = 0
     normal_proposal_transfer_payload_len: int = 0
     normal_proposal_transfer_next_collective_stage: Optional[str] = None
+    dual_collective_stage_order: List[str] = field(default_factory=list)
+    normal_proposal_transfer_enter: bool = False
+    normal_proposal_transfer_exit: bool = False
+    target_verify_result_transfer_enter: bool = False
+    target_verify_result_transfer_exit: bool = False
+    verify_result_numel: int = 0
+    eager_transfer_enter: bool = False
+    eager_transfer_exit: bool = False
+    eager_result_transfer_enter: bool = False
+    eager_result_transfer_exit: bool = False
+    generic_full_continuous_stage_enter: bool = False
+    generic_full_continuous_stage_exit: bool = False
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1103,6 +1115,18 @@ class StepPlan:
             "normal_proposal_transfer_meta_len": int(self.normal_proposal_transfer_meta_len),
             "normal_proposal_transfer_payload_len": int(self.normal_proposal_transfer_payload_len),
             "normal_proposal_transfer_next_collective_stage": self.normal_proposal_transfer_next_collective_stage,
+            "dual_collective_stage_order": list(self.dual_collective_stage_order),
+            "normal_proposal_transfer_enter": bool(self.normal_proposal_transfer_enter),
+            "normal_proposal_transfer_exit": bool(self.normal_proposal_transfer_exit),
+            "target_verify_result_transfer_enter": bool(self.target_verify_result_transfer_enter),
+            "target_verify_result_transfer_exit": bool(self.target_verify_result_transfer_exit),
+            "verify_result_numel": int(self.verify_result_numel),
+            "eager_transfer_enter": bool(self.eager_transfer_enter),
+            "eager_transfer_exit": bool(self.eager_transfer_exit),
+            "eager_result_transfer_enter": bool(self.eager_result_transfer_enter),
+            "eager_result_transfer_exit": bool(self.eager_result_transfer_exit),
+            "generic_full_continuous_stage_enter": bool(self.generic_full_continuous_stage_enter),
+            "generic_full_continuous_stage_exit": bool(self.generic_full_continuous_stage_exit),
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

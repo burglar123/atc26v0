@@ -16,6 +16,15 @@ from benchmark.bounded_rolling_chain_parser import int_value  # noqa: E402
 from benchmark.check_eager_performance_accounting import load_json, trace_payload_to_records  # noqa: E402
 
 
+DUAL_COLLECTIVE_STAGE_ORDER = [
+    "normal_proposal_transfer",
+    "target_verify_result_transfer",
+    "eager_transfer",
+    "eager_result_transfer",
+    "generic_full_continuous_stage",
+]
+
+
 def bool_value(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "pass"}
@@ -111,6 +120,25 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "normal_proposal_transfer_meta_len",
                     "normal_proposal_transfer_payload_len",
                     "normal_proposal_transfer_next_collective_stage",
+                    "dual_collective_stage_order",
+                    "normal_proposal_transfer_enter",
+                    "normal_proposal_transfer_exit",
+                    "target_verify_result_transfer_enter",
+                    "target_verify_result_transfer_exit",
+                    "target_verify_result_transfer_meta_len",
+                    "target_verify_result_transfer_payload_len",
+                    "target_verify_result_transfer_num_results",
+                    "target_verify_result_transfer_seq_ids",
+                    "target_verify_result_transfer_zero_result_step",
+                    "verify_result_numel",
+                    "eager_transfer_enter",
+                    "eager_transfer_exit",
+                    "eager_result_transfer_enter",
+                    "eager_result_transfer_exit",
+                    "generic_full_continuous_stage_enter",
+                    "generic_full_continuous_stage_exit",
+                    "full_continuous_enabled",
+                    "generic_full_continuous_enabled",
                     "dual_step_id",
                     "normal_transfer_called",
                     "normal_transfer_meta_len",
@@ -124,6 +152,162 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 if key not in summary or value not in (None, [], {}, ""):
                     summary[key] = value
     return summary
+
+
+def stage_order(record: dict[str, Any]) -> list[str]:
+    raw_order = record.get("dual_collective_stage_order")
+    if isinstance(raw_order, list):
+        return [str(item) for item in raw_order]
+    return []
+
+
+def stage_indices(record: dict[str, Any]) -> tuple[dict[str, int], dict[str, int]]:
+    enter: dict[str, int] = {}
+    exit_: dict[str, int] = {}
+    for index, item in enumerate(stage_order(record)):
+        if ":" not in item:
+            continue
+        stage, event = item.rsplit(":", 1)
+        if stage not in DUAL_COLLECTIVE_STAGE_ORDER:
+            continue
+        if event == "enter" and stage not in enter:
+            enter[stage] = index
+        elif event == "exit" and stage not in exit_:
+            exit_[stage] = index
+    return enter, exit_
+
+
+def has_stage_trace(record: dict[str, Any]) -> bool:
+    if stage_order(record):
+        return True
+    return any(
+        f"{stage}_{event}" in record
+        for stage in DUAL_COLLECTIVE_STAGE_ORDER
+        for event in ("enter", "exit")
+    )
+
+
+def stage_called(record: dict[str, Any], stage: str) -> bool:
+    enter, exit_ = stage_indices(record)
+    return (
+        bool_value(record.get(f"{stage}_enter"))
+        or bool_value(record.get(f"{stage}_exit"))
+        or stage in enter
+        or stage in exit_
+    )
+
+
+def first_enter_stage(record: dict[str, Any]) -> str | None:
+    enter, _ = stage_indices(record)
+    if not enter:
+        return None
+    return min(enter.items(), key=lambda item: item[1])[0]
+
+
+def role_family(record: dict[str, Any]) -> str:
+    role = str(record.get("normal_proposal_transfer_role") or record.get("runner_role") or "")
+    if "draft" in role:
+        return "draft"
+    if "verify" in role or "target" in role or "aggregate" in role:
+        return "verify"
+    return role
+
+
+def validate_dual_collective_stage_order(records: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    grouped: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, record in enumerate(records):
+        if not has_stage_trace(record):
+            continue
+        try:
+            step_id = int(record.get("dual_step_id", record.get("iteration_id", -1)))
+        except Exception:
+            step_id = -1
+        grouped.setdefault(step_id, []).append((idx, record))
+
+        enter, exit_ = stage_indices(record)
+        for stage in DUAL_COLLECTIVE_STAGE_ORDER:
+            enter_bool = bool_value(record.get(f"{stage}_enter"))
+            exit_bool = bool_value(record.get(f"{stage}_exit"))
+            called = enter_bool or exit_bool or stage in enter or stage in exit_
+            if not called:
+                continue
+            if enter_bool != exit_bool:
+                errors.append(f"record[{idx}] stage {stage} enter/exit flags disagree")
+            if stage in enter and stage not in exit_:
+                errors.append(f"record[{idx}] stage {stage} has enter without exit in stage order")
+            if stage in exit_ and stage not in enter:
+                errors.append(f"record[{idx}] stage {stage} has exit without enter in stage order")
+            if stage in enter and stage in exit_ and enter[stage] > exit_[stage]:
+                errors.append(f"record[{idx}] stage {stage} exits before enter")
+
+        for left_index, left_stage in enumerate(DUAL_COLLECTIVE_STAGE_ORDER):
+            for right_stage in DUAL_COLLECTIVE_STAGE_ORDER[left_index + 1:]:
+                if left_stage in enter and right_stage in enter and enter[left_stage] > enter[right_stage]:
+                    errors.append(
+                        f"record[{idx}] stage order violation: {left_stage} enters after {right_stage}"
+                    )
+
+        cached = bool_value(record.get("cached_admission_enabled"))
+        full = bool_value(
+            record.get("full_continuous_enabled")
+            or record.get("generic_full_continuous_enabled")
+            or record.get("enable_full_continuous_eager")
+        )
+        if cached and full and stage_order(record):
+            first_stage = first_enter_stage(record)
+            if first_stage != "normal_proposal_transfer":
+                errors.append(
+                    f"record[{idx}] cached full-continuous first collective stage must be "
+                    f"normal_proposal_transfer, got {first_stage}"
+                )
+            if not stage_called(record, "target_verify_result_transfer"):
+                errors.append(
+                    f"record[{idx}] cached full-continuous requires zero-safe target verify result stage"
+                )
+
+    for step_id, indexed_records in grouped.items():
+        cached_full = any(
+            bool_value(record.get("cached_admission_enabled"))
+            and bool_value(
+                record.get("full_continuous_enabled")
+                or record.get("generic_full_continuous_enabled")
+                or record.get("enable_full_continuous_eager")
+            )
+            for _, record in indexed_records
+        )
+        if not cached_full:
+            continue
+        records_by_role: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for idx, record in indexed_records:
+            records_by_role.setdefault(role_family(record), []).append((idx, record))
+        for role in ("draft", "verify"):
+            role_records = records_by_role.get(role, [])
+            if not role_records:
+                continue
+            if not any(stage_called(record, "target_verify_result_transfer") for _, record in role_records):
+                errors.append(
+                    f"dual_step_id={step_id} role={role} missing zero-safe target verify result stage"
+                )
+        first_by_role = {
+            role: next(
+                (
+                    first_enter_stage(record)
+                    for _, record in role_records
+                    if first_enter_stage(record) is not None
+                ),
+                None,
+            )
+            for role, role_records in records_by_role.items()
+        }
+        draft_first = first_by_role.get("draft")
+        verify_first = first_by_role.get("verify")
+        if draft_first and verify_first and draft_first != verify_first:
+            errors.append(
+                f"dual_step_id={step_id} collective first-stage mismatch: "
+                f"draft={draft_first}, verify={verify_first}"
+            )
+    return errors
 
 
 def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -214,6 +398,8 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
     if seen_completed and not seen_completed.issubset(seen_admitted):
         missing = sorted(seen_completed - seen_admitted)
         errors.append(f"completed request was never admitted: {missing}")
+
+    errors.extend(validate_dual_collective_stage_order(records))
 
     for idx, record in enumerate(records):
         execution_mode = str(record.get("execution_mode") or summary.get("execution_mode") or "")
@@ -400,6 +586,25 @@ def print_summary(summary: dict[str, Any]) -> None:
         "normal_proposal_transfer_meta_len",
         "normal_proposal_transfer_payload_len",
         "normal_proposal_transfer_next_collective_stage",
+        "dual_collective_stage_order",
+        "normal_proposal_transfer_enter",
+        "normal_proposal_transfer_exit",
+        "target_verify_result_transfer_enter",
+        "target_verify_result_transfer_exit",
+        "target_verify_result_transfer_meta_len",
+        "target_verify_result_transfer_payload_len",
+        "target_verify_result_transfer_num_results",
+        "target_verify_result_transfer_seq_ids",
+        "target_verify_result_transfer_zero_result_step",
+        "verify_result_numel",
+        "eager_transfer_enter",
+        "eager_transfer_exit",
+        "eager_result_transfer_enter",
+        "eager_result_transfer_exit",
+        "generic_full_continuous_stage_enter",
+        "generic_full_continuous_stage_exit",
+        "full_continuous_enabled",
+        "generic_full_continuous_enabled",
         "dual_step_id",
         "normal_transfer_called",
         "normal_transfer_meta_len",
@@ -599,7 +804,89 @@ def synthetic_dual_payload(
     return records, result
 
 
+def stage_trace_record(
+    *,
+    runner_role: str,
+    dual_step_id: int = 0,
+    full_continuous_enabled: bool = True,
+    order: list[str] | None = None,
+    verify_payload_len: int = 0,
+    verify_num_results: int = 0,
+    verify_seq_ids: list[int] | None = None,
+    normal_zero_payload: bool = True,
+) -> dict[str, Any]:
+    order = order or []
+    enter_stages = {
+        item.rsplit(":", 1)[0]
+        for item in order
+        if isinstance(item, str) and item.endswith(":enter") and ":" in item
+    }
+    exit_stages = {
+        item.rsplit(":", 1)[0]
+        for item in order
+        if isinstance(item, str) and item.endswith(":exit") and ":" in item
+    }
+    record: dict[str, Any] = {
+        "execution_mode": "dual_batch_pearl",
+        "cached_admission_enabled": True,
+        "full_continuous_enabled": bool(full_continuous_enabled),
+        "generic_full_continuous_enabled": bool(full_continuous_enabled),
+        "enable_full_continuous_eager": bool(full_continuous_enabled),
+        "runner_role": runner_role,
+        "normal_proposal_transfer_role": "draft" if "draft" in runner_role else "verify",
+        "dual_step_id": int(dual_step_id),
+        "target_normal_verify_seq_ids": [],
+        "actual_draft_home_set_for_normal_draft": [],
+        "proposal_buffer_hit_seq_ids": [],
+        "proposal_buffer_miss_seq_ids": [],
+        "normal_proposal_transfer_called": "normal_proposal_transfer" in enter_stages,
+        "normal_proposal_transfer_zero_payload": bool(normal_zero_payload),
+        "normal_proposal_transfer_meta_len": 5 if "normal_proposal_transfer" in enter_stages else 0,
+        "normal_proposal_transfer_payload_len": 0 if normal_zero_payload else 1,
+        "normal_proposal_transfer_next_collective_stage": "target_verify_result_transfer",
+        "dual_collective_stage_order": list(order),
+        "target_verify_result_transfer_meta_len": (
+            6 if "target_verify_result_transfer" in enter_stages else 0
+        ),
+        "target_verify_result_transfer_payload_len": int(verify_payload_len),
+        "target_verify_result_transfer_num_results": int(verify_num_results),
+        "target_verify_result_transfer_seq_ids": verify_seq_ids or [],
+        "target_verify_result_transfer_zero_result_step": int(verify_num_results == 0),
+        "verify_result_numel": int(4 * verify_num_results),
+        "dual_proposal_sent_seq_ids": [],
+        "dual_proposal_expected_receive_seq_ids": [],
+        "dual_proposal_received_seq_ids": [],
+        "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
+        "missing_buffered_proposal_unexpected_seq_ids": [],
+    }
+    for stage in DUAL_COLLECTIVE_STAGE_ORDER:
+        record[f"{stage}_enter"] = stage in enter_stages
+        record[f"{stage}_exit"] = stage in exit_stages
+    return record
+
+
+def synthetic_stage_payload(stage_records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records, result = synthetic_payload()
+    result.setdefault("args", {})["execution_mode"] = "dual_batch_pearl"
+    records.extend(stage_records)
+    return records, result
+
+
 def run_synthetic() -> int:
+    legal_depth4_order = [
+        "normal_proposal_transfer:enter",
+        "normal_proposal_transfer:exit",
+        "target_verify_result_transfer:enter",
+        "target_verify_result_transfer:exit",
+        "eager_transfer:enter",
+        "eager_transfer:exit",
+        "eager_result_transfer:enter",
+        "eager_result_transfer:exit",
+    ]
+    legal_full_order = legal_depth4_order + [
+        "generic_full_continuous_stage:enter",
+        "generic_full_continuous_stage:exit",
+    ]
     cases = [
         ("disabled", synthetic_payload(enabled=False), False),
         ("fifo", synthetic_payload(), False),
@@ -809,6 +1096,104 @@ def run_synthetic() -> int:
                 received_proposal_seq_ids=[7],
                 filtered_draft_seq_ids=[5],
                 normal_proposal_transfer_called=True,
+            ),
+            False,
+        ),
+        (
+            "cached_depth4_legal_stage_order",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft",
+                        full_continuous_enabled=False,
+                        order=legal_depth4_order,
+                    ),
+                    stage_trace_record(
+                        runner_role="verify",
+                        full_continuous_enabled=False,
+                        order=legal_depth4_order,
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_legal_stage_order",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(runner_role="draft", order=legal_full_order),
+                    stage_trace_record(runner_role="verify", order=legal_full_order),
+                ]
+            ),
+            False,
+        ),
+        (
+            "cached_full_continuous_divergent_first_stage_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft",
+                        order=[
+                            "target_verify_result_transfer:enter",
+                            "target_verify_result_transfer:exit",
+                            "eager_transfer:enter",
+                            "eager_transfer:exit",
+                        ],
+                    ),
+                    stage_trace_record(runner_role="verify", order=legal_full_order),
+                ]
+            ),
+            True,
+        ),
+        (
+            "cached_full_continuous_missing_verify_stage_bad",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(runner_role="draft", order=legal_full_order),
+                    stage_trace_record(
+                        runner_role="verify",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                            "eager_transfer:enter",
+                            "eager_transfer:exit",
+                            "eager_result_transfer:enter",
+                            "eager_result_transfer:exit",
+                            "generic_full_continuous_stage:enter",
+                            "generic_full_continuous_stage:exit",
+                        ],
+                    ),
+                ]
+            ),
+            True,
+        ),
+        (
+            "cached_full_continuous_zero_target_verify_stage",
+            synthetic_stage_payload(
+                [
+                    stage_trace_record(
+                        runner_role="draft",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                            "target_verify_result_transfer:enter",
+                            "target_verify_result_transfer:exit",
+                        ],
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                    ),
+                    stage_trace_record(
+                        runner_role="verify",
+                        order=[
+                            "normal_proposal_transfer:enter",
+                            "normal_proposal_transfer:exit",
+                            "target_verify_result_transfer:enter",
+                            "target_verify_result_transfer:exit",
+                        ],
+                        verify_payload_len=0,
+                        verify_num_results=0,
+                    ),
+                ]
             ),
             False,
         ),

@@ -105,6 +105,10 @@ GENERIC_ROLLING_COMMIT_MAGIC = 0x1A8FC
 GENERIC_ROLLING_COMMIT_OP = 0x1A8FC1
 GENERIC_ROLLING_COMMIT_META_LEN = 7
 GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH = 8
+DUAL_VERIFY_RESULT_TRANSFER_MAGIC = 0x1A9FC
+DUAL_VERIFY_RESULT_TRANSFER_OP = 0x1A9FC1
+DUAL_VERIFY_RESULT_TRANSFER_META_LEN = 6
+DUAL_VERIFY_RESULT_TRANSFER_PAYLOAD_WIDTH = 5
 
 
 @dataclass
@@ -2155,6 +2159,58 @@ class ModelRunnerBase:
     def _full_continuous_eager_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_full_continuous_eager", False))
 
+    def _cached_full_continuous_stage_aligned_enabled(self) -> bool:
+        return (
+            self.active_execution_mode == "dual_batch_pearl"
+            and bool(getattr(self.global_config, "enable_cached_admission", False))
+            and self._full_continuous_eager_enabled()
+        )
+
+    def _record_dual_collective_stage(self, plan: StepPlan, stage: str, event: str) -> None:
+        stage = str(stage)
+        event = str(event)
+        plan.dual_collective_stage_order.append(f"{stage}:{event}")
+        field_name = f"{stage}_{event}"
+        if hasattr(plan, field_name):
+            setattr(plan, field_name, True)
+
+    def _update_dual_collective_stage_trace(self, trace_record: dict | None, plan: StepPlan) -> None:
+        if trace_record is None:
+            return
+        trace_record["dual_step_id"] = int(plan.iteration_id)
+        trace_record["runner_role"] = str(trace_record.get("runner_role") or self._runner_role())
+        trace_record["rank"] = int(self.rank)
+        trace_record["plan_id"] = int(plan.plan_id)
+        trace_record["plan_phase"] = str(plan.plan_phase)
+        trace_record["cached_admission_enabled"] = bool(
+            getattr(self.global_config, "enable_cached_admission", False)
+        )
+        full_continuous_enabled = self._full_continuous_eager_enabled()
+        trace_record["full_continuous_enabled"] = bool(full_continuous_enabled)
+        trace_record["generic_full_continuous_enabled"] = bool(full_continuous_enabled)
+        trace_record["enable_full_continuous_eager"] = bool(full_continuous_enabled)
+        trace_record["dual_collective_stage_order"] = list(plan.dual_collective_stage_order)
+        trace_record["normal_proposal_transfer_enter"] = bool(plan.normal_proposal_transfer_enter)
+        trace_record["normal_proposal_transfer_exit"] = bool(plan.normal_proposal_transfer_exit)
+        trace_record["target_verify_result_transfer_enter"] = bool(
+            plan.target_verify_result_transfer_enter
+        )
+        trace_record["target_verify_result_transfer_exit"] = bool(
+            plan.target_verify_result_transfer_exit
+        )
+        trace_record["verify_result_numel"] = int(plan.verify_result_numel)
+        trace_record["eager_transfer_enter"] = bool(plan.eager_transfer_enter)
+        trace_record["eager_transfer_exit"] = bool(plan.eager_transfer_exit)
+        trace_record["eager_result_transfer_enter"] = bool(plan.eager_result_transfer_enter)
+        trace_record["eager_result_transfer_exit"] = bool(plan.eager_result_transfer_exit)
+        trace_record["generic_full_continuous_stage_enter"] = bool(
+            plan.generic_full_continuous_stage_enter
+        )
+        trace_record["generic_full_continuous_stage_exit"] = bool(
+            plan.generic_full_continuous_stage_exit
+        )
+        trace_record["next_collective_stage"] = plan.normal_proposal_transfer_next_collective_stage
+
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
         return level if level in {"full", "summary", "minimal"} else "full"
@@ -3049,6 +3105,7 @@ class ModelRunnerBase:
         trace_record["next_collective_stage"] = (
             plan.normal_proposal_transfer_next_collective_stage
         )
+        self._update_dual_collective_stage_trace(trace_record, plan)
         trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
         trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
             plan.missing_buffered_proposal_allowed_by_eager_seq_ids
@@ -3302,16 +3359,150 @@ class ModelRunnerBase:
             plan.normal_proposal_transfer_payload_len = 0
             return []
 
-        if self.is_draft:
-            self._send_dual_proposals(proposals_to_send, plan)
-            return []
+        self._record_dual_collective_stage(plan, "normal_proposal_transfer", "enter")
+        try:
+            if self.is_draft:
+                self._send_dual_proposals(proposals_to_send, plan)
+                return []
 
-        receive_expected_seq_ids = (
-            None
-            if bool(getattr(self.global_config, "enable_cached_admission", False))
-            else list(expected_receive_seq_ids)
+            receive_expected_seq_ids = (
+                None
+                if bool(getattr(self.global_config, "enable_cached_admission", False))
+                else list(expected_receive_seq_ids)
+            )
+            return self._receive_dual_proposals(receive_expected_seq_ids, plan)
+        finally:
+            self._record_dual_collective_stage(plan, "normal_proposal_transfer", "exit")
+
+    def _set_dual_verify_result_transfer_trace(
+        self,
+        trace_record: dict | None,
+        plan: StepPlan,
+        *,
+        seq_ids: list[int],
+        payload_len: int,
+        result_plan_id: int,
+        result_step_id: int,
+    ) -> None:
+        plan.verify_result_numel = int(4 * len(seq_ids))
+        if trace_record is None:
+            return
+        trace_record["target_verify_result_transfer_called"] = True
+        trace_record["target_verify_result_transfer_meta_len"] = int(
+            DUAL_VERIFY_RESULT_TRANSFER_META_LEN
         )
-        return self._receive_dual_proposals(receive_expected_seq_ids, plan)
+        trace_record["target_verify_result_transfer_payload_len"] = int(payload_len)
+        trace_record["target_verify_result_transfer_num_results"] = int(len(seq_ids))
+        trace_record["target_verify_result_transfer_seq_ids"] = [int(seq_id) for seq_id in seq_ids]
+        trace_record["target_verify_result_transfer_zero_result_step"] = int(len(seq_ids) == 0)
+        trace_record["target_verify_result_transfer_plan_id"] = int(result_plan_id)
+        trace_record["target_verify_result_transfer_step_id"] = (
+            None if int(result_step_id) < 0 else int(result_step_id)
+        )
+        trace_record["verify_result_numel"] = int(plan.verify_result_numel)
+
+    def _send_dual_verify_result_transfer(
+        self,
+        plan: StepPlan,
+        trace_record: dict | None,
+        seqs: list[Sequence],
+        verify_res: torch.Tensor,
+    ) -> None:
+        self._record_dual_collective_stage(plan, "target_verify_result_transfer", "enter")
+        seq_ids = [int(seq.seq_id) for seq in seqs]
+        payload_len = len(seq_ids) * DUAL_VERIFY_RESULT_TRANSFER_PAYLOAD_WIDTH
+        result_step_id = -1 if plan.step_id is None else int(plan.step_id)
+        meta_values = [
+            int(DUAL_VERIFY_RESULT_TRANSFER_MAGIC),
+            int(DUAL_VERIFY_RESULT_TRANSFER_OP),
+            int(len(seq_ids)),
+            int(payload_len),
+            int(plan.plan_id),
+            int(result_step_id),
+        ]
+        self._set_dual_verify_result_transfer_trace(
+            trace_record,
+            plan,
+            seq_ids=seq_ids,
+            payload_len=payload_len,
+            result_plan_id=int(plan.plan_id),
+            result_step_id=int(result_step_id),
+        )
+        meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank)
+        if payload_len > 0:
+            if self.rank == self.global_config.target_config.master_rank:
+                values = verify_res.to(dtype=torch.int64).tolist()
+                payload_values: list[int] = []
+                for idx, seq_id in enumerate(seq_ids):
+                    payload_values.extend(
+                        [
+                            int(seq_id),
+                            int(values[0][idx]),
+                            int(values[1][idx]),
+                            int(values[2][idx]),
+                            int(values[3][idx]),
+                        ]
+                    )
+                payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            else:
+                payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank)
+        self._record_dual_collective_stage(plan, "target_verify_result_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
+
+    def _receive_dual_verify_result_transfer(
+        self,
+        plan: StepPlan,
+        trace_record: dict | None,
+    ) -> tuple[list[Sequence], torch.Tensor]:
+        self._record_dual_collective_stage(plan, "target_verify_result_transfer", "enter")
+        meta = torch.zeros(DUAL_VERIFY_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank)
+        meta_values = [int(value) for value in meta.tolist()]
+        if int(meta_values[0]) != int(DUAL_VERIFY_RESULT_TRANSFER_MAGIC):
+            raise ValueError(f"dual verify result transfer magic mismatch: got={meta_values[0]}")
+        if int(meta_values[1]) != int(DUAL_VERIFY_RESULT_TRANSFER_OP):
+            raise ValueError(f"dual verify result transfer op mismatch: got={meta_values[1]}")
+        num_results = int(meta_values[2])
+        payload_len = int(meta_values[3])
+        expected_payload_len = num_results * DUAL_VERIFY_RESULT_TRANSFER_PAYLOAD_WIDTH
+        if payload_len != expected_payload_len:
+            raise ValueError(
+                "dual verify result transfer payload length mismatch: "
+                f"num_results={num_results}, payload_len={payload_len}, expected={expected_payload_len}"
+            )
+        payload_values: list[int] = []
+        if payload_len > 0:
+            payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank)
+            payload_values = [int(value) for value in payload.tolist()]
+        seq_ids: list[int] = []
+        rows = [[], [], [], []]
+        for idx in range(num_results):
+            base = idx * DUAL_VERIFY_RESULT_TRANSFER_PAYLOAD_WIDTH
+            seq_id, acc, rollout, revise_token, finish = payload_values[base:base + 5]
+            seq_ids.append(int(seq_id))
+            rows[0].append(int(acc))
+            rows[1].append(int(rollout))
+            rows[2].append(int(revise_token))
+            rows[3].append(int(finish))
+        if num_results > 0:
+            verify_res = torch.tensor(rows, dtype=torch.int64, device="cuda")
+        else:
+            verify_res = torch.zeros((4, 0), dtype=torch.int64, device="cuda")
+        self._set_dual_verify_result_transfer_trace(
+            trace_record,
+            plan,
+            seq_ids=seq_ids,
+            payload_len=payload_len,
+            result_plan_id=int(meta_values[4]),
+            result_step_id=int(meta_values[5]),
+        )
+        seqs = self._resolve_dual_seq_ids(seq_ids, plan, "draft_apply_verify_transfer")
+        self._record_dual_collective_stage(plan, "target_verify_result_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
+        return seqs, verify_res
 
     def _trace_eager_transfer_send(
         self,
@@ -3343,6 +3534,7 @@ class ModelRunnerBase:
         plan: StepPlan,
         trace_record: dict,
     ) -> None:
+        self._record_dual_collective_stage(plan, "eager_transfer", "enter")
         timer_start = time.perf_counter()
         buffer_size_before = self.eager_proposal_buffer.size()
         ready_proposals = [
@@ -3370,6 +3562,8 @@ class ModelRunnerBase:
         )
         if self.tp_params.local_rank != 0:
             self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
+            self._record_dual_collective_stage(plan, "eager_transfer", "exit")
+            self._update_dual_collective_stage_trace(trace_record, plan)
             return
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
@@ -3377,6 +3571,8 @@ class ModelRunnerBase:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
+        self._record_dual_collective_stage(plan, "eager_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
 
     def _result_action_code(self, action: str) -> int:
         return {
@@ -4750,6 +4946,7 @@ class ModelRunnerBase:
         trace_record: dict,
         scheduled_proposals: list[EagerProposal],
     ) -> None:
+        self._record_dual_collective_stage(plan, "eager_result_transfer", "enter")
         timer_start = time.perf_counter()
         results = self._build_eager_result_transfer_results(plan, trace_record, scheduled_proposals)
         meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
@@ -4854,6 +5051,8 @@ class ModelRunnerBase:
                 payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
         self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
+        self._record_dual_collective_stage(plan, "eager_result_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
 
     def _validate_eager_result_on_draft(
         self,
@@ -4974,6 +5173,7 @@ class ModelRunnerBase:
         trace_record: dict,
         known_proposals: list[EagerProposal],
     ) -> None:
+        self._record_dual_collective_stage(plan, "eager_result_transfer", "enter")
         timer_start = time.perf_counter()
         known_by_id = dict(self._draft_sent_eager_proposals_by_id)
         known_by_id.update({int(proposal.proposal_id): proposal for proposal in known_proposals})
@@ -4985,6 +5185,8 @@ class ModelRunnerBase:
         )
         if self.tp_params.local_rank != 0:
             self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
+            self._record_dual_collective_stage(plan, "eager_result_transfer", "exit")
+            self._update_dual_collective_stage_trace(trace_record, plan)
             return
         meta = torch.zeros(EAGER_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
@@ -5225,6 +5427,8 @@ class ModelRunnerBase:
         trace_record["result_transfer_called"] = True
         trace_record["result_transfer_zero_result"] = len(results) == 0
         self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
+        self._record_dual_collective_stage(plan, "eager_result_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
         if self._eager_sync_apply_dry_run_enabled():
             plan.eager_sync_apply_dry_run_enabled = True
             self._run_draft_sync_apply_dry_run(
@@ -11950,6 +12154,7 @@ class ModelRunnerBase:
         trace_record: dict,
         seq_by_id: dict[int, Sequence],
     ) -> None:
+        self._record_dual_collective_stage(plan, "generic_full_continuous_stage", "enter")
         decisions = self._run_generic_full_continuous_tail_draft(
             plan,
             trace_record,
@@ -11968,12 +12173,15 @@ class ModelRunnerBase:
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        self._record_dual_collective_stage(plan, "generic_full_continuous_stage", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
 
     def _receive_generic_rolling_commit_decision(
         self,
         plan: StepPlan,
         trace_record: dict,
     ) -> None:
+        self._record_dual_collective_stage(plan, "generic_full_continuous_stage", "enter")
         meta = torch.zeros(GENERIC_ROLLING_COMMIT_META_LEN, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
@@ -11995,6 +12203,8 @@ class ModelRunnerBase:
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
+        self._record_dual_collective_stage(plan, "generic_full_continuous_stage", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
 
     def _run_generic_rolling_commit_ready_only(
         self,
@@ -14193,6 +14403,7 @@ class ModelRunnerBase:
         return scheduled
 
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
+        self._record_dual_collective_stage(plan, "eager_transfer", "enter")
         timer_start = time.perf_counter()
         seq_by_id = self._local_sequence_by_id()
         plan_context = self._eager_transfer_plan_context(plan, trace_record)
@@ -14448,6 +14659,8 @@ class ModelRunnerBase:
         trace_record["eager_buffer_size_after"] = int(buffer_size_after_clear)
         trace_record["eager_proposal_transfer_called"] = True
         self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
+        self._record_dual_collective_stage(plan, "eager_transfer", "exit")
+        self._update_dual_collective_stage_trace(trace_record, plan)
         return scheduled_for_result_transfer
 
     def _validate_proposals_for_target(self, proposals: list[BufferedProposal], seqs: list[Sequence], plan: StepPlan):
@@ -15598,7 +15811,51 @@ class DraftModelRunner(ModelRunnerBase):
             eager_proposals = self._run_eager_draft_dry_run(eager_draft_seqs, plan, eager_trace_record)
             self._finalize_record_profile(eager_trace_record)
 
-        if target_seqs:
+        if self._cached_full_continuous_stage_aligned_enabled():
+            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
+            target_trace_record = trace_record
+            trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
+            trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
+            if target_seqs:
+                torch.cuda.synchronize()
+                self._mark_trace_start(trace_record)
+            received_target_seqs, verify_res = self._receive_dual_verify_result_transfer(
+                plan,
+                trace_record,
+            )
+            if received_target_seqs:
+                trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(
+                    received_target_seqs
+                )
+                trace_record["proposal_tokens_available"] = trace_record["proposal_tokens_verified"]
+                accepted_lens, invalidated_lens = self._apply_verify_result(received_target_seqs, verify_res)
+                if self._eager_promotion_dry_run_enabled() and eager_proposals:
+                    self._evaluate_eager_promotion_dry_run(
+                        eager_proposals,
+                        plan,
+                        received_target_seqs,
+                        accepted_lens,
+                        invalidated_lens,
+                        eager_trace_record or trace_record,
+                    )
+                consumed_seq_ids = self.dual_proposal_buffer.discard(
+                    [seq.seq_id for seq in received_target_seqs]
+                )
+                trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
+                trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                torch.cuda.synchronize()
+                self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            else:
+                trace_record["proposal_buffer_consumed_seq_ids"] = []
+                trace_record["proposal_buffer_consumed_count"] = 0
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                if target_seqs:
+                    torch.cuda.synchronize()
+                    self._mark_trace_end(trace_record, accepted_lens={}, invalidated_lens={})
+                else:
+                    self._finalize_record_profile(trace_record)
+        elif target_seqs:
             trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "draft_apply_verify")
             target_trace_record = trace_record
             trace_record["proposal_tokens_verified"] = self._proposal_verify_token_count(target_seqs)
@@ -15899,6 +16156,7 @@ class TargetModelRunner(ModelRunnerBase):
                 temperatures,
                 target_proposals,
                 plan,
+                trace_record,
             )
             if self._eager_verify_dry_run_enabled() and plan.target_eager_verify_proposal_ids_dry_run:
                 plan_context = self._eager_transfer_plan_context(plan, trace_record)
@@ -15927,9 +16185,29 @@ class TargetModelRunner(ModelRunnerBase):
                 plan,
                 received_proposals=received_proposals,
             )
-            self._finalize_record_profile(priming_record)
+            if not self._cached_full_continuous_stage_aligned_enabled():
+                self._finalize_record_profile(priming_record)
         elif trace_record is not None and self._eager_lane_exclusion_dry_run_enabled():
             self._update_lane_exclusion_proposal_trace(trace_record, plan, received_proposals=[])
+
+        if self._cached_full_continuous_stage_aligned_enabled() and not target_seqs:
+            if priming_record is None:
+                priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
+                priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                if plan.normal_proposal_transfer_called:
+                    self._update_lane_exclusion_proposal_trace(
+                        priming_record,
+                        plan,
+                        received_proposals=received_proposals,
+                    )
+            zero_verify_res = torch.zeros((4, 0), dtype=torch.int64, device="cuda")
+            self._send_dual_verify_result_transfer(
+                plan,
+                priming_record,
+                [],
+                zero_verify_res,
+            )
+            self._finalize_record_profile(priming_record)
 
         if (
             self._eager_verify_dry_run_enabled()
@@ -16034,6 +16312,7 @@ class TargetModelRunner(ModelRunnerBase):
         temperatures: torch.Tensor,
         proposals: list[BufferedProposal],
         plan: StepPlan,
+        trace_record: dict | None = None,
     ):
         self._validate_proposals_for_target(proposals, seqs, plan)
         to_be_verified_tokens = []
@@ -16042,14 +16321,34 @@ class TargetModelRunner(ModelRunnerBase):
             to_be_verified_tokens.extend(proposal.to_be_verified_token_ids)
             next_round_input.extend(proposal.proposal_token_ids)
         msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
+        if self._cached_full_continuous_stage_aligned_enabled():
+            verify_res = self._compute_verify_result_from_message(
+                logits,
+                seqs,
+                temperatures,
+                msg,
+                len(to_be_verified_tokens),
+            )
+            self._send_dual_verify_result_transfer(plan, trace_record, seqs, verify_res)
+            return self._apply_target_verify_result_from_message(
+                seqs,
+                verify_res,
+                next_round_input,
+            )
         return self._verify_from_message(logits, seqs, temperatures, msg, len(to_be_verified_tokens))
 
     @torch.inference_mode()
-    def _verify_from_message(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, msg: torch.Tensor, num_to_be_verified_tokens: int):
+    def _compute_verify_result_from_message(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor,
+        msg: torch.Tensor,
+        num_to_be_verified_tokens: int,
+    ) -> torch.Tensor:
         """Refer to the verification logic in the draft model verification function."""
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
-        next_round_input = msg[num_to_be_verified_tokens:].tolist()
-        
+
         verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
 
         if self.tp_params.local_rank == 0:
@@ -16102,10 +16401,14 @@ class TargetModelRunner(ModelRunnerBase):
                 v_idx += 1 if seq.pre_verify else self.gamma
         
             verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
-        
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        return verify_res
 
-        # post-process the seqs according to the verify_res.
+    def _apply_target_verify_result_from_message(
+        self,
+        seqs: list[Sequence],
+        verify_res: torch.Tensor,
+        next_round_input: list[int],
+    ):
         acc, rollout, revise_token, finish = verify_res.tolist()
         accepted_lens = {}
         invalidated_lens = {}
@@ -16151,3 +16454,17 @@ class TargetModelRunner(ModelRunnerBase):
                 self.scheduler.finished.append(seq)
                 continue
         return accepted_lens, invalidated_lens
+
+    @torch.inference_mode()
+    def _verify_from_message(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor, msg: torch.Tensor, num_to_be_verified_tokens: int):
+        """Refer to the verification logic in the draft model verification function."""
+        next_round_input = msg[num_to_be_verified_tokens:].tolist()
+        verify_res = self._compute_verify_result_from_message(
+            logits,
+            seqs,
+            temperatures,
+            msg,
+            num_to_be_verified_tokens,
+        )
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        return self._apply_target_verify_result_from_message(seqs, verify_res, next_round_input)
