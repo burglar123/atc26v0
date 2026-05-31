@@ -2496,13 +2496,14 @@ class ModelRunnerBase:
         if not raw_candidates:
             return []
 
+        src_rank = int(self.global_config.target_config.master_rank)
+        is_master = bool(self.rank == src_rank)
+
         # Master inspects its buffer; workers receive the decision.
-        tp_local_rank = int(self.tp_params.local_rank)
-        tp_size = int(self.tensor_parallel_size)
         master_hit_count = 0
         master_hit_seq_ids: list[int] = []
 
-        if tp_local_rank == 0:
+        if is_master:
             buf = self.dual_proposal_buffer
             master_hit_seq_ids = [
                 int(seq_id) for seq_id in raw_candidates
@@ -2512,16 +2513,16 @@ class ModelRunnerBase:
 
         # Broadcast hit count from master → workers.
         count_tensor = torch.tensor([master_hit_count], dtype=torch.int64, device="cuda")
-        dist.broadcast(count_tensor, src=0, group=self.group)
+        dist.broadcast(count_tensor, src=src_rank, group=self.group)
         agreed_hit_count = int(count_tensor.item())
 
         # Broadcast the hit seq_ids.
         hit_tensor = torch.zeros(max(1, agreed_hit_count), dtype=torch.int64, device="cuda")
-        if tp_local_rank == 0 and agreed_hit_count > 0:
+        if is_master and agreed_hit_count > 0:
             for i, seq_id in enumerate(master_hit_seq_ids[:agreed_hit_count]):
                 hit_tensor[i] = int(seq_id)
         if agreed_hit_count > 0:
-            dist.broadcast(hit_tensor, src=0, group=self.group)
+            dist.broadcast(hit_tensor, src=src_rank, group=self.group)
         agreed_hit_seq_ids = [int(hit_tensor[i].item()) for i in range(agreed_hit_count)]
 
         agreed_miss_seq_ids = [
@@ -2532,17 +2533,17 @@ class ModelRunnerBase:
         # Master broadcasts proposal metadata for every agreed-hit seq so that
         # workers can install placeholders for any proposal they are missing.
         # Protocol: [num_proposals] + per-proposal [8-header-ints, N to_verify tokens, M proposal tokens]
-        if tp_local_rank == 0:
+        if is_master:
             broadcast_seq_ids = list(agreed_hit_seq_ids)
         else:
             broadcast_seq_ids = []
         num_tensor = torch.tensor([len(broadcast_seq_ids)], dtype=torch.int64, device="cuda")
-        dist.broadcast(num_tensor, src=0, group=self.group)
+        dist.broadcast(num_tensor, src=src_rank, group=self.group)
         total_broadcast = int(num_tensor.item())
 
         for _ in range(total_broadcast):
             header = torch.zeros(8, dtype=torch.int64, device="cuda")
-            if tp_local_rank == 0 and broadcast_seq_ids:
+            if is_master and broadcast_seq_ids:
                 seq_id = broadcast_seq_ids.pop(0)
                 proposal = self.dual_proposal_buffer.get_many([seq_id])
                 if proposal:
@@ -2557,21 +2558,21 @@ class ModelRunnerBase:
                     header[5] = int(p.plan_id)
                     header[6] = len(vt)
                     header[7] = len(pt)
-            dist.broadcast(header, src=0, group=self.group)
+            dist.broadcast(header, src=src_rank, group=self.group)
             n_vt = int(header[6].item())
             n_pt = int(header[7].item())
             vt_tensor = torch.zeros(max(1, n_vt), dtype=torch.int64, device="cuda")
             pt_tensor = torch.zeros(max(1, n_pt), dtype=torch.int64, device="cuda")
-            if tp_local_rank == 0 and n_vt > 0:
+            if is_master and n_vt > 0:
                 for i, t in enumerate(vt):
                     vt_tensor[i] = t
-            if tp_local_rank == 0 and n_pt > 0:
+            if is_master and n_pt > 0:
                 for i, t in enumerate(pt):
                     pt_tensor[i] = t
             if n_vt > 0:
-                dist.broadcast(vt_tensor, src=0, group=self.group)
+                dist.broadcast(vt_tensor, src=src_rank, group=self.group)
             if n_pt > 0:
-                dist.broadcast(pt_tensor, src=0, group=self.group)
+                dist.broadcast(pt_tensor, src=src_rank, group=self.group)
             # Install placeholder on any rank missing this proposal.
             bcast_seq_id = int(header[0].item())
             if not self.dual_proposal_buffer.has_all([bcast_seq_id]):
