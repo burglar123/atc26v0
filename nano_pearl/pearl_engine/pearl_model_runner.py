@@ -2264,6 +2264,18 @@ class ModelRunnerBase:
             [int(value) for value in signature]
             for signature in plan.target_tp_verify_seq_agreement_signature
         ]
+        trace_record["target_tp_buffer_seq_agreement_ok"] = bool(
+            plan.target_tp_buffer_seq_agreement_ok
+        )
+        trace_record["target_tp_buffer_seq_agreement_signature"] = [
+            [int(value) for value in signature]
+            for signature in plan.target_tp_buffer_seq_agreement_signature
+        ]
+        trace_record["target_tp_buffer_seq_ids"] = [
+            int(seq_id) for seq_id in plan.target_tp_buffer_seq_ids
+        ]
+        if plan.dual_buffer_mutation_events:
+            trace_record["dual_buffer_mutation_events"] = list(plan.dual_buffer_mutation_events)
         trace_record["received_proposal_seq_ids"] = [
             int(seq_id) for seq_id in plan.received_proposal_seq_ids
         ]
@@ -2350,6 +2362,69 @@ class ModelRunnerBase:
         weighted_sum = sum((index + 1) * int(seq_id) for index, seq_id in enumerate(normalized))
         return [len(normalized), sum(normalized), weighted_sum]
 
+    @staticmethod
+    def _proposal_buffer_seq_signature(seq_ids: list[int]) -> list[int]:
+        normalized = sorted(int(seq_id) for seq_id in seq_ids)
+        weighted_sum = sum((index + 1) * int(seq_id) for index, seq_id in enumerate(normalized))
+        return [len(normalized), sum(normalized), weighted_sum]
+
+    def _assert_target_tp_buffer_seq_agreement(
+        self,
+        plan: StepPlan,
+        *,
+        context: str,
+        target_normal_verify_seq_ids: list[int] | None = None,
+    ) -> None:
+        if self.is_draft or not self._requires_framed_dual_verify_result_transfer():
+            return
+        local_buffer_seq_ids = self.dual_proposal_buffer.pending_seq_ids()
+        plan.target_tp_buffer_seq_ids = [int(seq_id) for seq_id in local_buffer_seq_ids]
+        local_signature = torch.tensor(
+            self._proposal_buffer_seq_signature(local_buffer_seq_ids),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        gathered = [
+            torch.zeros_like(local_signature)
+            for _ in range(int(self.tensor_parallel_size))
+        ]
+        dist.all_gather(gathered, local_signature, group=self.group)
+        signatures = [
+            [int(value) for value in signature.tolist()]
+            for signature in gathered
+        ]
+        ok = all(signature == signatures[0] for signature in signatures)
+        plan.target_tp_buffer_seq_agreement_ok = bool(ok)
+        plan.target_tp_buffer_seq_agreement_signature = signatures
+        target_before_filter = (
+            [int(seq_id) for seq_id in target_normal_verify_seq_ids]
+            if target_normal_verify_seq_ids is not None
+            else self._target_normal_verify_seq_ids(plan)
+        )
+        assert ok, self._proposal_assertion_message(
+            plan,
+            "target TP proposal-buffer seq divergence: "
+            f"rank={int(self.rank)}, tp_local_rank={int(self.tp_params.local_rank)}, "
+            f"plan_id={int(plan.plan_id)}, dual_step_id={int(plan.iteration_id)}, "
+            f"plan_phase={plan.plan_phase}, context={context}, "
+            f"local_buffer_seq_ids={[int(seq_id) for seq_id in local_buffer_seq_ids]}, "
+            f"target_home_set={[int(seq_id) for seq_id in plan.target_home_set]}, "
+            f"draft_home_set={[int(seq_id) for seq_id in plan.draft_home_set]}, "
+            f"target_normal_verify_seq_ids_before_filter={target_before_filter}, "
+            f"normal_draft_transfer_sender_seq_ids={list(plan.normal_draft_transfer_sender_seq_ids)}, "
+            f"cached_admission_draft_priming_seq_ids="
+            f"{list(plan.cached_admission_draft_priming_seq_ids)}, "
+            f"cached_admission_unprimed_target_filtered_seq_ids="
+            f"{list(plan.cached_admission_unprimed_target_filtered_seq_ids)}, "
+            f"cached_admission_priming_received_seq_ids="
+            f"{list(plan.cached_admission_priming_received_seq_ids)}, "
+            f"cached_admission_priming_buffered_seq_ids="
+            f"{list(plan.cached_admission_priming_buffered_seq_ids)}, "
+            f"cached_admission_priming_same_step_verify_suppressed_seq_ids="
+            f"{list(plan.cached_admission_priming_same_step_verify_suppressed_seq_ids)}, "
+            f"signatures={signatures}",
+        )
+
     def _assert_target_tp_verify_seq_agreement(
         self,
         plan: StepPlan,
@@ -2386,8 +2461,126 @@ class ModelRunnerBase:
             f"received_proposal_seq_ids={[int(seq_id) for seq_id in received_proposal_seq_ids]}, "
             f"plan_target_normal_verify_seq_ids={self._target_normal_verify_seq_ids(plan)}, "
             f"normal_draft_transfer_sender_seq_ids={list(plan.normal_draft_transfer_sender_seq_ids)}, "
+            f"buffered_proposal_seq_ids={self.dual_proposal_buffer.pending_seq_ids()}, "
             f"signatures={signatures}",
         )
+
+    def _dual_buffer_debug_enabled(self) -> bool:
+        env_value = str(os.environ.get("PEARL_DEBUG_DUAL_BUFFER", "") or "").strip().lower()
+        if env_value not in {"", "0", "false", "no", "off"}:
+            return True
+        return self._active_cached_stage_debug_enabled()
+
+    def _record_dual_buffer_mutation(
+        self,
+        plan: StepPlan,
+        *,
+        kind: str,
+        seq_ids: list[int],
+        before_seq_ids: list[int],
+        after_seq_ids: list[int],
+    ) -> None:
+        plan.buffered_proposal_seq_ids = [int(seq_id) for seq_id in after_seq_ids]
+        if not self._dual_buffer_debug_enabled():
+            return
+        event = {
+            "buffer_mutation_kind": str(kind),
+            "buffer_mutation_seq_ids": [int(seq_id) for seq_id in seq_ids],
+            "buffer_seq_ids_before": [int(seq_id) for seq_id in before_seq_ids],
+            "buffer_seq_ids_after": [int(seq_id) for seq_id in after_seq_ids],
+            "rank": int(self.rank),
+            "tp_local_rank": int(self.tp_params.local_rank),
+            "plan_id": int(plan.plan_id),
+            "dual_step_id": int(plan.iteration_id),
+            "plan_phase": str(plan.plan_phase),
+            "runner_role": self._runner_role(),
+        }
+        plan.dual_buffer_mutation_events.append(event)
+        print(
+            "[dual-buffer] "
+            f"rank={event['rank']} tp_local_rank={event['tp_local_rank']} "
+            f"role={event['runner_role']} plan_id={event['plan_id']} "
+            f"dual_step_id={event['dual_step_id']} phase={event['plan_phase']} "
+            f"kind={event['buffer_mutation_kind']} seq_ids={event['buffer_mutation_seq_ids']} "
+            f"before={event['buffer_seq_ids_before']} after={event['buffer_seq_ids_after']}",
+            flush=True,
+        )
+
+    def _dual_buffer_store(
+        self,
+        plan: StepPlan,
+        proposals: list[BufferedProposal],
+        *,
+        kind: str = "store",
+    ) -> None:
+        before = self.dual_proposal_buffer.pending_seq_ids()
+        seq_ids = [int(proposal.seq_id) for proposal in proposals if proposal.valid]
+        self.dual_proposal_buffer.store(proposals)
+        after = self.dual_proposal_buffer.pending_seq_ids()
+        self._record_dual_buffer_mutation(
+            plan,
+            kind=kind,
+            seq_ids=seq_ids,
+            before_seq_ids=before,
+            after_seq_ids=after,
+        )
+
+    def _dual_buffer_discard(
+        self,
+        plan: StepPlan,
+        seq_ids: list[int],
+        *,
+        kind: str = "discard",
+    ) -> list[int]:
+        before = self.dual_proposal_buffer.pending_seq_ids()
+        dropped = self.dual_proposal_buffer.discard(seq_ids)
+        after = self.dual_proposal_buffer.pending_seq_ids()
+        self._record_dual_buffer_mutation(
+            plan,
+            kind=kind,
+            seq_ids=[int(seq_id) for seq_id in seq_ids],
+            before_seq_ids=before,
+            after_seq_ids=after,
+        )
+        return dropped
+
+    def _dual_buffer_get_many(
+        self,
+        plan: StepPlan,
+        seq_ids: list[int],
+        *,
+        kind: str = "get",
+    ) -> list[BufferedProposal]:
+        before = self.dual_proposal_buffer.pending_seq_ids()
+        proposals = self.dual_proposal_buffer.get_many(seq_ids)
+        after = self.dual_proposal_buffer.pending_seq_ids()
+        self._record_dual_buffer_mutation(
+            plan,
+            kind=kind,
+            seq_ids=[int(seq_id) for seq_id in seq_ids],
+            before_seq_ids=before,
+            after_seq_ids=after,
+        )
+        return proposals
+
+    def _dual_buffer_inspect(
+        self,
+        plan: StepPlan,
+        seq_ids: list[int],
+        *,
+        kind: str = "inspect",
+    ) -> dict:
+        before = self.dual_proposal_buffer.pending_seq_ids()
+        result = self.dual_proposal_buffer.inspect(seq_ids)
+        after = self.dual_proposal_buffer.pending_seq_ids()
+        self._record_dual_buffer_mutation(
+            plan,
+            kind=kind,
+            seq_ids=[int(seq_id) for seq_id in seq_ids],
+            before_seq_ids=before,
+            after_seq_ids=after,
+        )
+        return result
 
     def _eager_trace_level(self) -> str:
         level = str(getattr(self.global_config, "eager_trace_level", "full") or "full")
@@ -2585,7 +2778,11 @@ class ModelRunnerBase:
         if not cached_admission_active:
             return
 
-        buffer_inspect = self.dual_proposal_buffer.inspect(raw_target)
+        buffer_inspect = self._dual_buffer_inspect(
+            plan,
+            raw_target,
+            kind="inspect_target_normal_before_filter",
+        )
         hit_seq_ids = [int(seq_id) for seq_id in buffer_inspect["hit_seq_ids"]]
         miss_seq_ids = [int(seq_id) for seq_id in buffer_inspect["miss_seq_ids"]]
         invalid_seq_ids = [int(seq_id) for seq_id in buffer_inspect["invalid_seq_ids"]]
@@ -2959,11 +3156,13 @@ class ModelRunnerBase:
 
     def _build_dual_batch_step_plan(self) -> StepPlan:
         proposal_buffer_size_before = self.dual_proposal_buffer.size()
+        proposal_buffer_seq_ids_before_prepare = self.dual_proposal_buffer.pending_seq_ids()
         iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
         lane_sync_info = self._sync_ready_eager_proposals_before_step_plan(plan_id)
         dropped_seq_ids = self._prepare_dual_batch_state()
+        proposal_buffer_seq_ids_after_prepare = self.dual_proposal_buffer.pending_seq_ids()
         plan = self.dual_batch_manager.build_step_plan(
             plan_id=plan_id,
             iteration_id=iteration_id,
@@ -2975,6 +3174,16 @@ class ModelRunnerBase:
             enable_eager_lane_exclusion_dry_run=self._eager_lane_exclusion_dry_run_enabled(),
             running_seqs=list(self.scheduler.running),
         )
+        plan.target_tp_buffer_seq_ids = [int(seq_id) for seq_id in proposal_buffer_seq_ids_after_prepare]
+        plan.buffered_proposal_seq_ids = [int(seq_id) for seq_id in proposal_buffer_seq_ids_after_prepare]
+        if dropped_seq_ids:
+            self._record_dual_buffer_mutation(
+                plan,
+                kind="discard_inactive",
+                seq_ids=[int(seq_id) for seq_id in dropped_seq_ids],
+                before_seq_ids=proposal_buffer_seq_ids_before_prepare,
+                after_seq_ids=proposal_buffer_seq_ids_after_prepare,
+            )
         self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
@@ -2982,6 +3191,11 @@ class ModelRunnerBase:
         self._apply_cached_admission_dual_batch_priming(plan)
         self._canonicalize_actual_normal_draft_seq_ids(plan)
         initial_target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        self._assert_target_tp_buffer_seq_agreement(
+            plan,
+            context="before_target_normal_buffer_filter",
+            target_normal_verify_seq_ids=initial_target_normal_verify_seq_ids,
+        )
         initial_actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         initial_fallback_same_batch = (
             bool(initial_target_normal_verify_seq_ids)
@@ -2992,10 +3206,18 @@ class ModelRunnerBase:
             plan,
             fallback_same_batch=initial_fallback_same_batch,
         )
-        raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
+        raw_buffer_inspect = self._dual_buffer_inspect(
+            plan,
+            plan.target_home_set,
+            kind="inspect_target_home",
+        )
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
-        buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
+        buffer_inspect = self._dual_buffer_inspect(
+            plan,
+            target_normal_verify_seq_ids,
+            kind="inspect_target_normal",
+        )
         allowed_missing = sorted(
             set(raw_buffer_inspect["miss_seq_ids"])
             & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
@@ -3478,7 +3700,11 @@ class ModelRunnerBase:
         for proposal in proposals:
             if int(proposal.seq_id) in mismatch_set:
                 proposal.valid = False
-        self.dual_proposal_buffer.discard(mismatch_ids)
+        self._dual_buffer_discard(
+            plan,
+            mismatch_ids,
+            kind="discard_pre_verify_mismatch",
+        )
         plan.target_normal_verify_seq_ids = [int(seq.seq_id) for seq in kept_seqs]
         plan.target_normal_verify_seq_ids_after_buffer_filter = [int(seq.seq_id) for seq in kept_seqs]
         self._update_pre_verify_alignment_plan(
@@ -16212,7 +16438,7 @@ class DraftModelRunner(ModelRunnerBase):
             proposals = self._normal_draft_proposals_for_actual_seq_ids(proposals, plan)
             primed_seq_ids = []
             if plan.plan_phase in {"priming", "steady"}:
-                self.dual_proposal_buffer.store(proposals)
+                self._dual_buffer_store(plan, proposals)
                 primed_seq_ids = self._clear_cached_admission_priming_for_proposals(proposals)
                 plan.cached_admission_primed_seq_ids = list(primed_seq_ids)
             elif plan.plan_phase == "fallback":
@@ -16223,7 +16449,11 @@ class DraftModelRunner(ModelRunnerBase):
                     if int(proposal.seq_id) not in target_normal_seq_ids
                 ]
                 if buffered_fallback_proposals:
-                    self.dual_proposal_buffer.store(buffered_fallback_proposals)
+                    self._dual_buffer_store(
+                        plan,
+                        buffered_fallback_proposals,
+                        kind="store_fallback_buffered",
+                    )
                     primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                         buffered_fallback_proposals
                     )
@@ -16309,9 +16539,11 @@ class DraftModelRunner(ModelRunnerBase):
                         accepted_lens,
                         invalidated_lens,
                         eager_trace_record or trace_record,
-                    )
-                consumed_seq_ids = self.dual_proposal_buffer.discard(
-                    [seq.seq_id for seq in received_target_seqs]
+                )
+                consumed_seq_ids = self._dual_buffer_discard(
+                    plan,
+                    [seq.seq_id for seq in received_target_seqs],
+                    kind="discard_consumed_verify_result",
                 )
                 trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
                 trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
@@ -16349,7 +16581,11 @@ class DraftModelRunner(ModelRunnerBase):
                     invalidated_lens,
                     eager_trace_record or trace_record,
                 )
-            consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+            consumed_seq_ids = self._dual_buffer_discard(
+                plan,
+                [seq.seq_id for seq in target_seqs],
+                kind="discard_consumed_verify",
+            )
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
@@ -16543,7 +16779,11 @@ class TargetModelRunner(ModelRunnerBase):
                 plan,
                 f"missing buffered proposals for target seq_ids={target_seq_ids}",
             )
-            target_proposals = self.dual_proposal_buffer.get_many(target_seq_ids)
+            target_proposals = self._dual_buffer_get_many(
+                plan,
+                target_seq_ids,
+                kind="get_target_verify",
+            )
 
         trace_record = None
         priming_record = None
@@ -16599,7 +16839,11 @@ class TargetModelRunner(ModelRunnerBase):
                 plan.fallback_same_batch_received_seq_ids = list(same_batch_received_seq_ids)
                 plan.fallback_same_batch_verify_seq_ids = list(same_batch_received_seq_ids)
                 if priming_received_proposals:
-                    self.dual_proposal_buffer.store(priming_received_proposals)
+                    self._dual_buffer_store(
+                        plan,
+                        priming_received_proposals,
+                        kind="store_priming_received",
+                    )
                     plan.cached_admission_priming_buffered_seq_ids = (
                         self._clear_cached_admission_priming_for_proposals(
                             priming_received_proposals
@@ -16648,7 +16892,11 @@ class TargetModelRunner(ModelRunnerBase):
                     if int(proposal.seq_id) not in target_seq_id_set
                 ]
                 if buffered_fallback_proposals:
-                    self.dual_proposal_buffer.store(buffered_fallback_proposals)
+                    self._dual_buffer_store(
+                        plan,
+                        buffered_fallback_proposals,
+                        kind="store_fallback_received_buffered",
+                    )
                     plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                         buffered_fallback_proposals
                     )
@@ -16659,7 +16907,11 @@ class TargetModelRunner(ModelRunnerBase):
                             received_proposals=received_proposals,
                         )
             elif not use_received_fallback_targets:
-                self.dual_proposal_buffer.store(received_proposals)
+                self._dual_buffer_store(
+                    plan,
+                    received_proposals,
+                    kind="store_received",
+                )
                 plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                     received_proposals
                 )
@@ -16712,7 +16964,11 @@ class TargetModelRunner(ModelRunnerBase):
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
-            consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
+            consumed_seq_ids = self._dual_buffer_discard(
+                plan,
+                target_seq_ids,
+                kind="discard_target_verified",
+            )
             if fallback_same_batch:
                 consumed_seq_ids = [proposal.seq_id for proposal in target_proposals]
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids

@@ -253,6 +253,10 @@ class StepPlan:
     target_verify_seq_ids_after_received_proposal_override: List[int] = field(default_factory=list)
     target_tp_verify_seq_agreement_ok: bool = False
     target_tp_verify_seq_agreement_signature: List[List[int]] = field(default_factory=list)
+    target_tp_buffer_seq_agreement_ok: bool = False
+    target_tp_buffer_seq_agreement_signature: List[List[int]] = field(default_factory=list)
+    target_tp_buffer_seq_ids: List[int] = field(default_factory=list)
+    dual_buffer_mutation_events: List[Dict[str, Any]] = field(default_factory=list)
     received_proposal_seq_ids: List[int] = field(default_factory=list)
     cached_admission_priming_received_seq_ids: List[int] = field(default_factory=list)
     cached_admission_priming_buffered_seq_ids: List[int] = field(default_factory=list)
@@ -1194,6 +1198,13 @@ class StepPlan:
                 _int_list(signature)
                 for signature in self.target_tp_verify_seq_agreement_signature
             ],
+            "target_tp_buffer_seq_agreement_ok": bool(self.target_tp_buffer_seq_agreement_ok),
+            "target_tp_buffer_seq_agreement_signature": [
+                _int_list(signature)
+                for signature in self.target_tp_buffer_seq_agreement_signature
+            ],
+            "target_tp_buffer_seq_ids": _int_list(self.target_tp_buffer_seq_ids),
+            "dual_buffer_mutation_events": list(self.dual_buffer_mutation_events),
             "received_proposal_seq_ids": _int_list(self.received_proposal_seq_ids),
             "cached_admission_priming_received_seq_ids": _int_list(
                 self.cached_admission_priming_received_seq_ids
