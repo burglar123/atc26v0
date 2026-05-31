@@ -1100,6 +1100,17 @@ class DualBatchManager:
     def active_batch_ids(self) -> list[int]:
         return [batch_id for batch_id, batch in self.batches.items() if batch.seq_ids]
 
+    @property
+    def pending_batch_ids(self) -> list[int]:
+        """Batch ids whose proposals must not be discarded by ``discard_inactive``.
+
+        Includes currently active batches.  Because DualBatchManager assigns seqs
+        to batches deterministically (not from per-rank ``scheduler.running``),
+        this set is identical across TP ranks and therefore safe as a
+        TP-consistent guard against asymmetric proposal eviction.
+        """
+        return self.active_batch_ids()
+
     def home_batch_ids(self) -> dict[int, int]:
         mapping = {}
         for batch_id, batch in self.batches.items():
