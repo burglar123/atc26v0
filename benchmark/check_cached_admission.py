@@ -53,6 +53,18 @@ def int_list(value: Any) -> list[int]:
         return []
 
 
+def bool_map(value: Any) -> dict[int, bool]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, bool] = {}
+    for raw_key, raw_value in value.items():
+        try:
+            result[int(raw_key)] = bool_value(raw_value)
+        except Exception:
+            continue
+    return result
+
+
 def load_trace_records(path: Path) -> list[dict[str, Any]]:
     payload = load_json(path)
     if isinstance(payload, dict):
@@ -111,6 +123,12 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 in {
                     "raw_target_normal_verify_seq_ids_before_buffer_filter",
                     "target_normal_verify_seq_ids_after_buffer_filter",
+                    "proposal_pre_verify_by_seq_id",
+                    "target_seq_pre_verify_by_seq_id",
+                    "pre_verify_mismatch_seq_ids",
+                    "pre_verify_stale_proposal_discarded_seq_ids",
+                    "pre_verify_redraft_required_seq_ids",
+                    "warmup_mode",
                     "local_actual_draft_home_set_for_normal_draft",
                     "normal_draft_transfer_synced_expected_seq_ids",
                     "normal_draft_transfer_sender_seq_ids",
@@ -430,6 +448,15 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
             int_list(record.get("missing_buffered_proposal_allowed_by_eager_seq_ids"))
         )
         fallback_pending = set(int_list(record.get("fallback_pending_receive_seq_ids")))
+        proposal_pre_verify = bool_map(record.get("proposal_pre_verify_by_seq_id"))
+        target_seq_pre_verify = bool_map(record.get("target_seq_pre_verify_by_seq_id"))
+        pre_verify_mismatch = set(int_list(record.get("pre_verify_mismatch_seq_ids")))
+        pre_verify_stale_discarded = set(
+            int_list(record.get("pre_verify_stale_proposal_discarded_seq_ids"))
+        )
+        pre_verify_redraft_required = set(
+            int_list(record.get("pre_verify_redraft_required_seq_ids"))
+        )
         actual_draft = set(
             int_list(record.get("actual_draft_home_set_for_normal_draft") or record.get("draft_home_set"))
         )
@@ -471,6 +498,35 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
             errors.append(
                 f"record[{idx}] target verify after buffer filter must match final target verify: "
                 f"after={target_after_filter}, final={int_list(record.get('target_normal_verify_seq_ids'))}"
+            )
+        common_pre_verify_seq_ids = set(proposal_pre_verify) & set(target_seq_pre_verify)
+        observed_pre_verify_mismatch = {
+            seq_id
+            for seq_id in common_pre_verify_seq_ids
+            if bool(proposal_pre_verify[seq_id]) != bool(target_seq_pre_verify[seq_id])
+        }
+        if observed_pre_verify_mismatch and observed_pre_verify_mismatch != pre_verify_mismatch:
+            errors.append(
+                f"record[{idx}] pre_verify mismatch trace does not match observed proposal/target "
+                f"state: observed={sorted(observed_pre_verify_mismatch)}, "
+                f"traced={sorted(pre_verify_mismatch)}"
+            )
+        if pre_verify_mismatch & target_normal:
+            errors.append(
+                f"record[{idx}] stale pre_verify-mismatched proposals entered target verify: "
+                f"{sorted(pre_verify_mismatch & target_normal)}"
+            )
+        if pre_verify_stale_discarded & target_normal:
+            errors.append(
+                f"record[{idx}] stale pre_verify proposals marked discarded still entered target verify: "
+                f"{sorted(pre_verify_stale_discarded & target_normal)}"
+            )
+        if pre_verify_mismatch and not pre_verify_mismatch <= (
+            pre_verify_stale_discarded | pre_verify_redraft_required
+        ):
+            errors.append(
+                f"record[{idx}] pre_verify mismatches must be discarded or redraft-required: "
+                f"{sorted(pre_verify_mismatch - (pre_verify_stale_discarded | pre_verify_redraft_required))}"
             )
         target_miss_still_selected = (target_buffer_misses & target_normal) - allowed_missing - fallback_pending
         if target_miss_still_selected:
@@ -577,6 +633,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "cached_admission_target_buffer_hit_seq_ids",
         "cached_admission_target_buffer_miss_seq_ids",
         "target_normal_verify_seq_ids_after_buffer_filter",
+        "proposal_pre_verify_by_seq_id",
+        "target_seq_pre_verify_by_seq_id",
+        "pre_verify_mismatch_seq_ids",
+        "pre_verify_stale_proposal_discarded_seq_ids",
+        "pre_verify_redraft_required_seq_ids",
+        "warmup_mode",
         "local_actual_draft_home_set_for_normal_draft",
         "normal_draft_transfer_synced_expected_seq_ids",
         "normal_draft_transfer_sender_seq_ids",
@@ -715,6 +777,12 @@ def synthetic_dual_payload(
     target_buffer_hit_seq_ids: list[int] | None = None,
     target_buffer_miss_seq_ids: list[int] | None = None,
     target_after_filter_seq_ids: list[int] | None = None,
+    proposal_pre_verify_by_seq_id: dict[int, bool] | None = None,
+    target_seq_pre_verify_by_seq_id: dict[int, bool] | None = None,
+    pre_verify_mismatch_seq_ids: list[int] | None = None,
+    pre_verify_stale_proposal_discarded_seq_ids: list[int] | None = None,
+    pre_verify_redraft_required_seq_ids: list[int] | None = None,
+    warmup_mode: bool = False,
     original_draft_seq_ids: list[int] | None = None,
     sent_proposal_seq_ids: list[int] | None = None,
     expected_receive_seq_ids: list[int] | None = None,
@@ -757,6 +825,20 @@ def synthetic_dual_payload(
             "cached_admission_target_buffer_hit_seq_ids": target_buffer_hit_seq_ids or [],
             "cached_admission_target_buffer_miss_seq_ids": target_buffer_miss_seq_ids or [],
             "target_normal_verify_seq_ids_after_buffer_filter": target_after_filter_seq_ids or [],
+            "proposal_pre_verify_by_seq_id": {
+                str(seq_id): bool(value)
+                for seq_id, value in sorted((proposal_pre_verify_by_seq_id or {}).items())
+            },
+            "target_seq_pre_verify_by_seq_id": {
+                str(seq_id): bool(value)
+                for seq_id, value in sorted((target_seq_pre_verify_by_seq_id or {}).items())
+            },
+            "pre_verify_mismatch_seq_ids": pre_verify_mismatch_seq_ids or [],
+            "pre_verify_stale_proposal_discarded_seq_ids": (
+                pre_verify_stale_proposal_discarded_seq_ids or []
+            ),
+            "pre_verify_redraft_required_seq_ids": pre_verify_redraft_required_seq_ids or [],
+            "warmup_mode": bool(warmup_mode),
             "local_actual_draft_home_set_for_normal_draft": actual_draft_seq_ids or [],
             "normal_draft_transfer_synced_expected_seq_ids": synced_expected_receive_seq_ids or [],
             "normal_draft_transfer_sender_seq_ids": sender_seq_ids or [],
@@ -1096,6 +1178,61 @@ def run_synthetic() -> int:
                 received_proposal_seq_ids=[7],
                 filtered_draft_seq_ids=[5],
                 normal_proposal_transfer_called=True,
+            ),
+            False,
+        ),
+        (
+            "pre_verify_aligned_target_verify",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[0],
+                proposal_hit_seq_ids=[0],
+                target_buffer_hit_seq_ids=[0],
+                target_after_filter_seq_ids=[0],
+                proposal_pre_verify_by_seq_id={0: True},
+                target_seq_pre_verify_by_seq_id={0: True},
+            ),
+            False,
+        ),
+        (
+            "pre_verify_stale_proposal_discarded",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[],
+                proposal_hit_seq_ids=[0],
+                target_buffer_hit_seq_ids=[0],
+                target_after_filter_seq_ids=[],
+                proposal_pre_verify_by_seq_id={0: False},
+                target_seq_pre_verify_by_seq_id={0: True},
+                pre_verify_mismatch_seq_ids=[0],
+                pre_verify_stale_proposal_discarded_seq_ids=[0],
+                pre_verify_redraft_required_seq_ids=[0],
+            ),
+            False,
+        ),
+        (
+            "pre_verify_stale_proposal_used_for_target_verify_bad",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[0],
+                proposal_hit_seq_ids=[0],
+                target_buffer_hit_seq_ids=[0],
+                target_after_filter_seq_ids=[0],
+                proposal_pre_verify_by_seq_id={0: False},
+                target_seq_pre_verify_by_seq_id={0: True},
+                pre_verify_mismatch_seq_ids=[0],
+                pre_verify_stale_proposal_discarded_seq_ids=[0],
+                pre_verify_redraft_required_seq_ids=[0],
+            ),
+            True,
+        ),
+        (
+            "pre_verify_warmup_aligned_target_verify",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[0],
+                proposal_hit_seq_ids=[0],
+                target_buffer_hit_seq_ids=[0],
+                target_after_filter_seq_ids=[0],
+                proposal_pre_verify_by_seq_id={0: True},
+                target_seq_pre_verify_by_seq_id={0: True},
+                warmup_mode=True,
             ),
             False,
         ),

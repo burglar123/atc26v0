@@ -3067,6 +3067,22 @@ class ModelRunnerBase:
         trace_record["target_normal_verify_seq_ids_after_buffer_filter"] = list(
             plan.target_normal_verify_seq_ids_after_buffer_filter
         )
+        trace_record["proposal_pre_verify_by_seq_id"] = {
+            str(seq_id): bool(value)
+            for seq_id, value in sorted(plan.proposal_pre_verify_by_seq_id.items())
+        }
+        trace_record["target_seq_pre_verify_by_seq_id"] = {
+            str(seq_id): bool(value)
+            for seq_id, value in sorted(plan.target_seq_pre_verify_by_seq_id.items())
+        }
+        trace_record["pre_verify_mismatch_seq_ids"] = list(plan.pre_verify_mismatch_seq_ids)
+        trace_record["pre_verify_stale_proposal_discarded_seq_ids"] = list(
+            plan.pre_verify_stale_proposal_discarded_seq_ids
+        )
+        trace_record["pre_verify_redraft_required_seq_ids"] = list(
+            plan.pre_verify_redraft_required_seq_ids
+        )
+        trace_record["warmup_mode"] = bool(plan.warmup_mode)
         trace_record["local_actual_draft_home_set_for_normal_draft"] = list(
             plan.local_actual_draft_home_set_for_normal_draft
             or self._actual_normal_draft_seq_ids(plan)
@@ -3225,6 +3241,77 @@ class ModelRunnerBase:
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta[1].item()) > 0:
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+    def _update_pre_verify_alignment_plan(
+        self,
+        proposals: list[BufferedProposal],
+        seqs: list[Sequence],
+        plan: StepPlan,
+        *,
+        mismatch_ids: list[int] | None = None,
+        stale_discarded_ids: list[int] | None = None,
+        redraft_required_ids: list[int] | None = None,
+    ) -> None:
+        plan.proposal_pre_verify_by_seq_id = {
+            int(proposal.seq_id): bool(proposal.pre_verify)
+            for proposal in proposals
+        }
+        plan.target_seq_pre_verify_by_seq_id = {
+            int(seq.seq_id): bool(seq.pre_verify)
+            for seq in seqs
+        }
+        plan.pre_verify_mismatch_seq_ids = sorted(int(seq_id) for seq_id in (mismatch_ids or []))
+        plan.pre_verify_stale_proposal_discarded_seq_ids = sorted(
+            int(seq_id) for seq_id in (stale_discarded_ids or [])
+        )
+        plan.pre_verify_redraft_required_seq_ids = sorted(
+            int(seq_id) for seq_id in (redraft_required_ids or [])
+        )
+        plan.warmup_mode = bool(
+            getattr(self.global_config, "enable_cached_admission", False)
+            and not bool(self.active_decode_ready_mode)
+        )
+
+    def _filter_pre_verify_stale_target_proposals(
+        self,
+        proposals: list[BufferedProposal],
+        seqs: list[Sequence],
+        plan: StepPlan,
+    ) -> tuple[list[BufferedProposal], list[Sequence]]:
+        self._update_pre_verify_alignment_plan(proposals, seqs, plan)
+        proposal_seq_ids = [int(proposal.seq_id) for proposal in proposals]
+        seq_ids = [int(seq.seq_id) for seq in seqs]
+        if proposal_seq_ids != seq_ids:
+            return proposals, seqs
+
+        mismatch_ids = [
+            int(seq.seq_id)
+            for proposal, seq in zip(proposals, seqs)
+            if bool(proposal.pre_verify) != bool(seq.pre_verify)
+        ]
+        if not mismatch_ids:
+            return proposals, seqs
+
+        mismatch_set = set(mismatch_ids)
+        kept_proposals = [
+            proposal for proposal in proposals if int(proposal.seq_id) not in mismatch_set
+        ]
+        kept_seqs = [seq for seq in seqs if int(seq.seq_id) not in mismatch_set]
+        for proposal in proposals:
+            if int(proposal.seq_id) in mismatch_set:
+                proposal.valid = False
+        self.dual_proposal_buffer.discard(mismatch_ids)
+        plan.target_normal_verify_seq_ids = [int(seq.seq_id) for seq in kept_seqs]
+        plan.target_normal_verify_seq_ids_after_buffer_filter = [int(seq.seq_id) for seq in kept_seqs]
+        self._update_pre_verify_alignment_plan(
+            proposals,
+            seqs,
+            plan,
+            mismatch_ids=mismatch_ids,
+            stale_discarded_ids=mismatch_ids,
+            redraft_required_ids=mismatch_ids,
+        )
+        return kept_proposals, kept_seqs
 
     def _receive_dual_proposals(
         self,
@@ -16120,6 +16207,13 @@ class TargetModelRunner(ModelRunnerBase):
                 "fallback same-batch missing synced proposals for target seq_ids="
                 f"{target_seq_ids}",
             )
+
+        target_proposals, target_seqs = self._filter_pre_verify_stale_target_proposals(
+            target_proposals,
+            target_seqs,
+            plan,
+        )
+        target_seq_ids = [int(seq.seq_id) for seq in target_seqs]
 
         if target_seqs:
             self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")

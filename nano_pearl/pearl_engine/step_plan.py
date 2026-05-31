@@ -215,6 +215,12 @@ class StepPlan:
     cached_admission_target_buffer_hit_seq_ids: List[int] = field(default_factory=list)
     cached_admission_target_buffer_miss_seq_ids: List[int] = field(default_factory=list)
     target_normal_verify_seq_ids_after_buffer_filter: List[int] = field(default_factory=list)
+    proposal_pre_verify_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    target_seq_pre_verify_by_seq_id: Dict[int, bool] = field(default_factory=dict)
+    pre_verify_mismatch_seq_ids: List[int] = field(default_factory=list)
+    pre_verify_stale_proposal_discarded_seq_ids: List[int] = field(default_factory=list)
+    pre_verify_redraft_required_seq_ids: List[int] = field(default_factory=list)
+    warmup_mode: bool = False
     local_actual_draft_home_set_for_normal_draft: List[int] = field(default_factory=list)
     normal_draft_transfer_synced_expected_seq_ids: List[int] = field(default_factory=list)
     normal_draft_transfer_sender_seq_ids: List[int] = field(default_factory=list)
@@ -1100,6 +1106,22 @@ class StepPlan:
             "target_normal_verify_seq_ids_after_buffer_filter": _int_list(
                 self.target_normal_verify_seq_ids_after_buffer_filter
             ),
+            "proposal_pre_verify_by_seq_id": _trace_mapping(
+                self.proposal_pre_verify_by_seq_id,
+                lambda value: bool(value),
+            ),
+            "target_seq_pre_verify_by_seq_id": _trace_mapping(
+                self.target_seq_pre_verify_by_seq_id,
+                lambda value: bool(value),
+            ),
+            "pre_verify_mismatch_seq_ids": _int_list(self.pre_verify_mismatch_seq_ids),
+            "pre_verify_stale_proposal_discarded_seq_ids": _int_list(
+                self.pre_verify_stale_proposal_discarded_seq_ids
+            ),
+            "pre_verify_redraft_required_seq_ids": _int_list(
+                self.pre_verify_redraft_required_seq_ids
+            ),
+            "warmup_mode": bool(self.warmup_mode),
             "local_actual_draft_home_set_for_normal_draft": _int_list(
                 self.local_actual_draft_home_set_for_normal_draft
             ),
