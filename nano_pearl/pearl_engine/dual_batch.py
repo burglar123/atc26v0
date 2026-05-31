@@ -381,6 +381,7 @@ class ProposalBuffer:
         self,
         active_seq_ids: Iterable[int],
         pending_batch_ids: Iterable[int] | None = None,
+        protected_seq_ids: Iterable[int] | None = None,
     ) -> list[int]:
         active = {int(seq_id) for seq_id in active_seq_ids}
         protected: set[int] = set()
@@ -389,6 +390,8 @@ class ProposalBuffer:
             for seq_id, proposal in self._proposals.items():
                 if int(proposal.home_batch_id) in pending:
                     protected.add(int(seq_id))
+        if protected_seq_ids is not None:
+            protected.update(int(s) for s in protected_seq_ids)
         dropped = []
         for seq_id in list(self._proposals):
             if seq_id not in active and seq_id not in protected:
@@ -1051,6 +1054,7 @@ class DualBatchManager:
         self.batches = {0: BatchState(0), 1: BatchState(1)}
         self.step_id = 0
         self.ready_eager_proposals = ReadyEagerProposalRegistry()
+        self._managed_seq_ids: set[int] = set()
 
     def reset(self) -> None:
         for batch in self.batches.values():
@@ -1082,6 +1086,7 @@ class DualBatchManager:
     def assign(self, seq: Sequence, batch_id: int) -> None:
         batch_id = int(batch_id)
         seq.home_batch_id = batch_id
+        self._managed_seq_ids.add(int(seq.seq_id))
         if seq.seq_id not in self.batches[batch_id].seq_ids:
             self.batches[batch_id].seq_ids.append(seq.seq_id)
 
@@ -1102,14 +1107,24 @@ class DualBatchManager:
 
     @property
     def pending_batch_ids(self) -> list[int]:
-        """Batch ids whose proposals must not be discarded by ``discard_inactive``.
+        """All batch ids managed by this dual-batch instance.
 
-        Includes currently active batches.  Because DualBatchManager assigns seqs
-        to batches deterministically (not from per-rank ``scheduler.running``),
-        this set is identical across TP ranks and therefore safe as a
-        TP-consistent guard against asymmetric proposal eviction.
+        Returns all known batch ids (always [0, 1]) so that every proposal
+        buffered by the dual-batch system is protected from ``discard_inactive``,
+        regardless of per-rank ``scheduler.running`` state.
         """
-        return self.active_batch_ids()
+        return sorted(self.batches.keys())
+
+    @property
+    def all_managed_seq_ids(self) -> list[int]:
+        """Every seq_id ever assigned to a batch, monotonically growing.
+
+        This set is identical across TP ranks because batch assignments are
+        deterministic.  It is the correct TP-consistent guard for
+        ``discard_inactive``: a proposal for a managed seq_id must never be
+        evicted merely because that seq_id left the local ``scheduler.running``.
+        """
+        return sorted(self._managed_seq_ids)
 
     def home_batch_ids(self) -> dict[int, int]:
         mapping = {}

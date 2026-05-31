@@ -2086,10 +2086,18 @@ class ModelRunnerBase:
         self.dual_batch_manager.update_running(self.scheduler.running)
         active_seq_ids = [seq.seq_id for seq in self.scheduler.running]
         pending_batch_ids = list(self.dual_batch_manager.pending_batch_ids)
-        return self.dual_proposal_buffer.discard_inactive(
+        protected_seq_ids = list(self.dual_batch_manager.all_managed_seq_ids)
+        dropped = self.dual_proposal_buffer.discard_inactive(
             active_seq_ids,
             pending_batch_ids=pending_batch_ids,
+            protected_seq_ids=protected_seq_ids,
         )
+        discard_context = {
+            "active_seq_ids": active_seq_ids,
+            "pending_batch_ids": pending_batch_ids,
+            "protected_seq_ids": protected_seq_ids,
+        }
+        return dropped, discard_context
 
     def _eager_plan_dry_run_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_eager_plan_dry_run", False))
@@ -2515,14 +2523,28 @@ class ModelRunnerBase:
         for seq_id in sorted(set(raw_candidates)):
             mutation = self._dual_buffer_last_mutation_by_seq_id.get(seq_id)
             if mutation is not None:
-                last_mutation_lines.append(
+                lines = [
                     f"  seq_id={seq_id} last_mutation: "
                     f"kind={mutation['kind']} "
                     f"rank={mutation['rank']} tp_local_rank={mutation['tp_local_rank']} "
                     f"plan_id={mutation['plan_id']} dual_step_id={mutation['dual_step_id']} "
                     f"phase={mutation['plan_phase']} "
-                    f"before={mutation['before']} after={mutation['after']}"
-                )
+                    f"before={mutation['before']} after={mutation['after']}",
+                ]
+                if mutation["kind"] == "discard_inactive":
+                    lines.append(
+                        f"         discard_active_seq_ids={mutation.get('discard_active_seq_ids', [])}"
+                    )
+                    lines.append(
+                        f"         discard_pending_batch_ids={mutation.get('discard_pending_batch_ids', [])}"
+                    )
+                    lines.append(
+                        f"         discard_protected_seq_ids={mutation.get('discard_protected_seq_ids', [])}"
+                    )
+                    lines.append(
+                        f"         discard_reason={mutation.get('discard_reason', 'unknown')}"
+                    )
+                last_mutation_lines.append("\n".join(lines))
             else:
                 last_mutation_lines.append(
                     f"  seq_id={seq_id} last_mutation: (none recorded)"
@@ -2669,6 +2691,7 @@ class ModelRunnerBase:
         seq_ids: list[int],
         before_seq_ids: list[int],
         after_seq_ids: list[int],
+        discard_params: dict[str, Any] | None = None,
     ) -> None:
         plan.buffered_proposal_seq_ids = [int(seq_id) for seq_id in after_seq_ids]
         mutation_event = {
@@ -2698,7 +2721,15 @@ class ModelRunnerBase:
             ],
         }
         for seq_id in [int(s) for s in seq_ids]:
-            self._dual_buffer_last_mutation_by_seq_id[seq_id] = dict(mutation_event)
+            entry = dict(mutation_event)
+            if discard_params is not None:
+                entry["discard_active_seq_ids"] = list(discard_params.get("active_seq_ids", []))
+                entry["discard_pending_batch_ids"] = list(discard_params.get("pending_batch_ids", []))
+                entry["discard_protected_seq_ids"] = list(discard_params.get("protected_seq_ids", []))
+                entry["discard_reason"] = (
+                    "seq_id not in active and not protected by pending_batch_ids or protected_seq_ids"
+                )
+            self._dual_buffer_last_mutation_by_seq_id[seq_id] = entry
         if not self._dual_buffer_debug_enabled():
             return
         event = {
@@ -3383,7 +3414,7 @@ class ModelRunnerBase:
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
         lane_sync_info = self._sync_ready_eager_proposals_before_step_plan(plan_id)
-        dropped_seq_ids = self._prepare_dual_batch_state()
+        dropped_seq_ids, discard_context = self._prepare_dual_batch_state()
         proposal_buffer_seq_ids_after_prepare = self.dual_proposal_buffer.pending_seq_ids()
         plan = self.dual_batch_manager.build_step_plan(
             plan_id=plan_id,
@@ -3405,6 +3436,7 @@ class ModelRunnerBase:
                 seq_ids=[int(seq_id) for seq_id in dropped_seq_ids],
                 before_seq_ids=proposal_buffer_seq_ids_before_prepare,
                 after_seq_ids=proposal_buffer_seq_ids_after_prepare,
+                discard_params=discard_context,
             )
         self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
