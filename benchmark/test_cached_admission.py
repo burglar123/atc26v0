@@ -11,10 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 def _load_sequence_symbols():
     seq_path = ROOT / "nano_pearl/pearl_engine/sequence.py"
     src = seq_path.read_text(encoding="utf-8")
+    src = src.replace("from __future__ import annotations\n\n", "")
     src = src.replace("from ..layers.sampler import SamplingParams", "")
     module = types.ModuleType("seq_test_module")
     ns = module.__dict__
     exec(
+        "from __future__ import annotations\n"
         "class SamplingParams:\n"
         "    def __init__(self, temperature=0.0, max_tokens=16, ignore_eos=False):\n"
         "        self.temperature=temperature\n"
@@ -43,6 +45,7 @@ def _load_scheduler_symbol(sequence_cls, sequence_status_cls):
     ns["PEARLConfig"] = type("PEARLConfig", (), {})
 
     exec(
+        "from __future__ import annotations\n"
         "class _L:\n"
         "  def warning(self,*a,**k):\n"
         "   pass\n"

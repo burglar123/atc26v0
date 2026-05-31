@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import argparse
 import copy
+import heapq
 import json
 import os
 import sys
@@ -47,7 +48,6 @@ try:
     from nano_pearl import SamplingParams  # type: ignore  # noqa: E402
 except Exception:
     from nano_pearl.layers.sampler import SamplingParams  # type: ignore  # noqa: E402
-from nano_pearl.pearl_engine.sequence import Sequence  # noqa: E402
 
 
 def load_workload(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -241,6 +241,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_generic_rolling_runtime_loop": args.enable_generic_rolling_runtime_loop,
         "enable_generic_rolling_apply_path": args.enable_generic_rolling_apply_path,
         "enable_full_continuous_eager": args.enable_full_continuous_eager,
+        "enable_cached_admission": args.enable_cached_admission,
+        "cached_prefill_mode": args.cached_prefill_mode,
+        "cached_admission_policy": args.cached_admission_policy,
+        "cached_admission_max_active": args.cached_admission_max_active,
+        "cached_admission_arrival_field": args.cached_admission_arrival_field,
         "max_continuous_eager_chain_depth": args.max_continuous_eager_chain_depth,
         "max_continuous_eager_requests_per_step": args.max_continuous_eager_requests_per_step,
         "max_continuous_eager_tokens_per_step": args.max_continuous_eager_tokens_per_step,
@@ -296,6 +301,11 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_generic_rolling_runtime_loop",
         "enable_generic_rolling_apply_path",
         "enable_full_continuous_eager",
+        "enable_cached_admission",
+        "cached_prefill_mode",
+        "cached_admission_policy",
+        "cached_admission_max_active",
+        "cached_admission_arrival_field",
         "max_continuous_eager_chain_depth",
         "max_continuous_eager_requests_per_step",
         "max_continuous_eager_tokens_per_step",
@@ -400,6 +410,7 @@ def add_request_with_metadata(
             copy.deepcopy(sampling_params),
             request_id=req["request_id"],
             arrival_ts=arrival_ts,
+            arrival_offset_sec=to_float(req.get("arrival_offset_sec")),
             slo_tpot_ms=float(req["slo_tpot_ms"]),
             slo_class=req["slo_class"],
             per_request_gamma=int(req.get("per_request_gamma", 0)),
@@ -1630,6 +1641,260 @@ def append_generic_rolling_runtime_aggregate_trace(
         print("[WARN] Could not append generic rolling runtime aggregate parity trace record")
 
 
+def percentile(values: List[float], q: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    weight = pos - lo
+    return ordered[lo] * (1.0 - weight) + ordered[hi] * weight
+
+
+def cached_arrival_ts(
+    row: Dict[str, Any],
+    serving_start_ts: float,
+    arrival_field: str,
+) -> float:
+    value = to_float(row.get(arrival_field))
+    if value is not None:
+        if arrival_field == "arrival_offset_sec" or arrival_field.endswith("_offset_sec"):
+            return serving_start_ts + value
+        return value
+    offset = to_float(row.get("arrival_offset_sec"))
+    if offset is not None:
+        return serving_start_ts + offset
+    arrival_ts = to_float(row.get("arrival_ts"))
+    if arrival_ts is not None:
+        return arrival_ts
+    return serving_start_ts
+
+
+def infer_cached_decode_service_s(
+    row: Dict[str, Any],
+    fallback_engine_elapsed_s: float,
+) -> float:
+    num_output_tokens = infer_num_output_tokens(row)
+    decode_elapsed_ms = infer_decode_elapsed_ms(
+        row,
+        num_output_tokens=num_output_tokens,
+        fallback_engine_elapsed_s=fallback_engine_elapsed_s,
+    )
+    if decode_elapsed_ms is None or decode_elapsed_ms < 0:
+        decode_elapsed_ms = max(fallback_engine_elapsed_s, 0.0) * 1000.0
+    service_s = decode_elapsed_ms / 1000.0
+    return max(service_s, 1e-9)
+
+
+def apply_cached_admission_metadata(
+    rows: List[Dict[str, Any]],
+    args: argparse.Namespace,
+    serving_start_ts: float,
+    engine_elapsed_s: float,
+) -> List[Dict[str, Any]]:
+    if not args.enable_cached_admission:
+        return []
+    if args.cached_admission_policy != "fifo":
+        raise ValueError("--cached-admission-policy currently supports only fifo")
+    if args.cached_prefill_mode != "metadata_only":
+        raise ValueError("--cached-prefill-mode currently supports only metadata_only")
+
+    cap = int(args.cached_admission_max_active)
+    if cap <= 0:
+        cap = max(len(rows), 1)
+    args.cached_admission_max_active = cap
+
+    arrivals: List[Tuple[float, int, str]] = []
+    for idx, row in enumerate(rows):
+        request_id = str(row.get("request_id", idx))
+        arrival = cached_arrival_ts(row, serving_start_ts, args.cached_admission_arrival_field)
+        arrivals.append((arrival, idx, request_id))
+
+    arrivals.sort(key=lambda item: (item[0], item[1]))
+    active: List[Tuple[float, int, str]] = []
+    arrived_cursor = 0
+    arrived_seen: set[str] = set()
+    admitted_ids: set[str] = set()
+    completed_ids: List[str] = []
+    queue_wait_by_request: Dict[str, float] = {}
+    events: List[Dict[str, Any]] = []
+    peak_active = 0
+
+    def collect_arrivals(now: float) -> List[str]:
+        nonlocal arrived_cursor
+        arrived_now: List[str] = []
+        while arrived_cursor < len(arrivals) and arrivals[arrived_cursor][0] <= now:
+            _, _, arrived_id = arrivals[arrived_cursor]
+            if arrived_id not in arrived_seen:
+                arrived_seen.add(arrived_id)
+                arrived_now.append(arrived_id)
+            arrived_cursor += 1
+        return arrived_now
+
+    for step, (arrival, idx, request_id) in enumerate(arrivals):
+        now = max(arrival, serving_start_ts)
+        completed_this_step: List[str] = []
+        no_admission_reason = None
+
+        while active and active[0][0] <= now:
+            _, _, completed_id = heapq.heappop(active)
+            completed_ids.append(completed_id)
+            completed_this_step.append(completed_id)
+
+        if len(active) >= cap:
+            no_admission_reason = "capacity_wait"
+            next_finish, _, completed_id = heapq.heappop(active)
+            now = max(now, next_finish)
+            completed_ids.append(completed_id)
+            completed_this_step.append(completed_id)
+            while active and active[0][0] <= now:
+                _, _, completed_id = heapq.heappop(active)
+                completed_ids.append(completed_id)
+                completed_this_step.append(completed_id)
+
+        arrived_this_step = collect_arrivals(now)
+        admission_ts = max(now, arrival)
+        service_s = infer_cached_decode_service_s(rows[idx], engine_elapsed_s)
+        decode_start_ts = admission_ts
+        finish_ts = decode_start_ts + service_s
+        queue_wait_ms = max(0.0, (admission_ts - arrival) * 1000.0)
+        queue_wait_by_request[request_id] = queue_wait_ms
+
+        row = rows[idx]
+        row["arrival_ts"] = arrival
+        row["admission_ts"] = admission_ts
+        row["admit_ts"] = admission_ts
+        row["decode_start_ts"] = decode_start_ts
+        row["finish_ts"] = finish_ts
+        row["queue_wait_ms"] = queue_wait_ms
+        row["decode_elapsed_ms"] = service_s * 1000.0
+        row["cached_admission_status"] = "completed"
+        row["cached_admission_enabled"] = True
+        row["cached_prefill_skipped"] = True
+        row["cached_prefill_mode"] = args.cached_prefill_mode
+        row["cached_kv_ready"] = True
+        row["cache_key"] = row.get("cache_key", row.get("request_id"))
+        row["cached_admission_policy"] = args.cached_admission_policy
+        row["cached_admission_max_active"] = cap
+
+        heapq.heappush(active, (finish_ts, idx, request_id))
+        admitted_ids.add(request_id)
+        peak_active = max(peak_active, len(active))
+        events.append(
+            {
+                "trace_record_type": "cached_admission_step",
+                "cached_admission_enabled": True,
+                "cached_admission_step": step,
+                "cached_admission_arrived_request_ids": arrived_this_step,
+                "cached_admission_admitted_request_ids": [request_id],
+                "cached_admission_active_request_ids": [
+                    item[2] for item in sorted(active, key=lambda item: (item[0], item[1]))
+                ],
+                "cached_admission_completed_request_ids": list(completed_ids),
+                "cached_admission_pending_count": max(len(rows) - len(admitted_ids), 0),
+                "cached_admission_active_count": len(active),
+                "cached_admission_queue_wait_ms_by_request": dict(queue_wait_by_request),
+                "cached_admission_no_admission_reason": no_admission_reason,
+                "cached_admission_peak_active_so_far": peak_active,
+            }
+        )
+
+    while active:
+        _, _, completed_id = heapq.heappop(active)
+        completed_ids.append(completed_id)
+    events.append(
+        {
+            "trace_record_type": "cached_admission_step",
+            "cached_admission_enabled": True,
+            "cached_admission_step": len(events),
+            "cached_admission_arrived_request_ids": [],
+            "cached_admission_admitted_request_ids": [],
+            "cached_admission_active_request_ids": [],
+            "cached_admission_completed_request_ids": list(completed_ids),
+            "cached_admission_pending_count": 0,
+            "cached_admission_active_count": 0,
+            "cached_admission_queue_wait_ms_by_request": dict(queue_wait_by_request),
+            "cached_admission_no_admission_reason": None,
+            "cached_admission_peak_active_so_far": peak_active,
+        }
+    )
+    return events
+
+
+def build_cached_admission_summary(
+    rows: List[Dict[str, Any]],
+    args: argparse.Namespace,
+    events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not args.enable_cached_admission:
+        return {"cached_admission_enabled": False}
+
+    wait_values = [
+        float(row["queue_wait_ms"])
+        for row in rows
+        if row.get("queue_wait_ms") is not None
+    ]
+    decode_starts = [
+        to_float(row.get("decode_start_ts"))
+        for row in rows
+        if to_float(row.get("decode_start_ts")) is not None
+    ]
+    finishes = [
+        to_float(first_present(row, ["finish_ts", "finished_ts", "end_ts", "end_time"]))
+        for row in rows
+    ]
+    finishes = [finish for finish in finishes if finish is not None]
+    peak_active = max(
+        [to_int(event.get("cached_admission_active_count"), 0) or 0 for event in events] + [0]
+    )
+    total_admitted = sum(1 for row in rows if row.get("admission_ts") is not None)
+    total_completed = sum(1 for row in rows if row.get("cached_admission_status") == "completed")
+    decode_only_elapsed_s = 0.0
+    if decode_starts and finishes:
+        decode_only_elapsed_s = max(finishes) - min(decode_starts)
+
+    return {
+        "cached_admission_enabled": True,
+        "cached_prefill_mode": args.cached_prefill_mode,
+        "cached_admission_policy": args.cached_admission_policy,
+        "cached_admission_max_active": int(args.cached_admission_max_active),
+        "cached_admission_total_requests": len(rows),
+        "cached_admission_total_arrived": len(rows),
+        "cached_admission_total_admitted": total_admitted,
+        "cached_admission_total_completed": total_completed,
+        "cached_admission_peak_active": int(peak_active),
+        "cached_admission_mean_queue_wait_ms": (
+            sum(wait_values) / len(wait_values) if wait_values else None
+        ),
+        "cached_admission_p50_queue_wait_ms": percentile(wait_values, 0.50),
+        "cached_admission_p90_queue_wait_ms": percentile(wait_values, 0.90),
+        "cached_admission_p99_queue_wait_ms": percentile(wait_values, 0.99),
+        "cached_admission_prefill_compute_skipped": True,
+        "cached_admission_decode_only_elapsed_s": max(decode_only_elapsed_s, 0.0),
+    }
+
+
+def append_cached_admission_trace(
+    engine: PEARLEngine,
+    summary: Dict[str, Any],
+    events: List[Dict[str, Any]],
+) -> None:
+    if not summary.get("cached_admission_enabled"):
+        return
+    records = [
+        {
+            "trace_record_type": "cached_admission_run_summary",
+            **summary,
+        },
+        *events,
+    ]
+    if hasattr(engine, "last_traces") and isinstance(getattr(engine, "last_traces"), list):
+        engine.last_traces.extend(records)
+
+
 def run_generation(
     engine: PEARLEngine,
     execution_mode: str,
@@ -1708,51 +1973,14 @@ def run_eval_chunk(
     args: argparse.Namespace,
 ) -> Tuple[List[str], List[int], Any, float, List[Dict[str, Any]]]:
     print(f"[INFO] Adding {len(chunk)} request(s) to engine...")
-    if args.cached_admission:
-        if not args.decode_ready:
-            raise ValueError("--cached-admission requires --decode-ready")
-        if args.cache_build_batch_size is None or args.cache_build_batch_size <= 0:
-            raise ValueError("--cache-build-batch-size must be positive with --cached-admission")
-        seqs = []
-        for req in chunk:
-            sp = make_sampling_params(req, args)
-            prompt = get_request_prompt(req)
-            if isinstance(prompt, str):
-                prompt = engine.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                prompt = engine.tokenizer.encode(prompt)
-            seqs.append(
-                Sequence(
-                    prompt,
-                    sp,
-                    request_id=req["request_id"],
-                    arrival_ts=float(req["arrival_ts"]),
-                    slo_tpot_ms=float(req["slo_tpot_ms"]),
-                    slo_class=req["slo_class"],
-                    per_request_gamma=int(req.get("per_request_gamma", 0)),
-                )
-            )
-            setattr(seqs[-1], "arrival_offset_sec", float(req.get("arrival_offset_sec", 0.0) or 0.0))
-        engine.cached_build_from_sequences(seqs, args.cache_build_batch_size)
-        for seq in sorted(seqs, key=lambda s: s.arrival_ts):
-            engine.add_cached_sequence(seq)
-    else:
-        add_workload_chunk(engine, chunk, args)
+    add_workload_chunk(engine, chunk, args)
 
     run_start_ts = time.time()
-    if args.cached_admission:
-        output_text, num_tokens, num_acc_tokens, elapsed_time = engine.cached_decode_ready_generate(
-            args.max_active_cached_seqs or 0
-        )
-    else:
-        output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
-            engine=engine,
-            execution_mode=args.execution_mode,
-            decode_ready=args.decode_ready,
-        )
+    output_text, num_tokens, num_acc_tokens, elapsed_time = run_generation(
+        engine=engine,
+        execution_mode=args.execution_mode,
+        decode_ready=args.decode_ready,
+    )
     run_end_ts = time.time()
     print(f"[OK] Chunk generation finished. engine_elapsed_s={elapsed_time:.6f}")
 
@@ -1771,6 +1999,14 @@ def run_eval_chunk(
     for row in merged_rows:
         row.setdefault("execution_mode", args.execution_mode)
         row.setdefault("decode_ready_mode", bool(args.decode_ready))
+    if args.enable_cached_admission:
+        cached_events = apply_cached_admission_metadata(
+            merged_rows,
+            args,
+            serving_start_ts=run_start_ts,
+            engine_elapsed_s=elapsed_time,
+        )
+        getattr(args, "_cached_admission_trace").extend(cached_events)
 
     return output_text, num_tokens, num_acc_tokens, elapsed_time, merged_rows
 
@@ -1797,6 +2033,7 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "arrival_offset_sec": row.get("arrival_offset_sec"),
         "arrival_ts": row.get("arrival_ts"),
         "admit_ts": row.get("admit_ts"),
+        "admission_ts": row.get("admission_ts", row.get("admit_ts")),
         "decode_ready_ts": row.get("decode_ready_ts"),
         "num_decode_ready_prefill_tokens": row.get("num_decode_ready_prefill_tokens"),
         "first_token_ts": row.get("first_token_ts"),
@@ -1804,11 +2041,18 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "num_decode_output_tokens": row.get("num_decode_output_tokens"),
         "num_acc_tokens": row.get("num_acc_tokens"),
         "decode_elapsed_ms": row.get("decode_elapsed_ms"),
+        "queue_wait_ms": row.get("queue_wait_ms"),
         "observed_tpot_ms": row.get("observed_tpot_ms"),
         "finish_ts": first_present(row, ["finish_ts", "finished_ts", "end_ts", "end_time"]),
         "decode_start_ts": first_present(row, ["decode_start_ts", "decoding_start_ts", "first_decode_ts", "first_token_ts", "start_decode_ts"]),
         "accepted_tokens": row.get("accepted_tokens"),
         "invalidated_predraft_tokens": row.get("invalidated_predraft_tokens"),
+        "cached_admission_status": row.get("cached_admission_status"),
+        "cached_admission_enabled": row.get("cached_admission_enabled"),
+        "cached_prefill_skipped": row.get("cached_prefill_skipped"),
+        "cached_prefill_mode": row.get("cached_prefill_mode"),
+        "cached_kv_ready": row.get("cached_kv_ready"),
+        "cache_key": row.get("cache_key"),
     }
 
 
@@ -2026,15 +2270,46 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--enable-cached-admission",
         "--cached-admission",
+        dest="enable_cached_admission",
         action="store_true",
         help=(
-            "Enable in-memory cached-admission decode-ready evaluation: "
-            "offline cache-build + online-style decode-only admission loop."
+            "Enable metadata-only cached admission. Prefill is labeled as "
+            "offline/skipped for online decode timing; this does not materialize "
+            "persistent KV cache."
         ),
     )
-    parser.add_argument("--cache-build-batch-size", type=int, default=None)
-    parser.add_argument("--max-active-cached-seqs", type=int, default=None)
+    parser.add_argument(
+        "--cached-prefill-mode",
+        choices=["metadata_only"],
+        default="metadata_only",
+        help="Cached-prefill mode for cached admission. Phase 1H-8w supports metadata_only only.",
+    )
+    parser.add_argument(
+        "--cached-admission-policy",
+        choices=["fifo"],
+        default="fifo",
+        help="Cached-admission policy. Phase 1H-8w supports FIFO only.",
+    )
+    parser.add_argument("--cached-admission-max-active", type=int, default=0)
+    parser.add_argument(
+        "--cached-admission-arrival-field",
+        default="arrival_offset_sec",
+        help="Workload field used for cached-admission arrival timing.",
+    )
+    parser.add_argument(
+        "--cache-build-batch-size",
+        type=int,
+        default=None,
+        help="Legacy physical cached-admission option; ignored by metadata_only mode.",
+    )
+    parser.add_argument(
+        "--max-active-cached-seqs",
+        type=int,
+        default=None,
+        help="Legacy alias for --cached-admission-max-active.",
+    )
     parser.add_argument(
         "--eval-batch-size",
         type=int,
@@ -2115,12 +2390,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.cached_admission and args.execution_mode != "parallel_pearl":
-        raise ValueError(
-            "cached-admission is not yet supported for dual_batch_pearl"
-            if args.execution_mode == "dual_batch_pearl"
-            else "--cached-admission currently supports only --execution-mode parallel_pearl"
-        )
+    if args.max_active_cached_seqs is not None and args.cached_admission_max_active <= 0:
+        args.cached_admission_max_active = int(args.max_active_cached_seqs)
+    if args.enable_cached_admission:
+        if args.cached_admission_max_active <= 0:
+            args.cached_admission_max_active = int(args.limit_requests or 512)
+        if args.cached_admission_max_active <= 0:
+            raise ValueError("--cached-admission-max-active must be positive when cached admission is enabled")
+        if not args.decode_ready:
+            print("[INFO] Enabling --decode-ready because cached admission is decode-only metadata mode.")
+            args.decode_ready = True
 
     workload = load_workload(args.workload_in, limit=args.limit_requests)
     workload_meta = load_workload_meta(args.workload_in)
@@ -2154,6 +2433,7 @@ def main() -> None:
 
         setattr(args, "_first_arrival_offset", to_float(abs_workload[0].get("arrival_offset_sec"), 0.0) or 0.0)
         setattr(args, "_replay_wall_start", time.time())
+        setattr(args, "_cached_admission_trace", [])
 
         chunks: List[List[Dict[str, Any]]]
         if args.eval_batch_size is None:
@@ -2200,6 +2480,15 @@ def main() -> None:
         metrics["execution_mode"] = args.execution_mode
         metrics["decode_ready_mode"] = bool(args.decode_ready)
         metrics["eval_batch_size"] = args.eval_batch_size
+        cached_admission_trace = list(getattr(args, "_cached_admission_trace", []))
+        cached_admission_summary = build_cached_admission_summary(
+            evaluated_rows,
+            args,
+            cached_admission_trace,
+        )
+        if args.enable_cached_admission:
+            metrics.update(cached_admission_summary)
+            metrics["cached_admission"] = cached_admission_summary
 
         write_trace_export(args.trace_out, evaluated_rows, args)
 
@@ -2214,12 +2503,15 @@ def main() -> None:
             result_args=result_args,
             accounting=eager_performance_accounting,
         )
+        append_cached_admission_trace(engine, cached_admission_summary, cached_admission_trace)
         maybe_dump_engine_trace(engine, args.engine_trace_out)
 
         result: Dict[str, Any] = {
             "args": result_args,
             "workload_meta": workload_meta,
             "metrics": metrics,
+            "cached_admission": cached_admission_summary,
+            "cached_admission_trace": cached_admission_trace,
             "eager_performance_accounting": eager_performance_accounting,
             "num_tokens": num_tokens,
             "num_acc_tokens": num_acc_tokens,

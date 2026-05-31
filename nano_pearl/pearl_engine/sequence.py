@@ -41,6 +41,12 @@ class Sequence:
         self.decode_start_ts = None
         self.decode_ready_mode = False
         self.num_decode_ready_prefill_tokens = 0
+        self.cached_admission_enabled = False
+        self.cached_kv_ready = False
+        self.cached_prefill_mode = None
+        self.cache_key = None
+        self.cached_prefill_skipped = False
+        self.cached_admission_status = None
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
@@ -149,10 +155,30 @@ class Sequence:
         if self.decode_start_ts is None:
             self.decode_start_ts = time.time() if ts is None else ts
 
+    def mark_cached_prefill_metadata(
+        self,
+        mode: str = "metadata_only",
+        cache_key: str | int | None = None,
+    ):
+        self.cached_admission_enabled = True
+        self.cached_kv_ready = True
+        self.cached_prefill_mode = mode
+        self.cache_key = self.request_id if cache_key is None else cache_key
+        self.cached_prefill_skipped = True
+        self.cached_admission_status = "pending"
+
+    def mark_cached_admitted(self, ts: float | None = None):
+        admit_ts = time.time() if ts is None else ts
+        self.admit_ts = admit_ts
+        self.cached_admission_status = "admitted"
+        self.mark_decode_ready(admit_ts)
+
     def mark_finished(self, record_finish_ts: bool = True):
         self.status = SequenceStatus.FINISHED
         if record_finish_ts and self.finish_ts is None:
             self.finish_ts = time.time()
+        if self.cached_admission_enabled:
+            self.cached_admission_status = "completed"
 
     def service_metadata(self):
         num_decode_output_tokens = max(
@@ -161,11 +187,14 @@ class Sequence:
         )
         decode_elapsed_ms = None
         observed_tpot_ms = None
+        queue_wait_ms = None
         if self.decode_start_ts is not None and self.finish_ts is not None:
             decode_elapsed_ms = (self.finish_ts - self.decode_start_ts) * 1000
             if num_decode_output_tokens > 0:
                 observed_tpot_ms = decode_elapsed_ms / num_decode_output_tokens
-        return {
+        if self.admit_ts is not None and self.arrival_ts is not None:
+            queue_wait_ms = (self.admit_ts - self.arrival_ts) * 1000
+        metadata = {
             "seq_id": self.seq_id,
             "request_id": self.request_id,
             "arrival_ts": self.arrival_ts,
@@ -186,6 +215,20 @@ class Sequence:
             "home_batch_id": self.home_batch_id,
             "trace_stats": self.trace_stats,
         }
+        if self.cached_admission_enabled:
+            metadata.update(
+                {
+                    "cached_admission_enabled": True,
+                    "cached_admission_status": self.cached_admission_status,
+                    "admission_ts": self.admit_ts,
+                    "queue_wait_ms": queue_wait_ms,
+                    "cached_kv_ready": self.cached_kv_ready,
+                    "cached_prefill_mode": self.cached_prefill_mode,
+                    "cache_key": self.cache_key,
+                    "cached_prefill_skipped": self.cached_prefill_skipped,
+                }
+            )
+        return metadata
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
@@ -195,10 +238,18 @@ class Sequence:
                 self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
                 self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
                 self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
+                self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
+                self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
         fields = state[:-1]
+        self.cached_admission_enabled = False
+        self.cached_kv_ready = False
+        self.cached_prefill_mode = None
+        self.cache_key = None
+        self.cached_prefill_skipped = False
+        self.cached_admission_status = None
         if len(fields) == 25:
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
@@ -208,7 +259,7 @@ class Sequence:
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.trace_stats) = fields
             self.home_batch_id = None
-        else:
+        elif len(fields) == 26:
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
              self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
@@ -216,6 +267,16 @@ class Sequence:
              self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats) = fields
+        else:
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+             self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
+             self.arrival_offset_sec,
+             self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
+             self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
+             self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
+             self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
+             self.cache_key, self.cached_prefill_skipped, self.cached_admission_status) = fields
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

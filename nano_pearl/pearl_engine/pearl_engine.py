@@ -163,6 +163,7 @@ class PEARLEngine:
         sampling_params: SamplingParams,
         request_id: str | int | None = None,
         arrival_ts: float | None = None,
+        arrival_offset_sec: float | None = None,
         slo_tpot_ms: float | None = None,
         slo_class: str | None = None,
         per_request_gamma: int | None = None,
@@ -183,6 +184,12 @@ class PEARLEngine:
             slo_class=slo_class,
             per_request_gamma=per_request_gamma,
         )
+        seq.arrival_offset_sec = arrival_offset_sec
+        if getattr(self.config, "enable_cached_admission", False):
+            seq.mark_cached_prefill_metadata(
+                mode=getattr(self.config, "cached_prefill_mode", "metadata_only"),
+                cache_key=request_id,
+            )
         self.controller.write_draft_shm("add_request", seq)
         self.controller.write_target_shm("add_request", seq)
         self.control_event.wait()

@@ -13,6 +13,8 @@ PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
 )
 EAGER_POLICIES = {"none", "tight_only"}
 EAGER_TRACE_LEVELS = {"full", "summary", "minimal"}
+CACHED_PREFILL_MODES = {"metadata_only"}
+CACHED_ADMISSION_POLICIES = {"fifo"}
 
 
 def validate_eager_gamma(config, gamma: int) -> bool:
@@ -167,6 +169,11 @@ class PEARLConfig:
     max_rolling_continuous_depth: int = 2
     max_rolling_continuous_draft_children_per_step: int = 2
     max_rolling_continuous_seqs_per_step: int = 2
+    enable_cached_admission: bool = False
+    cached_prefill_mode: str = "metadata_only"
+    cached_admission_policy: str = "fifo"
+    cached_admission_max_active: int = 0
+    cached_admission_arrival_field: str = "arrival_offset_sec"
 
     def __post_init__(self):
         if self.execution_mode not in self.ALLOWED_EXECUTION_MODES:
@@ -214,6 +221,29 @@ class PEARLConfig:
         self.enable_generic_rolling_runtime_loop = bool(self.enable_generic_rolling_runtime_loop)
         self.enable_generic_rolling_apply_path = bool(self.enable_generic_rolling_apply_path)
         self.enable_full_continuous_eager = bool(self.enable_full_continuous_eager)
+        self.enable_cached_admission = bool(self.enable_cached_admission)
+        self.cached_prefill_mode = str(self.cached_prefill_mode)
+        if self.cached_prefill_mode not in CACHED_PREFILL_MODES:
+            raise ValueError(
+                f"Invalid cached_prefill_mode={self.cached_prefill_mode!r}. "
+                f"Expected one of {sorted(CACHED_PREFILL_MODES)}."
+            )
+        self.cached_admission_policy = str(self.cached_admission_policy)
+        if self.cached_admission_policy not in CACHED_ADMISSION_POLICIES:
+            raise ValueError(
+                f"Invalid cached_admission_policy={self.cached_admission_policy!r}. "
+                f"Expected one of {sorted(CACHED_ADMISSION_POLICIES)}."
+            )
+        self.cached_admission_arrival_field = str(self.cached_admission_arrival_field)
+        if not self.cached_admission_arrival_field:
+            raise ValueError("cached_admission_arrival_field must be non-empty")
+        self.cached_admission_max_active = int(self.cached_admission_max_active)
+        if self.cached_admission_max_active < 0:
+            raise ValueError(
+                f"cached_admission_max_active must be non-negative, got {self.cached_admission_max_active}"
+            )
+        if self.enable_cached_admission and self.cached_admission_max_active == 0:
+            self.cached_admission_max_active = int(self.max_num_seqs)
         if self.enable_full_continuous_eager:
             self.enable_generic_rolling_apply_path = True
         if self.enable_generic_rolling_apply_path:
@@ -453,6 +483,11 @@ class PEARLConfig:
             f"{self.max_rolling_continuous_draft_children_per_step}"
         )
         logger.info(f"Max_Rolling_Continuous_Seqs_Per_Step={self.max_rolling_continuous_seqs_per_step}")
+        logger.info(f"Enable_Cached_Admission={self.enable_cached_admission}")
+        logger.info(f"Cached_Prefill_Mode={self.cached_prefill_mode}")
+        logger.info(f"Cached_Admission_Policy={self.cached_admission_policy}")
+        logger.info(f"Cached_Admission_Max_Active={self.cached_admission_max_active}")
+        logger.info(f"Cached_Admission_Arrival_Field={self.cached_admission_arrival_field}")
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len
