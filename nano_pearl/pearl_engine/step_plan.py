@@ -218,6 +218,12 @@ class StepPlan:
     local_actual_draft_home_set_for_normal_draft: List[int] = field(default_factory=list)
     normal_draft_transfer_synced_expected_seq_ids: List[int] = field(default_factory=list)
     normal_draft_transfer_sender_seq_ids: List[int] = field(default_factory=list)
+    normal_proposal_transfer_called: bool = False
+    normal_proposal_transfer_zero_payload: bool = False
+    normal_proposal_transfer_role: Optional[str] = None
+    normal_proposal_transfer_meta_len: int = 0
+    normal_proposal_transfer_payload_len: int = 0
+    normal_proposal_transfer_next_collective_stage: Optional[str] = None
 
     enable_eager_plan_dry_run: bool = False
     eager_policy: str = "none"
@@ -1091,6 +1097,12 @@ class StepPlan:
             "normal_draft_transfer_sender_seq_ids": _int_list(
                 self.normal_draft_transfer_sender_seq_ids
             ),
+            "normal_proposal_transfer_called": bool(self.normal_proposal_transfer_called),
+            "normal_proposal_transfer_zero_payload": bool(self.normal_proposal_transfer_zero_payload),
+            "normal_proposal_transfer_role": self.normal_proposal_transfer_role,
+            "normal_proposal_transfer_meta_len": int(self.normal_proposal_transfer_meta_len),
+            "normal_proposal_transfer_payload_len": int(self.normal_proposal_transfer_payload_len),
+            "normal_proposal_transfer_next_collective_stage": self.normal_proposal_transfer_next_collective_stage,
             "enable_eager_plan_dry_run": bool(self.enable_eager_plan_dry_run),
             "eager_policy": self.eager_policy,
             "eager_candidate_seq_ids": _int_list(self.eager_candidate_seq_ids),

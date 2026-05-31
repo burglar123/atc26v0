@@ -3026,9 +3026,28 @@ class ModelRunnerBase:
             plan.dual_proposal_expected_receive_seq_ids
         )
         trace_record["dual_proposal_received_seq_ids"] = list(plan.dual_proposal_received_seq_ids)
+        trace_record["normal_proposal_transfer_called"] = bool(
+            plan.normal_proposal_transfer_called
+        )
         trace_record["normal_proposal_transfer_zero_payload"] = bool(
-            trace_record.get("normal_proposal_transfer_called", False)
-            and not plan.normal_draft_transfer_sender_seq_ids
+            plan.normal_proposal_transfer_zero_payload
+        )
+        trace_record["normal_proposal_transfer_role"] = plan.normal_proposal_transfer_role
+        trace_record["normal_proposal_transfer_meta_len"] = int(
+            plan.normal_proposal_transfer_meta_len
+        )
+        trace_record["normal_proposal_transfer_payload_len"] = int(
+            plan.normal_proposal_transfer_payload_len
+        )
+        trace_record["normal_proposal_transfer_next_collective_stage"] = (
+            plan.normal_proposal_transfer_next_collective_stage
+        )
+        trace_record["dual_step_id"] = int(plan.iteration_id)
+        trace_record["normal_transfer_called"] = bool(plan.normal_proposal_transfer_called)
+        trace_record["normal_transfer_meta_len"] = int(plan.normal_proposal_transfer_meta_len)
+        trace_record["normal_transfer_payload_len"] = int(plan.normal_proposal_transfer_payload_len)
+        trace_record["next_collective_stage"] = (
+            plan.normal_proposal_transfer_next_collective_stage
         )
         trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
         trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
@@ -3122,15 +3141,30 @@ class ModelRunnerBase:
         payload_tensor = torch.tensor(payload, dtype=torch.int64, device="cuda")
         return meta, payload_tensor
 
+    def _dual_proposal_payload_len(self, proposals: list[BufferedProposal]) -> int:
+        payload_len = 0
+        for proposal in proposals:
+            payload_len += 5
+            payload_len += len(proposal.to_be_verified_token_ids)
+            payload_len += len(proposal.proposal_token_ids)
+        return int(payload_len)
+
     def _send_dual_proposals(self, proposals: list[BufferedProposal], plan: StepPlan):
         sender_seq_ids = [int(proposal.seq_id) for proposal in proposals]
+        payload_len = self._dual_proposal_payload_len(proposals)
         plan.normal_draft_transfer_sender_seq_ids = list(sender_seq_ids)
         plan.normal_draft_transfer_synced_expected_seq_ids = list(sender_seq_ids)
         plan.dual_proposal_sent_seq_ids = list(sender_seq_ids)
         plan.dual_proposal_expected_receive_seq_ids = list(sender_seq_ids)
+        plan.normal_proposal_transfer_called = True
+        plan.normal_proposal_transfer_role = self._runner_role()
+        plan.normal_proposal_transfer_meta_len = 5
+        plan.normal_proposal_transfer_payload_len = int(payload_len)
+        plan.normal_proposal_transfer_zero_payload = int(payload_len) == 0
         if self.tp_params.local_rank != 0:
             return
         meta, payload = self._serialize_proposals(proposals, plan)
+        plan.normal_proposal_transfer_payload_len = int(meta[1].item())
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta[1].item()) > 0:
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
@@ -3143,6 +3177,11 @@ class ModelRunnerBase:
         meta = torch.zeros(5, dtype=torch.int64, device="cuda")
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         n, payload_len, gamma, proposal_plan_id, batch_id = [int(x) for x in meta.tolist()]
+        plan.normal_proposal_transfer_called = True
+        plan.normal_proposal_transfer_role = self._runner_role()
+        plan.normal_proposal_transfer_meta_len = 5
+        plan.normal_proposal_transfer_payload_len = int(payload_len)
+        plan.normal_proposal_transfer_zero_payload = int(payload_len) == 0
         assert n >= 0 and payload_len >= 0, self._proposal_assertion_message(
             plan,
             f"invalid proposal transfer meta: num_proposals={n}, payload_len={payload_len}",
@@ -3222,6 +3261,57 @@ class ModelRunnerBase:
                 f"proposal seq_id mismatch: expected={expected_seq_ids_list}, received={received_seq_ids}, batch_id={batch_id}",
             )
         return proposals
+
+    def _dual_normal_proposal_transfer_required(
+        self,
+        proposals_to_send: list[BufferedProposal] | None = None,
+        expected_receive_seq_ids: list[int] | None = None,
+    ) -> bool:
+        if self.active_execution_mode != "dual_batch_pearl":
+            return False
+        if bool(getattr(self.global_config, "enable_cached_admission", False)):
+            return True
+        if proposals_to_send:
+            return True
+        return bool(expected_receive_seq_ids)
+
+    def _run_dual_normal_proposal_transfer(
+        self,
+        plan: StepPlan,
+        *,
+        proposals_to_send: list[BufferedProposal] | None = None,
+        expected_receive_seq_ids: list[int] | None = None,
+        next_collective_stage: str,
+    ) -> list[BufferedProposal]:
+        plan.local_actual_draft_home_set_for_normal_draft = self._actual_normal_draft_seq_ids(plan)
+        plan.normal_proposal_transfer_next_collective_stage = str(next_collective_stage)
+        proposals_to_send = proposals_to_send or []
+        expected_receive_seq_ids = (
+            [int(seq_id) for seq_id in expected_receive_seq_ids]
+            if expected_receive_seq_ids is not None
+            else []
+        )
+        if not self._dual_normal_proposal_transfer_required(
+            proposals_to_send=proposals_to_send,
+            expected_receive_seq_ids=expected_receive_seq_ids,
+        ):
+            plan.normal_proposal_transfer_called = False
+            plan.normal_proposal_transfer_zero_payload = True
+            plan.normal_proposal_transfer_role = self._runner_role()
+            plan.normal_proposal_transfer_meta_len = 0
+            plan.normal_proposal_transfer_payload_len = 0
+            return []
+
+        if self.is_draft:
+            self._send_dual_proposals(proposals_to_send, plan)
+            return []
+
+        receive_expected_seq_ids = (
+            None
+            if bool(getattr(self.global_config, "enable_cached_admission", False))
+            else list(expected_receive_seq_ids)
+        )
+        return self._receive_dual_proposals(receive_expected_seq_ids, plan)
 
     def _trace_eager_transfer_send(
         self,
@@ -15435,7 +15525,7 @@ class DraftModelRunner(ModelRunnerBase):
         eager_proposals = []
         eager_trace_record = None
         target_trace_record = None
-        normal_transfer_required = bool(getattr(self.global_config, "enable_cached_admission", False))
+        lane_exclusion_trace_record = None
         if draft_seqs:
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             proposals = self._normal_draft_proposals_for_actual_seq_ids(proposals, plan)
@@ -15457,21 +15547,48 @@ class DraftModelRunner(ModelRunnerBase):
                         buffered_fallback_proposals
                     )
                     plan.cached_admission_primed_seq_ids = list(primed_seq_ids)
-            self._send_dual_proposals(proposals, plan)
-            for trace_record in draft_records:
-                trace_record["normal_proposal_transfer_called"] = True
-                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
-                self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=proposals)
-                self._finalize_record_profile(trace_record)
         elif self._eager_lane_exclusion_dry_run_enabled() and plan.lane_excluded_seq_ids:
-            trace_record = self._trace_dual_batch_schedule([], plan, "dual_draft_lane_exclusion")
-            if normal_transfer_required:
-                self._send_dual_proposals([], plan)
-                trace_record["normal_proposal_transfer_called"] = True
-            self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=[])
-            self._finalize_record_profile(trace_record)
-        elif normal_transfer_required:
-            self._send_dual_proposals([], plan)
+            lane_exclusion_trace_record = self._trace_dual_batch_schedule(
+                [],
+                plan,
+                "dual_draft_lane_exclusion",
+            )
+
+        self._run_dual_normal_proposal_transfer(
+            plan,
+            proposals_to_send=proposals,
+            next_collective_stage="eager_transfer_or_target_verify",
+        )
+        if draft_records:
+            for trace_record in draft_records:
+                trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                self._update_lane_exclusion_proposal_trace(
+                    trace_record,
+                    plan,
+                    sent_proposals=proposals,
+                )
+                self._finalize_record_profile(trace_record)
+        elif lane_exclusion_trace_record is not None:
+            lane_exclusion_trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            self._update_lane_exclusion_proposal_trace(
+                lane_exclusion_trace_record,
+                plan,
+                sent_proposals=proposals,
+            )
+            self._finalize_record_profile(lane_exclusion_trace_record)
+        elif plan.normal_proposal_transfer_called:
+            transfer_trace_record = self._trace_dual_batch_schedule(
+                [],
+                plan,
+                "dual_draft_transfer",
+            )
+            transfer_trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            self._update_lane_exclusion_proposal_trace(
+                transfer_trace_record,
+                plan,
+                sent_proposals=proposals,
+            )
+            self._finalize_record_profile(transfer_trace_record)
 
         if self._eager_draft_dry_run_enabled() and eager_draft_seqs:
             if draft_records:
@@ -15691,22 +15808,12 @@ class TargetModelRunner(ModelRunnerBase):
         eager_verify_dry_run_ran = False
         logits = None
         temperatures = None
-        normal_transfer_required = bool(getattr(self.global_config, "enable_cached_admission", False)) or bool(draft_seq_ids)
-        if target_seqs:
-            self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")
-            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "dual_verify")
-            trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
-            trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
-            input_ids, positions, temp_seqs = self.prepare_pearl_decode(target_seqs)
-            temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
-            torch.cuda.synchronize()
-            self._mark_trace_start(trace_record)
-            logits = self.run_model(input_ids, positions, False)
-
-        received_proposals = []
-        if normal_transfer_required:
-            receive_expected_seq_ids = None if bool(getattr(self.global_config, "enable_cached_admission", False)) else draft_seq_ids
-            received_proposals = self._receive_dual_proposals(receive_expected_seq_ids, plan)
+        received_proposals = self._run_dual_normal_proposal_transfer(
+            plan,
+            expected_receive_seq_ids=draft_seq_ids,
+            next_collective_stage="dual_verify_or_eager_transfer",
+        )
+        if plan.normal_proposal_transfer_called:
             if fallback_same_batch:
                 received_seq_ids = [int(proposal.seq_id) for proposal in received_proposals]
                 received_seq_id_set = set(received_seq_ids)
@@ -15715,13 +15822,6 @@ class TargetModelRunner(ModelRunnerBase):
                 ]
                 plan.fallback_received_seq_ids = list(received_seq_ids)
                 plan.fallback_missing_after_receive_seq_ids = list(missing_after_receive)
-            if trace_record is not None:
-                trace_record["normal_proposal_transfer_called"] = True
-                self._update_lane_exclusion_proposal_trace(
-                    trace_record,
-                    plan,
-                    received_proposals=received_proposals,
-                )
             if fallback_same_batch:
                 assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
                     plan,
@@ -15750,21 +15850,12 @@ class TargetModelRunner(ModelRunnerBase):
                             plan,
                             received_proposals=received_proposals,
                         )
-                if trace_record is not None:
-                    trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
-                    trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             else:
                 self.dual_proposal_buffer.store(received_proposals)
                 plan.cached_admission_primed_seq_ids = self._clear_cached_admission_priming_for_proposals(
                     received_proposals
                 )
-                if trace_record is not None:
-                    self._update_lane_exclusion_proposal_trace(
-                        trace_record,
-                        plan,
-                        received_proposals=received_proposals,
-                    )
-        if fallback_same_batch and target_seq_ids and normal_transfer_required and not received_proposals:
+        if fallback_same_batch and target_seq_ids and plan.normal_proposal_transfer_called and not received_proposals:
             plan.fallback_received_seq_ids = []
             plan.fallback_missing_after_receive_seq_ids = list(target_seq_ids)
             assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
@@ -15772,6 +15863,27 @@ class TargetModelRunner(ModelRunnerBase):
                 "fallback same-batch missing synced proposals for target seq_ids="
                 f"{target_seq_ids}",
             )
+
+        if target_seqs:
+            self._allocate_decode_slots_for_dual(target_seqs, plan, "dual_verify")
+            trace_record = self._trace_dual_batch_schedule(target_seqs, plan, "dual_verify")
+            trace_record["proposal_tokens_available"] = sum(len(p.to_be_verified_token_ids) for p in target_proposals)
+            trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
+            if plan.normal_proposal_transfer_called:
+                self._update_lane_exclusion_proposal_trace(
+                    trace_record,
+                    plan,
+                    received_proposals=received_proposals,
+                )
+                trace_record["proposal_tokens_available"] = sum(
+                    len(p.to_be_verified_token_ids) for p in target_proposals
+                )
+                trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode(target_seqs)
+            temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, False)
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
@@ -15807,9 +15919,8 @@ class TargetModelRunner(ModelRunnerBase):
                 eager_verify_dry_run_ran = True
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
-        elif received_proposals:
+        elif plan.normal_proposal_transfer_called:
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
-            priming_record["normal_proposal_transfer_called"] = True
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
             self._update_lane_exclusion_proposal_trace(
                 priming_record,

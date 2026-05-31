@@ -105,6 +105,17 @@ def trace_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "local_actual_draft_home_set_for_normal_draft",
                     "normal_draft_transfer_synced_expected_seq_ids",
                     "normal_draft_transfer_sender_seq_ids",
+                    "normal_proposal_transfer_called",
+                    "normal_proposal_transfer_zero_payload",
+                    "normal_proposal_transfer_role",
+                    "normal_proposal_transfer_meta_len",
+                    "normal_proposal_transfer_payload_len",
+                    "normal_proposal_transfer_next_collective_stage",
+                    "dual_step_id",
+                    "normal_transfer_called",
+                    "normal_transfer_meta_len",
+                    "normal_transfer_payload_len",
+                    "next_collective_stage",
                     "proposal_buffer_hit_seq_ids",
                     "proposal_buffer_miss_seq_ids",
                     "missing_buffered_proposal_unexpected_seq_ids",
@@ -244,6 +255,8 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
         received_proposals = int_list(record.get("dual_proposal_received_seq_ids"))
         transfer_called = bool_value(record.get("normal_proposal_transfer_called"))
         transfer_zero_payload = bool_value(record.get("normal_proposal_transfer_zero_payload"))
+        transfer_role = str(record.get("normal_proposal_transfer_role") or record.get("runner_role") or "")
+        transfer_payload_len = int_value(record.get("normal_proposal_transfer_payload_len"), 0)
         sender_seq_ids = int_list(record.get("normal_draft_transfer_sender_seq_ids"))
         if not sender_seq_ids:
             sender_seq_ids = int_list(record.get("normal_draft_transfer_synced_expected_seq_ids"))
@@ -309,6 +322,7 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                 f"{sorted(primed & target_normal)}"
             )
         if transfer_called:
+            is_draft_transfer_record = transfer_role == "draft" or "draft" in str(record.get("runner_role") or "")
             duplicate_sender = sorted({seq_id for seq_id in sender_seq_ids if sender_seq_ids.count(seq_id) > 1})
             if duplicate_sender:
                 errors.append(
@@ -323,6 +337,10 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                         f"expected={expected_receive}, received={received_proposals}"
                     )
             else:
+                if transfer_payload_len <= 0:
+                    errors.append(
+                        f"record[{idx}] nonzero normal proposal transfer must have payload_len > 0"
+                    )
                 if sender_seq_ids and sent_proposals != sender_seq_ids:
                     errors.append(
                         f"record[{idx}] dual proposal sent seqs must match sender seqs: "
@@ -333,10 +351,15 @@ def validate(records: list[dict[str, Any]], result_payload: dict[str, Any]) -> t
                         f"record[{idx}] dual proposal expected receive seqs must match sender seqs: "
                         f"expected={expected_receive}, sender={sender_seq_ids}"
                     )
-                if sender_seq_ids and received_proposals != sender_seq_ids:
+                if sender_seq_ids and received_proposals and received_proposals != sender_seq_ids:
                     errors.append(
                         f"record[{idx}] dual proposal received seqs must match sender seqs: "
                         f"received={received_proposals}, sender={sender_seq_ids}"
+                    )
+                if sender_seq_ids and not received_proposals and not is_draft_transfer_record:
+                    errors.append(
+                        f"record[{idx}] target normal proposal transfer must record received seqs: "
+                        f"sender={sender_seq_ids}"
                     )
 
     return errors, summary
@@ -371,6 +394,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "local_actual_draft_home_set_for_normal_draft",
         "normal_draft_transfer_synced_expected_seq_ids",
         "normal_draft_transfer_sender_seq_ids",
+        "normal_proposal_transfer_called",
+        "normal_proposal_transfer_zero_payload",
+        "normal_proposal_transfer_role",
+        "normal_proposal_transfer_meta_len",
+        "normal_proposal_transfer_payload_len",
+        "normal_proposal_transfer_next_collective_stage",
+        "dual_step_id",
+        "normal_transfer_called",
+        "normal_transfer_meta_len",
+        "normal_transfer_payload_len",
+        "next_collective_stage",
         "proposal_buffer_hit_seq_ids",
         "proposal_buffer_miss_seq_ids",
         "missing_buffered_proposal_unexpected_seq_ids",
@@ -484,6 +518,8 @@ def synthetic_dual_payload(
     sender_seq_ids: list[int] | None = None,
     normal_proposal_transfer_called: bool = False,
     normal_proposal_transfer_zero_payload: bool = False,
+    normal_proposal_transfer_role: str = "verify",
+    normal_proposal_transfer_payload_len: int | None = None,
     filtered_draft_seq_ids: list[int] | None = None,
     fallback_pending_receive_seq_ids: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -524,6 +560,35 @@ def synthetic_dual_payload(
             "dual_proposal_received_seq_ids": received_proposal_seq_ids or [],
             "normal_proposal_transfer_called": bool(normal_proposal_transfer_called),
             "normal_proposal_transfer_zero_payload": bool(normal_proposal_transfer_zero_payload),
+            "normal_proposal_transfer_role": str(normal_proposal_transfer_role),
+            "normal_proposal_transfer_meta_len": 5 if normal_proposal_transfer_called else 0,
+            "normal_proposal_transfer_payload_len": (
+                0
+                if normal_proposal_transfer_zero_payload
+                else (
+                    int(normal_proposal_transfer_payload_len)
+                    if normal_proposal_transfer_payload_len is not None
+                    else (1 if normal_proposal_transfer_called else 0)
+                )
+            ),
+            "normal_proposal_transfer_next_collective_stage": (
+                "synthetic_next" if normal_proposal_transfer_called else None
+            ),
+            "dual_step_id": 0,
+            "normal_transfer_called": bool(normal_proposal_transfer_called),
+            "normal_transfer_meta_len": 5 if normal_proposal_transfer_called else 0,
+            "normal_transfer_payload_len": (
+                0
+                if normal_proposal_transfer_zero_payload
+                else (
+                    int(normal_proposal_transfer_payload_len)
+                    if normal_proposal_transfer_payload_len is not None
+                    else (1 if normal_proposal_transfer_called else 0)
+                )
+            ),
+            "next_collective_stage": (
+                "synthetic_next" if normal_proposal_transfer_called else None
+            ),
             "missing_buffered_proposal_allowed_by_eager_seq_ids": [],
             "missing_buffered_proposal_unexpected_seq_ids": (
                 missing_buffered_unexpected_seq_ids or []
@@ -676,6 +741,20 @@ def run_synthetic() -> int:
                 received_proposal_seq_ids=[],
                 normal_proposal_transfer_called=True,
                 normal_proposal_transfer_zero_payload=True,
+            ),
+            False,
+        ),
+        (
+            "dual_draft_transfer_sent_only",
+            synthetic_dual_payload(
+                target_normal_verify_seq_ids=[],
+                actual_draft_seq_ids=[5, 7],
+                sent_proposal_seq_ids=[5, 7],
+                sender_seq_ids=[5, 7],
+                expected_receive_seq_ids=[5, 7],
+                received_proposal_seq_ids=[],
+                normal_proposal_transfer_called=True,
+                normal_proposal_transfer_role="draft",
             ),
             False,
         ),
