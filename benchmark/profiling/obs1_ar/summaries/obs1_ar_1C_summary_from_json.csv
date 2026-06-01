@@ -1,0 +1,6 @@
+obs,label,x,path,execution_mode,decode_ready_mode,engine_elapsed_s,total_output_tokens,goodput_tokens_per_s,mean_tpot_ms
+1C,scale1.0,1.0,raw/1C_ar_scale1.0.jsonl,,,,,,
+1C,scale1.1,1.1,raw/1C_ar_scale1.1.jsonl,,,,,,
+1C,scale1.2,1.2,raw/1C_ar_scale1.2.jsonl,,,,,,
+1C,scale1.4,1.4,raw/1C_ar_scale1.4.jsonl,,,,,,
+1C,scale1.6,1.6,raw/1C_ar_scale1.6.jsonl,,,,,,

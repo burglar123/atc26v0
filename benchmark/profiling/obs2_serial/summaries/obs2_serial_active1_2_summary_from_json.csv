@@ -1,0 +1,3 @@
+obs,label,active,path,execution_mode,decode_ready_mode,engine_elapsed_s,total_output_tokens,goodput_tokens_per_s,mean_tpot_ms
+2A,serial_active1,1,raw/2A_serial_active1.jsonl,,,,,,
+2A,serial_active2,2,raw/2A_serial_active2.jsonl,,,,,,
