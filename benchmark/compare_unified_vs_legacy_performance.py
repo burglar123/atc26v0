@@ -264,6 +264,25 @@ def top_stop_reasons(case: dict[str, Any]) -> dict[str, int]:
     return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:6])
 
 
+def sum_int_map(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return sum(int_value(item, 0) for item in value.values() if not isinstance(item, dict))
+
+
+def top_counts(value: Any, limit: int = 6) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    totals: dict[str, int] = {}
+    for key, item in value.items():
+        if isinstance(item, dict):
+            for nested_key, nested_value in item.items():
+                totals[str(nested_key)] = totals.get(str(nested_key), 0) + int_value(nested_value, 0)
+        else:
+            totals[str(key)] = totals.get(str(key), 0) + int_value(item, 0)
+    return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+
 def metric_definition_rows(legacy: dict[str, Any], unified: dict[str, Any]) -> list[tuple[str, Any, Any]]:
     keys = (
         "goodput_metric_numerator_tokens",
@@ -290,6 +309,67 @@ def diagnosis_rows(legacy: dict[str, Any], unified: dict[str, Any]) -> list[tupl
     num_steps = int_value(value(unified, "num_steps"), 0)
     zero_generic_ms = float_value(value(unified, "zero_generic_full_continuous_broadcast_time_ms"), 0.0)
     total_control_units = int_value(value(unified, "total_control_payload_len_units"), 0)
+    raw_target_available = bool(value(unified, "unified_raw_target_verification_available"))
+    raw_source = value(unified, "unified_raw_verification_source")
+    raw_partial = sum_int_map(value(unified, "unified_raw_partial_accept_proposal_count_by_depth"))
+    raw_reject = sum_int_map(value(unified, "unified_raw_reject_proposal_count_by_depth"))
+    raw_invalidated = sum_int_map(value(unified, "unified_raw_invalidated_proposal_count_by_depth"))
+    raw_full = sum_int_map(value(unified, "unified_raw_full_accept_proposal_count_by_depth"))
+    raw_verified = sum_int_map(value(unified, "unified_raw_verified_proposal_count_by_depth"))
+    ineligible = top_counts(value(unified, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth"))
+    commit_budget = int_value(value(unified, "unified_commit_budget_tokens_per_step"), 0)
+    commit_budget_used = int_value(value(unified, "unified_commit_budget_used_tokens_per_step"), 0)
+    commit_budget_saturated = int_value(value(unified, "unified_commit_budget_saturated_step_count"), 0)
+    no_commit_reasons = top_counts(value(unified, "unified_no_commit_step_reason_counts"))
+    candidate_reasons = top_counts(value(unified, "unified_candidate_step_reason_counts"))
+    if not raw_target_available:
+        rows.append(
+            (
+                "raw verification",
+                f"target raw verification unavailable; source={raw_source}",
+                "Next action: fix outcome accounting or add a real target-verify trace point before interpreting full accepts as target model agreement.",
+            )
+        )
+    elif raw_partial or raw_reject or raw_invalidated:
+        rows.append(
+            (
+                "raw verification",
+                f"partial={raw_partial}, reject={raw_reject}, invalidated={raw_invalidated}",
+                f"Partial recovery did not materialize because ineligible/filtered reasons were {format_value(ineligible)}.",
+            )
+        )
+    else:
+        rows.append(
+            (
+                "raw verification",
+                f"all raw verified proposals were full accepts ({raw_full}/{raw_verified})",
+                "Next action: inspect proposal/verification identity, tokenizer alignment, and whether the path is reusing target tokens instead of draft tokens.",
+            )
+        )
+    if commit_budget and commit_budget_used >= commit_budget and commit_budget_saturated:
+        rows.append(
+            (
+                "budget saturation",
+                f"commit used {commit_budget_used}/{commit_budget} tokens on {commit_budget_saturated} step(s)",
+                "The flat tokens/depth pattern is consistent with budget saturation; increase budget only after raw outcome accounting is trustworthy.",
+            )
+        )
+    elif commit_budget:
+        rows.append(
+            (
+                "budget saturation",
+                f"commit used {commit_budget_used}/{commit_budget} tokens",
+                "The flat tokens/depth pattern is not explained by the exposed commit budget alone.",
+            )
+        )
+    if no_commit_reasons or candidate_reasons:
+        rows.append(
+            (
+                "step coverage",
+                f"no_commit={format_value(no_commit_reasons)}, no_candidate={format_value(candidate_reasons)}",
+                "Use these top reasons to choose between no-ready-parent fixes, active-seq scheduling, or limit tuning.",
+            )
+        )
     if unified_goodput > legacy_goodput and unified_wall_decode < legacy_wall_decode:
         rows.append(
             (
@@ -422,6 +502,45 @@ def main() -> int:
             ("zero_generic_full_continuous_broadcast_time_ms", value(legacy, "zero_generic_full_continuous_broadcast_time_ms"), value(unified, "zero_generic_full_continuous_broadcast_time_ms")),
             ("total_eager_overhead_time_ms", value(legacy, "total_eager_overhead_time_ms"), value(unified, "total_eager_overhead_time_ms")),
             ("eager_transfer_time_ms", value(legacy, "eager_transfer_time_ms"), value(unified, "eager_transfer_time_ms")),
+        ],
+    )
+    print_compare_table(
+        "Unified Raw/Budget Diagnosis",
+        [
+            ("unified_raw_target_verification_available", value(legacy, "unified_raw_target_verification_available"), value(unified, "unified_raw_target_verification_available")),
+            ("unified_raw_verification_source", value(legacy, "unified_raw_verification_source"), value(unified, "unified_raw_verification_source")),
+            ("unified_raw_verified_proposal_count_by_depth", value(legacy, "unified_raw_verified_proposal_count_by_depth"), value(unified, "unified_raw_verified_proposal_count_by_depth")),
+            ("unified_raw_full_accept_proposal_count_by_depth", value(legacy, "unified_raw_full_accept_proposal_count_by_depth"), value(unified, "unified_raw_full_accept_proposal_count_by_depth")),
+            ("unified_raw_partial_accept_proposal_count_by_depth", value(legacy, "unified_raw_partial_accept_proposal_count_by_depth"), value(unified, "unified_raw_partial_accept_proposal_count_by_depth")),
+            ("unified_raw_reject_proposal_count_by_depth", value(legacy, "unified_raw_reject_proposal_count_by_depth"), value(unified, "unified_raw_reject_proposal_count_by_depth")),
+            ("unified_raw_invalidated_proposal_count_by_depth", value(legacy, "unified_raw_invalidated_proposal_count_by_depth"), value(unified, "unified_raw_invalidated_proposal_count_by_depth")),
+            ("unified_raw_accepted_len_hist_by_depth", value(legacy, "unified_raw_accepted_len_hist_by_depth"), value(unified, "unified_raw_accepted_len_hist_by_depth")),
+            ("unified_raw_revised_token_count_by_depth", value(legacy, "unified_raw_revised_token_count_by_depth"), value(unified, "unified_raw_revised_token_count_by_depth")),
+            ("unified_raw_partial_recovery_eligible_count_by_depth", value(legacy, "unified_raw_partial_recovery_eligible_count_by_depth"), value(unified, "unified_raw_partial_recovery_eligible_count_by_depth")),
+            ("unified_raw_partial_recovery_ineligible_reason_counts_by_depth", value(legacy, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth"), value(unified, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth")),
+            ("unified_raw_candidate_proposal_count_by_depth", value(legacy, "unified_raw_candidate_proposal_count_by_depth"), value(unified, "unified_raw_candidate_proposal_count_by_depth")),
+            ("unified_raw_committed_proposal_count_by_depth", value(legacy, "unified_raw_committed_proposal_count_by_depth"), value(unified, "unified_raw_committed_proposal_count_by_depth")),
+            ("unified_raw_verified_to_committed_ratio_by_depth", value(legacy, "unified_raw_verified_to_committed_ratio_by_depth"), value(unified, "unified_raw_verified_to_committed_ratio_by_depth")),
+            ("unified_candidate_budget_tokens_per_step", value(legacy, "unified_candidate_budget_tokens_per_step"), value(unified, "unified_candidate_budget_tokens_per_step")),
+            ("unified_candidate_budget_used_tokens_per_step", value(legacy, "unified_candidate_budget_used_tokens_per_step"), value(unified, "unified_candidate_budget_used_tokens_per_step")),
+            ("unified_candidate_budget_saturated_step_count", value(legacy, "unified_candidate_budget_saturated_step_count"), value(unified, "unified_candidate_budget_saturated_step_count")),
+            ("unified_commit_budget_tokens_per_step", value(legacy, "unified_commit_budget_tokens_per_step"), value(unified, "unified_commit_budget_tokens_per_step")),
+            ("unified_commit_budget_used_tokens_per_step", value(legacy, "unified_commit_budget_used_tokens_per_step"), value(unified, "unified_commit_budget_used_tokens_per_step")),
+            ("unified_commit_budget_saturated_step_count", value(legacy, "unified_commit_budget_saturated_step_count"), value(unified, "unified_commit_budget_saturated_step_count")),
+            ("unified_ready_but_not_committed_token_count", value(legacy, "unified_ready_but_not_committed_token_count"), value(unified, "unified_ready_but_not_committed_token_count")),
+            ("unified_ready_but_not_committed_reason_counts", value(legacy, "unified_ready_but_not_committed_reason_counts"), value(unified, "unified_ready_but_not_committed_reason_counts")),
+            ("unified_ready_but_not_committed_by_depth", value(legacy, "unified_ready_but_not_committed_by_depth"), value(unified, "unified_ready_but_not_committed_by_depth")),
+            ("unified_commit_limited_by_token_budget_count", value(legacy, "unified_commit_limited_by_token_budget_count"), value(unified, "unified_commit_limited_by_token_budget_count")),
+            ("unified_commit_limited_by_seq_budget_count", value(legacy, "unified_commit_limited_by_seq_budget_count"), value(unified, "unified_commit_limited_by_seq_budget_count")),
+            ("unified_commit_limited_by_no_ready_parent_count", value(legacy, "unified_commit_limited_by_no_ready_parent_count"), value(unified, "unified_commit_limited_by_no_ready_parent_count")),
+            ("unified_commit_limited_by_parent_not_full_accept_count", value(legacy, "unified_commit_limited_by_parent_not_full_accept_count"), value(unified, "unified_commit_limited_by_parent_not_full_accept_count")),
+            ("unified_no_candidate_step_count", value(legacy, "unified_no_candidate_step_count"), value(unified, "unified_no_candidate_step_count")),
+            ("unified_no_commit_step_count", value(legacy, "unified_no_commit_step_count"), value(unified, "unified_no_commit_step_count")),
+            ("unified_candidate_step_reason_counts", value(legacy, "unified_candidate_step_reason_counts"), value(unified, "unified_candidate_step_reason_counts")),
+            ("unified_no_commit_step_reason_counts", value(legacy, "unified_no_commit_step_reason_counts"), value(unified, "unified_no_commit_step_reason_counts")),
+            ("unified_active_seq_count_by_step", value(legacy, "unified_active_seq_count_by_step"), value(unified, "unified_active_seq_count_by_step")),
+            ("unified_ready_parent_count_by_step", value(legacy, "unified_ready_parent_count_by_step"), value(unified, "unified_ready_parent_count_by_step")),
+            ("unified_committed_seq_count_by_step", value(legacy, "unified_committed_seq_count_by_step"), value(unified, "unified_committed_seq_count_by_step")),
         ],
     )
     print_compare_table(

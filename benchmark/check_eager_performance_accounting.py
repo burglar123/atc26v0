@@ -405,6 +405,212 @@ def result_metrics(result_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def trace_has_field(records: list[dict[str, Any]], field: str) -> bool:
+    return any(field in record for record in records)
+
+
+def sum_trace_int(records: list[dict[str, Any]], field: str) -> int:
+    return sum(int_value(record.get(field), 0) for record in records)
+
+
+def max_trace_int(records: list[dict[str, Any]], field: str) -> int:
+    return max((int_value(record.get(field), 0) for record in records), default=0)
+
+
+def sum_trace_depth_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for record in records:
+        for field in fields:
+            for depth, value in as_depth_int_map(record.get(field)).items():
+                key = str(int(depth))
+                merged[key] = int(merged.get(key, 0)) + int(value)
+    return dict(sorted(merged.items(), key=lambda item: int(item[0])))
+
+
+def sum_trace_counter_fields(records: list[dict[str, Any]], *fields: str) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for record in records:
+        for field in fields:
+            value = record.get(field)
+            if not isinstance(value, dict):
+                continue
+            for key, count in value.items():
+                counter[str(key)] += int_value(count, 0)
+    return dict(sorted(counter.items()))
+
+
+def sum_trace_depth_reason_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, dict[str, int]]:
+    by_depth: dict[str, Counter[str]] = {}
+    for record in records:
+        for field in fields:
+            value = record.get(field)
+            if not isinstance(value, dict):
+                continue
+            for raw_depth, raw_counts in value.items():
+                try:
+                    depth = str(int(raw_depth))
+                except Exception:
+                    continue
+                if not isinstance(raw_counts, dict):
+                    continue
+                counter = by_depth.setdefault(depth, Counter())
+                for reason, count in raw_counts.items():
+                    counter[str(reason)] += int_value(count, 0)
+    return {
+        depth: dict(sorted(counter.items()))
+        for depth, counter in sorted(by_depth.items(), key=lambda item: int(item[0]))
+    }
+
+
+def count_trace_depth_lists(records: list[dict[str, Any]], field: str) -> dict[str, int]:
+    seen: dict[int, set[int]] = {}
+    for record in records:
+        for depth, proposal_ids in as_depth_int_lists(record.get(field)).items():
+            bucket = seen.setdefault(int(depth), set())
+            bucket.update(int(proposal_id) for proposal_id in proposal_ids)
+    return {str(depth): len(values) for depth, values in sorted(seen.items())}
+
+
+def fallback_unified_raw_outcome_counts(records: list[dict[str, Any]]) -> dict[str, Any]:
+    committed_by_depth: dict[int, set[int]] = {}
+    for record in records:
+        for depth, proposal_ids in as_depth_int_lists(
+            record.get("generic_rolling_real_committed_proposal_ids_by_depth")
+        ).items():
+            committed_by_depth.setdefault(int(depth), set()).update(proposal_ids)
+    result_by_id: dict[int, str] = {}
+    accept_by_id: dict[int, int] = {}
+    token_by_id: dict[int, int] = {}
+    for record in records:
+        accept_by_id.update(as_int_map(record.get("generic_rolling_real_committed_accept_len_by_proposal_id")))
+        token_by_id.update(as_int_map(record.get("generic_rolling_real_committed_token_count_by_proposal_id")))
+        token_by_id.update(as_int_map(record.get("generic_rolling_token_count_by_proposal_id")))
+        value = record.get("generic_rolling_real_commit_verify_result_by_proposal_id")
+        if isinstance(value, dict):
+            for raw_id, raw_result in value.items():
+                try:
+                    result_by_id.setdefault(int(raw_id), str(raw_result))
+                except Exception:
+                    continue
+    verified: dict[str, int] = {}
+    full: dict[str, int] = {}
+    partial: dict[str, int] = {}
+    reject: dict[str, int] = {}
+    invalidated: dict[str, int] = {}
+    accepted_hist: dict[str, dict[str, int]] = {}
+    eligible: dict[str, int] = {}
+    for depth, proposal_ids in committed_by_depth.items():
+        depth_key = str(int(depth))
+        for proposal_id in proposal_ids:
+            result = result_by_id.get(int(proposal_id), "full_accept")
+            verified[depth_key] = int(verified.get(depth_key, 0)) + 1
+            accepted_len = int(accept_by_id.get(int(proposal_id), token_by_id.get(int(proposal_id), 0)))
+            accepted_hist.setdefault(depth_key, {})
+            accepted_key = str(accepted_len)
+            accepted_hist[depth_key][accepted_key] = int(accepted_hist[depth_key].get(accepted_key, 0)) + 1
+            if result == "full_accept":
+                full[depth_key] = int(full.get(depth_key, 0)) + 1
+            elif result == "partial_accept":
+                partial[depth_key] = int(partial.get(depth_key, 0)) + 1
+                eligible[depth_key] = int(eligible.get(depth_key, 0)) + 1
+            elif result in {"reject", "rejected"}:
+                reject[depth_key] = int(reject.get(depth_key, 0)) + 1
+            elif result == "invalidated":
+                invalidated[depth_key] = int(invalidated.get(depth_key, 0)) + 1
+    return {
+        "unified_raw_verified_proposal_count_by_depth": dict(sorted(verified.items(), key=lambda item: int(item[0]))),
+        "unified_raw_full_accept_proposal_count_by_depth": dict(sorted(full.items(), key=lambda item: int(item[0]))),
+        "unified_raw_partial_accept_proposal_count_by_depth": dict(sorted(partial.items(), key=lambda item: int(item[0]))),
+        "unified_raw_reject_proposal_count_by_depth": dict(sorted(reject.items(), key=lambda item: int(item[0]))),
+        "unified_raw_invalidated_proposal_count_by_depth": dict(sorted(invalidated.items(), key=lambda item: int(item[0]))),
+        "unified_raw_accepted_len_hist_by_depth": {
+            depth: dict(sorted(hist.items(), key=lambda item: int(item[0])))
+            for depth, hist in sorted(accepted_hist.items(), key=lambda item: int(item[0]))
+        },
+        "unified_raw_revised_token_count_by_depth": {},
+        "unified_raw_partial_recovery_eligible_count_by_depth": dict(sorted(eligible.items(), key=lambda item: int(item[0]))),
+        "unified_raw_partial_recovery_ineligible_reason_counts_by_depth": {},
+    }
+
+
+def unified_8z_diagnostics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    fallback = fallback_unified_raw_outcome_counts(records)
+    raw_depth_fields = (
+        "unified_raw_verified_proposal_count_by_depth",
+        "unified_raw_full_accept_proposal_count_by_depth",
+        "unified_raw_partial_accept_proposal_count_by_depth",
+        "unified_raw_reject_proposal_count_by_depth",
+        "unified_raw_invalidated_proposal_count_by_depth",
+        "unified_raw_revised_token_count_by_depth",
+        "unified_raw_partial_recovery_eligible_count_by_depth",
+        "unified_raw_candidate_proposal_count_by_depth",
+        "unified_raw_committed_proposal_count_by_depth",
+    )
+    diagnostics: dict[str, Any] = {}
+    for field in raw_depth_fields:
+        if trace_has_field(records, field):
+            diagnostics[field] = sum_trace_depth_counts(records, field)
+        elif field == "unified_raw_candidate_proposal_count_by_depth":
+            diagnostics[field] = count_trace_depth_lists(records, "generic_rolling_candidate_proposal_ids_by_depth")
+        elif field == "unified_raw_committed_proposal_count_by_depth":
+            diagnostics[field] = count_trace_depth_lists(records, "generic_rolling_real_committed_proposal_ids_by_depth")
+        else:
+            diagnostics[field] = fallback.get(field, {})
+    diagnostics["unified_raw_accepted_len_hist_by_depth"] = (
+        sum_trace_depth_reason_counts(records, "unified_raw_accepted_len_hist_by_depth")
+        if trace_has_field(records, "unified_raw_accepted_len_hist_by_depth")
+        else fallback["unified_raw_accepted_len_hist_by_depth"]
+    )
+    diagnostics["unified_raw_partial_recovery_ineligible_reason_counts_by_depth"] = (
+        sum_trace_depth_reason_counts(records, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth")
+        if trace_has_field(records, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth")
+        else fallback["unified_raw_partial_recovery_ineligible_reason_counts_by_depth"]
+    )
+    verified = diagnostics["unified_raw_verified_proposal_count_by_depth"]
+    committed = diagnostics["unified_raw_committed_proposal_count_by_depth"]
+    diagnostics["unified_raw_verified_to_committed_ratio_by_depth"] = {
+        depth: safe_div(float(committed.get(depth, 0)), float(verified.get(depth, 0)))
+        for depth in sorted(set(verified) | set(committed), key=int)
+    }
+    sources = sorted(
+        {
+            str(record.get("unified_raw_verification_source"))
+            for record in records
+            if record.get("unified_raw_verification_source") is not None
+        }
+    )
+    diagnostics.update(
+        {
+            "unified_raw_target_verification_available": any(
+                bool(record.get("unified_raw_target_verification_available", False))
+                for record in records
+            ),
+            "unified_raw_verification_source": ",".join(sources) if sources else "legacy_committed_result_fallback",
+            "unified_candidate_budget_tokens_per_step": max_trace_int(records, "unified_candidate_budget_tokens_per_step"),
+            "unified_candidate_budget_used_tokens_per_step": max_trace_int(records, "unified_candidate_budget_used_tokens_per_step"),
+            "unified_candidate_budget_saturated_step_count": sum_trace_int(records, "unified_candidate_budget_saturated_step_count"),
+            "unified_commit_budget_tokens_per_step": max_trace_int(records, "unified_commit_budget_tokens_per_step"),
+            "unified_commit_budget_used_tokens_per_step": max_trace_int(records, "unified_commit_budget_used_tokens_per_step"),
+            "unified_commit_budget_saturated_step_count": sum_trace_int(records, "unified_commit_budget_saturated_step_count"),
+            "unified_ready_but_not_committed_token_count": sum_trace_int(records, "unified_ready_but_not_committed_token_count"),
+            "unified_ready_but_not_committed_reason_counts": sum_trace_counter_fields(records, "unified_ready_but_not_committed_reason_counts"),
+            "unified_ready_but_not_committed_by_depth": sum_trace_depth_counts(records, "unified_ready_but_not_committed_by_depth"),
+            "unified_commit_limited_by_token_budget_count": sum_trace_int(records, "unified_commit_limited_by_token_budget_count"),
+            "unified_commit_limited_by_seq_budget_count": sum_trace_int(records, "unified_commit_limited_by_seq_budget_count"),
+            "unified_commit_limited_by_no_ready_parent_count": sum_trace_int(records, "unified_commit_limited_by_no_ready_parent_count"),
+            "unified_commit_limited_by_parent_not_full_accept_count": sum_trace_int(records, "unified_commit_limited_by_parent_not_full_accept_count"),
+            "unified_no_candidate_step_count": sum_trace_int(records, "unified_no_candidate_step_count"),
+            "unified_no_commit_step_count": sum_trace_int(records, "unified_no_commit_step_count"),
+            "unified_candidate_step_reason_counts": sum_trace_counter_fields(records, "unified_candidate_step_reason_counts"),
+            "unified_no_commit_step_reason_counts": sum_trace_counter_fields(records, "unified_no_commit_step_reason_counts"),
+            "unified_active_seq_count_by_step": sum_trace_counter_fields(records, "unified_active_seq_count_by_step"),
+            "unified_ready_parent_count_by_step": sum_trace_counter_fields(records, "unified_ready_parent_count_by_step"),
+            "unified_committed_seq_count_by_step": sum_trace_counter_fields(records, "unified_committed_seq_count_by_step"),
+        }
+    )
+    return diagnostics
+
+
 def add_derived_metrics(accounting: dict[str, Any]) -> dict[str, Any]:
     total_output_tokens = int_value(accounting.get("total_output_tokens"), 0)
     candidate_tokens = int_value(accounting.get("eager_candidate_token_count"), 0)
@@ -2032,6 +2238,7 @@ def aggregate_performance_accounting(
             generic_full_continuous_total_output_token_count
         ),
         "unified_generic_parity_ok": bool(generic_full_continuous_parity_ok),
+        **unified_8z_diagnostics(records),
         "generic_rolling_runtime_enabled": bool(generic_rolling_runtime_enabled),
         "generic_rolling_apply_path_enabled": bool(generic_rolling_apply_path_enabled),
         "generic_full_continuous_total_full_commit_token_count": int(
@@ -2948,6 +3155,40 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_enabled",
         "generic_rolling_runtime_enabled",
         "generic_rolling_apply_path_enabled",
+        "unified_raw_target_verification_available",
+        "unified_raw_verification_source",
+        "unified_raw_verified_proposal_count_by_depth",
+        "unified_raw_full_accept_proposal_count_by_depth",
+        "unified_raw_partial_accept_proposal_count_by_depth",
+        "unified_raw_reject_proposal_count_by_depth",
+        "unified_raw_invalidated_proposal_count_by_depth",
+        "unified_raw_accepted_len_hist_by_depth",
+        "unified_raw_revised_token_count_by_depth",
+        "unified_raw_partial_recovery_eligible_count_by_depth",
+        "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
+        "unified_raw_candidate_proposal_count_by_depth",
+        "unified_raw_committed_proposal_count_by_depth",
+        "unified_raw_verified_to_committed_ratio_by_depth",
+        "unified_candidate_budget_tokens_per_step",
+        "unified_candidate_budget_used_tokens_per_step",
+        "unified_candidate_budget_saturated_step_count",
+        "unified_commit_budget_tokens_per_step",
+        "unified_commit_budget_used_tokens_per_step",
+        "unified_commit_budget_saturated_step_count",
+        "unified_ready_but_not_committed_token_count",
+        "unified_ready_but_not_committed_reason_counts",
+        "unified_ready_but_not_committed_by_depth",
+        "unified_commit_limited_by_token_budget_count",
+        "unified_commit_limited_by_seq_budget_count",
+        "unified_commit_limited_by_no_ready_parent_count",
+        "unified_commit_limited_by_parent_not_full_accept_count",
+        "unified_no_candidate_step_count",
+        "unified_no_commit_step_count",
+        "unified_candidate_step_reason_counts",
+        "unified_no_commit_step_reason_counts",
+        "unified_active_seq_count_by_step",
+        "unified_ready_parent_count_by_step",
+        "unified_committed_seq_count_by_step",
         "generic_full_continuous_total_full_commit_token_count",
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",
@@ -3497,7 +3738,12 @@ def synthetic_unified_generic_authority_records(
         "unified_generic_normal_lane_conflict_count": 0,
         "unified_generic_target_draft_mismatch_count": 0,
         "unified_generic_parity_ok": True,
+        "generic_rolling_candidate_proposal_ids_by_depth": {"1": [proposal_id]},
+        "generic_rolling_candidate_seq_ids_by_depth": {"1": [7]},
+        "generic_rolling_ready_proposal_ids_by_depth": {"1": [proposal_id]},
+        "generic_rolling_ready_seq_ids_by_depth": {"1": [7]},
         "generic_rolling_real_committed_proposal_ids_by_depth": {"1": [proposal_id]},
+        "generic_rolling_real_committed_seq_ids_by_depth": {"1": [7]},
         "generic_rolling_real_committed_token_count_by_depth": {"1": int(full_commit)},
         "generic_rolling_real_committed_token_count_by_proposal_id": {
             str(proposal_id): int(full_commit)
@@ -3786,6 +4032,9 @@ def run_synthetic_tests() -> None:
     assert unified_full_summary["combined_actual_accepted_token_increment_sum"] == 64
     assert unified_full_summary["combined_actual_revised_token_increment_sum"] == 0
     assert unified_full_summary["combined_actual_output_token_increment_sum"] == 64
+    assert unified_full_summary["unified_raw_candidate_proposal_count_by_depth"]["1"] == 1
+    assert unified_full_summary["unified_raw_committed_proposal_count_by_depth"]["1"] == 1
+    assert unified_full_summary["unified_raw_verified_to_committed_ratio_by_depth"]["1"] == 1.0
 
     unified_partial = synthetic_unified_generic_authority_records(
         full_commit=64,

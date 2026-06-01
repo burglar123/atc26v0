@@ -1549,6 +1549,40 @@ class ModelRunnerBase:
             "unified_generic_parity_ok": True,
             "unified_generic_depth1_seed_seq_ids": [],
             "unified_generic_depth1_reject_reason_by_seq_id": {},
+            "unified_raw_target_verification_available": False,
+            "unified_raw_verification_source": None,
+            "unified_raw_verified_proposal_count_by_depth": {},
+            "unified_raw_full_accept_proposal_count_by_depth": {},
+            "unified_raw_partial_accept_proposal_count_by_depth": {},
+            "unified_raw_reject_proposal_count_by_depth": {},
+            "unified_raw_invalidated_proposal_count_by_depth": {},
+            "unified_raw_accepted_len_hist_by_depth": {},
+            "unified_raw_revised_token_count_by_depth": {},
+            "unified_raw_partial_recovery_eligible_count_by_depth": {},
+            "unified_raw_partial_recovery_ineligible_reason_counts_by_depth": {},
+            "unified_raw_candidate_proposal_count_by_depth": {},
+            "unified_raw_committed_proposal_count_by_depth": {},
+            "unified_raw_verified_to_committed_ratio_by_depth": {},
+            "unified_candidate_budget_tokens_per_step": 0,
+            "unified_candidate_budget_used_tokens_per_step": 0,
+            "unified_candidate_budget_saturated_step_count": 0,
+            "unified_commit_budget_tokens_per_step": 0,
+            "unified_commit_budget_used_tokens_per_step": 0,
+            "unified_commit_budget_saturated_step_count": 0,
+            "unified_ready_but_not_committed_token_count": 0,
+            "unified_ready_but_not_committed_reason_counts": {},
+            "unified_ready_but_not_committed_by_depth": {},
+            "unified_commit_limited_by_token_budget_count": 0,
+            "unified_commit_limited_by_seq_budget_count": 0,
+            "unified_commit_limited_by_no_ready_parent_count": 0,
+            "unified_commit_limited_by_parent_not_full_accept_count": 0,
+            "unified_no_candidate_step_count": 0,
+            "unified_no_commit_step_count": 0,
+            "unified_candidate_step_reason_counts": {},
+            "unified_no_commit_step_reason_counts": {},
+            "unified_active_seq_count_by_step": {},
+            "unified_ready_parent_count_by_step": {},
+            "unified_committed_seq_count_by_step": {},
             "unified_generic_legacy_runtime_bypassed": bool(
                 getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
             ),
@@ -12929,6 +12963,72 @@ class ModelRunnerBase:
         counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
         trace_record["generic_full_continuous_stop_reason_counts"] = dict(sorted(counts.items()))
 
+    def _increment_trace_depth_counter(
+        self,
+        trace_record: dict,
+        field: str,
+        depth: int,
+        amount: int = 1,
+    ) -> None:
+        values = self._trace_depth_indexed_int_map(trace_record.get(field))
+        values[int(depth)] = int(values.get(int(depth), 0)) + int(amount)
+        trace_record[field] = self._trace_depth_map_to_json(values)
+
+    def _increment_trace_counter_map(
+        self,
+        trace_record: dict,
+        field: str,
+        reason: str,
+        amount: int = 1,
+    ) -> None:
+        values = dict(trace_record.get(field) or {})
+        key = str(reason)
+        values[key] = int(values.get(key, 0)) + int(amount)
+        trace_record[field] = dict(sorted(values.items()))
+
+    def _increment_trace_histogram(
+        self,
+        trace_record: dict,
+        field: str,
+        bucket: int,
+        amount: int = 1,
+    ) -> None:
+        self._increment_trace_counter_map(trace_record, field, str(int(bucket)), int(amount))
+
+    def _increment_trace_depth_reason_counter(
+        self,
+        trace_record: dict,
+        field: str,
+        depth: int,
+        reason: str,
+        amount: int = 1,
+    ) -> None:
+        by_depth = trace_record.get(field)
+        if not isinstance(by_depth, dict):
+            by_depth = {}
+        depth_key = str(int(depth))
+        reason_counts = dict(by_depth.get(depth_key) or {})
+        reason_key = str(reason)
+        reason_counts[reason_key] = int(reason_counts.get(reason_key, 0)) + int(amount)
+        by_depth[depth_key] = dict(sorted(reason_counts.items()))
+        trace_record[field] = {
+            str(key): by_depth[str(key)]
+            for key in sorted((int(item) for item in by_depth.keys()), key=int)
+        }
+
+    def _update_unified_raw_verified_to_committed_ratio(self, trace_record: dict) -> None:
+        verified = self._trace_depth_indexed_int_map(
+            trace_record.get("unified_raw_verified_proposal_count_by_depth")
+        )
+        committed = self._trace_depth_indexed_int_map(
+            trace_record.get("unified_raw_committed_proposal_count_by_depth")
+        )
+        ratios: dict[str, float] = {}
+        for depth in sorted(set(verified) | set(committed)):
+            denom = int(verified.get(depth, 0))
+            ratios[str(int(depth))] = (float(committed.get(depth, 0)) / float(denom)) if denom else 0.0
+        trace_record["unified_raw_verified_to_committed_ratio_by_depth"] = ratios
+
     def _select_unified_generic_depth1_seed_parents(
         self,
         plan: StepPlan,
@@ -13017,8 +13117,44 @@ class ModelRunnerBase:
         timer_start = time.perf_counter()
         gamma = int(self.gamma)
         max_depth, max_children, max_seqs = self._rolling_continuous_limits()
+        per_depth_budget_tokens = int(max(0, min(max_children, max_seqs)) * max(gamma, 0))
+        active_seq_count = sum(
+            1
+            for seq in self.scheduler.running
+            if getattr(seq, "status", None) == SequenceStatus.RUNNING
+        )
+        step_had_candidate = False
+        step_had_commit = False
+        max_ready_parent_count = 0
+        max_committed_seq_count = 0
+        max_candidate_budget_used_tokens = 0
+        max_commit_budget_used_tokens = 0
+        candidate_budget_saturated = False
+        commit_budget_saturated = False
+        step_candidate_reason_counts: dict[str, int] = {}
+        step_no_commit_reason_counts: dict[str, int] = {}
+        if unified_enabled:
+            trace_record["unified_raw_target_verification_available"] = False
+            trace_record["unified_raw_verification_source"] = "draft_commit_decision_no_target_verify"
+            trace_record["unified_candidate_budget_tokens_per_step"] = int(per_depth_budget_tokens)
+            trace_record["unified_commit_budget_tokens_per_step"] = int(per_depth_budget_tokens)
         if unified_enabled and max_depth < 1:
             self._increment_generic_stop_reason(trace_record, "max_depth_reached")
+            trace_record["unified_no_candidate_step_count"] = 1
+            trace_record["unified_no_commit_step_count"] = 1
+            self._increment_trace_counter_map(
+                trace_record,
+                "unified_candidate_step_reason_counts",
+                "max_depth_reached",
+            )
+            self._increment_trace_counter_map(
+                trace_record,
+                "unified_no_commit_step_reason_counts",
+                "max_depth_reached",
+            )
+            self._increment_trace_histogram(trace_record, "unified_active_seq_count_by_step", active_seq_count)
+            self._increment_trace_histogram(trace_record, "unified_ready_parent_count_by_step", 0)
+            self._increment_trace_histogram(trace_record, "unified_committed_seq_count_by_step", 0)
             return []
         if not unified_enabled and max_depth <= 4:
             self._increment_generic_stop_reason(trace_record, "max_depth_reached")
@@ -13089,6 +13225,31 @@ class ModelRunnerBase:
 
         if not current_parents:
             self._increment_generic_stop_reason(trace_record, "no_eligible_parent")
+            if unified_enabled:
+                reject_reasons = dict(trace_record.get("unified_generic_depth1_reject_reason_by_seq_id") or {})
+                reason_counts = Counter(str(reason) for reason in reject_reasons.values())
+                if not reason_counts:
+                    reason_counts["no_active_seq" if active_seq_count == 0 else "no_eligible_parent"] = 1
+                for reason, count in reason_counts.items():
+                    self._increment_trace_counter_map(
+                        trace_record,
+                        "unified_candidate_step_reason_counts",
+                        reason,
+                        int(count),
+                    )
+                    self._increment_trace_counter_map(
+                        trace_record,
+                        "unified_no_commit_step_reason_counts",
+                        reason,
+                        int(count),
+                    )
+                trace_record["unified_no_candidate_step_count"] = 1
+                trace_record["unified_no_commit_step_count"] = 1
+                trace_record["unified_commit_limited_by_no_ready_parent_count"] = 1
+                self._increment_trace_histogram(trace_record, "unified_active_seq_count_by_step", active_seq_count)
+                self._increment_trace_histogram(trace_record, "unified_ready_parent_count_by_step", 0)
+                self._increment_trace_histogram(trace_record, "unified_committed_seq_count_by_step", 0)
+                self._update_unified_raw_verified_to_committed_ratio(trace_record)
             return []
 
         decisions: list[dict] = []
@@ -13159,8 +13320,15 @@ class ModelRunnerBase:
         for depth in range(start_depth, max_depth + 1):
             selected = []
             seen_seq_ids: set[int] = set()
-            for parent in current_parents:
-                if len(selected) >= max_children or len(seen_seq_ids) >= max_seqs:
+            max_ready_parent_count = max(max_ready_parent_count, len(current_parents))
+            depth_limited_by_token_budget = 0
+            depth_limited_by_seq_budget = 0
+            for parent_index, parent in enumerate(current_parents):
+                if len(selected) >= max_children:
+                    depth_limited_by_token_budget += max(1, len(current_parents) - parent_index)
+                    break
+                if len(seen_seq_ids) >= max_seqs:
+                    depth_limited_by_seq_budget += max(1, len(current_parents) - parent_index)
                     break
                 seq_id = int(parent["seq_id"])
                 if seq_id < 0 or seq_id in seen_seq_ids:
@@ -13192,8 +13360,26 @@ class ModelRunnerBase:
                 selected.append((child_id, parent_id, root_id, base_len, seq, checkpoint, parent.get("proposal")))
                 seen_seq_ids.add(seq_id)
 
+            if unified_enabled:
+                selected_tokens = int(len(selected) * gamma)
+                max_candidate_budget_used_tokens = max(max_candidate_budget_used_tokens, selected_tokens)
+                if selected_tokens >= per_depth_budget_tokens and per_depth_budget_tokens > 0:
+                    candidate_budget_saturated = True
+                if depth_limited_by_token_budget:
+                    trace_record["unified_commit_limited_by_token_budget_count"] = int(
+                        trace_record.get("unified_commit_limited_by_token_budget_count", 0) or 0
+                    ) + int(depth_limited_by_token_budget)
+                if depth_limited_by_seq_budget:
+                    trace_record["unified_commit_limited_by_seq_budget_count"] = int(
+                        trace_record.get("unified_commit_limited_by_seq_budget_count", 0) or 0
+                    ) + int(depth_limited_by_seq_budget)
+
             if not selected:
                 self._increment_generic_stop_reason(trace_record, stop_reason or "no_eligible_ready_child")
+                if unified_enabled:
+                    reason = str(stop_reason or "no_eligible_ready_child")
+                    step_candidate_reason_counts[reason] = int(step_candidate_reason_counts.get(reason, 0)) + 1
+                    step_no_commit_reason_counts[reason] = int(step_no_commit_reason_counts.get(reason, 0)) + 1
                 break
 
             generated_by_child_id: dict[int, list[int]] = {int(child_id): [] for child_id, *_rest in selected}
@@ -13284,6 +13470,7 @@ class ModelRunnerBase:
                 candidate_seq_ids.append(seq_id)
                 ready_ids.append(child_id)
                 ready_seq_ids.append(seq_id)
+                step_had_candidate = True
                 if parent_id is not None:
                     parent_by_id[child_id] = int(parent_id)
                 parent_depth_by_id[child_id] = int(depth - 1)
@@ -13315,6 +13502,7 @@ class ModelRunnerBase:
                 local_finished = bool(self._mark_eager_commit_finished_if_needed(seq, commit_tokens))
                 committed_ids.append(child_id)
                 committed_seq_ids.append(seq_id)
+                step_had_commit = True
                 committed_token_by_id[child_id] = int(gamma)
                 committed_accept_by_id[child_id] = int(gamma)
                 committed_action_by_id[child_id] = "append_full_accept_real_commit"
@@ -13349,6 +13537,33 @@ class ModelRunnerBase:
                         }
                     )
             if candidate_ids or committed_ids:
+                if unified_enabled and candidate_ids:
+                    self._increment_trace_depth_counter(
+                        trace_record,
+                        "unified_raw_candidate_proposal_count_by_depth",
+                        depth,
+                        len(set(candidate_ids)),
+                    )
+                    self._increment_trace_depth_reason_counter(
+                        trace_record,
+                        "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
+                        depth,
+                        "target_verification_not_run",
+                        len(set(candidate_ids)),
+                    )
+                if unified_enabled and committed_ids:
+                    committed_seq_count = len(set(committed_seq_ids))
+                    max_committed_seq_count = max(max_committed_seq_count, committed_seq_count)
+                    committed_tokens = int(len(set(committed_ids)) * gamma)
+                    max_commit_budget_used_tokens = max(max_commit_budget_used_tokens, committed_tokens)
+                    if committed_tokens >= per_depth_budget_tokens and per_depth_budget_tokens > 0:
+                        commit_budget_saturated = True
+                    self._increment_trace_depth_counter(
+                        trace_record,
+                        "unified_raw_committed_proposal_count_by_depth",
+                        depth,
+                        len(set(committed_ids)),
+                    )
                 parent_ids_by_depth[depth] = [
                     int(parent_id)
                     for _child_id, parent_id, *_rest in selected
@@ -13373,6 +13588,46 @@ class ModelRunnerBase:
             if depth >= max_depth:
                 self._increment_generic_stop_reason(trace_record, "max_depth_reached")
                 break
+
+        if unified_enabled:
+            trace_record["unified_candidate_budget_used_tokens_per_step"] = int(max_candidate_budget_used_tokens)
+            trace_record["unified_commit_budget_used_tokens_per_step"] = int(max_commit_budget_used_tokens)
+            trace_record["unified_candidate_budget_saturated_step_count"] = int(bool(candidate_budget_saturated))
+            trace_record["unified_commit_budget_saturated_step_count"] = int(bool(commit_budget_saturated))
+            if not step_had_candidate:
+                trace_record["unified_no_candidate_step_count"] = 1
+                if not step_candidate_reason_counts:
+                    step_candidate_reason_counts["no_eligible_ready_child"] = 1
+            if not step_had_commit:
+                trace_record["unified_no_commit_step_count"] = 1
+                if not step_no_commit_reason_counts:
+                    step_no_commit_reason_counts.update(step_candidate_reason_counts or {"no_eligible_ready_child": 1})
+            for reason, count in step_candidate_reason_counts.items():
+                self._increment_trace_counter_map(
+                    trace_record,
+                    "unified_candidate_step_reason_counts",
+                    reason,
+                    int(count),
+                )
+            for reason, count in step_no_commit_reason_counts.items():
+                self._increment_trace_counter_map(
+                    trace_record,
+                    "unified_no_commit_step_reason_counts",
+                    reason,
+                    int(count),
+                )
+            self._increment_trace_histogram(trace_record, "unified_active_seq_count_by_step", active_seq_count)
+            self._increment_trace_histogram(
+                trace_record,
+                "unified_ready_parent_count_by_step",
+                max_ready_parent_count,
+            )
+            self._increment_trace_histogram(
+                trace_record,
+                "unified_committed_seq_count_by_step",
+                max_committed_seq_count,
+            )
+            self._update_unified_raw_verified_to_committed_ratio(trace_record)
 
         trace_record["generic_rolling_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_by_id)
         trace_record["generic_rolling_parent_depth_by_proposal_id"] = self._trace_sorted_int_map(parent_depth_by_id)
@@ -13693,6 +13948,29 @@ class ModelRunnerBase:
                 reason = "target_draft_frontier_mismatch"
             if reason is not None:
                 self._increment_generic_stop_reason(trace_record, reason)
+                if unified_enabled and side == "target":
+                    self._increment_trace_depth_counter(
+                        trace_record,
+                        "unified_ready_but_not_committed_by_depth",
+                        depth,
+                        max(0, token_count),
+                    )
+                    trace_record["unified_ready_but_not_committed_token_count"] = int(
+                        trace_record.get("unified_ready_but_not_committed_token_count", 0) or 0
+                    ) + max(0, int(token_count))
+                    self._increment_trace_counter_map(
+                        trace_record,
+                        "unified_ready_but_not_committed_reason_counts",
+                        reason,
+                    )
+                    if reason == "parent_not_full_accept":
+                        trace_record["unified_commit_limited_by_parent_not_full_accept_count"] = int(
+                            trace_record.get("unified_commit_limited_by_parent_not_full_accept_count", 0) or 0
+                        ) + 1
+                    if reason in {"parent_not_full_accept", "parent_depth_mismatch"}:
+                        trace_record["unified_commit_limited_by_no_ready_parent_count"] = int(
+                            trace_record.get("unified_commit_limited_by_no_ready_parent_count", 0) or 0
+                        ) + 1
                 continue
             commit_tokens = proposal_tokens[:token_count]
             for token_id in commit_tokens:
