@@ -21,10 +21,28 @@ from benchmark.bounded_rolling_chain_parser import (
 
 
 TAKEOVER_SOURCE = "phase1h5e3_takeover_lane"
+EAGER_TRANSFER_SEND_SUBSTAGE_TIMING_FIELDS = [
+    "eager_transfer_filter_time_ms",
+    "eager_transfer_payload_build_time_ms",
+    "eager_transfer_tensor_build_time_ms",
+    "eager_transfer_broadcast_time_ms",
+    "eager_transfer_trace_time_ms",
+]
+EAGER_TRANSFER_RECEIVE_SUBSTAGE_TIMING_FIELDS = [
+    "eager_transfer_receive_preprocess_time_ms",
+    "eager_transfer_receive_broadcast_time_ms",
+    "eager_transfer_deserialize_time_ms",
+    "eager_transfer_classify_time_ms",
+    "eager_transfer_receive_trace_time_ms",
+]
+EAGER_TRANSFER_SUBSTAGE_TIMING_FIELDS = (
+    EAGER_TRANSFER_SEND_SUBSTAGE_TIMING_FIELDS + EAGER_TRANSFER_RECEIVE_SUBSTAGE_TIMING_FIELDS
+)
 TIMING_FIELDS = [
     "eager_plan_time_ms",
     "eager_draft_time_ms",
     "eager_transfer_time_ms",
+    *EAGER_TRANSFER_SUBSTAGE_TIMING_FIELDS,
     "eager_verify_dry_run_time_ms",
     "eager_apply_dry_run_time_ms",
     "eager_result_transfer_time_ms",
@@ -65,6 +83,29 @@ PROPOSAL_LEN_MAP_KEYS = [
 ]
 DEFAULT_LOW_COMMITTED_SHARE_THRESHOLD = 0.01
 DEFAULT_HIGH_PAYLOAD_LEN_PER_COMMITTED_TOKEN_THRESHOLD = 128.0
+INT64_TRACE_UNIT_BYTES = 8
+BYTE_TRACE_FIELDS = (
+    "eager_transfer_meta_bytes",
+    "eager_transfer_payload_bytes",
+    "eager_result_transfer_meta_bytes",
+    "eager_result_transfer_payload_bytes",
+    "continuous_eager_transfer_meta_bytes",
+    "continuous_eager_transfer_payload_bytes",
+    "continuous_eager_result_transfer_meta_bytes",
+    "continuous_eager_result_transfer_payload_bytes",
+    "commit_decision_transfer_meta_bytes",
+    "commit_decision_transfer_payload_bytes",
+)
+ZERO_CANDIDATE_COUNTER_FIELDS = (
+    "zero_candidate_meta_broadcast_count",
+    "zero_candidate_payload_broadcast_skipped_count",
+    "zero_candidate_payload_build_skipped_count",
+    "zero_candidate_payload_build_executed_count",
+    "zero_candidate_trace_heavy_count",
+    "zero_candidate_trace_light_count",
+    "zero_candidate_registry_scan_count",
+    "zero_candidate_sync_apply_scan_count",
+)
 
 GENERIC_ACCOUNTING_FIELD_PAIRS = (
     ("eager_committed_token_count", "generic_one_shot_committed_token_count"),
@@ -249,28 +290,77 @@ def add_derived_metrics(accounting: dict[str, Any]) -> dict[str, Any]:
     total_output_tokens = int_value(accounting.get("total_output_tokens"), 0)
     candidate_tokens = int_value(accounting.get("eager_candidate_token_count"), 0)
     ready_tokens = int_value(accounting.get("eager_ready_token_count"), 0)
-    committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    one_shot_committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+    combined_committed_tokens = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    generic_committed_tokens = int_value(accounting.get("generic_combined_real_committed_token_count"), 0)
+    if generic_committed_tokens <= 0:
+        generic_committed_tokens = combined_committed_tokens
     suppressed_slots = int_value(accounting.get("normal_draft_token_slots_suppressed"), 0)
     replaced_slots = int_value(accounting.get("target_normal_verify_token_slots_replaced_by_eager"), 0)
     proposal_payload_units = int_value(accounting.get("eager_proposal_transfer_payload_len_units"), 0)
     result_payload_units = int_value(accounting.get("eager_result_transfer_payload_len_units"), 0)
+    continuous_proposal_payload_units = int_value(accounting.get("continuous_proposal_payload_len_units"), 0)
+    continuous_result_payload_units = int_value(accounting.get("continuous_result_payload_len_units"), 0)
+    commit_decision_payload_units = int_value(accounting.get("commit_decision_payload_len_units"), 0)
+    total_control_payload_units = (
+        proposal_payload_units
+        + result_payload_units
+        + continuous_proposal_payload_units
+        + continuous_result_payload_units
+        + commit_decision_payload_units
+    )
     accounting.update(
         {
-            "committed_token_share_of_output": safe_div(committed_tokens, total_output_tokens),
+            "one_shot_eager_committed_tokens": one_shot_committed_tokens,
+            "committed_token_share_of_output": safe_div(one_shot_committed_tokens, total_output_tokens),
             "candidate_token_share_of_output": safe_div(candidate_tokens, total_output_tokens),
-            "suppressed_slots_per_committed_token": safe_div(suppressed_slots, committed_tokens),
-            "replaced_slots_per_committed_token": safe_div(replaced_slots, committed_tokens),
+            "suppressed_slots_per_committed_token": safe_div(suppressed_slots, one_shot_committed_tokens),
+            "replaced_slots_per_committed_token": safe_div(replaced_slots, one_shot_committed_tokens),
+            "eager_proposal_payload_len_units": proposal_payload_units,
+            "eager_result_payload_len_units": result_payload_units,
+            "continuous_proposal_payload_len_units": continuous_proposal_payload_units,
+            "continuous_result_payload_len_units": continuous_result_payload_units,
+            "commit_decision_payload_len_units": commit_decision_payload_units,
+            "total_control_payload_len_units": total_control_payload_units,
             "proposal_payload_len_units_per_committed_token": safe_div(
                 proposal_payload_units,
-                committed_tokens,
+                one_shot_committed_tokens,
+            ),
+            "proposal_payload_len_units_per_one_shot_committed_token": safe_div(
+                proposal_payload_units,
+                one_shot_committed_tokens,
+            ),
+            "eager_proposal_payload_units_per_one_shot_committed_token": safe_div(
+                proposal_payload_units,
+                one_shot_committed_tokens,
+            ),
+            "eager_proposal_payload_units_per_generic_committed_token": safe_div(
+                proposal_payload_units,
+                generic_committed_tokens,
+            ),
+            "eager_proposal_payload_units_per_combined_committed_token": safe_div(
+                proposal_payload_units,
+                combined_committed_tokens,
+            ),
+            "eager_proposal_payload_units_per_total_output_token": safe_div(
+                proposal_payload_units,
+                total_output_tokens,
+            ),
+            "total_control_payload_units_per_generic_committed_token": safe_div(
+                total_control_payload_units,
+                generic_committed_tokens,
+            ),
+            "total_control_payload_units_per_total_output_token": safe_div(
+                total_control_payload_units,
+                total_output_tokens,
             ),
             "result_payload_len_units_per_committed_token": safe_div(
                 result_payload_units,
-                committed_tokens,
+                one_shot_committed_tokens,
             ),
-            "committed_tokens_per_candidate_token": safe_div(committed_tokens, candidate_tokens),
+            "committed_tokens_per_candidate_token": safe_div(one_shot_committed_tokens, candidate_tokens),
             "ready_tokens_per_candidate_token": safe_div(ready_tokens, candidate_tokens),
-            "committed_tokens_per_ready_token": safe_div(committed_tokens, ready_tokens),
+            "committed_tokens_per_ready_token": safe_div(one_shot_committed_tokens, ready_tokens),
         }
     )
     return accounting
@@ -309,12 +399,21 @@ def performance_warnings(
         warnings.append("timing_unavailable")
     if not bool(accounting.get("payload_bytes_available", False)):
         warnings.append("payload_bytes_unavailable")
-    if (
-        committed_tokens > 0
-        and float_value(accounting.get("proposal_payload_len_units_per_committed_token"), 0.0)
-        > high_payload_len_per_committed_token_threshold
-    ):
-        warnings.append("proposal_payload_len_units_high_per_committed_token")
+    if committed_tokens > 0:
+        if bool(accounting.get("generic_accounting_mode", False)):
+            proposal_payload_ratio = float_value(
+                accounting.get("eager_proposal_payload_units_per_generic_committed_token"),
+                0.0,
+            )
+            if proposal_payload_ratio > high_payload_len_per_committed_token_threshold:
+                warnings.append("eager_proposal_payload_units_high_per_generic_committed_token")
+        else:
+            proposal_payload_ratio = float_value(
+                accounting.get("eager_proposal_payload_units_per_one_shot_committed_token"),
+                float_value(accounting.get("proposal_payload_len_units_per_committed_token"), 0.0),
+            )
+            if proposal_payload_ratio > high_payload_len_per_committed_token_threshold:
+                warnings.append("proposal_payload_len_units_high_per_committed_token")
     if (
         committed_tokens > 0
         and int_value(accounting.get("normal_draft_token_slots_suppressed"), 0) > committed_tokens
@@ -425,6 +524,7 @@ def aggregate_performance_accounting(
     continuous_draft_rejected_sum = 0
     continuous_draft_invalidated_sum = 0
     continuous_depth2_real_commit_count = 0
+    continuous_proposal_transfer_payload_len_units = 0
     continuous_result_transfer_payload_len_units = 0
     continuous_commit_decision_payload_len_units = 0
     continuous_result_transfer_payload_len_units_before_compact = 0
@@ -556,8 +656,10 @@ def aggregate_performance_accounting(
     zero_result_transfer_steps: set[tuple[int, int]] = set()
     proposal_transfer_payload_len_units = 0
     result_transfer_payload_len_units = 0
+    eager_commit_decision_payload_len_units = 0
     proposal_transfer_payload_bytes = 0
     result_transfer_payload_bytes = 0
+    byte_trace_sums = {field: 0 for field in BYTE_TRACE_FIELDS}
     negative_payload_field_count = 0
     payload_bytes_available = False
     timing_sums = {key: 0.0 for key in TIMING_FIELDS}
@@ -574,6 +676,9 @@ def aggregate_performance_accounting(
     counted_rolling_depth3_commit_records: set[tuple[str, int, int]] = set()
     counted_rolling_depth4_commit_events: set[tuple[str, int, int, int]] = set()
     counted_rolling_depth4_commit_records: set[tuple[str, int, int]] = set()
+    zero_counter_by_field_step: dict[str, dict[tuple[int, int], int]] = {
+        field: {} for field in ZERO_CANDIDATE_COUNTER_FIELDS
+    }
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -815,6 +920,19 @@ def aggregate_performance_accounting(
                     )
                     continuous_draft_rejected_sum += int_value(record.get("continuous_eager_tokens_rejected"), 0)
                     continuous_draft_invalidated_sum += int_value(record.get("continuous_eager_tokens_invalidated"), 0)
+        if "continuous_eager_proposal_transfer_payload_len_units" in record:
+            payload_len = int_value(record.get("continuous_eager_proposal_transfer_payload_len_units"), 0)
+            if payload_len < 0:
+                negative_payload_field_count += 1
+            event_key = (
+                "continuous_eager_proposal_transfer_payload_len_units",
+                key[0],
+                key[1],
+                payload_len,
+            )
+            if payload_len > 0 and event_key not in counted_payload_len_events:
+                counted_payload_len_events.add(event_key)
+                continuous_proposal_transfer_payload_len_units += payload_len
         continuous_result_transfer_payload_len_units += max(
             0,
             int_value(record.get("continuous_eager_result_transfer_payload_len_units"), 0),
@@ -1276,6 +1394,19 @@ def aggregate_performance_accounting(
             if payload_len > 0 and event_key not in counted_payload_len_events:
                 counted_payload_len_events.add(event_key)
                 continuous_commit_decision_payload_len_units += payload_len
+        if "eager_commit_decision_payload_len_units" in record:
+            payload_len = int_value(record.get("eager_commit_decision_payload_len_units"), 0)
+            if payload_len < 0:
+                negative_payload_field_count += 1
+            event_key = (
+                "eager_commit_decision_payload_len_units",
+                key[0],
+                key[1],
+                payload_len,
+            )
+            if payload_len > 0 and event_key not in counted_payload_len_events:
+                counted_payload_len_events.add(event_key)
+                eager_commit_decision_payload_len_units += payload_len
 
         reason_map = record.get("eager_commit_skip_reason_by_proposal_id")
         if not isinstance(reason_map, dict):
@@ -1328,7 +1459,7 @@ def aggregate_performance_accounting(
                     else:
                         result_transfer_payload_len_units += payload_len
 
-        for field_name in ("eager_transfer_payload_bytes", "eager_result_transfer_payload_bytes"):
+        for field_name in BYTE_TRACE_FIELDS:
             if field_name in record:
                 payload_bytes_available = True
                 payload_bytes = int_value(record.get(field_name), 0)
@@ -1337,10 +1468,20 @@ def aggregate_performance_accounting(
                 event_key = (field_name, key[0], key[1], payload_bytes)
                 if payload_bytes >= 0 and event_key not in counted_payload_byte_events:
                     counted_payload_byte_events.add(event_key)
+                    byte_trace_sums[field_name] += payload_bytes
                     if field_name == "eager_transfer_payload_bytes":
                         proposal_transfer_payload_bytes += payload_bytes
-                    else:
+                    elif field_name == "eager_result_transfer_payload_bytes":
                         result_transfer_payload_bytes += payload_bytes
+
+        for field_name in ZERO_CANDIDATE_COUNTER_FIELDS:
+            if field_name in record:
+                value = int_value(record.get(field_name), 0)
+                if value < 0:
+                    negative_payload_field_count += 1
+                if value > 0:
+                    per_step = zero_counter_by_field_step[field_name]
+                    per_step[key] = max(int(per_step.get(key, 0)), int(value))
 
         if bool(record.get("eager_result_transfer_zero_result_step", False)):
             zero_result_transfer_steps.add(key)
@@ -1596,7 +1737,43 @@ def aggregate_performance_accounting(
     eager_partial_reject_rate = skipped_count / candidate_count if candidate_count else 0.0
 
     timing_summary = dict(timing_sums)
-    timing_summary["total_eager_overhead_time_ms"] = sum(timing_sums.values()) if timing_available else 0.0
+    timing_summary["total_eager_overhead_time_ms"] = (
+        sum(
+            timing_sums.get(field, 0.0)
+            for field in TIMING_FIELDS
+            if field not in EAGER_TRANSFER_SUBSTAGE_TIMING_FIELDS
+        )
+        if timing_available
+        else 0.0
+    )
+    timing_summary["eager_transfer_send_substage_time_ms"] = sum(
+        timing_sums.get(field, 0.0) for field in EAGER_TRANSFER_SEND_SUBSTAGE_TIMING_FIELDS
+    )
+    timing_summary["eager_transfer_receive_substage_time_ms"] = sum(
+        timing_sums.get(field, 0.0) for field in EAGER_TRANSFER_RECEIVE_SUBSTAGE_TIMING_FIELDS
+    )
+    timing_summary["eager_transfer_substage_accounted_time_ms"] = sum(
+        timing_sums.get(field, 0.0) for field in EAGER_TRANSFER_SUBSTAGE_TIMING_FIELDS
+    )
+    zero_counter_sums = {
+        field: sum(int(value) for value in per_step.values())
+        for field, per_step in zero_counter_by_field_step.items()
+    }
+    commit_decision_payload_len_units = (
+        eager_commit_decision_payload_len_units
+        + continuous_commit_decision_payload_len_units
+        + rolling_depth2_commit_decision_payload_len_units
+        + rolling_depth3_commit_decision_payload_len_units
+        + rolling_depth4_commit_decision_payload_len_units
+        + generic_rolling_commit_decision_payload_len_units
+    )
+    total_control_payload_len_units = (
+        proposal_transfer_payload_len_units
+        + result_transfer_payload_len_units
+        + continuous_proposal_transfer_payload_len_units
+        + continuous_result_transfer_payload_len_units
+        + commit_decision_payload_len_units
+    )
     embedded_accounting = (
         result_payload.get("eager_performance_accounting", {})
         if isinstance(result_payload, dict)
@@ -1899,13 +2076,20 @@ def aggregate_performance_accounting(
             continuous_result_transfer_payload_len_units_before_compact
         ),
         "continuous_eager_commit_decision_broadcast_payload_len_units": continuous_commit_decision_payload_len_units,
+        "continuous_eager_proposal_transfer_payload_len_units": continuous_proposal_transfer_payload_len_units,
         "continuous_eager_result_transfer_payload_len_units": continuous_result_transfer_payload_len_units,
+        "continuous_proposal_payload_len_units": continuous_proposal_transfer_payload_len_units,
+        "continuous_result_payload_len_units": continuous_result_transfer_payload_len_units,
         "rolling_depth3_commit_decision_broadcast_payload_len_units": rolling_depth3_commit_decision_payload_len_units,
         "rolling_depth4_commit_decision_broadcast_payload_len_units": rolling_depth4_commit_decision_payload_len_units,
+        "eager_commit_decision_payload_len_units": eager_commit_decision_payload_len_units,
+        "commit_decision_payload_len_units": commit_decision_payload_len_units,
+        "total_control_payload_len_units": total_control_payload_len_units,
         "continuous_zero_result_fast_path_count": continuous_zero_result_fast_path_count,
         "continuous_zero_decision_fast_path_count": continuous_zero_decision_fast_path_count,
         "continuous_eager_sync_apply_zero_steps": continuous_sync_apply_zero_steps,
         "continuous_eager_verify_apply_zero_candidate_steps": continuous_verify_apply_zero_candidate_steps,
+        **zero_counter_sums,
         "rolling_child_candidate_proposal_count": len(rolling_child_candidate_ids),
         "rolling_child_candidate_token_count": rolling_child_candidate_token_count,
         "rolling_child_ready_shadow_proposal_count": len(rolling_child_ready_ids),
@@ -1952,11 +2136,21 @@ def aggregate_performance_accounting(
             "draft_actual_eager_accepted_token_increment_sum", 0
         ),
         "eager_proposal_transfer_steps": len(proposal_transfer_steps),
+        "eager_transfer_meta_bytes": byte_trace_sums["eager_transfer_meta_bytes"],
+        "eager_transfer_payload_bytes": byte_trace_sums["eager_transfer_payload_bytes"],
         "eager_proposal_transfer_payload_bytes": proposal_transfer_payload_bytes,
         "eager_proposal_transfer_payload_len_units": proposal_transfer_payload_len_units,
         "eager_result_transfer_steps": len(result_transfer_steps),
+        "eager_result_transfer_meta_bytes": byte_trace_sums["eager_result_transfer_meta_bytes"],
         "eager_result_transfer_payload_bytes": result_transfer_payload_bytes,
         "eager_result_transfer_payload_len_units": result_transfer_payload_len_units,
+        "continuous_eager_transfer_meta_bytes": byte_trace_sums["continuous_eager_transfer_meta_bytes"],
+        "continuous_eager_transfer_payload_bytes": byte_trace_sums["continuous_eager_transfer_payload_bytes"],
+        "continuous_eager_result_transfer_meta_bytes": byte_trace_sums["continuous_eager_result_transfer_meta_bytes"],
+        "continuous_eager_result_transfer_payload_bytes": byte_trace_sums["continuous_eager_result_transfer_payload_bytes"],
+        "commit_decision_transfer_meta_bytes": byte_trace_sums["commit_decision_transfer_meta_bytes"],
+        "commit_decision_transfer_payload_bytes": byte_trace_sums["commit_decision_transfer_payload_bytes"],
+        "total_control_payload_bytes": sum(byte_trace_sums.values()),
         "negative_payload_field_count": negative_payload_field_count,
         "eager_lane_exclusion_sync_steps": len(lane_sync_steps),
         "eager_commit_check_active_records": commit_summary.get("commit_active_records", 0),
@@ -2360,9 +2554,27 @@ def validate_accounting(
         errors.append("target normal verify token slots replaced by eager must cover committed tokens")
     for field in (
         "eager_proposal_transfer_payload_bytes",
+        "eager_transfer_meta_bytes",
+        "eager_transfer_payload_bytes",
+        "eager_result_transfer_meta_bytes",
         "eager_result_transfer_payload_bytes",
         "eager_proposal_transfer_payload_len_units",
         "eager_result_transfer_payload_len_units",
+        "eager_proposal_payload_len_units",
+        "eager_result_payload_len_units",
+        "continuous_eager_transfer_meta_bytes",
+        "continuous_eager_transfer_payload_bytes",
+        "continuous_eager_result_transfer_meta_bytes",
+        "continuous_eager_result_transfer_payload_bytes",
+        "commit_decision_transfer_meta_bytes",
+        "commit_decision_transfer_payload_bytes",
+        "total_control_payload_bytes",
+        "continuous_eager_proposal_transfer_payload_len_units",
+        "continuous_proposal_payload_len_units",
+        "continuous_result_payload_len_units",
+        "eager_commit_decision_payload_len_units",
+        "commit_decision_payload_len_units",
+        "total_control_payload_len_units",
         "continuous_eager_commit_decision_broadcast_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units_before_compact",
@@ -2439,6 +2651,7 @@ def validate_accounting(
         "rolling_depth2_commit_decision_broadcast_payload_len_units",
         "rolling_depth3_commit_decision_broadcast_payload_len_units",
         "rolling_depth4_commit_decision_broadcast_payload_len_units",
+        *ZERO_CANDIDATE_COUNTER_FIELDS,
     ):
         if int_value(accounting.get(field), 0) < 0:
             errors.append(f"{field} must be nonnegative")
@@ -2492,6 +2705,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",
         "generic_full_continuous_total_output_token_count",
+        "one_shot_eager_committed_tokens",
         "generic_full_continuous_depth_partial_recovered_token_counts",
         "generic_full_continuous_depth_revised_token_counts",
         "generic_full_continuous_parity_ok",
@@ -2650,13 +2864,20 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_eager_result_transfer_protocol",
         "continuous_eager_result_transfer_protocols",
         "continuous_eager_result_transfer_payload_len_units_before_compact",
+        "continuous_eager_proposal_transfer_payload_len_units",
         "continuous_eager_commit_decision_broadcast_payload_len_units",
         "continuous_eager_result_transfer_payload_len_units",
+        "continuous_proposal_payload_len_units",
+        "continuous_result_payload_len_units",
         "rolling_depth4_commit_decision_broadcast_payload_len_units",
+        "eager_commit_decision_payload_len_units",
+        "commit_decision_payload_len_units",
+        "total_control_payload_len_units",
         "continuous_zero_result_fast_path_count",
         "continuous_zero_decision_fast_path_count",
         "continuous_eager_sync_apply_zero_steps",
         "continuous_eager_verify_apply_zero_candidate_steps",
+        *ZERO_CANDIDATE_COUNTER_FIELDS,
         "rolling_child_candidate_proposal_count",
         "rolling_child_candidate_token_count",
         "rolling_child_ready_shadow_proposal_count",
@@ -2677,6 +2898,13 @@ def print_summary(summary: dict[str, Any]) -> None:
         "suppressed_slots_per_committed_token",
         "replaced_slots_per_committed_token",
         "proposal_payload_len_units_per_committed_token",
+        "proposal_payload_len_units_per_one_shot_committed_token",
+        "eager_proposal_payload_units_per_one_shot_committed_token",
+        "eager_proposal_payload_units_per_generic_committed_token",
+        "eager_proposal_payload_units_per_combined_committed_token",
+        "eager_proposal_payload_units_per_total_output_token",
+        "total_control_payload_units_per_generic_committed_token",
+        "total_control_payload_units_per_total_output_token",
         "result_payload_len_units_per_committed_token",
         "committed_tokens_per_candidate_token",
         "ready_tokens_per_candidate_token",
@@ -2688,14 +2916,31 @@ def print_summary(summary: dict[str, Any]) -> None:
         "target_normal_verify_token_slots_replaced_by_eager",
         "target_actual_eager_verified_token_increment_sum",
         "target_actual_eager_accepted_token_increment_sum",
+        "eager_proposal_payload_len_units",
+        "eager_result_payload_len_units",
+        "eager_transfer_meta_bytes",
+        "eager_transfer_payload_bytes",
         "eager_proposal_transfer_payload_bytes",
         "eager_proposal_transfer_payload_len_units",
+        "eager_result_transfer_meta_bytes",
         "eager_result_transfer_payload_bytes",
         "eager_result_transfer_payload_len_units",
+        "continuous_eager_transfer_meta_bytes",
+        "continuous_eager_transfer_payload_bytes",
+        "continuous_eager_result_transfer_meta_bytes",
+        "continuous_eager_result_transfer_payload_bytes",
+        "commit_decision_transfer_meta_bytes",
+        "commit_decision_transfer_payload_bytes",
+        "total_control_payload_bytes",
+        "payload_bytes_available",
+        "missing_payload_bytes_reason",
         "eager_accounting_summary_time_ms",
         "timing_available",
         "missing_timing_reason",
         *TIMING_FIELDS,
+        "eager_transfer_send_substage_time_ms",
+        "eager_transfer_receive_substage_time_ms",
+        "eager_transfer_substage_accounted_time_ms",
         "total_eager_overhead_time_ms",
         "performance_warnings",
         "repeated_commit_proposal_ids",
@@ -2976,6 +3221,12 @@ def run_synthetic_tests() -> None:
     assert summary["committed_token_share_of_output"] == 4 / 64
     assert summary["suppressed_slots_per_committed_token"] == 2.0
     assert summary["proposal_payload_len_units_per_committed_token"] == 3.0
+    assert summary["eager_proposal_payload_len_units"] == 12
+    assert summary["eager_result_payload_len_units"] == 8
+    assert summary["total_control_payload_len_units"] == 20
+    assert summary["eager_proposal_payload_units_per_one_shot_committed_token"] == 3.0
+    assert summary["eager_proposal_payload_units_per_combined_committed_token"] == 1.0
+    assert summary["eager_proposal_payload_units_per_total_output_token"] == 12 / 64
     assert summary["continuous_eager_real_committed_token_count"] == 4
     assert summary["continuous_target_actual_verified_token_increment_sum"] == 4
     assert summary["continuous_draft_actual_verified_token_increment_sum"] == 4
@@ -2985,6 +3236,39 @@ def run_synthetic_tests() -> None:
     assert summary["combined_real_committed_token_count"] == 12
     assert summary["timing_available"] is False
     assert summary["missing_timing_reason"] == "not_instrumented"
+
+    byte_records = deepcopy(records)
+    byte_records[0].update(
+        {
+            "eager_transfer_meta_bytes": 40,
+            "eager_transfer_payload_bytes": 96,
+            "eager_result_transfer_meta_bytes": 56,
+            "eager_result_transfer_payload_bytes": 64,
+            "continuous_eager_transfer_meta_bytes": 56,
+            "continuous_eager_transfer_payload_bytes": 0,
+            "continuous_eager_result_transfer_meta_bytes": 56,
+            "continuous_eager_result_transfer_payload_bytes": 0,
+            "commit_decision_transfer_meta_bytes": 48,
+            "commit_decision_transfer_payload_bytes": 0,
+            "eager_transfer_filter_time_ms": 0.1,
+            "eager_transfer_payload_build_time_ms": 0.2,
+            "eager_transfer_tensor_build_time_ms": 0.3,
+            "eager_transfer_broadcast_time_ms": 0.4,
+            "eager_transfer_trace_time_ms": 0.5,
+            "eager_transfer_receive_preprocess_time_ms": 0.6,
+            "eager_transfer_receive_broadcast_time_ms": 0.7,
+            "eager_transfer_deserialize_time_ms": 0.8,
+            "eager_transfer_classify_time_ms": 0.9,
+            "eager_transfer_receive_trace_time_ms": 1.0,
+        }
+    )
+    errors, byte_summary = validate_accounting(byte_records, synthetic_result_payload())
+    assert not errors, f"byte-instrumented accounting synthetic failed: {errors}"
+    assert byte_summary["payload_bytes_available"] is True
+    assert "payload_bytes_unavailable" not in byte_summary["performance_warnings"]
+    assert byte_summary["eager_transfer_payload_bytes"] == 96
+    assert byte_summary["total_control_payload_bytes"] == 416
+    assert abs(byte_summary["eager_transfer_substage_accounted_time_ms"] - 5.5) < 1e-9
 
     invalid = deepcopy(records)
     invalid[0]["eager_tokens_verified"] = 0
@@ -3044,6 +3328,23 @@ def run_synthetic_tests() -> None:
     assert generic_summary["combined_actual_revised_token_increment_sum"] == 9
     assert generic_summary["combined_actual_output_token_increment_sum"] == 3676
     assert generic_summary["legacy_accounting_checks_skipped_due_to_generic_mode"]
+
+    denominator_records = synthetic_generic_full_continuous_records(
+        full_commit=6384,
+        partial_recovered=0,
+        revised=0,
+        total_output=6384,
+    )
+    denominator_records[0]["eager_transfer_payload_len"] = 70380
+    denominator_errors, denominator_summary = validate_accounting(
+        denominator_records,
+        synthetic_generic_result_payload(total_output_tokens=129572),
+    )
+    assert not denominator_errors, f"generic denominator synthetic failed: {denominator_errors}"
+    assert denominator_summary["eager_proposal_payload_units_per_one_shot_committed_token"] == 0.0
+    assert denominator_summary["eager_proposal_payload_units_per_generic_committed_token"] == 70380 / 6384
+    assert denominator_summary["eager_proposal_payload_units_per_total_output_token"] == 70380 / 129572
+    assert "proposal_payload_len_units_high_per_committed_token" not in denominator_summary["performance_warnings"]
 
     bad_generic_accounting = aggregate_performance_accounting(generic_records, synthetic_generic_result_payload())
     bad_generic_accounting["combined_actual_accepted_token_increment_sum"] += 1
