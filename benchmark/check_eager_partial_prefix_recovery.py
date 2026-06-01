@@ -72,18 +72,19 @@ def _max_int(records: list[dict[str, Any]], field: str, default: int = 0) -> int
     return max(values) if values else default
 
 
-def _merge_depth_counts(records: list[dict[str, Any]], field: str) -> dict[int, int]:
+def _merge_depth_counts(records: list[dict[str, Any]], *fields: str) -> dict[int, int]:
     merged: dict[int, int] = {}
     for record in records:
-        raw = record.get(field)
-        if not isinstance(raw, dict):
-            continue
-        for key, value in raw.items():
-            try:
-                depth = int(key)
-            except Exception:
+        for field in fields:
+            raw = record.get(field)
+            if not isinstance(raw, dict):
                 continue
-            merged[depth] = max(int_value(value, 0), int_value(merged.get(depth), 0))
+            for key, value in raw.items():
+                try:
+                    depth = int(key)
+                except Exception:
+                    continue
+                merged[depth] = max(int_value(value, 0), int_value(merged.get(depth), 0))
     return dict(sorted(merged.items()))
 
 
@@ -236,37 +237,73 @@ def validate_records(
     registry = parse_legacy_rolling_chain(records)
     accounting = aggregate_performance_accounting(records, result_payload)
     errors: list[str] = []
+    unified_authority = bool(
+        _bool_enabled(records, "unified_generic_rolling_enabled", "enable_unified_generic_rolling_runtime")
+        or bool(result_args.get("enable_unified_generic_rolling_runtime", False))
+        or bool(accounting.get("unified_generic_rolling_enabled", False))
+        or bool(accounting.get("enable_unified_generic_rolling_runtime", False))
+    )
 
     full_continuous_enabled = (
-        _bool_enabled(records, "generic_full_continuous_enabled", "enable_full_continuous_eager")
+        _bool_enabled(
+            records,
+            "generic_full_continuous_enabled",
+            "enable_full_continuous_eager",
+            "unified_generic_rolling_enabled",
+            "enable_unified_generic_rolling_runtime",
+        )
         or bool(result_args.get("enable_full_continuous_eager", False))
+        or bool(result_args.get("enable_unified_generic_rolling_runtime", False))
+        or bool(accounting.get("unified_generic_rolling_enabled", False))
     )
-    full_continuous_max_depth = _max_int(records, "generic_full_continuous_max_depth")
-    full_continuous_max_observed_depth = _max_int(records, "generic_full_continuous_max_observed_depth")
-    full_continuous_max_real_committed_depth = _max_int(
-        records,
-        "generic_full_continuous_max_real_committed_depth",
+    full_continuous_max_depth = max(
+        _max_int(records, "generic_full_continuous_max_depth"),
+        _max_int(records, "unified_generic_max_depth"),
+        int_value(result_args.get("max_rolling_continuous_depth"), 0),
+    )
+    full_continuous_max_observed_depth = max(
+        _max_int(records, "generic_full_continuous_max_observed_depth"),
+        _max_int(records, "unified_generic_max_observed_depth"),
+    )
+    full_continuous_max_real_committed_depth = max(
+        _max_int(records, "generic_full_continuous_max_real_committed_depth"),
+        _max_int(records, "unified_generic_max_real_committed_depth"),
     )
     full_continuous_depth_commit_counts = _merge_depth_counts(
         records,
         "generic_full_continuous_depth_commit_token_counts",
+        "unified_generic_depth_commit_token_counts",
     )
-    full_continuous_total_full_commit = _max_int(
-        records,
-        "generic_full_continuous_total_full_commit_token_count",
-    )
-    full_continuous_total_partial = _max_int(
-        records,
-        "generic_full_continuous_total_partial_recovered_token_count",
-    )
-    full_continuous_total_revised = _max_int(
-        records,
-        "generic_full_continuous_total_revised_token_count",
-    )
-    full_continuous_total_output = _max_int(
-        records,
-        "generic_full_continuous_total_output_token_count",
-    )
+    if unified_authority:
+        full_continuous_total_full_commit = int_value(
+            accounting.get("generic_full_continuous_total_full_commit_token_count"), 0
+        )
+        full_continuous_total_partial = int_value(
+            accounting.get("generic_full_continuous_total_partial_recovered_token_count"), 0
+        )
+        full_continuous_total_revised = int_value(
+            accounting.get("generic_full_continuous_total_revised_token_count"), 0
+        )
+        full_continuous_total_output = int_value(
+            accounting.get("generic_full_continuous_total_output_token_count"), 0
+        )
+    else:
+        full_continuous_total_full_commit = max(
+            _max_int(records, "generic_full_continuous_total_full_commit_token_count"),
+            int_value(accounting.get("generic_full_continuous_total_full_commit_token_count"), 0),
+        )
+        full_continuous_total_partial = max(
+            _max_int(records, "generic_full_continuous_total_partial_recovered_token_count"),
+            int_value(accounting.get("generic_full_continuous_total_partial_recovered_token_count"), 0),
+        )
+        full_continuous_total_revised = max(
+            _max_int(records, "generic_full_continuous_total_revised_token_count"),
+            int_value(accounting.get("generic_full_continuous_total_revised_token_count"), 0),
+        )
+        full_continuous_total_output = max(
+            _max_int(records, "generic_full_continuous_total_output_token_count"),
+            int_value(accounting.get("generic_full_continuous_total_output_token_count"), 0),
+        )
 
     enabled = _bool_enabled(
         records,
@@ -1064,18 +1101,74 @@ def run_synthetic() -> None:
         },
     )
 
-    full_continuous_missing_depth_gt4 = _make_full_continuous_records(include_generic_accounting=False)
-    assert_fail(
-        "full continuous missing depth5+ from expected",
-        full_continuous_missing_depth_gt4,
-        "combined committed",
+    unified_alias_partial = _make_full_continuous_records(partial=True)
+    for record in unified_alias_partial:
+        record.update(
+            {
+                "unified_generic_rolling_enabled": True,
+                "enable_unified_generic_rolling_runtime": True,
+                "unified_generic_total_full_commit_token_count": record[
+                    "generic_full_continuous_total_full_commit_token_count"
+                ],
+                "unified_generic_total_partial_recovered_token_count": record[
+                    "generic_full_continuous_total_partial_recovered_token_count"
+                ],
+                "unified_generic_total_revised_token_count": record[
+                    "generic_full_continuous_total_revised_token_count"
+                ],
+                "unified_generic_total_output_token_count": record[
+                    "generic_full_continuous_total_output_token_count"
+                ],
+                "unified_generic_depth_commit_token_counts": dict(
+                    record["generic_full_continuous_depth_commit_token_counts"]
+                ),
+                "combined_real_committed_token_count": 1244,
+            }
+        )
+        for key in (
+            "generic_full_continuous_total_full_commit_token_count",
+            "generic_full_continuous_total_partial_recovered_token_count",
+            "generic_full_continuous_total_revised_token_count",
+            "generic_full_continuous_total_output_token_count",
+            "generic_full_continuous_depth_commit_token_counts",
+        ):
+            record.pop(key, None)
+    assert_pass(
+        "unified alias partial recovery authority",
+        unified_alias_partial,
+        {
+            "generic_full_continuous_total_output_token_count": 486,
+            "combined_real_committed_token_count": 486,
+            "combined_actual_accepted_token_increment_sum": 485,
+            "combined_actual_revised_token_increment_sum": 1,
+            "combined_actual_output_token_increment_sum": 486,
+        },
     )
 
-    full_continuous_double_count = _make_full_continuous_records(tail_token_count=484)
-    assert_fail(
-        "full continuous double count",
-        full_continuous_double_count,
-        "combined committed",
+    full_continuous_total_authority = _make_full_continuous_records(include_generic_accounting=False)
+    assert_pass(
+        "full continuous total-output authority without raw generic commits",
+        full_continuous_total_authority,
+        {
+            "generic_full_continuous_total_output_token_count": 484,
+            "combined_real_committed_token_count": 484,
+            "combined_actual_accepted_token_increment_sum": 484,
+            "combined_actual_revised_token_increment_sum": 0,
+            "combined_actual_output_token_increment_sum": 484,
+        },
+    )
+
+    full_continuous_stale_legacy_double_count = _make_full_continuous_records(tail_token_count=484)
+    assert_pass(
+        "full continuous ignores stale legacy double count",
+        full_continuous_stale_legacy_double_count,
+        {
+            "generic_full_continuous_total_output_token_count": 484,
+            "combined_real_committed_token_count": 484,
+            "combined_actual_accepted_token_increment_sum": 484,
+            "combined_actual_revised_token_increment_sum": 0,
+            "combined_actual_output_token_increment_sum": 484,
+        },
     )
 
     full_continuous_bad_revised = _make_full_continuous_records(

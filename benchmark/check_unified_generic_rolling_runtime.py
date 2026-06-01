@@ -129,6 +129,11 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     if not isinstance(result_args, dict):
         result_args = {}
     accounting = aggregate_performance_accounting(records, result_payload)
+    unified_enabled = any(
+        bool(record.get("unified_generic_rolling_enabled", False))
+        or bool(record.get("enable_unified_generic_rolling_runtime", False))
+        for record in records
+    ) or bool(result_args.get("enable_unified_generic_rolling_runtime", False))
     committed_by_depth = merge_depth_lists(records, "generic_rolling_real_committed_proposal_ids_by_depth")
     candidate_by_depth = merge_depth_lists(records, "generic_rolling_candidate_proposal_ids_by_depth")
     ready_by_depth = merge_depth_lists(records, "generic_rolling_ready_proposal_ids_by_depth")
@@ -185,38 +190,27 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         for field in ("unified_generic_depth_commit_token_counts", "generic_full_continuous_depth_commit_token_counts"):
             for depth, token_count in as_depth_int_map(record.get(field)).items():
                 depth_commit_counts[str(depth)] = max(int(depth_commit_counts.get(str(depth), 0)), int(token_count))
-    total_full = max_record_int(
-        records,
-        "unified_generic_total_full_commit_token_count",
-        "generic_full_continuous_total_full_commit_token_count",
-    )
-    total_partial = max_record_int(
-        records,
-        "unified_generic_total_partial_recovered_token_count",
-        "generic_full_continuous_total_partial_recovered_token_count",
-    )
-    total_revised = max_record_int(
-        records,
-        "unified_generic_total_revised_token_count",
-        "generic_full_continuous_total_revised_token_count",
-    )
-    total_output = max_record_int(
-        records,
-        "unified_generic_total_output_token_count",
-        "generic_full_continuous_total_output_token_count",
-    )
+    unified_total_output = max_record_int(records, "unified_generic_total_output_token_count")
+    if unified_enabled and unified_total_output > 0:
+        total_full = max_record_int(records, "unified_generic_total_full_commit_token_count")
+        total_partial = max_record_int(records, "unified_generic_total_partial_recovered_token_count")
+        total_revised = max_record_int(records, "unified_generic_total_revised_token_count")
+        total_output = unified_total_output
+    else:
+        total_full = max_record_int(records, "generic_full_continuous_total_full_commit_token_count")
+        total_partial = max_record_int(
+            records,
+            "generic_full_continuous_total_partial_recovered_token_count",
+        )
+        total_revised = max_record_int(records, "generic_full_continuous_total_revised_token_count")
+        total_output = max_record_int(records, "generic_full_continuous_total_output_token_count")
     if total_full == 0 and depth_commit_counts:
         total_full = sum(int(value) for value in depth_commit_counts.values())
     if total_output == 0:
         total_output = total_full + total_partial
 
     return {
-        "unified_generic_rolling_enabled": any(
-            bool(record.get("unified_generic_rolling_enabled", False))
-            or bool(record.get("enable_unified_generic_rolling_runtime", False))
-            for record in records
-        )
-        or bool(result_args.get("enable_unified_generic_rolling_runtime", False)),
+        "unified_generic_rolling_enabled": bool(unified_enabled),
         "configured_max_depth": configured_max,
         "max_observed_depth": max_observed,
         "max_real_committed_depth": max_real,
@@ -421,11 +415,12 @@ def synthetic_records() -> list[dict[str, Any]]:
             "generic_full_continuous_total_full_commit_token_count": full,
             "generic_full_continuous_total_partial_recovered_token_count": partial,
             "generic_full_continuous_total_revised_token_count": revised,
-            "generic_full_continuous_total_output_token_count": full + partial,
+            "generic_full_continuous_total_output_token_count": 1244,
             "unified_generic_total_full_commit_token_count": full,
             "unified_generic_total_partial_recovered_token_count": partial,
             "unified_generic_total_revised_token_count": revised,
             "unified_generic_total_output_token_count": full + partial,
+            "combined_real_committed_token_count": 1244,
             "partial_prefix_recovery_enabled": True,
             "partial_prefix_recovered_proposal_ids": [2002],
             "partial_prefix_recovered_seq_ids": [8],
@@ -454,6 +449,7 @@ def run_synthetic_tests() -> None:
     payload = synthetic_payload(total_output_tokens=27)
     errors, summary = validate_records(records, payload)
     assert not errors, f"valid unified synthetic failed: {errors}\nsummary={summary}"
+    assert summary["combined_real_committed_token_count"] == 27
 
     bad_depth = [dict(records[0])]
     bad_depth[0]["generic_rolling_real_committed_proposal_ids_by_depth"] = {"2": [1002]}
