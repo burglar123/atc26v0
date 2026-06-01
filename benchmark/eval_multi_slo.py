@@ -1234,6 +1234,44 @@ def summarize_group(
     }
 
 
+def annotate_goodput_definition_fields(
+    metrics: Dict[str, Any],
+    cached_admission_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    overall = metrics.get("overall", {})
+    if not isinstance(overall, dict):
+        overall = {}
+        metrics["overall"] = overall
+
+    total_output_tokens = to_int(overall.get("total_output_tokens"), 0) or 0
+    goodput_numerator_tokens = to_int(overall.get("attained_output_tokens"), 0) or 0
+    engine_elapsed_s = to_float(metrics.get("engine_elapsed_s"), 0.0) or 0.0
+    denominator_s = to_float(metrics.get("goodput_denominator_s"), 0.0) or 0.0
+    denominator_mode = str(metrics.get("goodput_denominator_mode") or "engine_elapsed")
+    cached = cached_admission_summary if isinstance(cached_admission_summary, dict) else {}
+    decode_only_elapsed_s = to_float(cached.get("cached_admission_decode_only_elapsed_s"), 0.0) or 0.0
+
+    wall_decode_tokens_per_s = (
+        total_output_tokens / decode_only_elapsed_s if decode_only_elapsed_s > 0.0 else None
+    )
+    wall_engine_tokens_per_s = (
+        total_output_tokens / engine_elapsed_s if engine_elapsed_s > 0.0 else None
+    )
+    definition_fields = {
+        "wall_decode_tokens_per_s": wall_decode_tokens_per_s,
+        "wall_engine_tokens_per_s": wall_engine_tokens_per_s,
+        "goodput_metric_numerator_tokens": goodput_numerator_tokens,
+        "goodput_metric_denominator_s": denominator_s,
+        "goodput_metric_request_filter": "slo_attained == True",
+        "goodput_metric_includes_queue_wait": denominator_mode == "trace_makespan",
+        "goodput_metric_includes_decode_only": denominator_mode == "engine_elapsed",
+        "goodput_metric_includes_cache_build": False,
+        "goodput_metric_definition_version": "phase1h8y_goodput_v1",
+    }
+    metrics.update(definition_fields)
+    overall.update(definition_fields)
+
+
 def compute_metrics(
     rows: List[Dict[str, Any]],
     engine_elapsed_s: float,
@@ -2690,6 +2728,10 @@ def main() -> None:
         if args.enable_cached_admission:
             metrics.update(cached_admission_summary)
             metrics["cached_admission"] = cached_admission_summary
+        annotate_goodput_definition_fields(
+            metrics,
+            cached_admission_summary if args.enable_cached_admission else {},
+        )
 
         write_trace_export(args.trace_out, evaluated_rows, args)
 

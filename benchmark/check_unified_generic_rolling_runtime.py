@@ -108,6 +108,190 @@ def sum_depth_values(value: Any) -> int:
     return sum(int_value(item, 0) for item in (value or {}).values()) if isinstance(value, dict) else 0
 
 
+def safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def merge_depth_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for record in records:
+        for field in fields:
+            for depth, value in as_depth_int_map(record.get(field)).items():
+                key = str(int(depth))
+                merged[key] = max(int(merged.get(key, 0)), int(value))
+    return dict(sorted(merged.items(), key=lambda item: int(item[0])))
+
+
+def count_depth_lists(value: dict[int, list[int]]) -> dict[str, int]:
+    return {
+        str(int(depth)): len(set(int(item) for item in items))
+        for depth, items in sorted(value.items())
+    }
+
+
+def depth_list_token_counts(
+    records: list[dict[str, Any]],
+    depth_lists: dict[int, list[int]],
+    *token_fields: str,
+) -> dict[str, int]:
+    token_by_id = merge_int_map(
+        records,
+        *(token_fields or ("generic_rolling_token_count_by_proposal_id",)),
+    )
+    counts: dict[str, int] = {}
+    for depth, proposal_ids in sorted(depth_lists.items()):
+        total = 0
+        for proposal_id in set(int(item) for item in proposal_ids):
+            total += int(token_by_id.get(proposal_id, 0))
+        if total:
+            counts[str(int(depth))] = int(total)
+    return counts
+
+
+def record_step_key(record: dict[str, Any], index: int) -> tuple[int, int]:
+    return (
+        int_value(record.get("step_id"), int_value(record.get("eager_commit_step_id"), index)),
+        int_value(record.get("plan_id"), int_value(record.get("eager_commit_plan_id"), -1)),
+    )
+
+
+def record_max_depth(record: dict[str, Any], *fields: str) -> int:
+    depths: set[int] = set()
+    for field in fields:
+        depths.update(as_depth_int_lists(record.get(field)).keys())
+        depths.update(as_depth_int_map(record.get(field)).keys())
+    return max(depths or {0})
+
+
+def stop_reasons_by_depth(records: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    by_depth: dict[str, Counter[str]] = defaultdict(Counter)
+    for record in records:
+        if not (
+            bool(record.get("unified_generic_rolling_enabled", False))
+            or bool(record.get("enable_unified_generic_rolling_runtime", False))
+        ):
+            continue
+        reasons = record.get("generic_full_continuous_stop_reason_counts")
+        if not isinstance(reasons, dict):
+            continue
+        depth = max(
+            int_value(record.get("unified_generic_max_observed_depth"), 0),
+            record_max_depth(
+                record,
+                "generic_rolling_candidate_proposal_ids_by_depth",
+                "generic_rolling_ready_proposal_ids_by_depth",
+                "generic_rolling_real_committed_proposal_ids_by_depth",
+                "unified_generic_depth_candidate_token_counts",
+                "unified_generic_depth_ready_token_counts",
+                "unified_generic_depth_commit_token_counts",
+            ),
+        )
+        if depth <= 0:
+            depth = 1
+        for reason, count in reasons.items():
+            by_depth[str(int(depth))][str(reason)] += int_value(count, 0)
+    return {
+        depth: dict(sorted(counter.items()))
+        for depth, counter in sorted(by_depth.items(), key=lambda item: int(item[0]))
+    }
+
+
+def reason_count_by_depth(reason_by_depth: dict[str, dict[str, int]], reason: str) -> dict[str, int]:
+    return {
+        depth: int(counts.get(reason, 0))
+        for depth, counts in reason_by_depth.items()
+        if int(counts.get(reason, 0)) > 0
+    }
+
+
+def utilization_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    by_step: dict[tuple[int, int], dict[str, int]] = {}
+    for index, record in enumerate(records):
+        if not (
+            bool(record.get("unified_generic_rolling_enabled", False))
+            or bool(record.get("enable_unified_generic_rolling_runtime", False))
+        ):
+            continue
+        key = record_step_key(record, index)
+        stat = by_step.setdefault(
+            key,
+            {
+                "candidate_seqs": 0,
+                "ready_seqs": 0,
+                "committed_seqs": 0,
+                "candidate_tokens": 0,
+                "committed_tokens": 0,
+                "candidate_depth": 0,
+                "committed_depth": 0,
+            },
+        )
+        candidate_seq_count = sum(
+            len(set(items))
+            for items in as_depth_int_lists(record.get("generic_rolling_candidate_seq_ids_by_depth")).values()
+        )
+        ready_seq_count = sum(
+            len(set(items))
+            for items in as_depth_int_lists(record.get("generic_rolling_ready_seq_ids_by_depth")).values()
+        )
+        committed_seq_count = sum(
+            len(set(items))
+            for items in as_depth_int_lists(record.get("generic_rolling_real_committed_seq_ids_by_depth")).values()
+        )
+        candidate_tokens = sum_depth_values(
+            record.get("unified_generic_depth_candidate_token_counts")
+            or record.get("generic_full_continuous_depth_candidate_token_counts")
+        )
+        committed_tokens = sum_depth_values(
+            record.get("unified_generic_depth_commit_token_counts")
+            or record.get("generic_full_continuous_depth_commit_token_counts")
+        )
+        stat["candidate_seqs"] = max(stat["candidate_seqs"], int(candidate_seq_count))
+        stat["ready_seqs"] = max(stat["ready_seqs"], int(ready_seq_count))
+        stat["committed_seqs"] = max(stat["committed_seqs"], int(committed_seq_count))
+        stat["candidate_tokens"] = max(stat["candidate_tokens"], int(candidate_tokens))
+        stat["committed_tokens"] = max(stat["committed_tokens"], int(committed_tokens))
+        stat["candidate_depth"] = max(
+            stat["candidate_depth"],
+            record_max_depth(
+                record,
+                "generic_rolling_candidate_proposal_ids_by_depth",
+                "unified_generic_depth_candidate_token_counts",
+            ),
+        )
+        stat["committed_depth"] = max(
+            stat["committed_depth"],
+            record_max_depth(
+                record,
+                "generic_rolling_real_committed_proposal_ids_by_depth",
+                "unified_generic_depth_commit_token_counts",
+            ),
+        )
+    num_steps = len(by_step)
+    values = list(by_step.values())
+    return {
+        "num_steps": num_steps,
+        "steps_with_any_unified_candidate": sum(1 for item in values if item["candidate_seqs"] > 0),
+        "steps_with_any_unified_commit": sum(1 for item in values if item["committed_seqs"] > 0),
+        "avg_candidate_seqs_per_step": (
+            sum(item["candidate_seqs"] for item in values) / num_steps if num_steps else 0.0
+        ),
+        "avg_ready_seqs_per_step": (
+            sum(item["ready_seqs"] for item in values) / num_steps if num_steps else 0.0
+        ),
+        "avg_committed_seqs_per_step": (
+            sum(item["committed_seqs"] for item in values) / num_steps if num_steps else 0.0
+        ),
+        "avg_candidate_tokens_per_step": (
+            sum(item["candidate_tokens"] for item in values) / num_steps if num_steps else 0.0
+        ),
+        "avg_committed_tokens_per_step": (
+            sum(item["committed_tokens"] for item in values) / num_steps if num_steps else 0.0
+        ),
+        "max_candidate_depth_per_step": max((item["candidate_depth"] for item in values), default=0),
+        "max_committed_depth_per_step": max((item["committed_depth"] for item in values), default=0),
+    }
+
+
 def collect_descendants(parent_by_id: dict[int, int], root_id: int) -> set[int]:
     children: dict[int, set[int]] = defaultdict(set)
     for child_id, parent_id in parent_by_id.items():
@@ -190,6 +374,50 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         for field in ("unified_generic_depth_commit_token_counts", "generic_full_continuous_depth_commit_token_counts"):
             for depth, token_count in as_depth_int_map(record.get(field)).items():
                 depth_commit_counts[str(depth)] = max(int(depth_commit_counts.get(str(depth), 0)), int(token_count))
+    candidate_seq_counts = count_depth_lists(
+        merge_depth_lists(records, "generic_rolling_candidate_seq_ids_by_depth")
+    )
+    ready_seq_counts = count_depth_lists(merge_depth_lists(records, "generic_rolling_ready_seq_ids_by_depth"))
+    committed_seq_counts = count_depth_lists(
+        merge_depth_lists(records, "generic_rolling_real_committed_seq_ids_by_depth")
+    )
+    candidate_token_counts = depth_list_token_counts(
+        records,
+        candidate_by_depth,
+        "generic_rolling_token_count_by_proposal_id",
+    ) or merge_depth_counts(
+        records,
+        "unified_generic_depth_candidate_token_counts",
+        "generic_full_continuous_depth_candidate_token_counts",
+    )
+    ready_token_counts = depth_list_token_counts(
+        records,
+        ready_by_depth,
+        "generic_rolling_token_count_by_proposal_id",
+    ) or merge_depth_counts(
+        records,
+        "unified_generic_depth_ready_token_counts",
+        "generic_full_continuous_depth_ready_token_counts",
+    )
+    committed_token_counts = depth_list_token_counts(
+        records,
+        committed_by_depth,
+        "generic_rolling_real_committed_token_count_by_proposal_id",
+        "generic_rolling_token_count_by_proposal_id",
+    ) or merge_depth_counts(
+        records,
+        "unified_generic_depth_commit_token_counts",
+        "generic_full_continuous_depth_commit_token_counts",
+        "generic_rolling_real_committed_token_count_by_depth",
+    )
+    if not depth_commit_counts:
+        depth_commit_counts = {str(depth): int(value) for depth, value in committed_token_counts.items()}
+    commit_share_by_depth = {
+        depth: safe_div(float(committed_token_counts.get(depth, 0)), float(candidate_token_counts.get(depth, 0)))
+        for depth in sorted(set(candidate_token_counts) | set(committed_token_counts), key=int)
+    }
+    reason_by_depth = stop_reasons_by_depth(records)
+    utilization = utilization_summary(records)
     unified_total_output = max_record_int(records, "unified_generic_total_output_token_count")
     if unified_enabled and unified_total_output > 0:
         total_full = max_record_int(records, "unified_generic_total_full_commit_token_count")
@@ -218,6 +446,31 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "ready_depths": sorted(ready_by_depth),
         "committed_depths": sorted(committed_by_depth),
         "depth_commit_token_counts": dict(sorted(depth_commit_counts.items(), key=lambda item: int(item[0]))),
+        "unified_candidate_seq_count_by_depth": candidate_seq_counts,
+        "unified_ready_seq_count_by_depth": ready_seq_counts,
+        "unified_committed_seq_count_by_depth": committed_seq_counts,
+        "unified_candidate_token_count_by_depth": candidate_token_counts,
+        "unified_ready_token_count_by_depth": ready_token_counts,
+        "unified_committed_token_count_by_depth": committed_token_counts,
+        "unified_commit_share_by_depth": commit_share_by_depth,
+        "unified_parent_not_full_accept_count_by_depth": reason_count_by_depth(
+            reason_by_depth,
+            "parent_not_full_accept",
+        ),
+        "unified_stop_reason_counts_by_depth": reason_by_depth,
+        "unified_no_eligible_parent_count_by_depth": reason_count_by_depth(
+            reason_by_depth,
+            "no_eligible_parent",
+        ),
+        "unified_no_eligible_ready_child_count_by_depth": reason_count_by_depth(
+            reason_by_depth,
+            "no_eligible_ready_child",
+        ),
+        "unified_sequence_finished_count_by_depth": reason_count_by_depth(
+            reason_by_depth,
+            "sequence_finished",
+        ),
+        **utilization,
         "total_full_commit_token_count": total_full,
         "total_partial_recovered_token_count": total_partial,
         "total_revised_token_count": total_revised,
@@ -450,6 +703,12 @@ def run_synthetic_tests() -> None:
     errors, summary = validate_records(records, payload)
     assert not errors, f"valid unified synthetic failed: {errors}\nsummary={summary}"
     assert summary["combined_real_committed_token_count"] == 27
+    assert summary["unified_candidate_seq_count_by_depth"]["1"] == 1
+    assert summary["unified_committed_token_count_by_depth"]["6"] == 4
+    assert summary["unified_commit_share_by_depth"]["1"] == 1.0
+    assert summary["num_steps"] == 1
+    assert summary["steps_with_any_unified_candidate"] == 1
+    assert summary["steps_with_any_unified_commit"] == 1
 
     bad_depth = [dict(records[0])]
     bad_depth[0]["generic_rolling_real_committed_proposal_ids_by_depth"] = {"2": [1002]}
@@ -479,6 +738,28 @@ def print_summary(summary: dict[str, Any]) -> None:
         "candidate_depths",
         "ready_depths",
         "committed_depths",
+        "unified_candidate_seq_count_by_depth",
+        "unified_ready_seq_count_by_depth",
+        "unified_committed_seq_count_by_depth",
+        "unified_candidate_token_count_by_depth",
+        "unified_ready_token_count_by_depth",
+        "unified_committed_token_count_by_depth",
+        "unified_commit_share_by_depth",
+        "unified_parent_not_full_accept_count_by_depth",
+        "unified_stop_reason_counts_by_depth",
+        "unified_no_eligible_parent_count_by_depth",
+        "unified_no_eligible_ready_child_count_by_depth",
+        "unified_sequence_finished_count_by_depth",
+        "num_steps",
+        "steps_with_any_unified_candidate",
+        "steps_with_any_unified_commit",
+        "avg_candidate_seqs_per_step",
+        "avg_ready_seqs_per_step",
+        "avg_committed_seqs_per_step",
+        "avg_candidate_tokens_per_step",
+        "avg_committed_tokens_per_step",
+        "max_candidate_depth_per_step",
+        "max_committed_depth_per_step",
         "total_full_commit_token_count",
         "total_partial_recovered_token_count",
         "total_revised_token_count",

@@ -115,6 +115,18 @@ def summarize(path: Path) -> int:
     total_output_tokens = overall.get("total_output_tokens")
     goodput = overall.get("goodput_tokens_per_s")
     mean_tpot_ms = overall.get("mean_tpot_ms")
+    wall_decode_tokens_per_s = first_present(
+        metrics,
+        ["wall_decode_tokens_per_s"],
+    )
+    if wall_decode_tokens_per_s is None:
+        wall_decode_tokens_per_s = overall.get("wall_decode_tokens_per_s")
+    wall_engine_tokens_per_s = first_present(
+        metrics,
+        ["wall_engine_tokens_per_s"],
+    )
+    if wall_engine_tokens_per_s is None:
+        wall_engine_tokens_per_s = overall.get("wall_engine_tokens_per_s")
 
     decode_elapsed_values: List[float] = []
     observed_tpot_values: List[float] = []
@@ -158,6 +170,18 @@ def summarize(path: Path) -> int:
     print(f"total_output_tokens: {fmt(total_output_tokens)}")
     print(f"goodput_tokens_per_s: {fmt(goodput)}")
     print(f"mean_tpot_ms: {fmt(mean_tpot_ms)}")
+    print(f"wall_decode_tokens_per_s: {fmt(wall_decode_tokens_per_s)}")
+    print(f"wall_engine_tokens_per_s: {fmt(wall_engine_tokens_per_s)}")
+    for key in (
+        "goodput_metric_numerator_tokens",
+        "goodput_metric_denominator_s",
+        "goodput_metric_request_filter",
+        "goodput_metric_includes_queue_wait",
+        "goodput_metric_includes_decode_only",
+        "goodput_metric_includes_cache_build",
+        "goodput_metric_definition_version",
+    ):
+        print(f"{key}: {fmt(metrics.get(key, overall.get(key)))}")
     print(f"decode_elapsed_ms min/median/max: {fmt(dec_min)} / {fmt(dec_med)} / {fmt(dec_max)}")
     print(f"observed_tpot_ms min/median/max: {fmt(tpot_min)} / {fmt(tpot_med)} / {fmt(tpot_max)}")
     print(f"arrival_ts > finish_ts rows: {arrival_after_finish}")

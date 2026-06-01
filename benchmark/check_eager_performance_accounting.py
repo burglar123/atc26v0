@@ -315,13 +315,93 @@ def result_metrics(result_payload: dict[str, Any]) -> dict[str, Any]:
     args = result_payload.get("args", {}) if isinstance(result_payload, dict) else {}
     metrics = result_payload.get("metrics", {}) if isinstance(result_payload, dict) else {}
     overall = metrics.get("overall", {}) if isinstance(metrics, dict) else {}
+    total_output_tokens = int_value(overall.get("total_output_tokens"), 0)
+    engine_elapsed_s = float_value(metrics.get("engine_elapsed_s"), 0.0)
+    cached = result_payload.get("cached_admission", {}) if isinstance(result_payload, dict) else {}
+    if not isinstance(cached, dict):
+        cached = {}
+    decode_only_elapsed_s = float_value(
+        first_present(
+            metrics if isinstance(metrics, dict) else {},
+            ["cached_admission_decode_only_elapsed_s"],
+        ),
+        float_value(cached.get("cached_admission_decode_only_elapsed_s"), 0.0),
+    )
+    wall_decode_tokens_per_s = safe_div(total_output_tokens, decode_only_elapsed_s)
+    wall_engine_tokens_per_s = safe_div(total_output_tokens, engine_elapsed_s)
+    goodput_tokens_per_s = float_value(overall.get("goodput_tokens_per_s"), 0.0)
+    goodput_metric_denominator_s = float_value(
+        metrics.get(
+            "goodput_metric_denominator_s",
+            overall.get(
+                "goodput_metric_denominator_s",
+                metrics.get("goodput_denominator_s", engine_elapsed_s),
+            ),
+        ),
+        0.0,
+    )
+    goodput_metric_numerator_raw = metrics.get(
+        "goodput_metric_numerator_tokens",
+        overall.get("goodput_metric_numerator_tokens"),
+    )
+    if goodput_metric_numerator_raw is None:
+        goodput_metric_numerator_raw = overall.get("attained_output_tokens")
+    if goodput_metric_numerator_raw is None:
+        if goodput_tokens_per_s > 0 and goodput_metric_denominator_s > 0:
+            goodput_metric_numerator_tokens = int(round(goodput_tokens_per_s * goodput_metric_denominator_s))
+        else:
+            goodput_metric_numerator_tokens = total_output_tokens
+    else:
+        goodput_metric_numerator_tokens = int_value(goodput_metric_numerator_raw, 0)
     return {
         "execution_mode": args.get("execution_mode") or metrics.get("execution_mode"),
         "decode_ready_mode": args.get("decode_ready", metrics.get("decode_ready_mode")),
-        "total_output_tokens": int_value(overall.get("total_output_tokens"), 0),
-        "engine_elapsed_s": float_value(metrics.get("engine_elapsed_s"), 0.0),
-        "goodput_tokens_per_s": float_value(overall.get("goodput_tokens_per_s"), 0.0),
+        "total_output_tokens": total_output_tokens,
+        "engine_elapsed_s": engine_elapsed_s,
+        "goodput_tokens_per_s": goodput_tokens_per_s,
         "mean_tpot_ms": float_value(overall.get("mean_tpot_ms"), 0.0),
+        "wall_decode_tokens_per_s": float_value(
+            metrics.get("wall_decode_tokens_per_s", overall.get("wall_decode_tokens_per_s")),
+            wall_decode_tokens_per_s,
+        ),
+        "wall_engine_tokens_per_s": float_value(
+            metrics.get("wall_engine_tokens_per_s", overall.get("wall_engine_tokens_per_s")),
+            wall_engine_tokens_per_s,
+        ),
+        "goodput_metric_numerator_tokens": goodput_metric_numerator_tokens,
+        "goodput_metric_denominator_s": goodput_metric_denominator_s,
+        "goodput_metric_request_filter": metrics.get(
+            "goodput_metric_request_filter",
+            overall.get("goodput_metric_request_filter", "slo_attained == True"),
+        ),
+        "goodput_metric_includes_queue_wait": bool(
+            metrics.get(
+                "goodput_metric_includes_queue_wait",
+                overall.get(
+                    "goodput_metric_includes_queue_wait",
+                    metrics.get("goodput_denominator_mode") == "trace_makespan",
+                ),
+            )
+        ),
+        "goodput_metric_includes_decode_only": bool(
+            metrics.get(
+                "goodput_metric_includes_decode_only",
+                overall.get(
+                    "goodput_metric_includes_decode_only",
+                    metrics.get("goodput_denominator_mode", "engine_elapsed") == "engine_elapsed",
+                ),
+            )
+        ),
+        "goodput_metric_includes_cache_build": bool(
+            metrics.get(
+                "goodput_metric_includes_cache_build",
+                overall.get("goodput_metric_includes_cache_build", False),
+            )
+        ),
+        "goodput_metric_definition_version": metrics.get(
+            "goodput_metric_definition_version",
+            overall.get("goodput_metric_definition_version", "phase1h8y_goodput_v1_inferred"),
+        ),
     }
 
 
@@ -2848,6 +2928,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         "engine_elapsed_s",
         "goodput_tokens_per_s",
         "mean_tpot_ms",
+        "wall_decode_tokens_per_s",
+        "wall_engine_tokens_per_s",
+        "goodput_metric_numerator_tokens",
+        "goodput_metric_denominator_s",
+        "goodput_metric_request_filter",
+        "goodput_metric_includes_queue_wait",
+        "goodput_metric_includes_decode_only",
+        "goodput_metric_includes_cache_build",
+        "goodput_metric_definition_version",
         "generic_accounting_mode",
         "generic_combined_accounting_ok",
         "generic_full_commit_tokens",
@@ -3499,6 +3588,11 @@ def run_synthetic_tests() -> None:
     assert summary["normal_draft_token_slots_suppressed"] == 8
     assert summary["target_normal_verify_token_slots_replaced_by_eager"] == 8
     assert summary["committed_token_share_of_output"] == 4 / 64
+    assert summary["wall_engine_tokens_per_s"] == 64.0
+    assert summary["goodput_metric_numerator_tokens"] == 64
+    assert summary["goodput_metric_denominator_s"] == 1.0
+    assert summary["goodput_metric_request_filter"] == "slo_attained == True"
+    assert summary["goodput_metric_definition_version"] == "phase1h8y_goodput_v1_inferred"
     assert summary["suppressed_slots_per_committed_token"] == 2.0
     assert summary["proposal_payload_len_units_per_committed_token"] == 3.0
     assert summary["eager_proposal_payload_len_units"] == 12
