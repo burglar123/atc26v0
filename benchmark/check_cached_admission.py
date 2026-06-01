@@ -114,6 +114,72 @@ def require(condition: bool, errors: list[str], message: str) -> None:
         errors.append(message)
 
 
+def running_signature_key(signature: Any) -> tuple[Any, ...] | None:
+    if not isinstance(signature, dict):
+        return None
+    seq_ids = tuple(int_value(value) for value in signature.get("seq_ids", []) or [])
+    request_ids = tuple(str(value) for value in signature.get("request_ids", []) or [])
+    return (
+        int_value(signature.get("count"), len(seq_ids)),
+        seq_ids,
+        request_ids,
+        int_value(signature.get("sum_seq_ids"), sum(seq_ids)),
+        int_value(
+            signature.get("weighted_sum_seq_ids"),
+            sum((idx + 1) * seq_id for idx, seq_id in enumerate(seq_ids)),
+        ),
+    )
+
+
+def validate_running_signature_event(event: dict[str, Any], errors: list[str]) -> None:
+    if bool_value(event.get("cached_admission_running_divergence_detected")):
+        errors.append("cached admission trace reports running-set divergence")
+    local_signature = event.get("cached_admission_running_signature")
+    local_key = running_signature_key(local_signature)
+    if local_key is not None:
+        active_count = int_value(event.get("cached_admission_active_count"), local_key[0])
+        require(
+            active_count == local_key[0],
+            errors,
+            "cached admission active_count does not match running signature count",
+        )
+        running_seq_ids = tuple(int_value(value) for value in event.get("cached_admission_running_seq_ids", []) or [])
+        if running_seq_ids:
+            require(
+                tuple(sorted(running_seq_ids)) == tuple(sorted(local_key[1])),
+                errors,
+                "cached admission running seq ids do not match running signature",
+            )
+    reports = event.get("cached_admission_running_signature_by_rank")
+    if not isinstance(reports, list) or not reports:
+        return
+    signature_keys: list[tuple[Any, ...]] = []
+    for report in reports:
+        if not isinstance(report, dict):
+            errors.append("cached admission rank running-signature report must be an object")
+            continue
+        signature = report.get("cached_admission_running_signature")
+        key = running_signature_key(signature)
+        if key is None:
+            errors.append("cached admission rank report missing running signature")
+            continue
+        signature_keys.append(key)
+        running_count = int_value(report.get("running_count"), key[0])
+        require(
+            running_count == key[0],
+            errors,
+            "cached admission rank running_count does not match running signature count",
+        )
+    if signature_keys:
+        first = signature_keys[0]
+        for key in signature_keys[1:]:
+            require(
+                key == first,
+                errors,
+                "cached admission running signatures diverge across ranks",
+            )
+
+
 def result_execution_mode(payload: dict[str, Any]) -> str | None:
     for container_name in ("args", "metrics"):
         container = payload.get(container_name)
@@ -294,6 +360,7 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
     for event in events:
         active_count = int_value(event.get("cached_admission_active_count"), 0)
         require(active_count <= cap, errors, "trace active_count exceeds cap")
+        validate_running_signature_event(event, errors)
         for request_id in event.get("cached_admission_admitted_request_ids", []) or []:
             request_id = str(request_id)
             require(request_id not in event_admitted, errors, f"duplicate event admission for {request_id}")
@@ -390,6 +457,61 @@ def valid_enabled_payload() -> dict[str, Any]:
     }
 
 
+def cached_running_signature(seq_ids: list[int], request_ids: list[str]) -> dict[str, Any]:
+    sorted_seq_ids = sorted(int(seq_id) for seq_id in seq_ids)
+    sorted_request_ids = sorted(str(request_id) for request_id in request_ids)
+    return {
+        "count": len(sorted_seq_ids),
+        "seq_ids": sorted_seq_ids,
+        "request_ids": sorted_request_ids,
+        "sum_seq_ids": sum(sorted_seq_ids),
+        "weighted_sum_seq_ids": sum((idx + 1) * seq_id for idx, seq_id in enumerate(sorted_seq_ids)),
+    }
+
+
+def cached_running_rank_report(
+    rank: int,
+    seq_ids: list[int],
+    request_ids: list[str],
+    *,
+    materialized_count: int = 1,
+    pending_count: int = 1,
+) -> dict[str, Any]:
+    return {
+        "global_rank": int(rank),
+        "runner_role": "draft" if rank == 0 else "verify",
+        "group_name": "synthetic",
+        "materialized_count": int(materialized_count),
+        "pending_count": int(pending_count),
+        "running_count": len(seq_ids),
+        "running_request_ids": sorted(str(request_id) for request_id in request_ids),
+        "running_seq_ids": sorted(int(seq_id) for seq_id in seq_ids),
+        "admitted_this_step_request_ids": [],
+        "cached_step": 0,
+        "plan_id": 1,
+        "dual_step_id": None,
+        "enable_unified_generic_rolling_runtime": True,
+        "cached_admission_running_signature": cached_running_signature(seq_ids, request_ids),
+    }
+
+
+def attach_matching_running_reports(payload: dict[str, Any]) -> dict[str, Any]:
+    for event in payload.get("cached_admission_trace", []) or []:
+        active_request_ids = [str(request_id) for request_id in event.get("cached_admission_active_request_ids", [])]
+        seq_ids = list(range(len(active_request_ids)))
+        signature = cached_running_signature(seq_ids, active_request_ids)
+        event["cached_admission_running_request_ids"] = list(active_request_ids)
+        event["cached_admission_running_seq_ids"] = list(seq_ids)
+        event["cached_admission_running_signature"] = signature
+        event["cached_admission_running_signature_by_rank"] = [
+            cached_running_rank_report(rank, seq_ids, active_request_ids)
+            for rank in range(4)
+        ]
+        event["cached_admission_running_divergence_detected"] = False
+        event["cached_admission_unified_generic_enabled"] = True
+    return payload
+
+
 def valid_in_memory_payload() -> dict[str, Any]:
     payload = copy.deepcopy(valid_enabled_payload())
     payload["args"]["execution_mode"] = "parallel_pearl"
@@ -410,7 +532,7 @@ def valid_in_memory_payload() -> dict[str, Any]:
         row["cached_kv_materialized"] = True
     for event in payload["cached_admission_trace"]:
         event["cached_prefill_mode"] = "in_memory_kv"
-    return payload
+    return attach_matching_running_reports(payload)
 
 
 def disabled_payload() -> dict[str, Any]:
@@ -475,6 +597,25 @@ def run_synthetic() -> int:
     payload = valid_in_memory_payload()
     payload["args"]["execution_mode"] = "unsupported_mode"
     cases.append(("unsupported in_memory_kv execution_mode fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    event = payload["cached_admission_trace"][0]
+    event["cached_admission_running_signature_by_rank"] = [
+        cached_running_rank_report(0, [1], ["r0"], materialized_count=4, pending_count=28),
+        cached_running_rank_report(1, [1, 2], ["r0", "r1"], materialized_count=4, pending_count=28),
+    ]
+    cases.append(("running count divergence fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    event = payload["cached_admission_trace"][0]
+    event["cached_admission_running_signature_by_rank"] = [
+        cached_running_rank_report(0, [1], ["r0"], materialized_count=4, pending_count=28),
+        cached_running_rank_report(1, [2], ["r1"], materialized_count=4, pending_count=28),
+    ]
+    cases.append(("running seq id divergence fail", payload, False))
+
+    payload = valid_in_memory_payload()
+    cases.append(("running signature all ranks pass", payload, True))
 
     failures = 0
     for name, payload, expect_ok in cases:

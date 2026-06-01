@@ -801,6 +801,120 @@ class ModelRunnerBase:
     def _seq_request_id_map(self) -> dict[int, str]:
         return {int(seq.seq_id): str(seq.request_id) for seq in self.scheduler.running}
 
+    def _cached_running_signature(self) -> dict:
+        seq_ids = sorted(int(seq.seq_id) for seq in self.scheduler.running)
+        request_ids = sorted(str(seq.request_id) for seq in self.scheduler.running)
+        return {
+            "count": int(len(seq_ids)),
+            "seq_ids": seq_ids,
+            "request_ids": request_ids,
+            "sum_seq_ids": int(sum(seq_ids)),
+            "weighted_sum_seq_ids": int(sum((idx + 1) * seq_id for idx, seq_id in enumerate(seq_ids))),
+        }
+
+    def _cached_completed_request_ids_for_sync(self) -> list[str]:
+        completed: set[str] = set()
+        for seq in self.scheduler.finished:
+            completed.add(str(seq.request_id))
+        for seq in self.scheduler.running:
+            if getattr(seq, "finish_ts", None) is not None:
+                completed.add(str(seq.request_id))
+        return sorted(completed)
+
+    def _cached_admission_rank_report(
+        self,
+        *,
+        materialized_count: int,
+        pending_count: int,
+        admitted_this_step: list[str],
+        cached_step: int,
+        sync_vec: list[int] | None = None,
+        plan_id: int | None = None,
+        dual_step_id: int | None = None,
+    ) -> dict:
+        running_seq_ids = sorted(int(seq.seq_id) for seq in self.scheduler.running)
+        running_request_ids = sorted(str(seq.request_id) for seq in self.scheduler.running)
+        return {
+            "rank": int(self.rank),
+            "global_rank": int(self.rank),
+            "runner_role": self._runner_role(),
+            "group": self.group_name,
+            "group_name": self.group_name,
+            "materialized_count": int(materialized_count),
+            "pending_count": int(pending_count),
+            "running_count": int(len(self.scheduler.running)),
+            "running_request_ids": running_request_ids,
+            "running_seq_ids": running_seq_ids,
+            "admitted_this_step_request_ids": [str(request_id) for request_id in admitted_this_step],
+            "cached_step": int(cached_step),
+            "plan_id": None if plan_id is None else int(plan_id),
+            "dual_step_id": None if dual_step_id is None else int(dual_step_id),
+            "enable_unified_generic_rolling_runtime": bool(
+                getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
+            ),
+            "cached_admission_running_signature": self._cached_running_signature(),
+            "cached_admission_completed_request_ids": self._cached_completed_request_ids_for_sync(),
+            "sync_vec": None if sync_vec is None else [int(value) for value in sync_vec],
+        }
+
+    def _cached_admission_gather_rank_reports(
+        self,
+        *,
+        execution_mode: str,
+        materialized_count: int,
+        pending_count: int,
+        admitted_this_step: list[str],
+        cached_step: int,
+        sync_vec: list[int] | None = None,
+        plan_id: int | None = None,
+        dual_step_id: int | None = None,
+    ) -> list[dict]:
+        local_report = self._cached_admission_rank_report(
+            materialized_count=materialized_count,
+            pending_count=pending_count,
+            admitted_this_step=admitted_this_step,
+            cached_step=cached_step,
+            sync_vec=sync_vec,
+            plan_id=plan_id,
+            dual_step_id=dual_step_id,
+        )
+        if execution_mode == "ar":
+            gathered: list[dict | None] = [None for _ in range(self.tensor_parallel_size)]
+            dist.all_gather_object(gathered, local_report, group=self.group)
+        else:
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, local_report)
+        return [report for report in gathered if isinstance(report, dict)]
+
+    def _format_cached_admission_rank_reports(self, reports: list[dict]) -> str:
+        parts = []
+        for report in sorted(reports, key=lambda item: int(item.get("global_rank", item.get("rank", -1)))):
+            parts.append(
+                "{"
+                f"global_rank={report.get('global_rank')}, "
+                f"runner_role={report.get('runner_role')}, "
+                f"group={report.get('group_name') or report.get('group')}, "
+                f"materialized_count={report.get('materialized_count')}, "
+                f"pending_count={report.get('pending_count')}, "
+                f"running_count={report.get('running_count')}, "
+                f"running_request_ids={report.get('running_request_ids')}, "
+                f"running_seq_ids={report.get('running_seq_ids')}, "
+                f"admitted_this_step={report.get('admitted_this_step_request_ids')}, "
+                f"cached_step={report.get('cached_step')}, "
+                f"plan_id={report.get('plan_id')}, "
+                f"dual_step_id={report.get('dual_step_id')}, "
+                f"enable_unified_generic_rolling_runtime="
+                f"{report.get('enable_unified_generic_rolling_runtime')}, "
+                f"signature={report.get('cached_admission_running_signature')}, "
+                f"sync_vec={report.get('sync_vec')}"
+                "}"
+            )
+        return "; ".join(parts)
+
+    def _cached_running_signatures_diverge(self, reports: list[dict]) -> bool:
+        signatures = [report.get("cached_admission_running_signature") for report in reports]
+        return bool(signatures) and any(signature != signatures[0] for signature in signatures)
+
     def _assert_cached_seq_id_consistency(self, admitted_request_ids: list[str]) -> None:
         if not admitted_request_ids:
             return
@@ -8320,12 +8434,63 @@ class ModelRunnerBase:
         hit_max_tokens = int(seq.num_completion_tokens) >= int(seq.max_tokens)
         if not (hit_eos or hit_max_tokens):
             return
+        if self._defer_cached_unified_finish_removal():
+            seq.mark_finished()
+            return
         if seq in self.scheduler.running:
             self.scheduler.block_manager.deallocate(seq)
             self.scheduler.running.remove(seq)
         if seq not in self.scheduler.finished:
             self.scheduler.finished.append(seq)
         seq.mark_finished()
+
+    def _defer_cached_unified_finish_removal(self) -> bool:
+        return (
+            bool(getattr(self.global_config, "enable_cached_admission", False))
+            and self.active_decode_ready_mode
+            and self.active_execution_mode != "ar"
+            and self._unified_generic_rolling_runtime_enabled()
+        )
+
+    def _sync_cached_completed_running_set(self, execution_mode: str, cached_step: int) -> None:
+        if execution_mode == "ar":
+            return
+        reports = self._cached_admission_gather_rank_reports(
+            execution_mode=execution_mode,
+            materialized_count=0,
+            pending_count=0,
+            admitted_this_step=[],
+            cached_step=cached_step,
+            plan_id=self._trace_plan_id,
+            dual_step_id=None,
+        )
+        completed_sets = [
+            set(str(request_id) for request_id in report.get("cached_admission_completed_request_ids", []) or [])
+            for report in reports
+        ]
+        if not completed_sets:
+            return
+        globally_completed = set.intersection(*completed_sets)
+        divergent_completed = set.union(*completed_sets) - globally_completed
+        assert not divergent_completed, (
+            "cached admission completed-set divergence across ranks: "
+            f"divergent_request_ids={sorted(divergent_completed)}; "
+            + self._format_cached_admission_rank_reports(reports)
+        )
+        if not globally_completed:
+            return
+        finished_by_request = {str(seq.request_id): seq for seq in self.scheduler.finished}
+        for seq in list(self.scheduler.running):
+            request_id = str(seq.request_id)
+            if request_id not in globally_completed:
+                continue
+            if seq in self.scheduler.running:
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+            seq.mark_finished()
+            if request_id not in finished_by_request:
+                self.scheduler.finished.append(seq)
+                finished_by_request[request_id] = seq
 
     def _continuous_shadow_proposal_id(self, root_proposal_id: int, chain_depth: int) -> int:
         return 900_000_000 + int(root_proposal_id) * 100 + int(chain_depth)
@@ -16203,9 +16368,14 @@ class ModelRunnerBase:
         queue_wait_by_request: dict[str, float],
         no_admission_reason: str | None,
         peak_active: int,
+        running_signature: dict | None = None,
+        running_signature_by_rank: list[dict] | None = None,
+        running_divergence_detected: bool = False,
     ) -> None:
         if self.is_draft or self.tp_params.local_rank != 0:
             return
+        running_request_ids = [str(seq.request_id) for seq in self.scheduler.running]
+        running_seq_ids = [int(seq.seq_id) for seq in self.scheduler.running]
         self.trace_records.append(
             {
                 "trace_record_type": "cached_admission_step",
@@ -16214,14 +16384,22 @@ class ModelRunnerBase:
                 "cached_admission_step": int(step),
                 "cached_admission_arrived_request_ids": list(arrived_ids),
                 "cached_admission_admitted_request_ids": list(admitted_ids),
-                "cached_admission_active_request_ids": [
-                    str(seq.request_id) for seq in self.scheduler.running
-                ],
+                "cached_admission_active_request_ids": list(running_request_ids),
                 "cached_admission_completed_request_ids": [
                     str(seq.request_id) for seq in self.scheduler.finished
                 ],
                 "cached_admission_pending_count": int(len(self.scheduler.pending_cached)),
                 "cached_admission_active_count": int(len(self.scheduler.running)),
+                "cached_admission_running_request_ids": list(running_request_ids),
+                "cached_admission_running_seq_ids": list(running_seq_ids),
+                "cached_admission_running_signature": (
+                    dict(running_signature) if running_signature is not None else self._cached_running_signature()
+                ),
+                "cached_admission_running_signature_by_rank": list(running_signature_by_rank or []),
+                "cached_admission_running_divergence_detected": bool(running_divergence_detected),
+                "cached_admission_unified_generic_enabled": bool(
+                    getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
+                ),
                 "cached_admission_queue_wait_ms_by_request": dict(queue_wait_by_request),
                 "cached_admission_no_admission_reason": no_admission_reason,
                 "cached_admission_peak_active_so_far": int(peak_active),
@@ -16359,17 +16537,49 @@ class ModelRunnerBase:
             min_free_blocks = min(min_free_blocks, free_blocks_after)
             running_count = len(self.scheduler.running)
             pending_count = len(pending)
+            local_signature = self._cached_running_signature()
+            running_reports: list[dict] = []
+            running_divergence_detected = False
             sync_vec = torch.tensor([materialized_count, pending_count, running_count], dtype=torch.int64, device="cuda")
             if execution_mode == "ar":
                 gathered = [torch.zeros_like(sync_vec) for _ in range(self.tensor_parallel_size)]
                 dist.all_gather(gathered, sync_vec, group=self.group)
             else:
+                running_reports = self._cached_admission_gather_rank_reports(
+                    execution_mode=execution_mode,
+                    materialized_count=materialized_count,
+                    pending_count=pending_count,
+                    admitted_this_step=admitted_this_step,
+                    cached_step=cached_step,
+                    sync_vec=[materialized_count, pending_count, running_count],
+                    plan_id=self._trace_plan_id,
+                    dual_step_id=None,
+                )
+                running_divergence_detected = self._cached_running_signatures_diverge(running_reports)
+                assert not running_divergence_detected, (
+                    "cached admission running-set divergence across ranks: "
+                    + self._format_cached_admission_rank_reports(running_reports)
+                )
                 gathered = [torch.zeros_like(sync_vec) for _ in range(dist.get_world_size())]
                 dist.all_gather(gathered, sync_vec)
-            assert all(torch.equal(g, gathered[0]) for g in gathered), (
-                "cached admission divergence across ranks: "
-                + ", ".join(str(g.tolist()) for g in gathered)
-            )
+            if not all(torch.equal(g, gathered[0]) for g in gathered):
+                if not running_reports:
+                    running_reports = self._cached_admission_gather_rank_reports(
+                        execution_mode=execution_mode,
+                        materialized_count=materialized_count,
+                        pending_count=pending_count,
+                        admitted_this_step=admitted_this_step,
+                        cached_step=cached_step,
+                        sync_vec=[materialized_count, pending_count, running_count],
+                        plan_id=self._trace_plan_id,
+                        dual_step_id=None,
+                    )
+                raise AssertionError(
+                    "cached admission divergence across ranks: "
+                    + ", ".join(str(g.tolist()) for g in gathered)
+                    + "; "
+                    + self._format_cached_admission_rank_reports(running_reports)
+                )
             peak_active = max(peak_active, len(self.scheduler.running))
             self._append_cached_admission_trace(
                 cached_step,
@@ -16378,6 +16588,9 @@ class ModelRunnerBase:
                 queue_wait_by_request,
                 no_admission_reason,
                 peak_active,
+                running_signature=local_signature,
+                running_signature_by_rank=running_reports,
+                running_divergence_detected=running_divergence_detected,
             )
             cached_step += 1
             mat_bucket = materialized_count // self.cached_admission_log_interval
@@ -16402,6 +16615,7 @@ class ModelRunnerBase:
             if self.scheduler.running:
                 blocked_without_progress = 0
                 self._cached_decode_step(execution_mode)
+                self._sync_cached_completed_running_set(execution_mode, cached_step)
             elif pending:
                 if eligible > 0 and global_k == 0:
                     blocked_without_progress += 1
