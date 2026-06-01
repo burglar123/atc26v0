@@ -106,6 +106,45 @@ ZERO_CANDIDATE_COUNTER_FIELDS = (
     "zero_candidate_registry_scan_count",
     "zero_candidate_sync_apply_scan_count",
 )
+ZERO_STAGE_NAMES = (
+    "zero_eager_proposal",
+    "zero_eager_result",
+    "zero_continuous_proposal",
+    "zero_continuous_result",
+    "zero_commit_decision",
+    "zero_generic_full_continuous",
+)
+ZERO_STAGE_COUNTER_SUFFIXES = (
+    "meta_broadcast_count",
+    "payload_broadcast_skipped_count",
+    "payload_build_skipped_count",
+    "trace_heavy_count",
+    "trace_light_count",
+    "registry_scan_count",
+)
+ZERO_STAGE_COUNTER_FIELDS = tuple(
+    f"{stage}_{suffix}"
+    for stage in ZERO_STAGE_NAMES
+    for suffix in ZERO_STAGE_COUNTER_SUFFIXES
+)
+ZERO_STAGE_TIMING_FIELDS = (
+    "zero_eager_proposal_broadcast_time_ms",
+    "zero_eager_result_broadcast_time_ms",
+    "zero_continuous_proposal_broadcast_time_ms",
+    "zero_continuous_result_broadcast_time_ms",
+    "zero_commit_decision_broadcast_time_ms",
+    "zero_generic_full_continuous_broadcast_time_ms",
+)
+ZERO_STAGE_FAST_PATH_COUNTER_FIELDS = (
+    "zero_stage_fast_path_enabled",
+    "zero_stage_fast_path_payload_build_skipped_count",
+    "zero_stage_fast_path_trace_heavy_skipped_count",
+    "zero_stage_fast_path_registry_scan_skipped_count",
+    "zero_stage_fast_path_meta_broadcast_skipped_count",
+    "zero_stage_fast_path_meta_broadcast_kept_count",
+    "zero_stage_fast_path_fallback_count",
+)
+ZERO_STAGE_FAST_PATH_REASON_FIELD = "zero_stage_fast_path_fallback_reason_counts"
 
 GENERIC_ACCOUNTING_FIELD_PAIRS = (
     ("eager_committed_token_count", "generic_one_shot_committed_token_count"),
@@ -677,8 +716,15 @@ def aggregate_performance_accounting(
     counted_rolling_depth4_commit_events: set[tuple[str, int, int, int]] = set()
     counted_rolling_depth4_commit_records: set[tuple[str, int, int]] = set()
     zero_counter_by_field_step: dict[str, dict[tuple[int, int], int]] = {
-        field: {} for field in ZERO_CANDIDATE_COUNTER_FIELDS
+        field: {}
+        for field in (
+            *ZERO_CANDIDATE_COUNTER_FIELDS,
+            *ZERO_STAGE_COUNTER_FIELDS,
+            *ZERO_STAGE_FAST_PATH_COUNTER_FIELDS,
+        )
     }
+    zero_stage_timing_sums = {key: 0.0 for key in ZERO_STAGE_TIMING_FIELDS}
+    zero_stage_fast_path_reason_counts_by_step: dict[str, dict[tuple[int, int], int]] = {}
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -1474,13 +1520,27 @@ def aggregate_performance_accounting(
                     elif field_name == "eager_result_transfer_payload_bytes":
                         result_transfer_payload_bytes += payload_bytes
 
-        for field_name in ZERO_CANDIDATE_COUNTER_FIELDS:
+        for field_name in (
+            *ZERO_CANDIDATE_COUNTER_FIELDS,
+            *ZERO_STAGE_COUNTER_FIELDS,
+            *ZERO_STAGE_FAST_PATH_COUNTER_FIELDS,
+        ):
             if field_name in record:
                 value = int_value(record.get(field_name), 0)
                 if value < 0:
                     negative_payload_field_count += 1
                 if value > 0:
                     per_step = zero_counter_by_field_step[field_name]
+                    per_step[key] = max(int(per_step.get(key, 0)), int(value))
+        reason_counts = record.get(ZERO_STAGE_FAST_PATH_REASON_FIELD)
+        if isinstance(reason_counts, dict):
+            for reason, raw_value in reason_counts.items():
+                value = int_value(raw_value, 0)
+                if value < 0:
+                    negative_payload_field_count += 1
+                    continue
+                if value > 0:
+                    per_step = zero_stage_fast_path_reason_counts_by_step.setdefault(str(reason), {})
                     per_step[key] = max(int(per_step.get(key, 0)), int(value))
 
         if bool(record.get("eager_result_transfer_zero_result_step", False)):
@@ -1494,6 +1554,14 @@ def aggregate_performance_accounting(
                 if event_key not in counted_timing_events:
                     counted_timing_events.add(event_key)
                     timing_sums[field_name] += value
+        for field_name in ZERO_STAGE_TIMING_FIELDS:
+            if field_name in record:
+                value = float_value(record.get(field_name), 0.0)
+                if value >= 0.0:
+                    event_key = (field_name, key[0], key[1], value)
+                    if event_key not in counted_timing_events:
+                        counted_timing_events.add(event_key)
+                        zero_stage_timing_sums[field_name] += value
 
     committed_token_count = int_value(commit_summary.get("committed_token_count"), 0)
     committed_proposal_count = int_value(commit_summary.get("committed_proposal_count"), len(committed_ids))
@@ -1755,9 +1823,14 @@ def aggregate_performance_accounting(
     timing_summary["eager_transfer_substage_accounted_time_ms"] = sum(
         timing_sums.get(field, 0.0) for field in EAGER_TRANSFER_SUBSTAGE_TIMING_FIELDS
     )
+    timing_summary.update(zero_stage_timing_sums)
     zero_counter_sums = {
         field: sum(int(value) for value in per_step.values())
         for field, per_step in zero_counter_by_field_step.items()
+    }
+    zero_fast_path_reason_sums = {
+        reason: sum(int(value) for value in per_step.values())
+        for reason, per_step in sorted(zero_stage_fast_path_reason_counts_by_step.items())
     }
     commit_decision_payload_len_units = (
         eager_commit_decision_payload_len_units
@@ -2090,6 +2163,7 @@ def aggregate_performance_accounting(
         "continuous_eager_sync_apply_zero_steps": continuous_sync_apply_zero_steps,
         "continuous_eager_verify_apply_zero_candidate_steps": continuous_verify_apply_zero_candidate_steps,
         **zero_counter_sums,
+        ZERO_STAGE_FAST_PATH_REASON_FIELD: zero_fast_path_reason_sums,
         "rolling_child_candidate_proposal_count": len(rolling_child_candidate_ids),
         "rolling_child_candidate_token_count": rolling_child_candidate_token_count,
         "rolling_child_ready_shadow_proposal_count": len(rolling_child_ready_ids),
@@ -2582,6 +2656,10 @@ def validate_accounting(
         "continuous_zero_decision_fast_path_count",
         "continuous_eager_sync_apply_zero_steps",
         "continuous_eager_verify_apply_zero_candidate_steps",
+        *ZERO_CANDIDATE_COUNTER_FIELDS,
+        *ZERO_STAGE_COUNTER_FIELDS,
+        *ZERO_STAGE_TIMING_FIELDS,
+        *ZERO_STAGE_FAST_PATH_COUNTER_FIELDS,
         "rolling_child_candidate_token_count",
         "rolling_child_ready_shadow_token_count",
         "rolling_child_invalidated_count",
@@ -2878,6 +2956,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "continuous_eager_sync_apply_zero_steps",
         "continuous_eager_verify_apply_zero_candidate_steps",
         *ZERO_CANDIDATE_COUNTER_FIELDS,
+        *ZERO_STAGE_COUNTER_FIELDS,
+        *ZERO_STAGE_TIMING_FIELDS,
+        *ZERO_STAGE_FAST_PATH_COUNTER_FIELDS,
+        ZERO_STAGE_FAST_PATH_REASON_FIELD,
         "rolling_child_candidate_proposal_count",
         "rolling_child_candidate_token_count",
         "rolling_child_ready_shadow_proposal_count",
@@ -3260,6 +3342,17 @@ def run_synthetic_tests() -> None:
             "eager_transfer_deserialize_time_ms": 0.8,
             "eager_transfer_classify_time_ms": 0.9,
             "eager_transfer_receive_trace_time_ms": 1.0,
+            "zero_eager_proposal_meta_broadcast_count": 1,
+            "zero_eager_proposal_payload_broadcast_skipped_count": 1,
+            "zero_eager_proposal_payload_build_skipped_count": 1,
+            "zero_eager_proposal_trace_light_count": 1,
+            "zero_eager_proposal_broadcast_time_ms": 0.11,
+            "zero_stage_fast_path_enabled": 1,
+            "zero_stage_fast_path_payload_build_skipped_count": 1,
+            "zero_stage_fast_path_meta_broadcast_kept_count": 1,
+            "zero_stage_fast_path_fallback_reason_counts": {
+                "eager_proposal_pending_buffer_nonempty": 1,
+            },
         }
     )
     errors, byte_summary = validate_accounting(byte_records, synthetic_result_payload())
@@ -3269,6 +3362,13 @@ def run_synthetic_tests() -> None:
     assert byte_summary["eager_transfer_payload_bytes"] == 96
     assert byte_summary["total_control_payload_bytes"] == 416
     assert abs(byte_summary["eager_transfer_substage_accounted_time_ms"] - 5.5) < 1e-9
+    assert byte_summary["zero_eager_proposal_meta_broadcast_count"] == 1
+    assert byte_summary["zero_eager_proposal_payload_build_skipped_count"] == 1
+    assert byte_summary["zero_stage_fast_path_payload_build_skipped_count"] == 1
+    assert byte_summary["zero_stage_fast_path_fallback_reason_counts"] == {
+        "eager_proposal_pending_buffer_nonempty": 1,
+    }
+    assert abs(byte_summary["zero_eager_proposal_broadcast_time_ms"] - 0.11) < 1e-9
 
     invalid = deepcopy(records)
     invalid[0]["eager_tokens_verified"] = 0

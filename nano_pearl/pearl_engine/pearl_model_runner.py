@@ -106,6 +106,22 @@ GENERIC_ROLLING_COMMIT_OP = 0x1A8FC1
 GENERIC_ROLLING_COMMIT_META_LEN = 7
 GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH = 8
 INT64_TRACE_UNIT_BYTES = 8
+ZERO_STAGE_COUNTER_PREFIX_BY_STAGE = {
+    "eager_proposal": "zero_eager_proposal",
+    "eager_result": "zero_eager_result",
+    "continuous_proposal": "zero_continuous_proposal",
+    "continuous_result": "zero_continuous_result",
+    "commit_decision": "zero_commit_decision",
+    "generic_full_continuous": "zero_generic_full_continuous",
+}
+ZERO_STAGE_BROADCAST_TIME_FIELD_BY_STAGE = {
+    "eager_proposal": "zero_eager_proposal_broadcast_time_ms",
+    "eager_result": "zero_eager_result_broadcast_time_ms",
+    "continuous_proposal": "zero_continuous_proposal_broadcast_time_ms",
+    "continuous_result": "zero_continuous_result_broadcast_time_ms",
+    "commit_decision": "zero_commit_decision_broadcast_time_ms",
+    "generic_full_continuous": "zero_generic_full_continuous_broadcast_time_ms",
+}
 
 
 def cached_seq_id_consistency_mismatches(gathered: list[dict]) -> list[tuple[str, list[tuple]]]:
@@ -2329,10 +2345,29 @@ class ModelRunnerBase:
         elapsed_ms = max(0.0, (time.perf_counter() - start_time) * 1000.0)
         trace_record[field_name] = float(trace_record.get(field_name) or 0.0) + elapsed_ms
 
+    def _add_trace_time_ms(self, trace_record: dict | None, field_name: str, elapsed_ms: float) -> None:
+        if trace_record is None:
+            return
+        trace_record[field_name] = float(trace_record.get(field_name) or 0.0) + max(0.0, float(elapsed_ms))
+
     def _add_trace_counter(self, trace_record: dict | None, field_name: str, value: int = 1) -> None:
         if trace_record is None:
             return
         trace_record[field_name] = int(trace_record.get(field_name) or 0) + int(value)
+
+    def _add_trace_reason_counter(
+        self,
+        trace_record: dict | None,
+        field_name: str,
+        reason: str,
+        value: int = 1,
+    ) -> None:
+        if trace_record is None:
+            return
+        reason_counts = dict(trace_record.get(field_name) or {})
+        reason_key = str(reason or "unknown")
+        reason_counts[reason_key] = int(reason_counts.get(reason_key, 0)) + int(value)
+        trace_record[field_name] = dict(sorted(reason_counts.items()))
 
     def _record_int64_transfer_bytes(
         self,
@@ -2364,6 +2399,9 @@ class ModelRunnerBase:
         trace_heavy: bool = False,
         registry_scan: bool = False,
         sync_apply_scan: bool = False,
+        stage: str | None = None,
+        plan: StepPlan | None = None,
+        meta_units: int | None = None,
     ) -> None:
         if trace_record is None or int(payload_units) > 0:
             return
@@ -2381,6 +2419,94 @@ class ModelRunnerBase:
             self._add_trace_counter(trace_record, "zero_candidate_registry_scan_count")
         if sync_apply_scan:
             self._add_trace_counter(trace_record, "zero_candidate_sync_apply_scan_count")
+        prefix = ZERO_STAGE_COUNTER_PREFIX_BY_STAGE.get(str(stage)) if stage is not None else None
+        if prefix is None:
+            return
+        self._add_trace_counter(trace_record, f"{prefix}_meta_broadcast_count")
+        self._add_trace_counter(trace_record, f"{prefix}_payload_broadcast_skipped_count")
+        if not payload_build_executed:
+            self._add_trace_counter(trace_record, f"{prefix}_payload_build_skipped_count")
+        self._add_trace_counter(
+            trace_record,
+            f"{prefix}_trace_heavy_count" if trace_heavy else f"{prefix}_trace_light_count",
+        )
+        if registry_scan:
+            self._add_trace_counter(trace_record, f"{prefix}_registry_scan_count")
+        self._record_zero_stage_minimal_trace(
+            trace_record,
+            stage=stage,
+            plan=plan,
+            meta_units=meta_units,
+            payload_units=payload_units,
+        )
+
+    def _record_zero_stage_broadcast_timing(
+        self,
+        trace_record: dict | None,
+        *,
+        stage: str,
+        elapsed_ms: float,
+    ) -> None:
+        field_name = ZERO_STAGE_BROADCAST_TIME_FIELD_BY_STAGE.get(str(stage))
+        if field_name is not None:
+            self._add_trace_time_ms(trace_record, field_name, elapsed_ms)
+
+    def _record_zero_stage_minimal_trace(
+        self,
+        trace_record: dict | None,
+        *,
+        stage: str | None,
+        plan: StepPlan | None,
+        meta_units: int | None,
+        payload_units: int = 0,
+    ) -> None:
+        if trace_record is None:
+            return
+        prefix = ZERO_STAGE_COUNTER_PREFIX_BY_STAGE.get(str(stage)) if stage is not None else None
+        if prefix is None:
+            return
+        trace_record[f"{prefix}_stage_enabled"] = True
+        trace_record[f"{prefix}_stage_called"] = True
+        trace_record[f"{prefix}_zero_stage"] = True
+        trace_record[f"{prefix}_payload_len_units"] = int(payload_units)
+        if meta_units is not None:
+            trace_record[f"{prefix}_meta_len_units"] = int(meta_units)
+        if plan is not None:
+            trace_record[f"{prefix}_plan_id"] = int(plan.plan_id)
+            trace_record[f"{prefix}_dual_step_id"] = -1 if plan.step_id is None else int(plan.step_id)
+        trace_record[f"{prefix}_runner_role"] = self._runner_role()
+
+    def _record_zero_stage_fast_path(
+        self,
+        trace_record: dict | None,
+        *,
+        payload_build_skipped: bool = False,
+        trace_heavy_skipped: bool = False,
+        registry_scan_skipped: bool = False,
+        meta_broadcast_skipped: bool = False,
+        meta_broadcast_kept: bool = False,
+        fallback_reason: str | None = None,
+    ) -> None:
+        if trace_record is None:
+            return
+        trace_record["zero_stage_fast_path_enabled"] = 1
+        if payload_build_skipped:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_payload_build_skipped_count")
+        if trace_heavy_skipped:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_trace_heavy_skipped_count")
+        if registry_scan_skipped:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_registry_scan_skipped_count")
+        if meta_broadcast_skipped:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_meta_broadcast_skipped_count")
+        if meta_broadcast_kept:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_meta_broadcast_kept_count")
+        if fallback_reason:
+            self._add_trace_counter(trace_record, "zero_stage_fast_path_fallback_count")
+            self._add_trace_reason_counter(
+                trace_record,
+                "zero_stage_fast_path_fallback_reason_counts",
+                fallback_reason,
+            )
 
     def _trace_value_is_empty_debug_default(self, value) -> bool:
         return value is None or value == [] or value == {}
@@ -3228,12 +3354,23 @@ class ModelRunnerBase:
             self._draft_sent_eager_proposals_by_id[int(proposal.proposal_id)] = proposal
         self._record_elapsed_ms(trace_record, "eager_transfer_filter_time_ms", stage_start)
         stage_start = time.perf_counter()
-        meta_values, payload_values = serialize_eager_transfer_payload(
-            ready_proposals,
-            gamma=int(self.gamma),
-            plan_id=int(plan.plan_id),
-            step_id=plan.step_id,
-        )
+        payload_build_executed = bool(ready_proposals)
+        if payload_build_executed:
+            meta_values, payload_values = serialize_eager_transfer_payload(
+                ready_proposals,
+                gamma=int(self.gamma),
+                plan_id=int(plan.plan_id),
+                step_id=plan.step_id,
+            )
+        else:
+            meta_values = [
+                0,
+                0,
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+            ]
+            payload_values = []
         for proposal in ready_proposals:
             proposal.state = EAGER_STATE_TRANSFERRED_DRY_RUN
             proposal.valid = False
@@ -3263,15 +3400,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="eager_proposal",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         stage_start = time.perf_counter()
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
         self._record_elapsed_ms(trace_record, "eager_transfer_tensor_build_time_ms", stage_start)
         stage_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
-        self._record_elapsed_ms(trace_record, "eager_transfer_broadcast_time_ms", stage_start)
+        elapsed_ms = max(0.0, (time.perf_counter() - stage_start) * 1000.0)
+        self._add_trace_time_ms(trace_record, "eager_transfer_broadcast_time_ms", elapsed_ms)
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="eager_proposal",
+                elapsed_ms=elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         if payload_len > 0:
             stage_start = time.perf_counter()
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
@@ -4700,7 +4853,20 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         results = self._build_eager_result_transfer_results(plan, trace_record, scheduled_proposals)
-        meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
+        payload_build_executed = bool(results)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_eager_result_transfer_payload(results, plan)
+        else:
+            meta_values = [
+                int(EAGER_RESULT_TRANSFER_MAGIC),
+                int(EAGER_RESULT_TRANSFER_OP_DRY_RUN),
+                0,
+                0,
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+            ]
+            payload_values = []
         result_source = (
             EAGER_TAKEOVER_DRY_RUN_SOURCE
             if (
@@ -4802,10 +4968,19 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="eager_result",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
         broadcast_meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(broadcast_meta_values[3])
@@ -4815,6 +4990,14 @@ class ModelRunnerBase:
             else:
                 payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="eager_result",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
 
     def _validate_eager_result_on_draft(
@@ -4937,18 +5120,11 @@ class ModelRunnerBase:
         known_proposals: list[EagerProposal],
     ) -> None:
         timer_start = time.perf_counter()
-        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
-        known_by_id.update({int(proposal.proposal_id): proposal for proposal in known_proposals})
-        known_by_id.update(
-            {
-                int(proposal.proposal_id): proposal
-                for proposal in self.dual_batch_manager.ready_eager_proposals.proposals()
-            }
-        )
         if self.tp_params.local_rank != 0:
             self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
             return
         meta = torch.zeros(EAGER_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         if int(meta_values[0]) != int(EAGER_RESULT_TRANSFER_MAGIC):
@@ -4964,6 +5140,7 @@ class ModelRunnerBase:
         payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
         if payload_len > 0:
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         self._record_int64_transfer_bytes(
             trace_record,
             meta_field="eager_result_transfer_meta_bytes",
@@ -4972,14 +5149,74 @@ class ModelRunnerBase:
             payload_units=payload_len,
         )
         if payload_len == 0:
+            zero_fast_path = int(num_results) == 0 and self._eager_trace_level() != "full"
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
-                registry_scan=True,
+                registry_scan=not zero_fast_path,
+                stage="eager_result",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="eager_result",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            if zero_fast_path:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    trace_heavy_skipped=True,
+                    registry_scan_skipped=True,
+                    meta_broadcast_kept=True,
+                )
+                trace_record["enable_eager_result_transfer_dry_run"] = True
+                trace_record["eager_result_transfer_dry_run_enabled"] = True
+                trace_record["eager_result_transfer_dry_run_source"] = result_source
+                trace_record["eager_result_transfer_step_id"] = None if result_step_id < 0 else int(result_step_id)
+                trace_record["eager_result_transfer_plan_id"] = int(result_plan_id)
+                trace_record["eager_result_transfer_received_result_count"] = 0
+                trace_record["eager_result_transfer_validated_result_count"] = 0
+                trace_record["eager_result_transfer_invalid_result_count"] = 0
+                trace_record["eager_result_transfer_zero_result_step"] = True
+                trace_record["eager_result_received_num_results"] = 0
+                trace_record["eager_result_received_payload_len"] = 0
+                trace_record["eager_result_transfer_received_proposal_ids"] = []
+                trace_record["eager_result_transfer_received_seq_ids"] = []
+                trace_record["eager_result_transfer_received_count"] = 0
+                trace_record["eager_result_transfer_validated_proposal_ids"] = []
+                trace_record["eager_result_transfer_invalid_proposal_ids"] = []
+                trace_record["eager_result_received_proposal_ids"] = []
+                trace_record["eager_result_received_seq_ids"] = []
+                trace_record["eager_result_validated_proposal_ids"] = []
+                trace_record["eager_result_invalid_proposal_ids"] = []
+                trace_record["eager_tokens_result_transfer_received"] = 0
+                trace_record["eager_tokens_result_transfer_validated"] = 0
+                trace_record["eager_tokens_result_transfer_invalid"] = 0
+                trace_record["eager_tokens_result_transfer_dry_run"] = 0
+                trace_record["eager_tokens_result_transfer_full_accept"] = 0
+                trace_record["eager_tokens_result_transfer_discarded"] = 0
+                trace_record["eager_result_zero_result_step"] = True
+                trace_record["result_transfer_called"] = True
+                trace_record["result_transfer_zero_result"] = True
+                self._record_elapsed_ms(trace_record, "eager_result_transfer_time_ms", timer_start)
+                if self._eager_sync_apply_dry_run_enabled():
+                    plan.eager_sync_apply_dry_run_enabled = True
+                    self._run_draft_sync_apply_dry_run(plan, trace_record, [], {}, {})
+                if self._eager_commit_ready_only_enabled():
+                    self._send_eager_commit_ready_only_decision(plan, trace_record, {}, {})
+                return
         results = self._deserialize_eager_result_transfer_payload(meta_values, payload.tolist())
+        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
+        known_by_id.update({int(proposal.proposal_id): proposal for proposal in known_proposals})
+        known_by_id.update(
+            {
+                int(proposal.proposal_id): proposal
+                for proposal in self.dual_batch_manager.ready_eager_proposals.proposals()
+            }
+        )
         seq_by_id = self._local_sequence_by_id()
         validated: list[dict] = []
         invalid: list[dict] = []
@@ -6799,7 +7036,55 @@ class ModelRunnerBase:
         known_by_id: dict[int, EagerProposal],
         seq_by_id: dict[int, Sequence],
     ) -> None:
+        timer_start = time.perf_counter()
         gamma = int(self.gamma)
+        if not validated_results and self._eager_trace_level() != "full":
+            result_source = str(
+                trace_record.get("eager_result_transfer_dry_run_source")
+                or EAGER_LEGACY_RESULT_TRANSFER_SOURCE
+            )
+            trace_record["enable_eager_sync_apply_dry_run"] = True
+            trace_record["eager_sync_apply_dry_run_enabled"] = True
+            trace_record["eager_sync_apply_dry_run_source"] = result_source
+            trace_record["eager_sync_apply_step_id"] = None if plan.step_id is None else int(plan.step_id)
+            trace_record["eager_sync_apply_plan_id"] = int(plan.plan_id)
+            trace_record["eager_sync_apply_candidate_proposal_ids"] = []
+            trace_record["eager_sync_apply_candidate_seq_ids"] = []
+            trace_record["eager_sync_apply_executed_proposal_ids"] = []
+            trace_record["eager_sync_apply_executed_seq_ids"] = []
+            trace_record["eager_sync_apply_skipped_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_candidate_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_candidate_seq_ids"] = []
+            trace_record["eager_sync_apply_dry_run_from_result_transfer_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_from_result_transfer_seq_ids"] = []
+            trace_record["eager_sync_apply_dry_run_executed_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_executed_seq_ids"] = []
+            trace_record["eager_sync_apply_dry_run_skipped_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_consistent_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_inconsistent_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_missing_local_proposal_ids"] = []
+            trace_record["eager_sync_apply_dry_run_duplicate_proposal_ids"] = []
+            trace_record["eager_tokens_sync_apply_dry_run"] = 0
+            trace_record["eager_tokens_sync_apply_dry_run_full_accept"] = 0
+            trace_record["eager_tokens_sync_apply_dry_run_discarded"] = 0
+            trace_record["eager_sync_apply_dry_run_append_tokens"] = 0
+            trace_record["eager_tokens_sync_apply_dry_run_target_side"] = 0
+            trace_record["eager_tokens_sync_apply_dry_run_draft_side"] = 0
+            trace_record["eager_sync_apply_target_mutation_remaining_count"] = 0
+            trace_record["eager_sync_apply_draft_mutation_remaining_count"] = 0
+            trace_record["eager_commit_ready_proposal_ids"] = []
+            trace_record["eager_commit_ready_seq_ids"] = []
+            trace_record["eager_commit_ready_token_count_by_proposal_id"] = {}
+            trace_record["eager_commit_ready_action_by_proposal_id"] = {}
+            trace_record["eager_commit_ready_accept_len_by_proposal_id"] = {}
+            trace_record["eager_commit_ready_verify_result_by_proposal_id"] = {}
+            self._record_zero_stage_fast_path(
+                trace_record,
+                trace_heavy_skipped=True,
+                registry_scan_skipped=True,
+            )
+            self._record_elapsed_ms(trace_record, "eager_sync_apply_dry_run_time_ms", timer_start)
+            return
         plan_context = self._eager_transfer_plan_context(plan, trace_record)
         result_source = str(
             trace_record.get("eager_result_transfer_dry_run_source")
@@ -7719,7 +8004,19 @@ class ModelRunnerBase:
         seq_by_id: dict[int, Sequence],
     ) -> None:
         decisions = self._commit_ready_only_decisions_from_trace(trace_record)
-        meta_values, payload_values = self._serialize_eager_commit_ready_only_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_eager_commit_ready_only_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(EAGER_COMMIT_READY_ONLY_MAGIC),
+                int(EAGER_COMMIT_READY_ONLY_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+            ]
+            payload_values = []
         payload_len = int(meta_values[5])
         trace_record["eager_commit_decision_payload_len_units"] = payload_len
         self._record_int64_transfer_bytes(
@@ -7734,14 +8031,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if payload_len > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._run_eager_commit_ready_only(
             plan,
             trace_record,
@@ -7826,6 +8140,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> None:
         meta = torch.zeros(EAGER_COMMIT_READY_ONLY_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -7834,6 +8149,7 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         trace_record["eager_commit_decision_payload_len_units"] = payload_len
         self._record_int64_transfer_bytes(
             trace_record,
@@ -7849,9 +8165,22 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
-        decisions = self._deserialize_eager_commit_ready_only_payload(meta_values, payload_values)
-        known_by_id = {
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
+            )
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_eager_commit_ready_only_payload(meta_values, payload_values)
+        known_by_id = {} if not decisions else {
             int(proposal.proposal_id): proposal
             for proposal in self.dual_batch_manager.ready_eager_proposals.proposals()
         }
@@ -7860,7 +8189,7 @@ class ModelRunnerBase:
             trace_record,
             decisions,
             known_by_id,
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -8858,7 +9187,20 @@ class ModelRunnerBase:
         plan: StepPlan,
         trace_record: dict,
     ) -> None:
-        meta_values, payload_values = self._serialize_continuous_eager_transfer_payload(proposals, plan)
+        payload_build_executed = bool(proposals)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_continuous_eager_transfer_payload(proposals, plan)
+        else:
+            meta_values = [
+                int(CONTINUOUS_EAGER_TRANSFER_MAGIC),
+                int(CONTINUOUS_EAGER_TRANSFER_OP_DRY_RUN),
+                0,
+                0,
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+            ]
+            payload_values = []
         trace_record["continuous_eager_result_transfer_zero_steps"] = int(len(proposals) == 0)
         trace_record["continuous_eager_proposal_transfer_payload_len_units"] = int(meta_values[3])
         payload_len = int(meta_values[3])
@@ -8875,14 +9217,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="continuous_proposal",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if payload_len > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="continuous_proposal",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
 
     def _receive_continuous_eager_transfer_dry_run(
         self,
@@ -8890,6 +9249,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> list[EagerProposal]:
         meta = torch.zeros(CONTINUOUS_EAGER_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[3])
@@ -8898,7 +9258,8 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
-        proposals = self._deserialize_continuous_eager_transfer_payload(meta_values, payload_values)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        proposals = [] if payload_len == 0 and int(meta_values[2]) == 0 else self._deserialize_continuous_eager_transfer_payload(meta_values, payload_values)
         trace_record["continuous_eager_proposal_transfer_payload_len_units"] = payload_len
         self._record_int64_transfer_bytes(
             trace_record,
@@ -8913,6 +9274,19 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="continuous_proposal",
+                plan=plan,
+                meta_units=len(meta_values),
+            )
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="continuous_proposal",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                trace_heavy_skipped=int(meta_values[2]) == 0,
+                meta_broadcast_kept=True,
             )
         return proposals
 
@@ -8963,6 +9337,83 @@ class ModelRunnerBase:
         timer_start = time.perf_counter()
         gamma = int(self.gamma)
         max_depth, max_requests, token_per_request, max_tokens_per_step = self._continuous_eager_limits()
+        if not proposals and self._eager_trace_level() != "full":
+            self._continuous_set_common_trace(
+                trace_record,
+                max_depth,
+                max_requests,
+                token_per_request,
+                max_tokens_per_step,
+                {},
+            )
+            trace_record["continuous_eager_candidate_proposal_ids"] = []
+            trace_record["continuous_eager_candidate_seq_ids"] = []
+            trace_record["continuous_eager_candidate_token_count_by_proposal_id"] = {}
+            trace_record["continuous_eager_parent_proposal_id_by_proposal_id"] = {}
+            trace_record["continuous_eager_chain_depth_by_proposal_id"] = {}
+            trace_record["continuous_eager_root_proposal_id_by_proposal_id"] = {}
+            trace_record["continuous_eager_parent_source_by_proposal_id"] = {}
+            trace_record["continuous_eager_verify_dry_run_candidate_proposal_ids"] = []
+            trace_record["continuous_eager_verify_dry_run_executed_proposal_ids"] = []
+            trace_record["continuous_eager_verify_dry_run_skipped_proposal_ids"] = []
+            trace_record["continuous_eager_verified_proposal_ids"] = []
+            trace_record["continuous_eager_verify_result_by_proposal_id"] = {}
+            trace_record["continuous_eager_accept_len_by_proposal_id"] = {}
+            trace_record["continuous_eager_full_accept_proposal_ids"] = []
+            trace_record["continuous_eager_partial_reject_proposal_ids"] = []
+            trace_record["continuous_eager_verified_token_count"] = 0
+            trace_record["continuous_eager_full_accept_token_count"] = 0
+            trace_record["continuous_eager_partial_reject_token_count"] = 0
+            trace_record["continuous_eager_apply_dry_run_candidate_proposal_ids"] = []
+            trace_record["continuous_eager_apply_dry_run_executed_proposal_ids"] = []
+            trace_record["continuous_eager_commit_ready_shadow_proposal_ids"] = []
+            trace_record["continuous_eager_commit_ready_shadow_seq_ids"] = []
+            trace_record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {}
+            trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = []
+            trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = {}
+            trace_record["continuous_eager_parent_not_ready_proposal_ids"] = []
+            trace_record["continuous_eager_true_frontier_mismatch_proposal_ids"] = []
+            trace_record["continuous_eager_frontier_mismatch_proposal_ids"] = []
+            trace_record["continuous_eager_seq_finished_proposal_ids"] = []
+            trace_record["continuous_eager_invalidated_proposal_ids"] = []
+            trace_record["continuous_eager_stale_proposal_ids"] = []
+            trace_record["continuous_eager_candidate_proposal_count"] = 0
+            trace_record["continuous_eager_candidate_token_count"] = 0
+            trace_record["continuous_eager_verified_proposal_count"] = 0
+            trace_record["continuous_eager_full_accept_proposal_count"] = 0
+            trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = 0
+            trace_record["continuous_eager_commit_ready_shadow_token_count"] = 0
+            trace_record["continuous_eager_not_ready_shadow_proposal_count"] = 0
+            trace_record["continuous_eager_chain_length_distribution"] = {}
+            trace_record["continuous_eager_drop_reason_counts"] = {}
+            trace_record["continuous_parent_shadow_not_committed_count"] = 0
+            trace_record["continuous_parent_shadow_not_ready_count"] = 0
+            trace_record["continuous_true_frontier_mismatch_count"] = 0
+            trace_record["continuous_eager_mutation_detected_count"] = 0
+            trace_record["continuous_eager_real_commit_count"] = 0
+            trace_record["continuous_eager_verify_apply_zero_candidate_steps"] = 1
+            self._add_trace_counter(trace_record, "zero_candidate_trace_light_count")
+            self._record_zero_stage_fast_path(
+                trace_record,
+                trace_heavy_skipped=True,
+                registry_scan_skipped=True,
+            )
+            if self._rolling_continuous_eager_dry_run_enabled():
+                max_rolling_depth, _max_children, _max_seqs = self._rolling_continuous_limits()
+                self._set_rolling_common_trace(trace_record, max_rolling_depth)
+                trace_record["target_rolling_eager_verify_proposal_ids"] = []
+                trace_record["target_rolling_eager_verify_seq_ids"] = []
+                trace_record["rolling_parent_verified_proposal_ids"] = []
+                trace_record["rolling_parent_full_accept_proposal_ids"] = []
+                trace_record["rolling_parent_partial_reject_proposal_ids"] = []
+                trace_record["rolling_parent_invalidated_proposal_ids"] = []
+                trace_record["rolling_normal_lane_excluded_seq_ids"] = []
+                trace_record["rolling_normal_lane_conflict_seq_ids"] = []
+                trace_record["rolling_normal_lane_conflict_count"] = 0
+                trace_record["rolling_depth2_real_commit_count"] = 0
+                trace_record["rolling_depth_gt1_real_commit_count"] = 0
+            self._record_elapsed_ms(trace_record, "continuous_eager_overhead_time_ms", timer_start)
+            return []
         seq_by_id = self._local_sequence_by_id()
         candidate_ids = [int(proposal.proposal_id) for proposal in proposals]
         candidate_seq_ids = [int(proposal.seq_id) for proposal in proposals]
@@ -9428,7 +9879,20 @@ class ModelRunnerBase:
         results: list[dict],
     ) -> None:
         timer_start = time.perf_counter()
-        meta_values, payload_values = self._serialize_continuous_eager_result_transfer_payload(results, plan)
+        payload_build_executed = bool(results)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_continuous_eager_result_transfer_payload(results, plan)
+        else:
+            meta_values = [
+                int(CONTINUOUS_EAGER_RESULT_TRANSFER_MAGIC),
+                int(CONTINUOUS_EAGER_RESULT_TRANSFER_OP_COMPACT_V1),
+                0,
+                0,
+                int(self.gamma),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+            ]
+            payload_values = []
         num_results = int(meta_values[2])
         payload_len = int(meta_values[3])
         trace_record["continuous_eager_result_transfer_sent_proposal_ids"] = [
@@ -9454,10 +9918,19 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=payload_len,
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="continuous_result",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
         if payload_len > 0:
             if self.rank == self.global_config.target_config.master_rank:
@@ -9465,6 +9938,14 @@ class ModelRunnerBase:
             else:
                 payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="continuous_result",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "continuous_eager_result_transfer_time_ms", timer_start)
 
     def _receive_continuous_eager_result_transfer_dry_run(
@@ -9473,6 +9954,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> list[dict]:
         meta = torch.zeros(CONTINUOUS_EAGER_RESULT_TRANSFER_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[3])
@@ -9481,9 +9963,11 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
-        known_by_id = dict(self._draft_sent_eager_proposals_by_id)
-        results = self._deserialize_continuous_eager_result_transfer_payload(meta_values, payload_values, known_by_id)
-        seq_by_id = self._local_sequence_by_id()
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        zero_fast_path = payload_len == 0 and int(meta_values[2]) == 0 and self._eager_trace_level() != "full"
+        known_by_id = {} if zero_fast_path else dict(self._draft_sent_eager_proposals_by_id)
+        results = [] if zero_fast_path else self._deserialize_continuous_eager_result_transfer_payload(meta_values, payload_values, known_by_id)
+        seq_by_id = {} if zero_fast_path else self._local_sequence_by_id()
         validated: list[dict] = []
         invalid: list[dict] = []
         validation_reason_by_id: dict[int, str] = {}
@@ -9537,8 +10021,23 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
-                registry_scan=True,
+                registry_scan=not zero_fast_path,
+                stage="continuous_result",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="continuous_result",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            if zero_fast_path:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    trace_heavy_skipped=True,
+                    registry_scan_skipped=True,
+                    meta_broadcast_kept=True,
+                )
         return validated
 
     def _run_continuous_eager_sync_apply_dry_run(
@@ -9549,6 +10048,48 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         gamma = int(self.gamma)
+        if not validated_results and self._eager_trace_level() != "full":
+            trace_record["continuous_eager_sync_apply_candidate_proposal_ids"] = []
+            trace_record["continuous_eager_sync_apply_executed_proposal_ids"] = []
+            trace_record["continuous_eager_sync_apply_action_match_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_result_match_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_accept_len_match_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_rollback_ok_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_mutation_detected_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_checkpoint_failed_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_target_action_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_draft_action_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_target_verify_result_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_draft_verify_result_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_target_accept_len_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_draft_accept_len_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_append_tokens_by_proposal_id"] = {}
+            trace_record["continuous_eager_sync_apply_discarded_tokens_by_proposal_id"] = {}
+            trace_record["continuous_eager_commit_ready_shadow_proposal_ids"] = []
+            trace_record["continuous_eager_commit_ready_shadow_seq_ids"] = []
+            trace_record["continuous_eager_commit_ready_shadow_token_count_by_proposal_id"] = {}
+            existing_not_ready = set(
+                int(proposal_id)
+                for proposal_id in trace_record.get("continuous_eager_not_ready_shadow_proposal_ids", [])
+            )
+            trace_record["continuous_eager_not_ready_shadow_proposal_ids"] = sorted(existing_not_ready)
+            trace_record["continuous_eager_not_ready_shadow_reason_by_proposal_id"] = dict(
+                trace_record.get("continuous_eager_not_ready_shadow_reason_by_proposal_id", {})
+            )
+            trace_record["continuous_eager_commit_ready_shadow_proposal_count"] = 0
+            trace_record["continuous_eager_commit_ready_shadow_token_count"] = 0
+            trace_record["continuous_eager_not_ready_shadow_proposal_count"] = len(existing_not_ready)
+            trace_record["continuous_eager_mutation_detected_count"] = 0
+            trace_record["continuous_eager_real_commit_count"] = 0
+            trace_record["continuous_eager_sync_apply_zero_steps"] = 1
+            self._add_trace_counter(trace_record, "zero_candidate_trace_light_count")
+            self._record_zero_stage_fast_path(
+                trace_record,
+                trace_heavy_skipped=True,
+                registry_scan_skipped=True,
+            )
+            self._record_elapsed_ms(trace_record, "continuous_eager_sync_apply_dry_run_time_ms", timer_start)
+            return
         seq_by_id = self._local_sequence_by_id()
         known_by_id = dict(self._draft_sent_eager_proposals_by_id)
         candidate_ids = [int(result["proposal_id"]) for result in validated_results]
@@ -9864,7 +10405,19 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         decisions = self._continuous_commit_depth1_decisions_from_trace(trace_record)
-        meta_values, payload_values = self._serialize_continuous_eager_commit_depth1_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_continuous_eager_commit_depth1_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(CONTINUOUS_EAGER_COMMIT_DEPTH1_MAGIC),
+                int(CONTINUOUS_EAGER_COMMIT_DEPTH1_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+            ]
+            payload_values = []
         trace_record["continuous_eager_commit_decision_broadcast_payload_len_units"] = int(meta_values[5])
         trace_record["continuous_eager_commit_decision_broadcast_count"] = int(meta_values[4])
         trace_record["continuous_eager_commit_decision_broadcast_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -9881,14 +10434,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=int(meta_values[5]),
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if int(meta_values[5]) == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "continuous_eager_commit_decision_broadcast_time_ms", timer_start)
         self._run_continuous_eager_commit_depth1_ready_only(
             plan,
@@ -9907,6 +10477,7 @@ class ModelRunnerBase:
         known_by_id: dict[int, EagerProposal],
     ) -> None:
         meta = torch.zeros(CONTINUOUS_EAGER_COMMIT_DEPTH1_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -9915,6 +10486,7 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         self._record_int64_transfer_bytes(
             trace_record,
             meta_field="commit_decision_transfer_meta_bytes",
@@ -9929,14 +10501,27 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
-        decisions = self._deserialize_continuous_eager_commit_depth1_payload(meta_values, payload_values)
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
+            )
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_continuous_eager_commit_depth1_payload(meta_values, payload_values)
         self._run_continuous_eager_commit_depth1_ready_only(
             plan,
             trace_record,
             decisions,
             known_by_id,
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -10594,7 +11179,20 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         decisions = self._rolling_depth2_commit_decisions_from_trace(trace_record, known_by_id)
-        meta_values, payload_values = self._serialize_rolling_depth2_commit_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_rolling_depth2_commit_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(ROLLING_DEPTH2_COMMIT_MAGIC),
+                int(ROLLING_DEPTH2_COMMIT_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+                int(self.gamma),
+            ]
+            payload_values = []
         trace_record["rolling_depth2_commit_decision_broadcast_payload_len_units"] = int(meta_values[5])
         trace_record["rolling_depth2_commit_decision_broadcast_count"] = int(meta_values[4])
         trace_record["rolling_depth2_commit_decision_broadcast_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -10610,14 +11208,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=int(meta_values[5]),
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if int(meta_values[5]) == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "rolling_depth2_commit_decision_broadcast_time_ms", timer_start)
         self._run_rolling_depth2_commit_ready_only(
             plan,
@@ -10635,6 +11250,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> None:
         meta = torch.zeros(ROLLING_DEPTH2_COMMIT_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -10643,6 +11259,7 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         self._record_int64_transfer_bytes(
             trace_record,
             meta_field="commit_decision_transfer_meta_bytes",
@@ -10657,14 +11274,27 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
-        decisions = self._deserialize_rolling_depth2_commit_payload(meta_values, payload_values)
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
+            )
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_rolling_depth2_commit_payload(meta_values, payload_values)
         self._run_rolling_depth2_commit_ready_only(
             plan,
             trace_record,
             decisions,
             {},
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -10871,7 +11501,20 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         decisions = self._rolling_depth3_commit_decisions_from_trace(trace_record, known_by_id)
-        meta_values, payload_values = self._serialize_rolling_depth3_commit_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_rolling_depth3_commit_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(ROLLING_DEPTH3_COMMIT_MAGIC),
+                int(ROLLING_DEPTH3_COMMIT_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+                int(self.gamma),
+            ]
+            payload_values = []
         trace_record["rolling_depth3_commit_decision_broadcast_payload_len_units"] = int(meta_values[5])
         trace_record["rolling_depth3_commit_decision_broadcast_count"] = int(meta_values[4])
         trace_record["rolling_depth3_commit_decision_broadcast_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -10887,14 +11530,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=int(meta_values[5]),
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if int(meta_values[5]) == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "rolling_depth3_commit_decision_broadcast_time_ms", timer_start)
         self._run_rolling_depth3_commit_ready_only(
             plan,
@@ -10912,6 +11572,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> None:
         meta = torch.zeros(ROLLING_DEPTH3_COMMIT_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -10920,6 +11581,7 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         self._record_int64_transfer_bytes(
             trace_record,
             meta_field="commit_decision_transfer_meta_bytes",
@@ -10934,14 +11596,27 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
-        decisions = self._deserialize_rolling_depth3_commit_payload(meta_values, payload_values)
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
+            )
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_rolling_depth3_commit_payload(meta_values, payload_values)
         self._run_rolling_depth3_commit_ready_only(
             plan,
             trace_record,
             decisions,
             {},
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -11553,7 +12228,20 @@ class ModelRunnerBase:
     ) -> None:
         timer_start = time.perf_counter()
         decisions = self._rolling_depth4_commit_decisions_from_trace(trace_record, known_by_id)
-        meta_values, payload_values = self._serialize_rolling_depth4_commit_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_rolling_depth4_commit_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(ROLLING_DEPTH4_COMMIT_MAGIC),
+                int(ROLLING_DEPTH4_COMMIT_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+                int(self.gamma),
+            ]
+            payload_values = []
         trace_record["rolling_depth4_commit_decision_broadcast_payload_len_units"] = int(meta_values[5])
         trace_record["rolling_depth4_commit_decision_broadcast_count"] = int(meta_values[4])
         trace_record["rolling_depth4_commit_decision_broadcast_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -11569,14 +12257,31 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=int(meta_values[5]),
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if int(meta_values[5]) == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
         self._record_elapsed_ms(trace_record, "rolling_depth4_commit_decision_broadcast_time_ms", timer_start)
         self._run_rolling_depth4_commit_ready_only(
             plan,
@@ -11594,6 +12299,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> None:
         meta = torch.zeros(ROLLING_DEPTH4_COMMIT_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -11602,6 +12308,7 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
         self._record_int64_transfer_bytes(
             trace_record,
             meta_field="commit_decision_transfer_meta_bytes",
@@ -11616,14 +12323,27 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="commit_decision",
+                plan=plan,
+                meta_units=len(meta_values),
             )
-        decisions = self._deserialize_rolling_depth4_commit_payload(meta_values, payload_values)
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="commit_decision",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
+            )
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_rolling_depth4_commit_payload(meta_values, payload_values)
         self._run_rolling_depth4_commit_ready_only(
             plan,
             trace_record,
             decisions,
             {},
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -12151,7 +12871,20 @@ class ModelRunnerBase:
             seq_by_id,
             self._eager_transfer_plan_context(plan, trace_record),
         )
-        meta_values, payload_values = self._serialize_generic_rolling_commit_payload(decisions, plan)
+        payload_build_executed = bool(decisions)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_generic_rolling_commit_payload(decisions, plan)
+        else:
+            meta_values = [
+                int(GENERIC_ROLLING_COMMIT_MAGIC),
+                int(GENERIC_ROLLING_COMMIT_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+                int(self.gamma),
+            ]
+            payload_values = []
         trace_record["generic_rolling_commit_decision_payload_len_units"] = int(meta_values[5])
         trace_record["generic_rolling_commit_decision_count"] = int(meta_values[4])
         trace_record["generic_rolling_commit_decision_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -12167,17 +12900,34 @@ class ModelRunnerBase:
             self._record_zero_payload_transfer_counters(
                 trace_record,
                 payload_units=int(meta_values[5]),
-                payload_build_executed=True,
+                payload_build_executed=payload_build_executed,
                 trace_heavy=False,
+                stage="generic_full_continuous",
+                plan=plan,
+                meta_units=len(meta_values),
             )
+            if not payload_build_executed:
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    payload_build_skipped=True,
+                )
         trace_record["generic_rolling_commit_candidate_proposal_ids_by_depth"] = trace_record.get(
             "generic_rolling_candidate_proposal_ids_by_depth", {}
         )
         meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta_values[5]) > 0:
             payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        if int(meta_values[5]) == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="generic_full_continuous",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
 
     def _receive_generic_rolling_commit_decision(
         self,
@@ -12185,6 +12935,7 @@ class ModelRunnerBase:
         trace_record: dict,
     ) -> None:
         meta = torch.zeros(GENERIC_ROLLING_COMMIT_META_LEN, dtype=torch.int64, device="cuda")
+        broadcast_start = time.perf_counter()
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         meta_values = [int(value) for value in meta.tolist()]
         payload_len = int(meta_values[5])
@@ -12193,7 +12944,8 @@ class ModelRunnerBase:
             payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
             dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
             payload_values = [int(value) for value in payload.tolist()]
-        decisions = self._deserialize_generic_rolling_commit_payload(meta_values, payload_values)
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - broadcast_start) * 1000.0)
+        decisions = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_generic_rolling_commit_payload(meta_values, payload_values)
         trace_record["generic_rolling_commit_decision_payload_len_units"] = int(meta_values[5])
         trace_record["generic_rolling_commit_decision_count"] = int(meta_values[4])
         trace_record["generic_rolling_commit_decision_zero_steps"] = int(int(meta_values[4]) == 0)
@@ -12211,12 +12963,25 @@ class ModelRunnerBase:
                 payload_units=payload_len,
                 payload_build_executed=False,
                 trace_heavy=False,
+                stage="generic_full_continuous",
+                plan=plan,
+                meta_units=len(meta_values),
+            )
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="generic_full_continuous",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            self._record_zero_stage_fast_path(
+                trace_record,
+                registry_scan_skipped=True,
+                meta_broadcast_kept=True,
             )
         self._run_generic_rolling_commit_ready_only(
             plan,
             trace_record,
             decisions,
-            self._local_sequence_by_id(),
+            {} if not decisions else self._local_sequence_by_id(),
             self._eager_transfer_plan_context(plan, trace_record),
             side="target",
         )
@@ -14420,6 +15185,98 @@ class ModelRunnerBase:
     def _receive_eager_transfer_dry_run(self, plan: StepPlan, trace_record: dict) -> list[EagerProposal]:
         timer_start = time.perf_counter()
         stage_start = timer_start
+        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        num_proposals, payload_len, gamma, transfer_plan_id, transfer_step_id = meta_values
+        if int(gamma) != int(self.gamma):
+            raise ValueError(f"eager transfer gamma mismatch: expected={self.gamma}, got={gamma}")
+        payload_values: list[int] = []
+        if payload_len > 0:
+            payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+            payload_values = [int(value) for value in payload.tolist()]
+        broadcast_elapsed_ms = max(0.0, (time.perf_counter() - stage_start) * 1000.0)
+        self._add_trace_time_ms(trace_record, "eager_transfer_receive_broadcast_time_ms", broadcast_elapsed_ms)
+        zero_fast_path = (
+            int(num_proposals) == 0
+            and int(payload_len) == 0
+            and self.eager_proposal_buffer.size() == 0
+            and self._eager_trace_level() != "full"
+        )
+        if payload_len == 0:
+            self._record_zero_stage_broadcast_timing(
+                trace_record,
+                stage="eager_proposal",
+                elapsed_ms=broadcast_elapsed_ms,
+            )
+            if zero_fast_path:
+                trace_start = time.perf_counter()
+                trace_record["enable_eager_transfer_dry_run"] = True
+                trace_record["eager_transfer_dry_run_enabled"] = True
+                trace_record["eager_transfer_step_id"] = None if transfer_step_id < 0 else int(transfer_step_id)
+                trace_record["eager_transfer_plan_id"] = int(transfer_plan_id)
+                trace_record["eager_transfer_num_proposals"] = 0
+                trace_record["eager_transfer_payload_len"] = 0
+                trace_record["eager_transfer_received_proposal_ids"] = []
+                trace_record["eager_transfer_received_seq_ids"] = []
+                trace_record["eager_transfer_validated_proposal_ids"] = []
+                trace_record["eager_transfer_pending_proposal_ids"] = []
+                trace_record["eager_transfer_dropped_proposal_ids"] = []
+                trace_record["target_ready_buffer_size_after_receive"] = 0
+                trace_record["target_ready_buffer_size_after_schedule"] = 0
+                trace_record["eager_pending_received_proposal_ids"] = []
+                trace_record["eager_pending_received_seq_ids"] = []
+                trace_record["eager_pending_base_not_reached_proposal_ids"] = []
+                trace_record["eager_pending_base_not_reached_seq_ids"] = []
+                trace_record["eager_pending_ready_proposal_ids"] = []
+                trace_record["eager_pending_ready_seq_ids"] = []
+                trace_record["eager_pending_dropped_proposal_ids"] = []
+                trace_record["eager_pending_buffer_size_before_update"] = 0
+                trace_record["eager_pending_buffer_size_after_update"] = 0
+                trace_record["eager_pending_buffer_size_after_receive"] = 0
+                trace_record["eager_pending_buffer_size_after_clear"] = 0
+                trace_record["target_eager_buffer_size_before_receive"] = 0
+                trace_record["target_eager_buffer_size_after_receive"] = 0
+                trace_record["target_eager_buffer_size_after_clear"] = 0
+                trace_record["eager_tokens_transfer_pending"] = 0
+                trace_record["eager_tokens_transfer_validated"] = 0
+                trace_record["eager_tokens_transfer_dropped"] = 0
+                trace_record["eager_buffer_size_after"] = 0
+                trace_record["eager_proposal_transfer_called"] = True
+                self._record_int64_transfer_bytes(
+                    trace_record,
+                    meta_field="eager_transfer_meta_bytes",
+                    payload_field="eager_transfer_payload_bytes",
+                    meta_units=len(meta_values),
+                    payload_units=payload_len,
+                )
+                self._record_zero_payload_transfer_counters(
+                    trace_record,
+                    payload_units=payload_len,
+                    payload_build_executed=False,
+                    trace_heavy=False,
+                    registry_scan=False,
+                    stage="eager_proposal",
+                    plan=plan,
+                    meta_units=len(meta_values),
+                )
+                self._record_zero_stage_fast_path(
+                    trace_record,
+                    trace_heavy_skipped=True,
+                    registry_scan_skipped=True,
+                    meta_broadcast_kept=True,
+                )
+                self._record_elapsed_ms(trace_record, "eager_transfer_receive_trace_time_ms", trace_start)
+                self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
+                return []
+            fallback_reason = (
+                "eager_proposal_pending_buffer_nonempty"
+                if self.eager_proposal_buffer.size() != 0
+                else "eager_proposal_full_trace_requested"
+            )
+            self._record_zero_stage_fast_path(trace_record, fallback_reason=fallback_reason)
+        stage_start = time.perf_counter()
         seq_by_id = self._local_sequence_by_id()
         plan_context = self._eager_transfer_plan_context(plan, trace_record)
         buffer_size_before_update = self.eager_proposal_buffer.size()
@@ -14477,18 +15334,6 @@ class ModelRunnerBase:
         )
 
         self._record_elapsed_ms(trace_record, "eager_transfer_receive_preprocess_time_ms", stage_start)
-        stage_start = time.perf_counter()
-        meta = torch.zeros(5, dtype=torch.int64, device="cuda")
-        dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
-        meta_values = [int(value) for value in meta.tolist()]
-        num_proposals, payload_len, gamma, transfer_plan_id, transfer_step_id = meta_values
-        if int(gamma) != int(self.gamma):
-            raise ValueError(f"eager transfer gamma mismatch: expected={self.gamma}, got={gamma}")
-        payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
-        if payload_len > 0:
-            dist.broadcast(payload, src=self.global_config.draft_config.master_rank, group=self.verify_group)
-        payload_values = payload.tolist()
-        self._record_elapsed_ms(trace_record, "eager_transfer_receive_broadcast_time_ms", stage_start)
         stage_start = time.perf_counter()
         proposals = deserialize_eager_transfer_payload(meta_values, payload_values)
         self._record_elapsed_ms(trace_record, "eager_transfer_deserialize_time_ms", stage_start)
@@ -14696,6 +15541,9 @@ class ModelRunnerBase:
                 payload_build_executed=False,
                 trace_heavy=True,
                 registry_scan=True,
+                stage="eager_proposal",
+                plan=plan,
+                meta_units=len(meta_values),
             )
         self._record_elapsed_ms(trace_record, "eager_transfer_receive_trace_time_ms", stage_start)
         self._record_elapsed_ms(trace_record, "eager_transfer_time_ms", timer_start)
