@@ -362,6 +362,70 @@ def test_ar_draft_cached_decode_noop_runtime_does_not_write_payload():
     assert dist.barriers == 2
 
 
+def test_ar_cached_admission_completion_is_signaled_by_target_master():
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    runner_cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelRunnerBase"
+    )
+    methods = [
+        node
+        for node in runner_cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_command_execution_mode", "_should_signal_control_event"}
+    ]
+    fake_cls = ast.ClassDef(
+        name="FakeRunner",
+        bases=[],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
+    )
+    module_ast = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                fake_cls,
+            ],
+            type_ignores=[],
+        )
+    )
+    ns: dict = {}
+    exec(compile(module_ast, str(ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py"), "exec"), ns)
+
+    class _TP:
+        def __init__(self, local_rank):
+            self.local_rank = local_rank
+
+    def make_runner(rank, is_draft, local_rank):
+        runner = ns["FakeRunner"]()
+        runner.rank = rank
+        runner.is_draft = is_draft
+        runner.tp_params = _TP(local_rank)
+        return runner
+
+    draft_master = make_runner(rank=0, is_draft=True, local_rank=0)
+    target_master = make_runner(rank=1, is_draft=False, local_rank=0)
+    target_peer = make_runner(rank=2, is_draft=False, local_rank=1)
+
+    ar_commands = [
+        ("cache_build_prepare", [[], 8, "ar"]),
+        ("add_cached_request", [object(), "ar"]),
+        ("cached_decode_ready_generate", ["ar", 4, "arrival_offset_sec"]),
+    ]
+    for method_name, args in ar_commands:
+        assert draft_master._should_signal_control_event(method_name, args) is False
+        assert target_master._should_signal_control_event(method_name, args) is True
+        assert target_peer._should_signal_control_event(method_name, args) is False
+
+    assert draft_master._should_signal_control_event(
+        "cache_build_prepare", [[], 8, "parallel_pearl"]
+    ) is True
+    assert target_master._should_signal_control_event(
+        "cache_build_prepare", [[], 8, "parallel_pearl"]
+    ) is False
+
+
 def test_runner_malformed_method_guard_is_clear():
     src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text(encoding="utf-8")
     assert "runner control method_name must be str" in src

@@ -239,7 +239,7 @@ class ModelRunnerBase:
         self.global_config = config
         self.group_config = config.draft_config if self.is_draft else config.target_config
         self.hf_config = self.group_config.hf_config
-        self.control_event = control_event if rank == 0  else None
+        self.control_event = control_event
 
         self.block_size = self.global_config.kvcache_block_size
         self.tensor_parallel_size = self.group_config.tensor_parallel_size
@@ -374,11 +374,31 @@ class ModelRunnerBase:
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
-            if self.rank == 0 and method_name != "exit":
+            if self._should_signal_control_event(method_name, args):
                 self.control_event.set()
             
             if method_name == "exit":
                 break
+
+    def _command_execution_mode(self, method_name: str, args: list) -> str | None:
+        if method_name == "cache_build_prepare" and len(args) >= 3:
+            return args[2]
+        if method_name == "add_cached_request" and len(args) >= 2:
+            return args[1]
+        if method_name == "cached_decode_ready_generate" and len(args) >= 1:
+            return args[0]
+        return None
+
+    def _should_signal_control_event(self, method_name: str, args: list) -> bool:
+        if method_name == "exit":
+            return False
+        if (
+            method_name in {"cache_build_prepare", "add_cached_request", "cached_decode_ready_generate"}
+            and self._command_execution_mode(method_name, args) == "ar"
+        ):
+            # AR cached admission is target-only; the target master owns the payload read by the controller.
+            return (not self.is_draft) and self.tp_params.local_rank == 0
+        return self.rank == 0
 
     def read_shm(self):
         self.event.wait()
