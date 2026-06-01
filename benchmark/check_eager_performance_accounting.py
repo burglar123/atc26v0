@@ -1386,6 +1386,25 @@ def aggregate_performance_accounting(
         )
         for proposal_id in partial_prefix_recovered_ids
     )
+    partial_prefix_recovered_token_count_by_depth: Counter[str] = Counter()
+    partial_prefix_revised_token_count_by_depth: Counter[str] = Counter()
+    partial_prefix_depths: set[int] = set()
+    for proposal_id in sorted(partial_prefix_recovered_ids):
+        depth = partial_prefix_depth_by_id.get(proposal_id)
+        if depth is None:
+            continue
+        depth_key = str(int(depth))
+        partial_prefix_depths.add(int(depth))
+        partial_prefix_recovered_token_count_by_depth[depth_key] += int(
+            partial_prefix_committed_token_count_by_id.get(
+                proposal_id,
+                int(partial_prefix_accepted_len_by_id.get(proposal_id, 0))
+                + int(partial_prefix_revised_token_count_by_id.get(proposal_id, 0)),
+            )
+        )
+        partial_prefix_revised_token_count_by_depth[depth_key] += int(
+            partial_prefix_revised_token_count_by_id.get(proposal_id, 0)
+        )
     full_accept_combined_real_committed_token_count = (
         committed_token_count
         + continuous_real_committed_token_count
@@ -1659,6 +1678,13 @@ def aggregate_performance_accounting(
         "partial_prefix_accepted_token_count": partial_prefix_accepted_token_count,
         "partial_prefix_revised_token_count": partial_prefix_revised_token_count,
         "partial_prefix_total_recovered_token_count": partial_prefix_total_recovered_token_count,
+        "partial_prefix_recovery_max_depth": max(partial_prefix_depths or {0}),
+        "partial_prefix_recovered_token_count_by_depth": dict(
+            sorted(partial_prefix_recovered_token_count_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "partial_prefix_revised_token_count_by_depth": dict(
+            sorted(partial_prefix_revised_token_count_by_depth.items(), key=lambda item: int(item[0]))
+        ),
         "partial_recovery_cascade_discard_count": len(partial_recovery_cascade_discard_ids),
         "partial_recovery_target_draft_length_mismatch_count": partial_recovery_target_draft_length_mismatch_count,
         "partial_recovery_target_draft_token_mismatch_count": partial_recovery_target_draft_token_mismatch_count,
@@ -2280,6 +2306,9 @@ def print_summary(summary: dict[str, Any]) -> None:
         "partial_prefix_accepted_token_count",
         "partial_prefix_revised_token_count",
         "partial_prefix_total_recovered_token_count",
+        "partial_prefix_recovery_max_depth",
+        "partial_prefix_recovered_token_count_by_depth",
+        "partial_prefix_revised_token_count_by_depth",
         "partial_recovery_cascade_discard_count",
         "partial_recovery_target_draft_length_mismatch_count",
         "partial_recovery_target_draft_token_mismatch_count",

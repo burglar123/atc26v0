@@ -3982,6 +3982,9 @@ class ModelRunnerBase:
         revised_token_count = 1
         committed_token_count = accepted_prefix_len + revised_token_count
         prefix = self._partial_recovery_prefix_for_depth(depth)
+        frontier_before = int(frontier_before)
+        frontier_after = int(frontier_after)
+        actual_delta = frontier_after - frontier_before
 
         recovered_ids = set(int(pid) for pid in trace_record.get("partial_prefix_recovered_proposal_ids", []))
         recovered_ids.add(proposal_id)
@@ -4016,17 +4019,59 @@ class ModelRunnerBase:
             ("partial_prefix_revised_token_count_by_proposal_id", proposal_id, revised_token_count),
             ("partial_prefix_committed_token_count_by_proposal_id", proposal_id, committed_token_count),
             ("partial_prefix_descendant_cascade_discard_count_by_proposal_id", proposal_id, descendant_cascade_discard_count),
-            ("partial_prefix_recovery_frontier_before_by_seq_id", seq_id, int(frontier_before)),
-            ("partial_prefix_recovery_frontier_after_by_seq_id", seq_id, int(frontier_after)),
-            ("partial_recovery_target_seq_len_before_by_seq_id", seq_id, int(frontier_before)),
-            ("partial_recovery_target_seq_len_after_by_seq_id", seq_id, int(frontier_after)),
-            ("partial_recovery_draft_seq_len_before_by_seq_id", seq_id, int(frontier_before)),
-            ("partial_recovery_draft_seq_len_after_by_seq_id", seq_id, int(frontier_after)),
+            ("partial_prefix_recovered_seq_id_by_proposal_id", proposal_id, seq_id),
+            ("partial_prefix_recovery_frontier_before_by_proposal_id", proposal_id, frontier_before),
+            ("partial_prefix_recovery_frontier_after_by_proposal_id", proposal_id, frontier_after),
+            ("partial_recovery_target_seq_len_before_by_proposal_id", proposal_id, frontier_before),
+            ("partial_recovery_target_seq_len_after_by_proposal_id", proposal_id, frontier_after),
+            ("partial_recovery_draft_seq_len_before_by_proposal_id", proposal_id, frontier_before),
+            ("partial_recovery_draft_seq_len_after_by_proposal_id", proposal_id, frontier_after),
         )
         for field, key, value in int_maps:
             current = {int(k): int(v) for k, v in (trace_record.get(field, {}) or {}).items()}
             current[int(key)] = int(value)
             trace_record[field] = self._trace_sorted_int_map(current)
+
+        for field in (
+            "partial_prefix_recovery_frontier_before_by_seq_id",
+            "partial_recovery_target_seq_len_before_by_seq_id",
+            "partial_recovery_draft_seq_len_before_by_seq_id",
+        ):
+            current = {int(k): int(v) for k, v in (trace_record.get(field, {}) or {}).items()}
+            current.setdefault(seq_id, frontier_before)
+            trace_record[field] = self._trace_sorted_int_map(current)
+        for field in (
+            "partial_prefix_recovery_frontier_after_by_seq_id",
+            "partial_recovery_target_seq_len_after_by_seq_id",
+            "partial_recovery_draft_seq_len_after_by_seq_id",
+        ):
+            current = {int(k): int(v) for k, v in (trace_record.get(field, {}) or {}).items()}
+            current[seq_id] = frontier_after
+            trace_record[field] = self._trace_sorted_int_map(current)
+
+        event = {
+            "proposal_id": proposal_id,
+            "seq_id": seq_id,
+            "depth": depth,
+            "accepted_len": accepted_prefix_len,
+            "revised_len": revised_token_count,
+            "recovered_token_count": committed_token_count,
+            "before_len": frontier_before,
+            "after_len": frontier_after,
+            "expected_delta": committed_token_count,
+            "actual_delta": actual_delta,
+            "target_frontier_before": frontier_before,
+            "target_frontier_after": frontier_after,
+            "draft_frontier_before": frontier_before,
+            "draft_frontier_after": frontier_after,
+        }
+        events = list(trace_record.get("partial_prefix_recovery_events") or [])
+        events.append(event)
+        trace_record["partial_prefix_recovery_events"] = events
+        trace_record["partial_prefix_recovery_event_count"] = int(
+            trace_record.get("partial_prefix_recovery_event_count", 0)
+        ) + 1
+
         bool_maps = (
             "partial_recovery_target_draft_len_match_by_seq_id",
             "partial_recovery_target_draft_token_match_by_seq_id",

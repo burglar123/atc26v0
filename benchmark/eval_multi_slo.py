@@ -1510,10 +1510,24 @@ def append_generic_rolling_runtime_aggregate_trace(
         "3": to_int(accounting.get("rolling_depth3_child_ready_shadow_token_count"), 0) or 0,
         "4": to_int(accounting.get("rolling_depth4_child_ready_shadow_token_count"), 0) or 0,
     }
+    raw_depth_partial_counts = accounting.get("partial_prefix_recovered_token_count_by_depth")
+    raw_depth_revised_counts = accounting.get("partial_prefix_revised_token_count_by_depth")
+    depth_partial_counts = {
+        str(to_int(depth, 0)): int(to_int(tokens, 0) or 0)
+        for depth, tokens in (
+            raw_depth_partial_counts.items() if isinstance(raw_depth_partial_counts, dict) else []
+        )
+        if (to_int(depth, 0) or 0) > 0 and (to_int(tokens, 0) or 0) > 0
+    }
+    depth_revised_counts = {
+        str(to_int(depth, 0)): int(to_int(tokens, 0) or 0)
+        for depth, tokens in (
+            raw_depth_revised_counts.items() if isinstance(raw_depth_revised_counts, dict) else []
+        )
+        if (to_int(depth, 0) or 0) > 0 and (to_int(tokens, 0) or 0) > 0
+    }
     partial_depth = str(to_int(accounting.get("partial_prefix_recovery_max_depth"), 0) or 0)
-    depth_partial_counts = {}
-    depth_revised_counts = {}
-    if partial_total and partial_depth != "0":
+    if partial_total and not depth_partial_counts and partial_depth != "0":
         depth_partial_counts[partial_depth] = int(partial_total)
         depth_revised_counts[partial_depth] = int(revised_tokens)
     stop_reason_counts = {}

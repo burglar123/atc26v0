@@ -101,6 +101,116 @@ def _false_count(records: list[dict[str, Any]], field: str) -> int:
     return count
 
 
+def _event_int(event: dict[str, Any], key: str, default: int = 0) -> int:
+    return int_value(event.get(key), default)
+
+
+def _normalize_partial_recovery_event(event: dict[str, Any]) -> dict[str, int]:
+    before = _event_int(event, "before_len", _event_int(event, "frontier_before", -1))
+    after = _event_int(event, "after_len", _event_int(event, "frontier_after", -1))
+    recovered = _event_int(
+        event,
+        "recovered_token_count",
+        _event_int(event, "accepted_len", 0) + _event_int(event, "revised_len", 0),
+    )
+    actual_delta = _event_int(event, "actual_delta", after - before if before >= 0 and after >= 0 else -1)
+    return {
+        "proposal_id": _event_int(event, "proposal_id", -1),
+        "seq_id": _event_int(event, "seq_id", -1),
+        "depth": _event_int(event, "depth", -1),
+        "accepted_len": _event_int(event, "accepted_len", -1),
+        "revised_len": _event_int(event, "revised_len", -1),
+        "recovered_token_count": recovered,
+        "before_len": before,
+        "after_len": after,
+        "expected_delta": _event_int(event, "expected_delta", recovered),
+        "actual_delta": actual_delta,
+        "target_frontier_before": _event_int(event, "target_frontier_before", before),
+        "target_frontier_after": _event_int(event, "target_frontier_after", after),
+        "draft_frontier_before": _event_int(event, "draft_frontier_before", before),
+        "draft_frontier_after": _event_int(event, "draft_frontier_after", after),
+    }
+
+
+def _partial_recovery_events(
+    records: list[dict[str, Any]],
+    registry,
+) -> list[dict[str, int]]:
+    events_by_proposal: dict[int, dict[str, int]] = {}
+    for record in records:
+        raw_events = record.get("partial_prefix_recovery_events")
+        if not isinstance(raw_events, list):
+            continue
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            event = _normalize_partial_recovery_event(raw_event)
+            proposal_id = int(event["proposal_id"])
+            if proposal_id < 0:
+                continue
+            events_by_proposal.setdefault(proposal_id, event)
+
+    recovered_ids = _merge_int_set(records, "partial_prefix_recovered_proposal_ids")
+    if recovered_ids <= set(events_by_proposal):
+        return sorted(
+            events_by_proposal.values(),
+            key=lambda event: (event["seq_id"], event["before_len"], event["proposal_id"]),
+        )
+
+    recovered_seq_ids = _merge_int_set(records, "partial_prefix_recovered_seq_ids")
+    depth_by_id = _merge_int_map(records, "partial_prefix_recovered_depth_by_proposal_id")
+    seq_by_id = _merge_int_map(records, "partial_prefix_recovered_seq_id_by_proposal_id")
+    accepted_by_id = _merge_int_map(records, "partial_prefix_accepted_len_by_proposal_id")
+    revised_by_id = _merge_int_map(records, "partial_prefix_revised_token_count_by_proposal_id")
+    committed_by_id = _merge_int_map(records, "partial_prefix_committed_token_count_by_proposal_id")
+    before_by_id = _merge_int_map(records, "partial_prefix_recovery_frontier_before_by_proposal_id")
+    after_by_id = _merge_int_map(records, "partial_prefix_recovery_frontier_after_by_proposal_id")
+    target_before_by_id = _merge_int_map(records, "partial_recovery_target_seq_len_before_by_proposal_id")
+    target_after_by_id = _merge_int_map(records, "partial_recovery_target_seq_len_after_by_proposal_id")
+    draft_before_by_id = _merge_int_map(records, "partial_recovery_draft_seq_len_before_by_proposal_id")
+    draft_after_by_id = _merge_int_map(records, "partial_recovery_draft_seq_len_after_by_proposal_id")
+    frontier_before_by_seq = _merge_int_map(records, "partial_prefix_recovery_frontier_before_by_seq_id")
+    frontier_after_by_seq = _merge_int_map(records, "partial_prefix_recovery_frontier_after_by_seq_id")
+
+    for proposal_id in sorted(recovered_ids):
+        if proposal_id in events_by_proposal:
+            continue
+        depth = int(depth_by_id.get(proposal_id, -1))
+        seq_id = int(seq_by_id.get(proposal_id, -1))
+        if seq_id < 0 and depth >= 0:
+            seq_id = int(registry.seq_by_depth.get(depth, {}).get(proposal_id, -1))
+        if seq_id < 0 and len(recovered_seq_ids) == 1:
+            seq_id = next(iter(recovered_seq_ids))
+        accepted_len = int(accepted_by_id.get(proposal_id, -1))
+        revised_len = int(revised_by_id.get(proposal_id, -1))
+        recovered = int(
+            committed_by_id.get(
+                proposal_id,
+                max(0, accepted_len) + max(0, revised_len),
+            )
+        )
+        before = int(before_by_id.get(proposal_id, frontier_before_by_seq.get(seq_id, -1)))
+        after = int(after_by_id.get(proposal_id, frontier_after_by_seq.get(seq_id, -1)))
+        events_by_proposal[proposal_id] = {
+            "proposal_id": int(proposal_id),
+            "seq_id": int(seq_id),
+            "depth": depth,
+            "accepted_len": accepted_len,
+            "revised_len": revised_len,
+            "recovered_token_count": recovered,
+            "before_len": before,
+            "after_len": after,
+            "expected_delta": recovered,
+            "actual_delta": after - before if before >= 0 and after >= 0 else -1,
+            "target_frontier_before": int(target_before_by_id.get(proposal_id, before)),
+            "target_frontier_after": int(target_after_by_id.get(proposal_id, after)),
+            "draft_frontier_before": int(draft_before_by_id.get(proposal_id, before)),
+            "draft_frontier_after": int(draft_after_by_id.get(proposal_id, after)),
+        }
+
+    return sorted(events_by_proposal.values(), key=lambda event: (event["seq_id"], event["before_len"], event["proposal_id"]))
+
+
 def _committed_ids_by_depth(registry) -> dict[int, set[int]]:
     return {depth: set(ids) for depth, ids in registry.committed_by_depth.items()}
 
@@ -175,6 +285,11 @@ def validate_records(
     release_seq_ids = _merge_int_set(records, "partial_prefix_recovery_normal_release_seq_ids")
     cascade_descendant_ids = _merge_int_set(records, "partial_recovery_cascade_discarded_descendant_proposal_ids")
     skip_reason_counts = _sum_reason_counts(records, "partial_prefix_recovery_skip_reason_counts")
+    partial_events = _partial_recovery_events(records, registry)
+    event_by_proposal = {int(event["proposal_id"]): event for event in partial_events}
+    events_by_seq: dict[int, list[dict[str, int]]] = {}
+    for event in partial_events:
+        events_by_seq.setdefault(int(event["seq_id"]), []).append(event)
 
     partial_accepted = sum(max(0, int(accepted_by_id.get(proposal_id, 0))) for proposal_id in recovered_ids)
     partial_revised = sum(max(0, int(revised_by_id.get(proposal_id, 0))) for proposal_id in recovered_ids)
@@ -215,7 +330,10 @@ def validate_records(
         if accepted_len < 0:
             errors.append(f"partial recovered proposal {proposal_id} has negative accepted prefix")
         if proposal_len and accepted_len >= proposal_len:
-            errors.append(f"partial recovered proposal {proposal_id} is not partial: accepted={accepted_len} len={proposal_len}")
+            errors.append(
+                f"partial recovered proposal {proposal_id} is not partial: "
+                f"accepted={accepted_len} len={proposal_len}"
+            )
         if reject_index != accepted_len:
             errors.append(f"partial recovered proposal {proposal_id} reject index must equal accepted prefix length")
         if revised_count != 1:
@@ -224,20 +342,53 @@ def validate_records(
             errors.append(f"partial recovered proposal {proposal_id} committed tokens must equal prefix plus revised token")
         if node is not None and node.committed:
             errors.append(f"partial recovered proposal {proposal_id} must not also be full-accept real committed")
+        event = event_by_proposal.get(proposal_id)
+        if event is None:
+            errors.append(f"partial recovered proposal {proposal_id} missing recovery event detail")
+        else:
+            if int(event.get("depth", -1)) != depth:
+                errors.append(f"partial recovered proposal {proposal_id} event depth mismatch")
+            if int(event.get("accepted_len", -1)) != accepted_len:
+                errors.append(f"partial recovered proposal {proposal_id} event accepted length mismatch")
+            if int(event.get("revised_len", -1)) != revised_count:
+                errors.append(f"partial recovered proposal {proposal_id} event revised length mismatch")
+            if int(event.get("recovered_token_count", -1)) != committed_count:
+                errors.append(f"partial recovered proposal {proposal_id} event recovered token mismatch")
+            if int(event.get("expected_delta", -1)) != committed_count:
+                errors.append(f"partial recovered proposal {proposal_id} expected frontier delta mismatch")
+            if int(event.get("actual_delta", -1)) != committed_count:
+                errors.append(
+                    f"partial recovered proposal {proposal_id} frontier delta does not match recovered token count"
+                )
 
     for seq_id in sorted(recovered_seq_ids):
-        before = frontier_before_by_seq.get(seq_id)
-        after = frontier_after_by_seq.get(seq_id)
-        if before is None or after is None:
-            errors.append(f"partial recovered seq {seq_id} missing frontier before/after")
-            continue
-        seq_token_sum = sum(
-            int(committed_by_id.get(proposal_id, 0))
-            for proposal_id in recovered_ids
-            if int(registry.seq_by_depth.get(int(depth_by_id.get(proposal_id, 0)), {}).get(proposal_id, seq_id)) == seq_id
-        )
-        if after - before != seq_token_sum:
-            errors.append(f"partial recovered seq {seq_id} frontier delta does not match recovered token count")
+        seq_events = events_by_seq.get(seq_id, [])
+        if seq_events:
+            for event in seq_events:
+                if int(event.get("actual_delta", -1)) != int(event.get("expected_delta", -2)):
+                    errors.append(
+                        f"partial recovered seq {seq_id} event {event.get('proposal_id')} "
+                        "frontier delta does not match recovered token count"
+                    )
+        else:
+            before = frontier_before_by_seq.get(seq_id)
+            after = frontier_after_by_seq.get(seq_id)
+            if before is None or after is None:
+                errors.append(f"partial recovered seq {seq_id} missing frontier before/after")
+                continue
+            seq_token_sum = sum(
+                int(committed_by_id.get(proposal_id, 0))
+                for proposal_id in recovered_ids
+                if int(
+                    registry.seq_by_depth.get(
+                        int(depth_by_id.get(proposal_id, 0)),
+                        {},
+                    ).get(proposal_id, seq_id)
+                )
+                == seq_id
+            )
+            if after - before != seq_token_sum:
+                errors.append(f"partial recovered seq {seq_id} frontier delta does not match recovered token count")
         if seq_id not in release_seq_ids:
             errors.append(f"partial recovered seq {seq_id} was not released to normal/recovery state")
 
@@ -352,6 +503,8 @@ def validate_records(
         "partial_prefix_accepted_token_count": partial_accepted,
         "partial_prefix_revised_token_count": partial_revised,
         "partial_prefix_total_recovered_token_count": partial_total,
+        "partial_recovery_seq27_event_count": len(events_by_seq.get(27, [])),
+        "partial_recovery_seq27_events": events_by_seq.get(27, []),
         "partial_recovery_cascade_discard_count": len(cascade_descendant_ids),
         "partial_recovery_target_draft_length_mismatch_count": len_mismatches,
         "partial_recovery_target_draft_token_mismatch_count": token_mismatches,
@@ -397,6 +550,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "partial_prefix_accepted_token_count",
         "partial_prefix_revised_token_count",
         "partial_prefix_total_recovered_token_count",
+        "partial_recovery_seq27_event_count",
         "partial_recovery_cascade_discard_count",
         "partial_recovery_target_draft_length_mismatch_count",
         "partial_recovery_target_draft_token_mismatch_count",
@@ -412,6 +566,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "descendant_committed_after_partial_count",
     ):
         print(f"{key}={summary.get(key)}")
+    for index, event in enumerate(summary.get("partial_recovery_seq27_events") or []):
+        print(f"partial_recovery_seq27_event[{index}]=" + json.dumps(event, sort_keys=True))
 
 
 def _base_records() -> list[dict[str, Any]]:
@@ -482,6 +638,11 @@ def _apply_partial_recovery(
         record["partial_prefix_reject_index_by_proposal_id"] = {str(proposal_id): accepted_len}
         record["partial_prefix_revised_token_count_by_proposal_id"] = {str(proposal_id): revised_count}
         record["partial_prefix_committed_token_count_by_proposal_id"] = {str(proposal_id): committed_count}
+        record["partial_prefix_recovered_seq_id_by_proposal_id"] = {str(proposal_id): seq_id}
+        record["partial_prefix_recovery_frontier_before_by_proposal_id"] = {str(proposal_id): frontier_before}
+        record["partial_prefix_recovery_frontier_after_by_proposal_id"] = {
+            str(proposal_id): frontier_before + committed_count
+        }
         record["partial_prefix_recovery_frontier_before_by_seq_id"] = {str(seq_id): frontier_before}
         record["partial_prefix_recovery_frontier_after_by_seq_id"] = {str(seq_id): frontier_before + committed_count}
         record["partial_prefix_descendant_cascade_discard_count_by_proposal_id"] = {
@@ -495,6 +656,14 @@ def _apply_partial_recovery(
         record["partial_recovery_target_seq_len_after_by_seq_id"] = {str(seq_id): frontier_before + committed_count}
         record["partial_recovery_draft_seq_len_before_by_seq_id"] = {str(seq_id): frontier_before}
         record["partial_recovery_draft_seq_len_after_by_seq_id"] = {str(seq_id): frontier_before + committed_count}
+        record["partial_recovery_target_seq_len_before_by_proposal_id"] = {str(proposal_id): frontier_before}
+        record["partial_recovery_target_seq_len_after_by_proposal_id"] = {
+            str(proposal_id): frontier_before + committed_count
+        }
+        record["partial_recovery_draft_seq_len_before_by_proposal_id"] = {str(proposal_id): frontier_before}
+        record["partial_recovery_draft_seq_len_after_by_proposal_id"] = {
+            str(proposal_id): frontier_before + committed_count
+        }
         record["partial_recovery_target_draft_len_match_by_seq_id"] = {str(seq_id): True}
         record["partial_recovery_target_draft_token_match_by_seq_id"] = {str(seq_id): True}
         record["partial_recovery_cascade_discarded_descendant_proposal_ids"] = list(descendants)
@@ -504,6 +673,25 @@ def _apply_partial_recovery(
         record["partial_recovery_cascade_discarded_descendant_reason_by_proposal_id"] = {
             str(pid): "ancestor_partial_prefix_recovered" for pid in descendants
         }
+        record["partial_prefix_recovery_event_count"] = 1
+        record["partial_prefix_recovery_events"] = [
+            {
+                "proposal_id": int(proposal_id),
+                "seq_id": int(seq_id),
+                "depth": int(depth),
+                "accepted_len": int(accepted_len),
+                "revised_len": int(revised_count),
+                "recovered_token_count": int(committed_count),
+                "before_len": int(frontier_before),
+                "after_len": int(frontier_before) + int(committed_count),
+                "expected_delta": int(committed_count),
+                "actual_delta": int(committed_count),
+                "target_frontier_before": int(frontier_before),
+                "target_frontier_after": int(frontier_before) + int(committed_count),
+                "draft_frontier_before": int(frontier_before),
+                "draft_frontier_after": int(frontier_before) + int(committed_count),
+            }
+        ]
 
 
 def _make_depth1_partial_records(*, accepted_len: int = 2, revised_count: int = 1) -> list[dict[str, Any]]:
@@ -577,6 +765,106 @@ def _make_missing_revised_records() -> list[dict[str, Any]]:
         record["partial_prefix_recovery_attempt_count"] = 1
         record["partial_prefix_recovery_success_count"] = 0
         record["partial_prefix_recovery_skip_reason_counts"] = {PARTIAL_REASON_MISSING_REVISED: 1}
+    return records
+
+
+def _make_multi_event_seq27_records() -> list[dict[str, Any]]:
+    records = _base_records()
+    events = [
+        {
+            "proposal_id": 970000101,
+            "seq_id": 27,
+            "depth": 1,
+            "accepted_len": 1,
+            "revised_len": 1,
+            "recovered_token_count": 2,
+            "before_len": 100,
+            "after_len": 102,
+            "expected_delta": 2,
+            "actual_delta": 2,
+            "target_frontier_before": 100,
+            "target_frontier_after": 102,
+            "draft_frontier_before": 100,
+            "draft_frontier_after": 102,
+        },
+        {
+            "proposal_id": 970000202,
+            "seq_id": 27,
+            "depth": 2,
+            "accepted_len": 2,
+            "revised_len": 1,
+            "recovered_token_count": 3,
+            "before_len": 110,
+            "after_len": 113,
+            "expected_delta": 3,
+            "actual_delta": 3,
+            "target_frontier_before": 110,
+            "target_frontier_after": 113,
+            "draft_frontier_before": 110,
+            "draft_frontier_after": 113,
+        },
+    ]
+    for record in records:
+        record["partial_prefix_recovery_enabled"] = True
+        record["enable_rolling_continuous_partial_prefix_recovery"] = True
+        record["partial_prefix_recovery_attempt_count"] = len(events)
+        record["partial_prefix_recovery_success_count"] = len(events)
+        record["partial_prefix_recovery_skip_reason_counts"] = {}
+        record["partial_prefix_recovered_proposal_ids"] = [event["proposal_id"] for event in events]
+        record["partial_prefix_recovered_seq_ids"] = [27]
+        record["partial_prefix_recovered_depth_by_proposal_id"] = {
+            str(event["proposal_id"]): event["depth"] for event in events
+        }
+        record["partial_prefix_recovered_seq_id_by_proposal_id"] = {
+            str(event["proposal_id"]): event["seq_id"] for event in events
+        }
+        record["partial_prefix_accepted_len_by_proposal_id"] = {
+            str(event["proposal_id"]): event["accepted_len"] for event in events
+        }
+        record["partial_prefix_reject_index_by_proposal_id"] = {
+            str(event["proposal_id"]): event["accepted_len"] for event in events
+        }
+        record["partial_prefix_revised_token_count_by_proposal_id"] = {
+            str(event["proposal_id"]): event["revised_len"] for event in events
+        }
+        record["partial_prefix_committed_token_count_by_proposal_id"] = {
+            str(event["proposal_id"]): event["recovered_token_count"] for event in events
+        }
+        record["partial_prefix_recovery_frontier_before_by_proposal_id"] = {
+            str(event["proposal_id"]): event["before_len"] for event in events
+        }
+        record["partial_prefix_recovery_frontier_after_by_proposal_id"] = {
+            str(event["proposal_id"]): event["after_len"] for event in events
+        }
+        record["partial_recovery_target_seq_len_before_by_proposal_id"] = {
+            str(event["proposal_id"]): event["target_frontier_before"] for event in events
+        }
+        record["partial_recovery_target_seq_len_after_by_proposal_id"] = {
+            str(event["proposal_id"]): event["target_frontier_after"] for event in events
+        }
+        record["partial_recovery_draft_seq_len_before_by_proposal_id"] = {
+            str(event["proposal_id"]): event["draft_frontier_before"] for event in events
+        }
+        record["partial_recovery_draft_seq_len_after_by_proposal_id"] = {
+            str(event["proposal_id"]): event["draft_frontier_after"] for event in events
+        }
+        record["partial_prefix_recovery_frontier_before_by_seq_id"] = {"27": 100}
+        record["partial_prefix_recovery_frontier_after_by_seq_id"] = {"27": 113}
+        record["partial_recovery_target_seq_len_before_by_seq_id"] = {"27": 100}
+        record["partial_recovery_target_seq_len_after_by_seq_id"] = {"27": 113}
+        record["partial_recovery_draft_seq_len_before_by_seq_id"] = {"27": 100}
+        record["partial_recovery_draft_seq_len_after_by_seq_id"] = {"27": 113}
+        record["partial_prefix_descendant_cascade_discard_count_by_proposal_id"] = {
+            str(event["proposal_id"]): 0 for event in events
+        }
+        record["partial_prefix_recovery_normal_release_seq_ids"] = [27]
+        record["partial_recovery_target_draft_len_match_by_seq_id"] = {"27": True}
+        record["partial_recovery_target_draft_token_match_by_seq_id"] = {"27": True}
+        record["partial_recovery_cascade_discarded_descendant_proposal_ids"] = []
+        record["partial_recovery_cascade_discarded_descendant_depth_by_proposal_id"] = {}
+        record["partial_recovery_cascade_discarded_descendant_reason_by_proposal_id"] = {}
+        record["partial_prefix_recovery_event_count"] = len(events)
+        record["partial_prefix_recovery_events"] = list(events)
     return records
 
 
@@ -836,6 +1124,19 @@ def run_synthetic() -> None:
             "partial_prefix_accepted_token_count": 0,
             "partial_prefix_revised_token_count": 1,
             "partial_prefix_total_recovered_token_count": 1,
+        },
+    )
+
+    multi_seq27 = _make_multi_event_seq27_records()
+    assert_pass(
+        "multiple partial recoveries on seq 27",
+        multi_seq27,
+        {
+            "partial_prefix_recovery_success_count": 2,
+            "partial_prefix_accepted_token_count": 3,
+            "partial_prefix_revised_token_count": 2,
+            "partial_prefix_total_recovered_token_count": 5,
+            "partial_recovery_seq27_event_count": 2,
         },
     )
 

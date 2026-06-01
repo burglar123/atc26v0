@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark.bounded_rolling_chain_parser import int_value  # noqa: E402
+from benchmark.bounded_rolling_chain_parser import as_int_map, as_int_set, int_value  # noqa: E402
 from benchmark.check_bounded_rolling_readiness_audit import load_trace, synthetic_result_payload  # noqa: E402
 from benchmark.check_eager_performance_accounting import aggregate_performance_accounting, load_json  # noqa: E402
 
@@ -39,6 +39,48 @@ def _bool_any(records: list[dict[str, Any]], *fields: str) -> bool:
 def _max_int(records: list[dict[str, Any]], field: str, default: int = 0) -> int:
     values = [int_value(record.get(field), default) for record in records if field in record]
     return max(values) if values else default
+
+
+def _merge_int_map(records: list[dict[str, Any]], field: str) -> dict[int, int]:
+    merged: dict[int, int] = {}
+    for record in records:
+        for key, value in as_int_map(record.get(field)).items():
+            merged.setdefault(int(key), int(value))
+    return merged
+
+
+def _merge_int_set(records: list[dict[str, Any]], field: str) -> set[int]:
+    merged: set[int] = set()
+    for record in records:
+        merged.update(as_int_set(record.get(field)))
+    return merged
+
+
+def _partial_recovery_depth_counts(records: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
+    recovered_ids = _merge_int_set(records, "partial_prefix_recovered_proposal_ids")
+    depth_by_id = _merge_int_map(records, "partial_prefix_recovered_depth_by_proposal_id")
+    recovered_by_id = _merge_int_map(records, "partial_prefix_committed_token_count_by_proposal_id")
+    accepted_by_id = _merge_int_map(records, "partial_prefix_accepted_len_by_proposal_id")
+    revised_by_id = _merge_int_map(records, "partial_prefix_revised_token_count_by_proposal_id")
+    partial_counts: dict[str, int] = {}
+    revised_counts: dict[str, int] = {}
+    for proposal_id in sorted(recovered_ids):
+        if proposal_id not in depth_by_id:
+            continue
+        depth = str(int(depth_by_id[proposal_id]))
+        revised = int(revised_by_id.get(proposal_id, 0))
+        recovered = int(
+            recovered_by_id.get(
+                proposal_id,
+                int(accepted_by_id.get(proposal_id, 0)) + revised,
+            )
+        )
+        partial_counts[depth] = int(partial_counts.get(depth, 0)) + recovered
+        revised_counts[depth] = int(revised_counts.get(depth, 0)) + revised
+    return (
+        dict(sorted(partial_counts.items(), key=lambda item: int(item[0]))),
+        dict(sorted(revised_counts.items(), key=lambda item: int(item[0]))),
+    )
 
 
 def _merge_depth_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
@@ -73,6 +115,9 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     if not isinstance(result_args, dict):
         result_args = {}
     accounting = aggregate_performance_accounting(records, result_payload)
+    accounting_partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+    accounting_partial_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+    partial_depth_counts, revised_depth_counts = _partial_recovery_depth_counts(records)
 
     summary: dict[str, Any] = {
         "generic_full_continuous_enabled": _bool_any(
@@ -101,8 +146,10 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         ),
         "one_shot_committed_token_count": int_value(accounting.get("eager_committed_token_count"), 0)
         or _max_int(records, "eager_committed_token_count"),
-        "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0)
-        or _max_int(records, "combined_real_committed_token_count"),
+        "combined_real_committed_token_count": max(
+            int_value(accounting.get("combined_real_committed_token_count"), 0),
+            _max_int(records, "combined_real_committed_token_count"),
+        ),
         "partial_prefix_accepted_token_count": int_value(
             accounting.get("partial_prefix_accepted_token_count"), 0
         )
@@ -122,6 +169,10 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     }
     for field in FULL_CONTINUOUS_INT_FIELDS:
         summary[field] = _max_int(records, field)
+    if accounting_partial_total:
+        summary["generic_full_continuous_total_partial_recovered_token_count"] = accounting_partial_total
+    if accounting_partial_revised:
+        summary["generic_full_continuous_total_revised_token_count"] = accounting_partial_revised
 
     summary["generic_full_continuous_depth_commit_token_counts"] = _merge_depth_counts(
         records,
@@ -139,13 +190,19 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         records,
         "generic_full_continuous_depth_ready_token_counts",
     )
-    summary["generic_full_continuous_depth_partial_recovered_token_counts"] = _merge_depth_counts(
+    fallback_partial_depth_counts = _merge_depth_counts(
         records,
         "generic_full_continuous_depth_partial_recovered_token_counts",
     )
-    summary["generic_full_continuous_depth_revised_token_counts"] = _merge_depth_counts(
+    fallback_revised_depth_counts = _merge_depth_counts(
         records,
         "generic_full_continuous_depth_revised_token_counts",
+    )
+    summary["generic_full_continuous_depth_partial_recovered_token_counts"] = (
+        partial_depth_counts or fallback_partial_depth_counts
+    )
+    summary["generic_full_continuous_depth_revised_token_counts"] = (
+        revised_depth_counts or fallback_revised_depth_counts
     )
     summary["generic_full_continuous_depth_cascade_discard_counts"] = _merge_depth_counts(
         records,
@@ -409,6 +466,49 @@ def run_synthetic() -> None:
             )
         ],
     )
+
+    derived_partial_depth = [
+        _base_record(
+            max_depth=100,
+            max_observed=6,
+            max_real=4,
+            partial_counts={"6": 2},
+            revised_counts={"6": 1},
+            stop_reasons={"partial_recovery": 2},
+            combined=49,
+        )
+    ]
+    derived_record = derived_partial_depth[0]
+    derived_record["partial_prefix_recovered_proposal_ids"] = [980000601, 980000602]
+    derived_record["partial_prefix_recovered_depth_by_proposal_id"] = {
+        "980000601": 6,
+        "980000602": 6,
+    }
+    derived_record["partial_prefix_accepted_len_by_proposal_id"] = {
+        "980000601": 1,
+        "980000602": 2,
+    }
+    derived_record["partial_prefix_revised_token_count_by_proposal_id"] = {
+        "980000601": 1,
+        "980000602": 1,
+    }
+    derived_record["partial_prefix_committed_token_count_by_proposal_id"] = {
+        "980000601": 2,
+        "980000602": 3,
+    }
+    derived_record["partial_prefix_accepted_token_count"] = 3
+    derived_record["partial_prefix_revised_token_count"] = 2
+    derived_record["partial_prefix_total_recovered_token_count"] = 5
+    derived_record["generic_full_continuous_total_partial_recovered_token_count"] = 5
+    derived_record["generic_full_continuous_total_revised_token_count"] = 2
+    derived_record["generic_full_continuous_total_output_token_count"] = 49
+    errors, summary = validate_records(derived_partial_depth, synthetic_result_payload())
+    if errors:
+        raise SystemExit(f"synthetic proposal-derived partial depth failed: {errors}\nsummary={summary}")
+    if summary.get("generic_full_continuous_depth_partial_recovered_token_counts") != {"6": 5}:
+        raise SystemExit(f"synthetic proposal-derived partial depth summary mismatch: {summary}")
+    if summary.get("generic_full_continuous_depth_revised_token_counts") != {"6": 2}:
+        raise SystemExit(f"synthetic proposal-derived revised depth summary mismatch: {summary}")
 
     _assert_pass(
         "reject at depth greater than 4",
