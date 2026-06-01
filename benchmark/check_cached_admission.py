@@ -180,6 +180,62 @@ def validate_running_signature_event(event: dict[str, Any], errors: list[str]) -
             )
 
 
+def request_id_set(value: Any) -> set[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    return {str(item) for item in value}
+
+
+def rank_request_sets(value: Any) -> dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(rank): request_id_set(request_ids)
+        for rank, request_ids in value.items()
+    }
+
+
+def validate_completed_sync_event(event: dict[str, Any], errors: list[str]) -> None:
+    divergence_count = int_value(event.get("cached_admission_completed_divergence_count"), 0)
+    divergence_allowed = bool_value(event.get("cached_admission_completed_divergence_allowed"))
+    if divergence_count and not divergence_allowed:
+        errors.append("cached admission completed-set divergence is not marked allowed")
+    global_completed = request_id_set(event.get("cached_admission_globally_completed_request_ids"))
+    pending_completion = request_id_set(event.get("cached_admission_pending_completion_request_ids"))
+    divergent_ids = request_id_set(event.get("cached_admission_completed_divergent_request_ids"))
+    require(
+        not (global_completed & pending_completion),
+        errors,
+        "cached admission globally completed and pending completion sets overlap",
+    )
+    if divergence_count:
+        require(
+            divergent_ids == pending_completion,
+            errors,
+            "cached admission divergent completion ids must match pending completion ids",
+        )
+    removed_by_rank = rank_request_sets(event.get("cached_admission_removed_request_ids_by_rank"))
+    if not removed_by_rank:
+        if bool_value(event.get("cached_admission_completion_sync")):
+            errors.append("cached admission completion sync event missing removed ids by rank")
+        return
+    expected_removed = None
+    for rank, removed in sorted(removed_by_rank.items()):
+        if expected_removed is None:
+            expected_removed = set(removed)
+        require(
+            removed == expected_removed,
+            errors,
+            f"cached admission removed request ids differ for rank={rank}",
+        )
+    if expected_removed is not None:
+        require(
+            expected_removed == global_completed,
+            errors,
+            "cached admission removed ids by rank must equal globally completed ids",
+        )
+
+
 def result_execution_mode(payload: dict[str, Any]) -> str | None:
     for container_name in ("args", "metrics"):
         container = payload.get(container_name)
@@ -228,6 +284,8 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
     require(total_arrived <= total_requests, errors, "total_arrived exceeds total_requests")
     require(total_admitted <= total_arrived, errors, "total_admitted exceeds total_arrived")
     require(total_completed <= total_admitted, errors, "total_completed exceeds total_admitted")
+    require(total_admitted == total_arrived, errors, "cached admission did not admit all arrived requests")
+    require(total_completed == total_admitted, errors, "cached admission did not complete all admitted requests")
     require(cap > 0, errors, "cached_admission_max_active must be positive when enabled")
     require(peak_active <= cap, errors, "cached_admission_peak_active exceeds cap")
     require(
@@ -361,6 +419,7 @@ def validate_enabled(payload: dict[str, Any]) -> list[str]:
         active_count = int_value(event.get("cached_admission_active_count"), 0)
         require(active_count <= cap, errors, "trace active_count exceeds cap")
         validate_running_signature_event(event, errors)
+        validate_completed_sync_event(event, errors)
         for request_id in event.get("cached_admission_admitted_request_ids", []) or []:
             request_id = str(request_id)
             require(request_id not in event_admitted, errors, f"duplicate event admission for {request_id}")
@@ -476,6 +535,7 @@ def cached_running_rank_report(
     *,
     materialized_count: int = 1,
     pending_count: int = 1,
+    completed_request_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "global_rank": int(rank),
@@ -492,6 +552,71 @@ def cached_running_rank_report(
         "dual_step_id": None,
         "enable_unified_generic_rolling_runtime": True,
         "cached_admission_running_signature": cached_running_signature(seq_ids, request_ids),
+        "cached_admission_completed_request_ids": [
+            str(request_id) for request_id in (completed_request_ids or [])
+        ],
+    }
+
+
+def completion_sync_event(
+    *,
+    local_completed_by_rank: dict[str, list[str]],
+    globally_completed: list[str],
+    pending_completion: list[str],
+    authority: str = "intersection",
+    removed_by_rank: dict[str, list[str]] | None = None,
+    divergence_allowed: bool = True,
+) -> dict[str, Any]:
+    removed_by_rank = removed_by_rank if removed_by_rank is not None else {
+        str(rank): list(globally_completed) for rank in range(4)
+    }
+    divergent_ids = sorted(str(request_id) for request_id in pending_completion)
+    return {
+        "trace_record_type": "cached_admission_step",
+        "cached_admission_completion_sync": True,
+        "cached_admission_enabled": True,
+        "cached_prefill_mode": "in_memory_kv",
+        "cached_admission_step": 99,
+        "cached_admission_arrived_request_ids": [],
+        "cached_admission_admitted_request_ids": [],
+        "cached_admission_active_request_ids": [],
+        "cached_admission_completed_request_ids": list(globally_completed),
+        "cached_admission_pending_count": 0,
+        "cached_admission_active_count": 0,
+        "cached_admission_running_request_ids": [],
+        "cached_admission_running_seq_ids": [],
+        "cached_admission_running_signature": cached_running_signature([], []),
+        "cached_admission_running_signature_by_rank": [
+            cached_running_rank_report(rank, [], [], completed_request_ids=globally_completed)
+            for rank in range(4)
+        ],
+        "cached_admission_running_divergence_detected": False,
+        "cached_admission_unified_generic_enabled": True,
+        "cached_admission_local_completed_request_ids_by_rank": {
+            str(rank): [str(request_id) for request_id in request_ids]
+            for rank, request_ids in local_completed_by_rank.items()
+        },
+        "cached_admission_globally_completed_request_ids": [
+            str(request_id) for request_id in globally_completed
+        ],
+        "cached_admission_pending_completion_request_ids": [
+            str(request_id) for request_id in pending_completion
+        ],
+        "cached_admission_completed_authority": authority,
+        "cached_admission_completed_divergence_count": len(divergent_ids),
+        "cached_admission_completed_divergent_request_ids": divergent_ids,
+        "cached_admission_completed_divergence_allowed": bool(divergence_allowed),
+        "cached_admission_removed_request_ids": [
+            str(request_id) for request_id in globally_completed
+        ],
+        "cached_admission_removed_request_ids_by_rank": {
+            str(rank): [str(request_id) for request_id in request_ids]
+            for rank, request_ids in removed_by_rank.items()
+        },
+        "cached_admission_completed_reason_by_request": {
+            str(request_id): "target_verified_finish" for request_id in globally_completed
+        },
+        "cached_admission_queue_wait_ms_by_request": {},
     }
 
 
@@ -616,6 +741,52 @@ def run_synthetic() -> int:
 
     payload = valid_in_memory_payload()
     cases.append(("running signature all ranks pass", payload, True))
+
+    payload = valid_in_memory_payload()
+    payload["cached_admission_trace"].append(
+        completion_sync_event(
+            local_completed_by_rank={"0": ["r0"], "1": [], "2": [], "3": []},
+            globally_completed=[],
+            pending_completion=["r0"],
+            authority="intersection",
+            removed_by_rank={"0": [], "1": [], "2": [], "3": []},
+        )
+    )
+    cases.append(("local completed draft-only pending pass", payload, True))
+
+    payload = valid_in_memory_payload()
+    payload["cached_admission_trace"].append(
+        completion_sync_event(
+            local_completed_by_rank={"0": ["r0"], "1": ["r0"], "2": ["r0"], "3": ["r0"]},
+            globally_completed=["r0"],
+            pending_completion=[],
+            authority="intersection",
+        )
+    )
+    cases.append(("local completed all ranks global removal pass", payload, True))
+
+    payload = valid_in_memory_payload()
+    payload["cached_admission_trace"].append(
+        completion_sync_event(
+            local_completed_by_rank={"0": [], "1": ["r0"], "2": [], "3": []},
+            globally_completed=["r0"],
+            pending_completion=[],
+            authority="target_master",
+        )
+    )
+    cases.append(("target master authority removal pass", payload, True))
+
+    payload = valid_in_memory_payload()
+    payload["cached_admission_trace"].append(
+        completion_sync_event(
+            local_completed_by_rank={"0": ["r0"], "1": ["r1"], "2": [], "3": []},
+            globally_completed=["r0"],
+            pending_completion=[],
+            authority="target_master",
+            removed_by_rank={"0": ["r0"], "1": ["r1"], "2": ["r0"], "3": ["r0"]},
+        )
+    )
+    cases.append(("different removed request ids fail", payload, False))
 
     failures = 0
     for name, payload, expect_ok in cases:

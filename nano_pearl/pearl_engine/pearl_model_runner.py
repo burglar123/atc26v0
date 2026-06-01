@@ -817,9 +817,30 @@ class ModelRunnerBase:
         for seq in self.scheduler.finished:
             completed.add(str(seq.request_id))
         for seq in self.scheduler.running:
-            if getattr(seq, "finish_ts", None) is not None:
+            if getattr(seq, "finish_ts", None) is not None or self._cached_local_completion_candidate(seq):
                 completed.add(str(seq.request_id))
         return sorted(completed)
+
+    def _cached_completed_reason_by_request_for_sync(self) -> dict[str, str]:
+        reason_by_request: dict[str, str] = {}
+        for seq in list(self.scheduler.finished) + list(self.scheduler.running):
+            request_id = str(seq.request_id)
+            if (
+                getattr(seq, "finish_ts", None) is None
+                and not getattr(seq, "is_finished", False)
+                and not self._cached_local_completion_candidate(seq)
+            ):
+                continue
+            reason = getattr(seq, "_cached_admission_finish_reason", None) or "unknown"
+            reason_by_request.setdefault(request_id, str(reason))
+        return dict(sorted(reason_by_request.items()))
+
+    def _cached_local_completion_candidate(self, seq: Sequence) -> bool:
+        return bool(getattr(seq, "_cached_admission_local_completed_candidate", False))
+
+    def _mark_cached_local_completion_candidate(self, seq: Sequence, reason: str) -> None:
+        setattr(seq, "_cached_admission_local_completed_candidate", True)
+        setattr(seq, "_cached_admission_finish_reason", str(reason or "unknown"))
 
     def _cached_admission_rank_report(
         self,
@@ -854,6 +875,9 @@ class ModelRunnerBase:
             ),
             "cached_admission_running_signature": self._cached_running_signature(),
             "cached_admission_completed_request_ids": self._cached_completed_request_ids_for_sync(),
+            "cached_admission_completed_reason_by_request": (
+                self._cached_completed_reason_by_request_for_sync()
+            ),
             "sync_vec": None if sync_vec is None else [int(value) for value in sync_vec],
         }
 
@@ -8427,22 +8451,24 @@ class ModelRunnerBase:
                                 self._receive_generic_rolling_commit_decision(plan, trace_record)
         self._emit_generic_rolling_runtime_parity_trace(trace_record, side="target")
 
-    def _mark_eager_commit_finished_if_needed(self, seq: Sequence, proposal_tokens: list[int]) -> None:
+    def _mark_eager_commit_finished_if_needed(self, seq: Sequence, proposal_tokens: list[int]) -> bool:
         if not proposal_tokens:
-            return
+            return False
         hit_eos = (not seq.ignore_eos) and any(is_eos(int(token_id), self.scheduler.eos) for token_id in proposal_tokens)
         hit_max_tokens = int(seq.num_completion_tokens) >= int(seq.max_tokens)
         if not (hit_eos or hit_max_tokens):
-            return
+            return False
         if self._defer_cached_unified_finish_removal():
-            seq.mark_finished()
-            return
+            self._mark_cached_local_completion_candidate(seq, "eos" if hit_eos else "max_tokens")
+            return True
         if seq in self.scheduler.running:
             self.scheduler.block_manager.deallocate(seq)
             self.scheduler.running.remove(seq)
         if seq not in self.scheduler.finished:
             self.scheduler.finished.append(seq)
         seq.mark_finished()
+        setattr(seq, "_cached_admission_finish_reason", "eos" if hit_eos else "max_tokens")
+        return True
 
     def _defer_cached_unified_finish_removal(self) -> bool:
         return (
@@ -8452,7 +8478,73 @@ class ModelRunnerBase:
             and self._unified_generic_rolling_runtime_enabled()
         )
 
-    def _sync_cached_completed_running_set(self, execution_mode: str, cached_step: int) -> None:
+    def _append_cached_completion_sync_trace(
+        self,
+        *,
+        cached_step: int,
+        pending_count: int,
+        pre_reports: list[dict],
+        post_reports: list[dict],
+        local_completed_by_rank: dict[str, list[str]],
+        globally_completed_request_ids: list[str],
+        pending_completion_request_ids: list[str],
+        completed_authority: str,
+        completed_divergent_request_ids: list[str],
+        removed_request_ids_by_rank: dict[str, list[str]],
+        finish_reason_by_request: dict[str, str],
+    ) -> None:
+        if self.is_draft or self.tp_params.local_rank != 0:
+            return
+        running_request_ids = [str(seq.request_id) for seq in self.scheduler.running]
+        running_seq_ids = [int(seq.seq_id) for seq in self.scheduler.running]
+        running_divergence_detected = self._cached_running_signatures_diverge(post_reports)
+        self.trace_records.append(
+            {
+                "trace_record_type": "cached_admission_step",
+                "cached_admission_completion_sync": True,
+                "cached_admission_enabled": True,
+                "cached_prefill_mode": "in_memory_kv",
+                "cached_admission_step": int(cached_step),
+                "cached_admission_arrived_request_ids": [],
+                "cached_admission_admitted_request_ids": [],
+                "cached_admission_active_request_ids": list(running_request_ids),
+                "cached_admission_completed_request_ids": [
+                    str(seq.request_id) for seq in self.scheduler.finished
+                ],
+                "cached_admission_pending_count": int(pending_count),
+                "cached_admission_active_count": int(len(self.scheduler.running)),
+                "cached_admission_running_request_ids": list(running_request_ids),
+                "cached_admission_running_seq_ids": list(running_seq_ids),
+                "cached_admission_running_signature": self._cached_running_signature(),
+                "cached_admission_running_signature_by_rank": list(post_reports),
+                "cached_admission_pre_sync_running_signature_by_rank": list(pre_reports),
+                "cached_admission_running_divergence_detected": bool(running_divergence_detected),
+                "cached_admission_unified_generic_enabled": bool(
+                    getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
+                ),
+                "cached_admission_local_completed_request_ids_by_rank": dict(local_completed_by_rank),
+                "cached_admission_globally_completed_request_ids": list(globally_completed_request_ids),
+                "cached_admission_pending_completion_request_ids": list(pending_completion_request_ids),
+                "cached_admission_completed_authority": str(completed_authority),
+                "cached_admission_completed_divergence_count": len(completed_divergent_request_ids),
+                "cached_admission_completed_divergent_request_ids": list(completed_divergent_request_ids),
+                "cached_admission_completed_divergence_allowed": True,
+                "cached_admission_removed_request_ids": list(globally_completed_request_ids),
+                "cached_admission_removed_request_ids_by_rank": dict(removed_request_ids_by_rank),
+                "cached_admission_completed_reason_by_request": dict(finish_reason_by_request),
+                "cached_admission_finish_reason_by_request": dict(finish_reason_by_request),
+                "cached_admission_queue_wait_ms_by_request": {},
+                "cached_admission_no_admission_reason": None,
+                "cached_admission_peak_active_so_far": int(len(self.scheduler.running)),
+            }
+        )
+
+    def _sync_cached_completed_running_set(
+        self,
+        execution_mode: str,
+        cached_step: int,
+        pending_count: int = 0,
+    ) -> None:
         if execution_mode == "ar":
             return
         reports = self._cached_admission_gather_rank_reports(
@@ -8464,21 +8556,54 @@ class ModelRunnerBase:
             plan_id=self._trace_plan_id,
             dual_step_id=None,
         )
-        completed_sets = [
-            set(str(request_id) for request_id in report.get("cached_admission_completed_request_ids", []) or [])
-            for report in reports
-        ]
-        if not completed_sets:
+        if not reports:
             return
-        globally_completed = set.intersection(*completed_sets)
-        divergent_completed = set.union(*completed_sets) - globally_completed
-        assert not divergent_completed, (
-            "cached admission completed-set divergence across ranks: "
-            f"divergent_request_ids={sorted(divergent_completed)}; "
-            + self._format_cached_admission_rank_reports(reports)
+        running_request_union: set[str] = set()
+        completed_sets: list[set[str]] = []
+        finish_reason_by_request: dict[str, str] = {}
+        for report in reports:
+            running_request_union.update(str(item) for item in report.get("running_request_ids", []) or [])
+            completed_set = set(
+                str(request_id)
+                for request_id in report.get("cached_admission_completed_request_ids", []) or []
+            )
+            completed_sets.append(completed_set)
+            reason_map = report.get("cached_admission_completed_reason_by_request", {})
+            if isinstance(reason_map, dict):
+                for request_id, reason in reason_map.items():
+                    finish_reason_by_request.setdefault(str(request_id), str(reason or "unknown"))
+
+        current_completed_sets = [completed_set & running_request_union for completed_set in completed_sets]
+        local_completed_by_rank = {
+            str(int(report.get("global_rank", report.get("rank", -1)))): sorted(current_completed)
+            for report, current_completed in zip(reports, current_completed_sets)
+        }
+        completed_union = set.union(*current_completed_sets) if current_completed_sets else set()
+        target_master_rank = int(getattr(self.global_config.target_config, "master_rank", -1))
+        authority_report = next(
+            (
+                report
+                for report in reports
+                if int(report.get("global_rank", report.get("rank", -2))) == target_master_rank
+            ),
+            None,
         )
-        if not globally_completed:
-            return
+        if authority_report is not None:
+            completed_authority = "target_master"
+            globally_completed = (
+                set(
+                    str(request_id)
+                    for request_id in authority_report.get("cached_admission_completed_request_ids", []) or []
+                )
+                & running_request_union
+            )
+        else:
+            completed_authority = "intersection"
+            globally_completed = set.intersection(*current_completed_sets) if current_completed_sets else set()
+        divergent_completed = completed_union - globally_completed
+        globally_completed_ids = sorted(globally_completed)
+        divergent_completed_ids = sorted(divergent_completed)
+
         finished_by_request = {str(seq.request_id): seq for seq in self.scheduler.finished}
         for seq in list(self.scheduler.running):
             request_id = str(seq.request_id)
@@ -8487,10 +8612,46 @@ class ModelRunnerBase:
             if seq in self.scheduler.running:
                 self.scheduler.block_manager.deallocate(seq)
                 self.scheduler.running.remove(seq)
+            if not getattr(seq, "_cached_admission_finish_reason", None):
+                setattr(
+                    seq,
+                    "_cached_admission_finish_reason",
+                    finish_reason_by_request.get(request_id, "unknown"),
+                )
             seq.mark_finished()
             if request_id not in finished_by_request:
                 self.scheduler.finished.append(seq)
                 finished_by_request[request_id] = seq
+        post_reports = self._cached_admission_gather_rank_reports(
+            execution_mode=execution_mode,
+            materialized_count=0,
+            pending_count=int(pending_count),
+            admitted_this_step=[],
+            cached_step=cached_step,
+            plan_id=self._trace_plan_id,
+            dual_step_id=None,
+        )
+        assert not self._cached_running_signatures_diverge(post_reports), (
+            "cached admission running-set divergence after completed sync: "
+            + self._format_cached_admission_rank_reports(post_reports)
+        )
+        removed_by_rank = {
+            str(int(report.get("global_rank", report.get("rank", -1)))): list(globally_completed_ids)
+            for report in post_reports
+        }
+        self._append_cached_completion_sync_trace(
+            cached_step=cached_step,
+            pending_count=pending_count,
+            pre_reports=reports,
+            post_reports=post_reports,
+            local_completed_by_rank=local_completed_by_rank,
+            globally_completed_request_ids=globally_completed_ids,
+            pending_completion_request_ids=divergent_completed_ids,
+            completed_authority=completed_authority,
+            completed_divergent_request_ids=divergent_completed_ids,
+            removed_request_ids_by_rank=removed_by_rank,
+            finish_reason_by_request=finish_reason_by_request,
+        )
 
     def _continuous_shadow_proposal_id(self, root_proposal_id: int, chain_depth: int) -> int:
         return 900_000_000 + int(root_proposal_id) * 100 + int(chain_depth)
@@ -13151,7 +13312,7 @@ class ModelRunnerBase:
                 setattr(proposal, "real_generic_rolling_commit_step_id", None if plan.step_id is None else int(plan.step_id))
                 setattr(proposal, "real_generic_rolling_commit_plan_id", int(plan.plan_id))
                 self._generic_rolling_committed_proposal_ids_by_depth.setdefault(depth, set()).add(child_id)
-                self._mark_eager_commit_finished_if_needed(seq, commit_tokens)
+                local_finished = bool(self._mark_eager_commit_finished_if_needed(seq, commit_tokens))
                 committed_ids.append(child_id)
                 committed_seq_ids.append(seq_id)
                 committed_token_by_id[child_id] = int(gamma)
@@ -13177,15 +13338,16 @@ class ModelRunnerBase:
                         "verify_result": "full_accept",
                     }
                 )
-                next_parents.append(
-                    {
-                        "proposal_id": child_id,
-                        "seq_id": seq_id,
-                        "root_id": int(root_id),
-                        "depth": int(depth),
-                        "proposal": proposal,
-                    }
-                )
+                if not local_finished:
+                    next_parents.append(
+                        {
+                            "proposal_id": child_id,
+                            "seq_id": seq_id,
+                            "root_id": int(root_id),
+                            "depth": int(depth),
+                            "proposal": proposal,
+                        }
+                    )
             if candidate_ids or committed_ids:
                 parent_ids_by_depth[depth] = [
                     int(parent_id)
@@ -16615,7 +16777,11 @@ class ModelRunnerBase:
             if self.scheduler.running:
                 blocked_without_progress = 0
                 self._cached_decode_step(execution_mode)
-                self._sync_cached_completed_running_set(execution_mode, cached_step)
+                self._sync_cached_completed_running_set(
+                    execution_mode,
+                    cached_step,
+                    pending_count=len(pending),
+                )
             elif pending:
                 if eligible > 0 and global_k == 0:
                     blocked_without_progress += 1
@@ -17223,6 +17389,7 @@ class DraftModelRunner(ModelRunnerBase):
             seq.record_invalidated_predraft(invalidated_len)
 
             if finish[idx]:
+                setattr(seq, "_cached_admission_finish_reason", "target_verified_finish")
                 seq.mark_finished()
                 self.scheduler.block_manager.deallocate(seq)
                 self.scheduler.running.remove(seq)
@@ -17814,6 +17981,7 @@ class TargetModelRunner(ModelRunnerBase):
                     seq.mark_finished(record_finish_ts=False)
 
             if finish[idx]:
+                setattr(seq, "_cached_admission_finish_reason", "target_verified_finish")
                 seq.mark_finished()
                 seq.num_acc_tokens.append(seq.cur_acc_tokens)
                 self.scheduler.block_manager.deallocate(seq)
