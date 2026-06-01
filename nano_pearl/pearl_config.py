@@ -154,6 +154,7 @@ class PEARLConfig:
     enable_rolling_continuous_depth4_shadow_dry_run: bool = False
     enable_rolling_continuous_depth4_commit_ready_only: bool = False
     enable_rolling_continuous_partial_prefix_recovery: bool = False
+    enable_unified_generic_rolling_runtime: bool = False
     enable_generic_rolling_runtime_loop: bool = False
     enable_generic_rolling_apply_path: bool = False
     enable_full_continuous_eager: bool = False
@@ -218,6 +219,7 @@ class PEARLConfig:
         self.enable_rolling_continuous_partial_prefix_recovery = bool(
             self.enable_rolling_continuous_partial_prefix_recovery
         )
+        self.enable_unified_generic_rolling_runtime = bool(self.enable_unified_generic_rolling_runtime)
         self.enable_generic_rolling_runtime_loop = bool(self.enable_generic_rolling_runtime_loop)
         self.enable_generic_rolling_apply_path = bool(self.enable_generic_rolling_apply_path)
         self.enable_full_continuous_eager = bool(self.enable_full_continuous_eager)
@@ -244,6 +246,31 @@ class PEARLConfig:
             )
         if self.enable_cached_admission and self.cached_admission_max_active == 0:
             self.cached_admission_max_active = int(self.max_num_seqs)
+        if self.enable_unified_generic_rolling_runtime:
+            self.enable_full_continuous_eager = True
+            self.enable_generic_rolling_apply_path = True
+            self.enable_generic_rolling_runtime_loop = True
+            self.enable_eager_plan_dry_run = False
+            self.enable_eager_draft_dry_run = False
+            self.enable_eager_promotion_dry_run = False
+            self.enable_eager_transfer_dry_run = False
+            self.enable_eager_schedule_dry_run = False
+            self.enable_eager_verify_dry_run = False
+            self.enable_eager_apply_dry_run = False
+            self.enable_eager_result_transfer_dry_run = False
+            self.enable_eager_sync_apply_dry_run = False
+            self.enable_eager_commit_readiness_dry_run = False
+            self.enable_eager_commit_ready_only = False
+            self.enable_eager_lane_exclusion_dry_run = False
+            self.enable_continuous_eager_dry_run = False
+            self.enable_continuous_eager_verify_apply_dry_run = False
+            self.enable_continuous_eager_commit_depth1_ready_only = False
+            self.enable_rolling_continuous_eager_dry_run = False
+            self.enable_rolling_continuous_depth2_commit_ready_only = False
+            self.enable_rolling_continuous_depth3_shadow_dry_run = False
+            self.enable_rolling_continuous_depth3_commit_ready_only = False
+            self.enable_rolling_continuous_depth4_shadow_dry_run = False
+            self.enable_rolling_continuous_depth4_commit_ready_only = False
         if self.enable_full_continuous_eager:
             self.enable_generic_rolling_apply_path = True
         if self.enable_generic_rolling_apply_path:
@@ -387,6 +414,24 @@ class PEARLConfig:
                 raise ValueError(
                     "enable_rolling_continuous_eager_dry_run requires max_rolling_continuous_seqs_per_step > 0"
                 )
+        if self.enable_unified_generic_rolling_runtime:
+            if self.max_rolling_continuous_depth < 1:
+                raise ValueError(
+                    "enable_unified_generic_rolling_runtime requires max_rolling_continuous_depth >= 1"
+                )
+            if self.max_rolling_continuous_depth > 100:
+                raise ValueError(
+                    "enable_unified_generic_rolling_runtime currently supports max_rolling_continuous_depth <= 100"
+                )
+            if self.max_rolling_continuous_draft_children_per_step <= 0:
+                raise ValueError(
+                    "enable_unified_generic_rolling_runtime requires "
+                    "max_rolling_continuous_draft_children_per_step > 0"
+                )
+            if self.max_rolling_continuous_seqs_per_step <= 0:
+                raise ValueError(
+                    "enable_unified_generic_rolling_runtime requires max_rolling_continuous_seqs_per_step > 0"
+                )
         if self.enable_eager_execution:
             raise NotImplementedError(PHASE_1H0_EAGER_NOT_IMPLEMENTED)
         if self.enable_eager_draft_dry_run:
@@ -465,6 +510,7 @@ class PEARLConfig:
             "Enable_Rolling_Continuous_Partial_Prefix_Recovery="
             f"{self.enable_rolling_continuous_partial_prefix_recovery}"
         )
+        logger.info(f"Enable_Unified_Generic_Rolling_Runtime={self.enable_unified_generic_rolling_runtime}")
         logger.info(f"Enable_Generic_Rolling_Runtime_Loop={self.enable_generic_rolling_runtime_loop}")
         logger.info(f"Enable_Generic_Rolling_Apply_Path={self.enable_generic_rolling_apply_path}")
         logger.info(f"Enable_Full_Continuous_Eager={self.enable_full_continuous_eager}")

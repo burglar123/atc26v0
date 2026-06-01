@@ -658,6 +658,7 @@ def aggregate_performance_accounting(
     generic_rolling_draft_verified_sum = 0
     generic_rolling_draft_accepted_sum = 0
     generic_rolling_commit_decision_payload_len_units = 0
+    unified_generic_enabled = False
     generic_full_continuous_enabled = False
     generic_rolling_runtime_enabled = False
     generic_rolling_apply_path_enabled = False
@@ -733,6 +734,9 @@ def aggregate_performance_accounting(
             for proposal_id, token_count in as_int_map(record.get(map_key)).items():
                 if token_count > 0:
                     proposal_len_by_id.setdefault(proposal_id, token_count)
+        unified_generic_enabled = unified_generic_enabled or bool(
+            record.get("unified_generic_rolling_enabled", False)
+        ) or bool(record.get("enable_unified_generic_rolling_runtime", False))
         generic_full_continuous_enabled = generic_full_continuous_enabled or bool(
             record.get("generic_full_continuous_enabled", False)
         ) or bool(record.get("enable_full_continuous_eager", False))
@@ -1369,8 +1373,9 @@ def aggregate_performance_accounting(
         generic_token_by_depth = as_depth_int_map(record.get("generic_rolling_real_committed_token_count_by_depth"))
         generic_committed_by_depth = as_depth_int_lists(record.get("generic_rolling_real_committed_proposal_ids_by_depth"))
         generic_depth_by_id = as_int_map(record.get("generic_rolling_real_commit_depth_by_proposal_id"))
+        min_generic_record_depth = 1 if unified_generic_enabled else 5
         for depth, proposal_ids in generic_committed_by_depth.items():
-            if depth < 5:
+            if depth < min_generic_record_depth:
                 continue
             generic_rolling_real_committed_ids_by_depth.setdefault(depth, set()).update(proposal_ids)
             for proposal_id in proposal_ids:
@@ -1379,17 +1384,19 @@ def aggregate_performance_accounting(
             if token_count > 0:
                 generic_rolling_real_committed_token_by_id.setdefault(proposal_id, token_count)
         for proposal_id, depth in generic_depth_by_id.items():
-            if depth >= 5 and proposal_id in generic_token_by_id:
+            if depth >= min_generic_record_depth and proposal_id in generic_token_by_id:
                 generic_rolling_real_committed_depth_by_id.setdefault(proposal_id, depth)
                 generic_rolling_real_committed_ids_by_depth.setdefault(depth, set()).add(proposal_id)
         for depth, token_count in generic_token_by_depth.items():
-            if depth >= 5 and token_count > 0:
+            if depth >= min_generic_record_depth and token_count > 0:
                 generic_rolling_real_committed_token_by_depth_fallback[depth] = max(
                     int(generic_rolling_real_committed_token_by_depth_fallback.get(depth, 0)),
                     int(token_count),
                 )
         generic_side = str(record.get("runner_role") or "")
-        generic_record_token_sum = sum(int(v) for d, v in generic_token_by_depth.items() if int(d) >= 5)
+        generic_record_token_sum = sum(
+            int(v) for d, v in generic_token_by_depth.items() if int(d) >= min_generic_record_depth
+        )
         if generic_record_token_sum and generic_side in {"target", "draft"}:
             if generic_side == "target":
                 generic_rolling_target_verified_sum = max(
@@ -1635,8 +1642,9 @@ def aggregate_performance_accounting(
     )
     generic_rolling_real_committed_token_by_depth = {}
     seen_generic_proposal_ids: set[int] = set()
+    min_generic_commit_depth = 1 if unified_generic_enabled else 5
     for depth, proposal_ids in sorted(generic_rolling_real_committed_ids_by_depth.items()):
-        if int(depth) < 5:
+        if int(depth) < min_generic_commit_depth:
             continue
         for proposal_id in sorted(int(item) for item in proposal_ids):
             if proposal_id in seen_generic_proposal_ids:
@@ -1646,7 +1654,7 @@ def aggregate_performance_accounting(
             if token_count <= 0:
                 continue
             proposal_depth = int(generic_rolling_real_committed_depth_by_id.get(proposal_id, depth))
-            if proposal_depth < 5:
+            if proposal_depth < min_generic_commit_depth:
                 continue
             generic_rolling_real_committed_token_by_depth[proposal_depth] = (
                 int(generic_rolling_real_committed_token_by_depth.get(proposal_depth, 0))
@@ -1758,7 +1766,8 @@ def aggregate_performance_accounting(
         + partial_prefix_revised_token_count
     )
     generic_accounting_mode = bool(
-        generic_full_continuous_enabled
+        unified_generic_enabled
+        or generic_full_continuous_enabled
         or generic_rolling_runtime_enabled
         or generic_rolling_apply_path_enabled
         or generic_full_continuous_total_output_token_count > 0
@@ -1877,6 +1886,21 @@ def aggregate_performance_accounting(
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0) or generic_total_output_tokens,
         ),
         "generic_full_continuous_enabled": bool(generic_full_continuous_enabled),
+        "unified_generic_rolling_enabled": bool(unified_generic_enabled),
+        "enable_unified_generic_rolling_runtime": bool(unified_generic_enabled),
+        "unified_generic_total_full_commit_token_count": int(
+            generic_full_continuous_total_full_commit_token_count
+        ),
+        "unified_generic_total_partial_recovered_token_count": int(
+            generic_full_continuous_total_partial_recovered_token_count
+        ),
+        "unified_generic_total_revised_token_count": int(
+            generic_full_continuous_total_revised_token_count
+        ),
+        "unified_generic_total_output_token_count": int(
+            generic_full_continuous_total_output_token_count
+        ),
+        "unified_generic_parity_ok": bool(generic_full_continuous_parity_ok),
         "generic_rolling_runtime_enabled": bool(generic_rolling_runtime_enabled),
         "generic_rolling_apply_path_enabled": bool(generic_rolling_apply_path_enabled),
         "generic_full_continuous_total_full_commit_token_count": int(
@@ -2278,6 +2302,8 @@ def generic_chain_accounting_errors(records: list[dict[str, Any]], accounting: d
 def generic_accounting_mode_enabled(accounting: dict[str, Any]) -> bool:
     return bool(
         accounting.get("generic_accounting_mode", False)
+        or accounting.get("unified_generic_rolling_enabled", False)
+        or accounting.get("enable_unified_generic_rolling_runtime", False)
         or accounting.get("generic_full_continuous_enabled", False)
         or accounting.get("generic_rolling_runtime_enabled", False)
         or accounting.get("generic_rolling_apply_path_enabled", False)
