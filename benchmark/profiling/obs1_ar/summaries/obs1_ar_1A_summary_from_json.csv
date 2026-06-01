@@ -1,0 +1,8 @@
+obs,label,x,active,path,execution_mode,decode_ready_mode,engine_elapsed_s,total_output_tokens,goodput_tokens_per_s,mean_tpot_ms
+1A,active1,1,1,raw/1A_ar_active1.jsonl,,,,,,
+1A,active2,2,2,raw/1A_ar_active2.jsonl,,,,,,
+1A,active4,4,4,raw/1A_ar_active4.jsonl,,,,,,
+1A,active8,8,8,raw/1A_ar_active8.jsonl,,,,,,
+1A,active16,16,16,raw/1A_ar_active16.jsonl,,,,,,
+1A,active32,32,32,raw/1A_ar_active32.jsonl,,,,,,
+1A,active64,64,64,raw/1A_ar_active64.jsonl,,,,,,
