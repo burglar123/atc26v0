@@ -1,0 +1,9 @@
+obs,label,x,rps,seed,path,execution_mode,decode_ready_mode,engine_elapsed_s,total_output_tokens,goodput_tokens_per_s,mean_tpot_ms
+1B,rps2.2_seed0,2.2,2.2,seed0,raw/1B_ar_rps2.2_seed0.jsonl,,,,,,
+1B,rps2.6_seed0,2.6,2.6,seed0,raw/1B_ar_rps2.6_seed0.jsonl,,,,,,
+1B,rps2_seed0,2,2,seed0,raw/1B_ar_rps2_seed0.jsonl,,,,,,
+1B,rps3.0_seed0,3.0,3.0,seed0,raw/1B_ar_rps3.0_seed0.jsonl,,,,,,
+1B,rps3.4_seed0,3.4,3.4,seed0,raw/1B_ar_rps3.4_seed0.jsonl,,,,,,
+1B,rps3.8_seed0,3.8,3.8,seed0,raw/1B_ar_rps3.8_seed0.jsonl,,,,,,
+1B,rps4_seed0,4,4,seed0,raw/1B_ar_rps4_seed0.jsonl,,,,,,
+1B,rps6_seed0,6,6,seed0,raw/1B_ar_rps6_seed0.jsonl,,,,,,
