@@ -78,6 +78,23 @@ GENERIC_ACCOUNTING_FIELD_PAIRS = (
     ("rolling_depth_gt4_real_commit_count", "generic_depth_gt4_real_commit_count"),
 )
 
+LEGACY_CHECKS_SKIPPED_DUE_TO_GENERIC_MODE = [
+    "commit checker draft-side legacy event pairing",
+    "continuous committed tokens must equal draft continuous verified increment sum",
+    "continuous committed tokens must equal draft continuous accepted increment sum",
+    "rolling depth-2 committed tokens must equal draft verified increment sum",
+    "rolling depth-2 committed tokens must equal draft accepted increment sum",
+    "rolling depth-3 committed tokens must equal draft verified increment sum",
+    "rolling depth-3 committed tokens must equal draft accepted increment sum",
+    "rolling depth-4 committed tokens must equal draft verified increment sum",
+    "rolling depth-4 committed tokens must equal draft accepted increment sum",
+    "rolling depth-3 ready shadow tokens exceed candidate tokens",
+    "rolling depth-3 ready shadow proposals exceed candidate proposals",
+    "rolling depth-4 ready shadow tokens exceed candidate tokens",
+    "rolling depth-4 ready shadow proposals exceed candidate proposals",
+    "generic chain target/draft legacy accounting check",
+]
+
 
 def safe_div(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
@@ -156,6 +173,11 @@ def as_depth_int_map(value: Any) -> dict[int, int]:
         except Exception:
             continue
     return result
+
+
+def merge_depth_max(target: dict[int, int], source: dict[int, int]) -> None:
+    for depth, value in source.items():
+        target[int(depth)] = max(int(target.get(int(depth), 0)), int(value))
 
 
 def int_value(value: Any, default: int = 0) -> int:
@@ -264,8 +286,15 @@ def performance_warnings(
     baseline_goodput_tokens_per_s: float | None = None,
 ) -> list[str]:
     warnings: list[str] = []
-    committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
-    committed_share = float_value(accounting.get("committed_token_share_of_output"), 0.0)
+    if bool(accounting.get("generic_accounting_mode", False)):
+        committed_tokens = int_value(
+            accounting.get("generic_combined_real_committed_token_count"),
+            int_value(accounting.get("combined_real_committed_token_count"), 0),
+        )
+        committed_share = float_value(accounting.get("generic_committed_token_share_of_output"), 0.0)
+    else:
+        committed_tokens = int_value(accounting.get("eager_committed_token_count"), 0)
+        committed_share = float_value(accounting.get("committed_token_share_of_output"), 0.0)
     if committed_tokens <= 0:
         warnings.append("no_committed_tokens")
     elif committed_share < low_committed_share_threshold:
@@ -490,6 +519,19 @@ def aggregate_performance_accounting(
     generic_rolling_draft_verified_sum = 0
     generic_rolling_draft_accepted_sum = 0
     generic_rolling_commit_decision_payload_len_units = 0
+    generic_full_continuous_enabled = False
+    generic_rolling_runtime_enabled = False
+    generic_rolling_apply_path_enabled = False
+    generic_full_continuous_total_full_commit_token_count = 0
+    generic_full_continuous_total_partial_recovered_token_count = 0
+    generic_full_continuous_total_revised_token_count = 0
+    generic_full_continuous_total_output_token_count = 0
+    generic_full_continuous_parity_ok = True
+    generic_full_continuous_normal_lane_conflict_count = 0
+    generic_full_continuous_target_draft_mismatch_count = 0
+    generic_full_continuous_depth_gt_max_real_commit_count = 0
+    generic_full_continuous_depth_partial_recovered_token_counts: dict[int, int] = {}
+    generic_full_continuous_depth_revised_token_counts: dict[int, int] = {}
     rolling_max_depth_observed = 0
     partial_prefix_recovery_enabled = False
     partial_prefix_recovered_ids: set[int] = set()
@@ -502,6 +544,7 @@ def aggregate_performance_accounting(
     partial_recovery_target_draft_length_mismatch_count = 0
     partial_recovery_target_draft_token_mismatch_count = 0
     partial_recovery_cascade_discard_ids: set[int] = set()
+    descendant_committed_after_partial_count = 0
     lane_applied_ids: set[int] = set()
     lane_applied_seq_fallback_events: set[tuple[int, int, int]] = set()
     takeover_ids: set[int] = set()
@@ -539,6 +582,56 @@ def aggregate_performance_accounting(
             for proposal_id, token_count in as_int_map(record.get(map_key)).items():
                 if token_count > 0:
                     proposal_len_by_id.setdefault(proposal_id, token_count)
+        generic_full_continuous_enabled = generic_full_continuous_enabled or bool(
+            record.get("generic_full_continuous_enabled", False)
+        ) or bool(record.get("enable_full_continuous_eager", False))
+        generic_rolling_runtime_enabled = generic_rolling_runtime_enabled or bool(
+            record.get("generic_rolling_runtime_enabled", False)
+        ) or bool(record.get("enable_generic_rolling_runtime_loop", False))
+        generic_rolling_apply_path_enabled = generic_rolling_apply_path_enabled or bool(
+            record.get("generic_rolling_apply_path_enabled", False)
+        ) or bool(record.get("enable_generic_rolling_apply_path", False))
+        generic_full_continuous_total_full_commit_token_count = max(
+            generic_full_continuous_total_full_commit_token_count,
+            int_value(record.get("generic_full_continuous_total_full_commit_token_count"), 0),
+        )
+        generic_full_continuous_total_partial_recovered_token_count = max(
+            generic_full_continuous_total_partial_recovered_token_count,
+            int_value(record.get("generic_full_continuous_total_partial_recovered_token_count"), 0),
+        )
+        generic_full_continuous_total_revised_token_count = max(
+            generic_full_continuous_total_revised_token_count,
+            int_value(record.get("generic_full_continuous_total_revised_token_count"), 0),
+        )
+        generic_full_continuous_total_output_token_count = max(
+            generic_full_continuous_total_output_token_count,
+            int_value(record.get("generic_full_continuous_total_output_token_count"), 0),
+        )
+        if (
+            bool(record.get("generic_full_continuous_enabled", False))
+            or bool(record.get("enable_full_continuous_eager", False))
+            or int_value(record.get("generic_full_continuous_total_output_token_count"), 0) > 0
+        ):
+            generic_full_continuous_parity_ok = generic_full_continuous_parity_ok and bool(
+                record.get("generic_full_continuous_parity_ok", True)
+            )
+        generic_full_continuous_normal_lane_conflict_count += int_value(
+            record.get("generic_full_continuous_normal_lane_conflict_count"), 0
+        )
+        generic_full_continuous_target_draft_mismatch_count += int_value(
+            record.get("generic_full_continuous_target_draft_mismatch_count"), 0
+        )
+        generic_full_continuous_depth_gt_max_real_commit_count += int_value(
+            record.get("generic_full_continuous_depth_gt_max_real_commit_count"), 0
+        )
+        merge_depth_max(
+            generic_full_continuous_depth_partial_recovered_token_counts,
+            as_depth_int_map(record.get("generic_full_continuous_depth_partial_recovered_token_counts")),
+        )
+        merge_depth_max(
+            generic_full_continuous_depth_revised_token_counts,
+            as_depth_int_map(record.get("generic_full_continuous_depth_revised_token_counts")),
+        )
         if bool(record.get("partial_prefix_recovery_enabled", False)) or bool(
             record.get("enable_rolling_continuous_partial_prefix_recovery", False)
         ):
@@ -593,6 +686,9 @@ def aggregate_performance_accounting(
                     partial_recovery_target_draft_token_mismatch_count += mismatches
         partial_recovery_cascade_discard_ids.update(
             as_int_set(record.get("partial_recovery_cascade_discarded_descendant_proposal_ids"))
+        )
+        descendant_committed_after_partial_count += int_value(
+            record.get("descendant_committed_after_partial_count"), 0
         )
 
         candidate_ids.update(as_int_set(record.get("eager_commit_candidate_proposal_ids")))
@@ -1405,6 +1501,16 @@ def aggregate_performance_accounting(
         partial_prefix_revised_token_count_by_depth[depth_key] += int(
             partial_prefix_revised_token_count_by_id.get(proposal_id, 0)
         )
+    if partial_prefix_recovered_token_count_by_depth:
+        generic_full_continuous_depth_partial_recovered_token_counts = {
+            int(depth): int(value)
+            for depth, value in partial_prefix_recovered_token_count_by_depth.items()
+        }
+    if partial_prefix_revised_token_count_by_depth:
+        generic_full_continuous_depth_revised_token_counts = {
+            int(depth): int(value)
+            for depth, value in partial_prefix_revised_token_count_by_depth.items()
+        }
     full_accept_combined_real_committed_token_count = (
         committed_token_count
         + continuous_real_committed_token_count
@@ -1427,10 +1533,47 @@ def aggregate_performance_accounting(
         + partial_prefix_accepted_token_count
     )
     combined_actual_revised_token_increment_sum = partial_prefix_revised_token_count
+    combined_actual_verified_token_increment_sum = (
+        int_value(commit_summary.get("target_actual_eager_verified_token_increment_sum"), 0)
+        + continuous_target_verified_sum
+        + rolling_depth2_target_verified_sum
+        + rolling_depth3_target_verified_sum
+        + rolling_depth4_target_verified_sum
+        + generic_rolling_target_verified_sum
+        + partial_prefix_accepted_token_count
+        + partial_prefix_revised_token_count
+    )
     combined_actual_output_token_increment_sum = (
         full_accept_combined_real_committed_token_count
         + partial_prefix_accepted_token_count
         + partial_prefix_revised_token_count
+    )
+    generic_accounting_mode = bool(
+        generic_full_continuous_enabled
+        or generic_rolling_runtime_enabled
+        or generic_rolling_apply_path_enabled
+        or generic_full_continuous_total_output_token_count > 0
+    )
+    generic_full_commit_tokens = int(generic_full_continuous_total_full_commit_token_count)
+    generic_partial_recovered_tokens = int(generic_full_continuous_total_partial_recovered_token_count)
+    generic_revised_tokens = int(generic_full_continuous_total_revised_token_count)
+    generic_total_output_tokens = int(generic_full_continuous_total_output_token_count)
+    generic_combined_real_committed_token_count = int(combined_real_committed_token_count)
+    if generic_accounting_mode and generic_total_output_tokens > 0:
+        combined_actual_verified_token_increment_sum = int(generic_total_output_tokens)
+        combined_actual_accepted_token_increment_sum = int(generic_total_output_tokens - generic_revised_tokens)
+        combined_actual_revised_token_increment_sum = int(generic_revised_tokens)
+        combined_actual_output_token_increment_sum = int(generic_total_output_tokens)
+    generic_combined_accounting_ok = bool(
+        not generic_accounting_mode
+        or (
+            generic_total_output_tokens == generic_full_commit_tokens + generic_partial_recovered_tokens
+            and generic_combined_real_committed_token_count == generic_total_output_tokens
+            and combined_actual_verified_token_increment_sum == generic_total_output_tokens
+            and combined_actual_output_token_increment_sum == generic_total_output_tokens
+            and combined_actual_accepted_token_increment_sum + combined_actual_revised_token_increment_sum
+            == combined_actual_output_token_increment_sum
+        )
     )
     continuous_chain_distribution = Counter(
         str(depth)
@@ -1472,6 +1615,53 @@ def aggregate_performance_accounting(
         "missing_timing_reason": None if timing_available else "not_instrumented",
         "payload_bytes_available": bool(payload_bytes_available),
         "missing_payload_bytes_reason": None if payload_bytes_available else "payload_byte_fields_not_instrumented",
+        "generic_accounting_mode": bool(generic_accounting_mode),
+        "generic_combined_accounting_ok": bool(generic_combined_accounting_ok),
+        "generic_full_commit_tokens": int(generic_full_commit_tokens),
+        "generic_partial_recovered_tokens": int(generic_partial_recovered_tokens),
+        "generic_revised_tokens": int(generic_revised_tokens),
+        "generic_total_output_tokens": int(generic_total_output_tokens),
+        "generic_combined_real_committed_token_count": int(generic_combined_real_committed_token_count),
+        "generic_committed_token_share_of_output": safe_div(
+            generic_combined_real_committed_token_count,
+            int_value(result_metrics(result_payload).get("total_output_tokens"), 0) or generic_total_output_tokens,
+        ),
+        "generic_full_continuous_enabled": bool(generic_full_continuous_enabled),
+        "generic_rolling_runtime_enabled": bool(generic_rolling_runtime_enabled),
+        "generic_rolling_apply_path_enabled": bool(generic_rolling_apply_path_enabled),
+        "generic_full_continuous_total_full_commit_token_count": int(
+            generic_full_continuous_total_full_commit_token_count
+        ),
+        "generic_full_continuous_total_partial_recovered_token_count": int(
+            generic_full_continuous_total_partial_recovered_token_count
+        ),
+        "generic_full_continuous_total_revised_token_count": int(
+            generic_full_continuous_total_revised_token_count
+        ),
+        "generic_full_continuous_total_output_token_count": int(
+            generic_full_continuous_total_output_token_count
+        ),
+        "generic_full_continuous_depth_partial_recovered_token_counts": {
+            str(depth): int(value)
+            for depth, value in sorted(generic_full_continuous_depth_partial_recovered_token_counts.items())
+        },
+        "generic_full_continuous_depth_revised_token_counts": {
+            str(depth): int(value)
+            for depth, value in sorted(generic_full_continuous_depth_revised_token_counts.items())
+        },
+        "generic_full_continuous_parity_ok": bool(generic_full_continuous_parity_ok),
+        "generic_full_continuous_normal_lane_conflict_count": int(
+            generic_full_continuous_normal_lane_conflict_count
+        ),
+        "generic_full_continuous_target_draft_mismatch_count": int(
+            generic_full_continuous_target_draft_mismatch_count
+        ),
+        "generic_full_continuous_depth_gt_max_real_commit_count": int(
+            generic_full_continuous_depth_gt_max_real_commit_count
+        ),
+        "legacy_accounting_checks_skipped_due_to_generic_mode": (
+            list(LEGACY_CHECKS_SKIPPED_DUE_TO_GENERIC_MODE) if generic_accounting_mode else []
+        ),
         "eager_candidate_proposal_count": candidate_count,
         "eager_candidate_token_count": candidate_token_count,
         "eager_ready_proposal_count": ready_count,
@@ -1688,21 +1878,13 @@ def aggregate_performance_accounting(
         "partial_recovery_cascade_discard_count": len(partial_recovery_cascade_discard_ids),
         "partial_recovery_target_draft_length_mismatch_count": partial_recovery_target_draft_length_mismatch_count,
         "partial_recovery_target_draft_token_mismatch_count": partial_recovery_target_draft_token_mismatch_count,
+        "descendant_committed_after_partial_count": int(descendant_committed_after_partial_count),
         "combined_real_committed_token_count": combined_real_committed_token_count,
         "combined_real_committed_token_share_of_output": safe_div(
             combined_real_committed_token_count,
             int_value(result_metrics(result_payload).get("total_output_tokens"), 0),
         ),
-        "combined_actual_verified_token_increment_sum": (
-            int_value(commit_summary.get("target_actual_eager_verified_token_increment_sum"), 0)
-            + continuous_target_verified_sum
-            + rolling_depth2_target_verified_sum
-            + rolling_depth3_target_verified_sum
-            + rolling_depth4_target_verified_sum
-            + generic_rolling_target_verified_sum
-            + partial_prefix_accepted_token_count
-            + partial_prefix_revised_token_count
-        ),
+        "combined_actual_verified_token_increment_sum": combined_actual_verified_token_increment_sum,
         "combined_actual_accepted_token_increment_sum": combined_actual_accepted_token_increment_sum,
         "combined_actual_revised_token_increment_sum": combined_actual_revised_token_increment_sum,
         "combined_actual_output_token_increment_sum": combined_actual_output_token_increment_sum,
@@ -1825,6 +2007,101 @@ def generic_chain_accounting_errors(records: list[dict[str, Any]], accounting: d
     return errors
 
 
+def generic_accounting_mode_enabled(accounting: dict[str, Any]) -> bool:
+    return bool(
+        accounting.get("generic_accounting_mode", False)
+        or accounting.get("generic_full_continuous_enabled", False)
+        or accounting.get("generic_rolling_runtime_enabled", False)
+        or accounting.get("generic_rolling_apply_path_enabled", False)
+        or int_value(accounting.get("generic_full_continuous_total_output_token_count"), 0) > 0
+    )
+
+
+def _sum_depth_values(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return sum(int_value(item, 0) for item in value.values())
+
+
+def generic_full_continuous_accounting_errors(accounting: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    total_full = int_value(accounting.get("generic_full_continuous_total_full_commit_token_count"), 0)
+    total_partial = int_value(accounting.get("generic_full_continuous_total_partial_recovered_token_count"), 0)
+    total_revised = int_value(accounting.get("generic_full_continuous_total_revised_token_count"), 0)
+    total_output = int_value(accounting.get("generic_full_continuous_total_output_token_count"), 0)
+    partial_prefix_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+    partial_prefix_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+    partial_enabled = bool(accounting.get("partial_prefix_recovery_enabled", False)) or partial_prefix_total > 0
+    combined_real = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    combined_verified = int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0)
+    combined_accepted = int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0)
+    combined_revised = int_value(accounting.get("combined_actual_revised_token_increment_sum"), 0)
+    combined_output = int_value(accounting.get("combined_actual_output_token_increment_sum"), 0)
+
+    combined_ok = True
+    if total_output != total_full + total_partial:
+        errors.append("generic full continuous output tokens must equal full commits plus partial recovered tokens")
+    if partial_enabled and total_partial != partial_prefix_total:
+        errors.append("generic full continuous partial total must match partial-prefix recovery total")
+    if total_revised and total_revised != partial_prefix_revised:
+        errors.append("generic full continuous revised total must match partial-prefix revised token count")
+    if combined_real != total_output:
+        errors.append("combined real committed tokens must equal generic full continuous output tokens")
+        combined_ok = False
+    if combined_verified != combined_real:
+        errors.append("combined verified increment must equal combined real committed token count")
+        combined_ok = False
+    if combined_output != combined_real:
+        errors.append("combined output increment must equal combined real committed token count")
+        combined_ok = False
+    if combined_accepted + combined_revised != combined_output:
+        errors.append("combined accepted plus revised increments must equal combined output increment")
+        combined_ok = False
+    if not bool(accounting.get("generic_full_continuous_parity_ok", False)):
+        errors.append("generic_full_continuous_parity_ok must be true")
+    if int_value(accounting.get("generic_full_continuous_normal_lane_conflict_count"), 0) != 0:
+        errors.append("generic full continuous normal lane conflict count must remain zero")
+    if int_value(accounting.get("generic_full_continuous_target_draft_mismatch_count"), 0) != 0:
+        errors.append("generic full continuous target/draft mismatch count must remain zero")
+    if int_value(accounting.get("generic_full_continuous_depth_gt_max_real_commit_count"), 0) != 0:
+        errors.append("generic full continuous depth_gt_max real commit count must remain zero")
+    if int_value(accounting.get("missing_buffered_proposal_unexpected_count"), 0) != 0:
+        errors.append("unexpected missing normal proposal count must be zero")
+    if accounting.get("repeated_commit_proposal_ids"):
+        errors.append(f"duplicate commit proposal ids present: {accounting['repeated_commit_proposal_ids']}")
+    if partial_enabled:
+        if int_value(accounting.get("partial_recovery_cascade_discard_count"), 0) != 0:
+            errors.append("partial recovery cascade discard count must be zero in generic full continuous mode")
+        if int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0) != 0:
+            errors.append("partial recovery target/draft length mismatch count must be zero")
+        if int_value(accounting.get("partial_recovery_target_draft_token_mismatch_count"), 0) != 0:
+            errors.append("partial recovery target/draft token mismatch count must be zero")
+        if int_value(accounting.get("descendant_committed_after_partial_count"), 0) != 0:
+            errors.append("descendant committed after partial recovery must remain zero")
+    depth_partial_sum = _sum_depth_values(
+        accounting.get("generic_full_continuous_depth_partial_recovered_token_counts")
+    )
+    depth_revised_sum = _sum_depth_values(accounting.get("generic_full_continuous_depth_revised_token_counts"))
+    if depth_partial_sum != total_partial:
+        errors.append(
+            f"generic full continuous depth-indexed partial recovery sum mismatch: "
+            f"sum={depth_partial_sum} total={total_partial}"
+        )
+    if depth_revised_sum != total_revised:
+        errors.append(
+            f"generic full continuous depth-indexed revised token sum mismatch: "
+            f"sum={depth_revised_sum} total={total_revised}"
+        )
+    accounting["generic_combined_accounting_ok"] = bool(
+        combined_ok
+        and combined_real == total_output
+        and combined_verified == combined_real
+        and combined_output == combined_real
+        and combined_accepted + combined_revised == combined_output
+    )
+    return errors
+
+
 def validate_accounting(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
@@ -1838,9 +2115,38 @@ def validate_accounting(
 ) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     commit_errors, _commit_summary = validate_commit_records(records)
-    errors.extend(f"commit checker: {error}" for error in commit_errors)
     accounting = aggregate_performance_accounting(records, result_payload)
+    generic_mode = generic_accounting_mode_enabled(accounting)
+    accounting["generic_accounting_mode"] = bool(generic_mode)
     accounting["commit_checker_error_count"] = len(commit_errors)
+    if generic_mode:
+        accounting["legacy_accounting_checks_skipped_due_to_generic_mode"] = list(
+            LEGACY_CHECKS_SKIPPED_DUE_TO_GENERIC_MODE
+        )
+        errors.extend(generic_full_continuous_accounting_errors(accounting))
+        if int_value(accounting.get("negative_payload_field_count"), 0) != 0:
+            errors.append("payload length/byte fields must be nonnegative")
+        if accounting.get("timing_available"):
+            for field in TIMING_FIELDS + ["total_eager_overhead_time_ms"]:
+                if float_value(accounting.get(field), 0.0) < 0.0:
+                    errors.append(f"{field} must be nonnegative")
+        elif accounting.get("missing_timing_reason") != "not_instrumented":
+            errors.append("missing timing must be explicitly marked not_instrumented")
+        if float_value(accounting.get("eager_accounting_summary_time_ms"), 0.0) < 0.0:
+            errors.append("eager_accounting_summary_time_ms must be nonnegative")
+        if result_payload:
+            errors.extend(validate_result_sanity(result_payload))
+        warnings = performance_warnings(
+            accounting,
+            low_committed_share_threshold=low_committed_share_threshold,
+            high_payload_len_per_committed_token_threshold=high_payload_len_per_committed_token_threshold,
+        )
+        accounting["performance_warnings"] = warnings
+        if strict_performance and warnings:
+            errors.append(f"strict performance warnings present: {warnings}")
+        return errors, accounting
+
+    errors.extend(f"commit checker: {error}" for error in commit_errors)
     if check_generic_chain:
         errors.extend(generic_chain_accounting_errors(records, accounting))
 
@@ -2171,6 +2477,28 @@ def print_summary(summary: dict[str, Any]) -> None:
         "engine_elapsed_s",
         "goodput_tokens_per_s",
         "mean_tpot_ms",
+        "generic_accounting_mode",
+        "generic_combined_accounting_ok",
+        "generic_full_commit_tokens",
+        "generic_partial_recovered_tokens",
+        "generic_revised_tokens",
+        "generic_total_output_tokens",
+        "generic_combined_real_committed_token_count",
+        "generic_committed_token_share_of_output",
+        "generic_full_continuous_enabled",
+        "generic_rolling_runtime_enabled",
+        "generic_rolling_apply_path_enabled",
+        "generic_full_continuous_total_full_commit_token_count",
+        "generic_full_continuous_total_partial_recovered_token_count",
+        "generic_full_continuous_total_revised_token_count",
+        "generic_full_continuous_total_output_token_count",
+        "generic_full_continuous_depth_partial_recovered_token_counts",
+        "generic_full_continuous_depth_revised_token_counts",
+        "generic_full_continuous_parity_ok",
+        "generic_full_continuous_normal_lane_conflict_count",
+        "generic_full_continuous_target_draft_mismatch_count",
+        "generic_full_continuous_depth_gt_max_real_commit_count",
+        "legacy_accounting_checks_skipped_due_to_generic_mode",
         "eager_candidate_proposal_count",
         "eager_candidate_token_count",
         "eager_ready_proposal_count",
@@ -2312,6 +2640,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "partial_recovery_cascade_discard_count",
         "partial_recovery_target_draft_length_mismatch_count",
         "partial_recovery_target_draft_token_mismatch_count",
+        "descendant_committed_after_partial_count",
         "combined_real_committed_token_count",
         "combined_real_committed_token_share_of_output",
         "combined_actual_verified_token_increment_sum",
@@ -2398,6 +2727,17 @@ def synthetic_result_payload() -> dict[str, Any]:
             }
         ],
     }
+
+
+def synthetic_generic_result_payload(total_output_tokens: int = 3676) -> dict[str, Any]:
+    payload = synthetic_result_payload()
+    payload["metrics"]["overall"]["total_output_tokens"] = int(total_output_tokens)
+    payload["metrics"]["overall"]["goodput_tokens_per_s"] = float(total_output_tokens)
+    payload["traces"][0]["num_output_tokens"] = int(total_output_tokens)
+    payload["traces"][0]["decode_elapsed_ms"] = float(total_output_tokens)
+    payload["traces"][0]["observed_tpot_ms"] = 1.0
+    payload["traces"][0]["finish_ts"] = payload["traces"][0]["decode_start_ts"] + float(total_output_tokens) / 1000.0
+    return payload
 
 
 def synthetic_records() -> list[dict[str, Any]]:
@@ -2524,6 +2864,106 @@ def synthetic_records() -> list[dict[str, Any]]:
     return [target, draft]
 
 
+def synthetic_generic_full_continuous_records(
+    *,
+    full_commit: int = 3648,
+    partial_recovered: int = 28,
+    revised: int = 9,
+    total_output: int = 3676,
+    legacy_continuous_tokens: int = 0,
+    legacy_ready_exceeds_candidate: bool = False,
+    parity_ok: bool = True,
+) -> list[dict[str, Any]]:
+    generic_tail_tokens = int(full_commit) - int(legacy_continuous_tokens)
+    if generic_tail_tokens < 0:
+        raise ValueError("legacy_continuous_tokens cannot exceed full_commit")
+    proposal_ids = [990000600 + index for index in range(1, int(revised) + 1)]
+    accepted_lengths = [2 for _ in proposal_ids]
+    if accepted_lengths:
+        accepted_lengths[-1] += int(partial_recovered) - (sum(accepted_lengths) + int(revised))
+    committed_counts = [accepted + 1 for accepted in accepted_lengths]
+    record: dict[str, Any] = {
+        "execution_mode": "dual_batch_pearl",
+        "dual_batch_enabled": True,
+        "normal_gamma": 4,
+        "runner_role": "target",
+        "generic_full_continuous_enabled": True,
+        "enable_full_continuous_eager": True,
+        "generic_rolling_runtime_enabled": True,
+        "enable_generic_rolling_runtime_loop": True,
+        "generic_rolling_apply_path_enabled": True,
+        "enable_generic_rolling_apply_path": True,
+        "generic_full_continuous_total_full_commit_token_count": int(full_commit),
+        "generic_full_continuous_total_partial_recovered_token_count": int(partial_recovered),
+        "generic_full_continuous_total_revised_token_count": int(revised),
+        "generic_full_continuous_total_output_token_count": int(total_output),
+        "generic_full_continuous_depth_partial_recovered_token_counts": {"60": int(partial_recovered)},
+        "generic_full_continuous_depth_revised_token_counts": {"60": int(revised)},
+        "generic_full_continuous_parity_ok": bool(parity_ok),
+        "generic_full_continuous_normal_lane_conflict_count": 0,
+        "generic_full_continuous_target_draft_mismatch_count": 0,
+        "generic_full_continuous_depth_gt_max_real_commit_count": 0,
+        "generic_rolling_real_committed_token_count_by_depth": {"60": int(generic_tail_tokens)},
+        "partial_prefix_recovery_enabled": True,
+        "enable_rolling_continuous_partial_prefix_recovery": True,
+        "partial_prefix_recovered_proposal_ids": proposal_ids,
+        "partial_prefix_recovered_seq_ids": list(range(27, 27 + len(proposal_ids))),
+        "partial_prefix_recovered_depth_by_proposal_id": {
+            str(proposal_id): 60 for proposal_id in proposal_ids
+        },
+        "partial_prefix_accepted_len_by_proposal_id": {
+            str(proposal_id): int(accepted)
+            for proposal_id, accepted in zip(proposal_ids, accepted_lengths)
+        },
+        "partial_prefix_revised_token_count_by_proposal_id": {
+            str(proposal_id): 1 for proposal_id in proposal_ids
+        },
+        "partial_prefix_committed_token_count_by_proposal_id": {
+            str(proposal_id): int(count)
+            for proposal_id, count in zip(proposal_ids, committed_counts)
+        },
+        "partial_recovery_cascade_discarded_descendant_proposal_ids": [],
+        "partial_recovery_target_draft_len_match_by_seq_id": {
+            str(seq_id): True for seq_id in range(27, 27 + len(proposal_ids))
+        },
+        "partial_recovery_target_draft_token_match_by_seq_id": {
+            str(seq_id): True for seq_id in range(27, 27 + len(proposal_ids))
+        },
+        "descendant_committed_after_partial_count": 0,
+        "missing_buffered_proposal_unexpected_count": 0,
+        "eager_accounting_summary_time_ms": 0.0,
+    }
+    if legacy_continuous_tokens:
+        record.update(
+            {
+                "enable_continuous_eager_commit_depth1_ready_only": True,
+                "continuous_eager_real_committed_proposal_ids": [990000101],
+                "continuous_eager_real_committed_token_count_by_proposal_id": {
+                    "990000101": int(legacy_continuous_tokens)
+                },
+                "continuous_eager_commit_ready_shadow_proposal_ids": [990000101],
+                "continuous_eager_commit_ready_shadow_token_count_by_proposal_id": {
+                    "990000101": int(legacy_continuous_tokens)
+                },
+                "continuous_eager_candidate_proposal_ids": [990000101],
+                "continuous_eager_candidate_token_count_by_proposal_id": {
+                    "990000101": int(legacy_continuous_tokens)
+                },
+                "continuous_eager_real_commit_count": 1,
+            }
+        )
+    if legacy_ready_exceeds_candidate:
+        record.update(
+            {
+                "rolling_depth3_child_ready_shadow_proposal_ids": [990000303],
+                "rolling_depth3_child_token_count_by_proposal_id": {"990000303": 4},
+                "rolling_depth4_child_ready_shadow_proposal_ids": [990000404],
+                "rolling_depth4_child_token_count_by_proposal_id": {"990000404": 4},
+            }
+        )
+    return [record]
+
+
 def run_synthetic_tests() -> None:
     records = synthetic_records()
     errors, summary = validate_accounting(records, synthetic_result_payload())
@@ -2585,6 +3025,51 @@ def run_synthetic_tests() -> None:
     bad_accounting["combined_real_committed_token_count"] += 1
     errors = generic_chain_accounting_errors(records, bad_accounting)
     assert any("combined" in error for error in errors), "missed generic-chain combined mismatch"
+
+    generic_records = synthetic_generic_full_continuous_records()
+    generic_errors, generic_summary = validate_accounting(
+        generic_records,
+        synthetic_generic_result_payload(),
+        check_generic_chain=True,
+    )
+    assert not generic_errors, f"valid generic full-continuous accounting failed: {generic_errors}"
+    assert generic_summary["generic_accounting_mode"] is True
+    assert generic_summary["generic_combined_accounting_ok"] is True
+    assert generic_summary["generic_full_commit_tokens"] == 3648
+    assert generic_summary["generic_partial_recovered_tokens"] == 28
+    assert generic_summary["generic_revised_tokens"] == 9
+    assert generic_summary["generic_total_output_tokens"] == 3676
+    assert generic_summary["generic_combined_real_committed_token_count"] == 3676
+    assert generic_summary["combined_actual_accepted_token_increment_sum"] == 3667
+    assert generic_summary["combined_actual_revised_token_increment_sum"] == 9
+    assert generic_summary["combined_actual_output_token_increment_sum"] == 3676
+    assert generic_summary["legacy_accounting_checks_skipped_due_to_generic_mode"]
+
+    bad_generic_accounting = aggregate_performance_accounting(generic_records, synthetic_generic_result_payload())
+    bad_generic_accounting["combined_actual_accepted_token_increment_sum"] += 1
+    errors = generic_full_continuous_accounting_errors(bad_generic_accounting)
+    assert any("accepted plus revised" in error for error in errors), "missed generic accepted/revised mismatch"
+    assert bad_generic_accounting["generic_combined_accounting_ok"] is False
+
+    invalid_generic = synthetic_generic_full_continuous_records(total_output=3675)
+    errors, _summary = validate_accounting(invalid_generic, synthetic_generic_result_payload())
+    assert any("combined real committed" in error for error in errors), "missed generic combined-real mismatch"
+
+    invalid_generic = synthetic_generic_full_continuous_records(parity_ok=False)
+    errors, _summary = validate_accounting(invalid_generic, synthetic_generic_result_payload())
+    assert any("parity_ok" in error for error in errors), "missed generic parity failure"
+
+    generic_zero_legacy_draft = synthetic_generic_full_continuous_records(legacy_continuous_tokens=4)
+    errors, _summary = validate_accounting(generic_zero_legacy_draft, synthetic_generic_result_payload())
+    assert not any("draft continuous" in error for error in errors), "generic mode failed on legacy draft counters"
+    assert not errors, f"generic mode should ignore zero legacy draft-side counters: {errors}"
+
+    generic_ready_exceeds = synthetic_generic_full_continuous_records(legacy_ready_exceeds_candidate=True)
+    errors, _summary = validate_accounting(generic_ready_exceeds, synthetic_generic_result_payload())
+    assert not any("ready shadow tokens exceed candidate tokens" in error for error in errors), (
+        "generic mode failed on legacy ready/candidate diagnostic"
+    )
+    assert not errors, f"generic mode should ignore legacy ready/candidate diagnostic: {errors}"
 
     errors, summary = validate_accounting(
         records,
