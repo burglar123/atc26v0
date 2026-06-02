@@ -1597,6 +1597,21 @@ class ModelRunnerBase:
             "unified_active_seq_count_by_step": {},
             "unified_ready_parent_count_by_step": {},
             "unified_committed_seq_count_by_step": {},
+            "unified_single_child_ahead_enabled": bool(
+                getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
+                and int(getattr(self.global_config, "unified_generic_max_unverified_depth_ahead", 0) or 0) == 1
+            ),
+            "unified_max_unverified_depth_ahead": int(
+                max(0, int(getattr(self.global_config, "unified_generic_max_unverified_depth_ahead", 0) or 0))
+            ),
+            "unified_unverified_depth_ahead_max_observed": 0,
+            "unified_unverified_depth_ahead_by_chain": {},
+            "unified_single_child_ahead_violation_count": 0,
+            "unified_single_child_ahead_violation_examples": [],
+            "unified_generated_grandchild_before_parent_verified_count": 0,
+            "unified_generated_grandchild_before_parent_verified_examples": [],
+            "unified_candidate_depth_created_before_parent_verified_count_by_depth": {},
+            "unified_candidate_depth_created_after_parent_verified_count_by_depth": {},
             "unified_generic_legacy_runtime_bypassed": bool(
                 getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
             ),
@@ -2614,6 +2629,9 @@ class ModelRunnerBase:
 
     def _unified_generic_rolling_runtime_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_unified_generic_rolling_runtime", False))
+
+    def _unified_generic_max_unverified_depth_ahead(self) -> int:
+        return max(0, int(getattr(self.global_config, "unified_generic_max_unverified_depth_ahead", 0) or 0))
 
     def _generic_rolling_apply_path_enabled(self) -> bool:
         return bool(getattr(self.global_config, "enable_generic_rolling_apply_path", False))
@@ -4061,6 +4079,12 @@ class ModelRunnerBase:
         trace_record["unified_generic_rolling_enabled"] = bool(unified_enabled)
         trace_record["enable_unified_generic_rolling_runtime"] = bool(unified_enabled)
         trace_record["unified_generic_legacy_runtime_bypassed"] = bool(unified_enabled)
+        trace_record["unified_single_child_ahead_enabled"] = bool(
+            unified_enabled and self._unified_generic_max_unverified_depth_ahead() == 1
+        )
+        trace_record["unified_max_unverified_depth_ahead"] = int(
+            self._unified_generic_max_unverified_depth_ahead() if unified_enabled else 0
+        )
         trace_record["generic_full_continuous_enabled"] = bool(full_continuous_enabled)
         trace_record["enable_full_continuous_eager"] = bool(full_continuous_enabled)
         trace_record["generic_rolling_max_depth"] = int(context.max_depth)
@@ -13359,6 +13383,86 @@ class ModelRunnerBase:
         }
         return selected
 
+    def _select_unified_generic_committed_frontier_parents(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+        *,
+        max_depth: int,
+        max_children: int,
+        max_seqs: int,
+    ) -> tuple[list[dict], int]:
+        selected: list[dict] = []
+        reject_reason_by_parent_id: dict[int, str] = {}
+        seen_seq_ids: set[int] = set()
+        for parent_depth in range(max(1, int(max_depth) - 1), 0, -1):
+            candidate_parent_ids = sorted(
+                int(proposal_id)
+                for proposal_id in self._generic_rolling_committed_proposal_ids_by_depth.get(parent_depth, set())
+            )
+            for parent_id in candidate_parent_ids:
+                if len(selected) >= max_children or len(seen_seq_ids) >= max_seqs:
+                    break
+                parent_proposal = self._generic_rolling_shadow_proposals_by_id.get(parent_id)
+                if parent_proposal is None:
+                    reject_reason_by_parent_id[parent_id] = "parent_proposal_missing"
+                    continue
+                seq_id = int(getattr(parent_proposal, "seq_id", -1))
+                if seq_id < 0 or seq_id in seen_seq_ids:
+                    continue
+                seq = seq_by_id.get(seq_id)
+                root_id = int(getattr(parent_proposal, "generic_rolling_root_id", parent_id))
+                child_depth = int(parent_depth) + 1
+                child_id = int(self._continuous_shadow_proposal_id(root_id, child_depth))
+                reason = None
+                if child_depth > int(max_depth):
+                    reason = "max_depth_reached"
+                elif seq is None:
+                    reason = "seq_not_found"
+                elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                    reason = "sequence_finished"
+                elif self.is_request_level_finished(seq, plan_context):
+                    reason = "sequence_finished"
+                elif bool(getattr(seq, "pre_verify", True)):
+                    reason = "seq_pre_verify"
+                elif self.is_speculative_span_invalidated(seq, plan_context):
+                    reason = "invalidated_ancestor"
+                elif child_id in self._generic_rolling_shadow_proposals_by_id:
+                    reason = "duplicate_proposal"
+                if reason is not None:
+                    reject_reason_by_parent_id[parent_id] = str(reason)
+                    continue
+                selected.append(
+                    {
+                        "proposal_id": int(parent_id),
+                        "seq_id": int(seq_id),
+                        "root_id": int(root_id),
+                        "depth": int(parent_depth),
+                        "proposal": parent_proposal,
+                    }
+                )
+                seen_seq_ids.add(seq_id)
+            if selected:
+                trace_record["unified_generic_frontier_parent_depth"] = int(parent_depth)
+                trace_record["unified_generic_frontier_parent_proposal_ids"] = [
+                    int(parent["proposal_id"]) for parent in selected
+                ]
+                trace_record["unified_generic_frontier_parent_seq_ids"] = [
+                    int(parent["seq_id"]) for parent in selected
+                ]
+                trace_record["unified_generic_frontier_parent_reject_reason_by_proposal_id"] = {
+                    str(parent_id): str(reason)
+                    for parent_id, reason in sorted(reject_reason_by_parent_id.items())
+                }
+                return selected, int(parent_depth) + 1
+        trace_record["unified_generic_frontier_parent_reject_reason_by_proposal_id"] = {
+            str(parent_id): str(reason)
+            for parent_id, reason in sorted(reject_reason_by_parent_id.items())
+        }
+        return [], 1
+
     def _run_generic_full_continuous_tail_draft(
         self,
         plan: StepPlan,
@@ -13376,6 +13480,8 @@ class ModelRunnerBase:
         timer_start = time.perf_counter()
         gamma = int(self.gamma)
         max_depth, max_children, max_seqs = self._rolling_continuous_limits()
+        max_unverified_depth_ahead = self._unified_generic_max_unverified_depth_ahead() if unified_enabled else 0
+        single_child_ahead_enabled = bool(unified_enabled and max_unverified_depth_ahead == 1)
         per_depth_budget_tokens = int(max(0, min(max_children, max_seqs)) * max(gamma, 0))
         active_seq_count = sum(
             1
@@ -13395,6 +13501,8 @@ class ModelRunnerBase:
         if unified_enabled:
             trace_record["unified_raw_target_verification_available"] = False
             trace_record["unified_raw_verification_source"] = "draft_commit_decision_no_target_verify"
+            trace_record["unified_single_child_ahead_enabled"] = bool(single_child_ahead_enabled)
+            trace_record["unified_max_unverified_depth_ahead"] = int(max_unverified_depth_ahead)
             trace_record["unified_candidate_budget_tokens_per_step"] = int(per_depth_budget_tokens)
             trace_record["unified_commit_budget_tokens_per_step"] = int(per_depth_budget_tokens)
         if unified_enabled and max_depth < 1:
@@ -13420,13 +13528,26 @@ class ModelRunnerBase:
             return []
 
         if unified_enabled:
-            current_parents = self._select_unified_generic_depth1_seed_parents(
-                plan,
-                trace_record,
-                seq_by_id,
-                plan_context,
-            )
+            current_parents = []
             start_depth = 1
+            if max_unverified_depth_ahead > 0:
+                current_parents, start_depth = self._select_unified_generic_committed_frontier_parents(
+                    plan,
+                    trace_record,
+                    seq_by_id,
+                    plan_context,
+                    max_depth=max_depth,
+                    max_children=max_children,
+                    max_seqs=max_seqs,
+                )
+            if not current_parents:
+                current_parents = self._select_unified_generic_depth1_seed_parents(
+                    plan,
+                    trace_record,
+                    seq_by_id,
+                    plan_context,
+                )
+                start_depth = 1
         else:
             parent_ids = self._trace_int_list(trace_record.get("rolling_depth4_real_committed_proposal_ids"))
             parent_seq_ids = self._trace_int_list(trace_record.get("rolling_depth4_real_committed_seq_ids"))
@@ -13819,7 +13940,12 @@ class ModelRunnerBase:
                         (not seq.ignore_eos)
                         and any(is_eos(int(token_id), self.scheduler.eos) for token_id in commit_tokens)
                     ) or int(seq.num_completion_tokens) >= int(seq.max_tokens)
-                    if not proposed_finish:
+                    generated_depths_ahead = int(depth - start_depth + 1)
+                    within_unverified_ahead_limit = (
+                        max_unverified_depth_ahead <= 0
+                        or generated_depths_ahead < int(max_unverified_depth_ahead)
+                    )
+                    if not proposed_finish and within_unverified_ahead_limit:
                         next_parents.append(
                             {
                                 "proposal_id": child_id,
@@ -13829,6 +13955,11 @@ class ModelRunnerBase:
                                 "proposal": proposal,
                             }
                         )
+                    elif not proposed_finish and max_unverified_depth_ahead > 0:
+                        stop_reason = "single_child_ahead_limit"
+                        step_no_commit_reason_counts["single_child_ahead_limit"] = int(
+                            step_no_commit_reason_counts.get("single_child_ahead_limit", 0)
+                        ) + 1
                     continue
                 for token_id in commit_tokens:
                     seq.append_token(int(token_id))
@@ -13963,6 +14094,31 @@ class ModelRunnerBase:
                 "unified_committed_seq_count_by_step",
                 max_committed_seq_count,
             )
+            if single_child_ahead_enabled:
+                root_depths: dict[int, list[int]] = {}
+                for proposal_id, root_id in root_by_id.items():
+                    depth = int(depth_by_id.get(int(proposal_id), 0))
+                    if depth <= 0:
+                        continue
+                    root_depths.setdefault(int(root_id), []).append(depth)
+                ahead_by_chain = {
+                    str(root_id): max(1, max(depths) - min(depths))
+                    for root_id, depths in sorted(root_depths.items())
+                    if depths
+                }
+                trace_record["unified_unverified_depth_ahead_by_chain"] = ahead_by_chain
+                trace_record["unified_unverified_depth_ahead_max_observed"] = max(
+                    ahead_by_chain.values(),
+                    default=1 if step_had_candidate else 0,
+                )
+                trace_record["unified_single_child_ahead_violation_count"] = int(
+                    trace_record["unified_unverified_depth_ahead_max_observed"] > int(max_unverified_depth_ahead)
+                )
+                trace_record["unified_single_child_ahead_violation_examples"] = []
+                trace_record["unified_generated_grandchild_before_parent_verified_count"] = 0
+                trace_record["unified_generated_grandchild_before_parent_verified_examples"] = []
+                trace_record["unified_candidate_depth_created_before_parent_verified_count_by_depth"] = {}
+                trace_record["unified_candidate_depth_created_after_parent_verified_count_by_depth"] = {}
             self._update_unified_raw_verified_to_committed_ratio(trace_record)
 
         trace_record["generic_rolling_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_by_id)
@@ -13977,6 +14133,17 @@ class ModelRunnerBase:
         trace_record["generic_rolling_source_dual_step_id_by_proposal_id"] = self._trace_sorted_int_map(
             source_dual_step_by_id
         )
+        if unified_enabled:
+            trace_record["unified_candidate_created_step_by_proposal_id"] = self._trace_sorted_int_map(
+                source_dual_step_by_id
+            )
+            trace_record["unified_candidate_parent_proposal_id_by_proposal_id"] = self._trace_sorted_int_map(
+                parent_by_id
+            )
+            trace_record["unified_candidate_root_proposal_id_by_proposal_id"] = self._trace_sorted_int_map(
+                root_by_id
+            )
+            trace_record["unified_candidate_depth_by_proposal_id"] = self._trace_sorted_int_map(depth_by_id)
         trace_record["generic_rolling_created_by_role_by_proposal_id"] = self._trace_sorted_str_map(
             created_by_role_by_id
         )
@@ -15680,6 +15847,15 @@ class ModelRunnerBase:
             parent_committed_by_depth.setdefault(depth, []).append(proposal_id)
             parent_depth_by_id[proposal_id] = depth
             parent_root_by_id[proposal_id] = root_id
+            runtime_proposal = self._generic_rolling_shadow_proposals_by_id.get(proposal_id)
+            if runtime_proposal is not None:
+                setattr(
+                    runtime_proposal,
+                    "real_generic_rolling_commit_step_id",
+                    None if plan.step_id is None else int(plan.step_id),
+                )
+                setattr(runtime_proposal, "real_generic_rolling_commit_plan_id", int(plan.plan_id))
+                self._generic_rolling_committed_proposal_ids_by_depth.setdefault(depth, set()).add(proposal_id)
             committed_ids_by_depth.setdefault(depth, []).append(proposal_id)
             committed_seq_ids_by_depth.setdefault(depth, []).append(seq_id)
             committed_token_by_id[proposal_id] = token_count

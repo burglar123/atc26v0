@@ -256,6 +256,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_rolling_continuous_depth": args.max_rolling_continuous_depth,
         "max_rolling_continuous_draft_children_per_step": args.max_rolling_continuous_draft_children_per_step,
         "max_rolling_continuous_seqs_per_step": args.max_rolling_continuous_seqs_per_step,
+        "unified_generic_max_unverified_depth_ahead": args.unified_generic_max_unverified_depth_ahead,
     }
 
     # Try new named-path style with gamma.
@@ -318,6 +319,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "max_rolling_continuous_depth",
         "max_rolling_continuous_draft_children_per_step",
         "max_rolling_continuous_seqs_per_step",
+        "unified_generic_max_unverified_depth_ahead",
     ):
         legacy_kwargs.pop(key, None)
 
@@ -2493,6 +2495,15 @@ def main() -> None:
     parser.add_argument("--max-rolling-continuous-depth", type=int, default=2)
     parser.add_argument("--max-rolling-continuous-draft-children-per-step", type=int, default=2)
     parser.add_argument("--max-rolling-continuous-seqs-per-step", type=int, default=2)
+    parser.add_argument(
+        "--unified-generic-max-unverified-depth-ahead",
+        type=int,
+        default=0,
+        help=(
+            "Default 0 preserves aggressive unified generic pre-expansion. Set to 1 "
+            "to allow only one unverified child depth ahead of the verified frontier."
+        ),
+    )
     parser.add_argument(
         "--eager-trace-level",
         choices=["full", "summary", "minimal"],

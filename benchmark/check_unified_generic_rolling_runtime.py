@@ -497,6 +497,16 @@ def raw_and_budget_summary(
         depth: safe_div(float(committed.get(depth, 0)), float(verified.get(depth, 0)))
         for depth in sorted(set(verified) | set(committed), key=int)
     }
+    candidate = summary["unified_raw_candidate_proposal_count_by_depth"]
+    invalidated = summary["unified_raw_invalidated_proposal_count_by_depth"]
+    wasted = {
+        depth: max(0, int_value(candidate.get(depth), 0) - int_value(committed.get(depth), 0))
+        for depth in sorted(set(candidate) | set(committed), key=int)
+    }
+    summary["unified_candidate_waste_ratio_by_depth"] = ratio_by_depth(wasted, candidate)
+    summary["unified_invalidated_candidate_ratio_by_depth"] = ratio_by_depth(invalidated, candidate)
+    summary["unified_verified_candidate_ratio_by_depth"] = ratio_by_depth(verified, candidate)
+    summary["unified_committed_candidate_ratio_by_depth"] = ratio_by_depth(committed, candidate)
     sources = sorted(
         {
             str(record.get("unified_raw_verification_source"))
@@ -680,6 +690,167 @@ def collect_descendants(parent_by_id: dict[int, int], root_id: int) -> set[int]:
     return descendants
 
 
+def ratio_by_depth(
+    numerator_by_depth: dict[str, int],
+    denominator_by_depth: dict[str, int],
+) -> dict[str, float]:
+    return {
+        depth: safe_div(float(numerator_by_depth.get(depth, 0)), float(denominator_by_depth.get(depth, 0)))
+        for depth in sorted(set(numerator_by_depth) | set(denominator_by_depth), key=int)
+    }
+
+
+def single_child_ahead_summary(
+    records: list[dict[str, Any]],
+    result_args: dict[str, Any],
+    candidate_by_depth: dict[int, list[int]],
+    parent_by_id: dict[int, int],
+    depth_by_id: dict[int, int],
+) -> dict[str, Any]:
+    configured_limit = max(
+        max_record_int(records, "unified_max_unverified_depth_ahead"),
+        int_value(result_args.get("unified_generic_max_unverified_depth_ahead"), 0),
+    )
+    single_child_enabled = any_record_bool(records, "unified_single_child_ahead_enabled") or configured_limit == 1
+    root_by_id = merge_int_map(
+        records,
+        "unified_candidate_root_proposal_id_by_proposal_id",
+        "generic_rolling_root_by_proposal_id",
+        "generic_rolling_real_commit_root_by_proposal_id",
+    )
+    created_step_by_id = merge_int_map(
+        records,
+        "unified_candidate_created_step_by_proposal_id",
+        "generic_rolling_source_dual_step_id_by_proposal_id",
+    )
+    parent_by_id = {
+        **parent_by_id,
+        **merge_int_map(records, "unified_candidate_parent_proposal_id_by_proposal_id"),
+    }
+    depth_by_id = {
+        **depth_by_id,
+        **merge_int_map(records, "unified_candidate_depth_by_proposal_id"),
+    }
+
+    candidate_depth_by_id: dict[int, int] = {}
+    candidate_ids: set[int] = set()
+    for depth, proposal_ids in candidate_by_depth.items():
+        for proposal_id in proposal_ids:
+            candidate_ids.add(int(proposal_id))
+            candidate_depth_by_id.setdefault(int(proposal_id), int(depth))
+            depth_by_id.setdefault(int(proposal_id), int(depth))
+
+    for index, record in enumerate(records):
+        step_id = int_value(record.get("step_id"), int_value(record.get("eager_commit_step_id"), index))
+        for depth, proposal_ids in as_depth_int_lists(record.get("generic_rolling_candidate_proposal_ids_by_depth")).items():
+            for proposal_id in proposal_ids:
+                candidate_ids.add(int(proposal_id))
+                candidate_depth_by_id.setdefault(int(proposal_id), int(depth))
+                depth_by_id.setdefault(int(proposal_id), int(depth))
+                created_step_by_id.setdefault(int(proposal_id), int(step_id))
+
+    def root_for(proposal_id: int) -> int:
+        if proposal_id in root_by_id:
+            return int(root_by_id[proposal_id])
+        seen: set[int] = set()
+        cursor = int(proposal_id)
+        while cursor in parent_by_id and cursor not in seen:
+            seen.add(cursor)
+            parent = int(parent_by_id[cursor])
+            if parent < 0:
+                break
+            cursor = parent
+        return int(cursor)
+
+    by_chain_step: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for proposal_id in sorted(candidate_ids):
+        depth = int(depth_by_id.get(proposal_id, candidate_depth_by_id.get(proposal_id, 0)))
+        if depth <= 0:
+            continue
+        step_id = int(created_step_by_id.get(proposal_id, -1))
+        root_id = root_for(int(proposal_id))
+        by_chain_step[(root_id, step_id)].append((int(depth), int(proposal_id)))
+
+    ahead_by_chain: dict[int, int] = {}
+    violation_examples: list[dict[str, Any]] = []
+    grandchild_examples: list[dict[str, Any]] = []
+    grandchild_count = 0
+    for (root_id, step_id), depth_ids in sorted(by_chain_step.items()):
+        depths = [depth for depth, _proposal_id in depth_ids]
+        if not depths:
+            continue
+        ahead = max(1, max(depths) - min(depths))
+        ahead_by_chain[root_id] = max(int(ahead_by_chain.get(root_id, 0)), int(ahead))
+        proposal_ids = [proposal_id for _depth, proposal_id in sorted(depth_ids)]
+        if configured_limit > 0 and ahead > configured_limit:
+            violation_examples.append(
+                {
+                    "root_id": int(root_id),
+                    "source_step_id": int(step_id),
+                    "depths": sorted(set(int(depth) for depth in depths)),
+                    "proposal_ids": proposal_ids[:8],
+                }
+            )
+        min_depth = min(depths)
+        for depth, proposal_id in sorted(depth_ids):
+            if int(depth) - int(min_depth) >= 2:
+                grandchild_count += 1
+                if len(grandchild_examples) < 8:
+                    grandchild_examples.append(
+                        {
+                            "root_id": int(root_id),
+                            "source_step_id": int(step_id),
+                            "depth": int(depth),
+                            "proposal_id": int(proposal_id),
+                            "earliest_depth_in_step": int(min_depth),
+                        }
+                    )
+
+    before_parent_verified_by_depth: Counter[str] = Counter()
+    after_parent_verified_by_depth: Counter[str] = Counter()
+    for proposal_id in sorted(candidate_ids):
+        parent_id = parent_by_id.get(int(proposal_id))
+        if parent_id is None or int(parent_id) < 0:
+            continue
+        depth = int(depth_by_id.get(int(proposal_id), 0))
+        if depth <= 0:
+            continue
+        child_step = int(created_step_by_id.get(int(proposal_id), -1))
+        parent_step = int(created_step_by_id.get(int(parent_id), -1))
+        if parent_step >= child_step >= 0:
+            before_parent_verified_by_depth[str(depth)] += 1
+        elif parent_step >= 0 and child_step > parent_step:
+            after_parent_verified_by_depth[str(depth)] += 1
+
+    trace_violation_count = sum_record_int(records, "unified_single_child_ahead_violation_count")
+    trace_grandchild_count = sum_record_int(records, "unified_generated_grandchild_before_parent_verified_count")
+    derived_violation_count = len(violation_examples) if configured_limit > 0 else 0
+    return {
+        "unified_single_child_ahead_enabled": bool(single_child_enabled),
+        "unified_max_unverified_depth_ahead": int(configured_limit),
+        "unified_unverified_depth_ahead_max_observed": max(
+            max((int(value) for value in ahead_by_chain.values()), default=0),
+            max_record_int(records, "unified_unverified_depth_ahead_max_observed"),
+        ),
+        "unified_unverified_depth_ahead_by_chain": {
+            str(root_id): int(value) for root_id, value in sorted(ahead_by_chain.items())
+        },
+        "unified_single_child_ahead_violation_count": max(int(trace_violation_count), int(derived_violation_count)),
+        "unified_single_child_ahead_violation_examples": violation_examples[:8],
+        "unified_generated_grandchild_before_parent_verified_count": max(
+            int(trace_grandchild_count),
+            int(grandchild_count if configured_limit > 0 else 0),
+        ),
+        "unified_generated_grandchild_before_parent_verified_examples": grandchild_examples[:8],
+        "unified_candidate_depth_created_before_parent_verified_count_by_depth": dict(
+            sorted(before_parent_verified_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_candidate_depth_created_after_parent_verified_count_by_depth": dict(
+            sorted(after_parent_verified_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+    }
+
+
 def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     result_payload = result_payload or {}
     result_args = result_payload.get("args", {}) if isinstance(result_payload, dict) else {}
@@ -792,6 +963,13 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     reason_by_depth = stop_reasons_by_depth(records)
     utilization = utilization_summary(records)
     diagnostics = raw_and_budget_summary(records, candidate_by_depth, committed_by_depth)
+    single_child_diagnostics = single_child_ahead_summary(
+        records,
+        result_args,
+        candidate_by_depth,
+        parent_by_id,
+        depth_by_id,
+    )
     unified_total_output = max_record_int(records, "unified_generic_total_output_token_count")
     if unified_enabled and unified_total_output > 0:
         total_full = max_record_int(records, "unified_generic_total_full_commit_token_count")
@@ -970,6 +1148,7 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         ),
         **utilization,
         **diagnostics,
+        **single_child_diagnostics,
         "total_full_commit_token_count": total_full,
         "total_partial_recovered_token_count": total_partial,
         "total_revised_token_count": total_revised,
@@ -1224,7 +1403,28 @@ def validate_records(
         and raw_verified_total > 0
         and raw_full_total == 0
     )
-    if max_depth > 4 and max_real <= 4 and not target_verified_reject_only:
+    single_child_ahead_enabled = bool(summary.get("unified_single_child_ahead_enabled", False))
+    if single_child_ahead_enabled:
+        ahead_limit = int_value(summary.get("unified_max_unverified_depth_ahead"), 0)
+        observed_ahead = int_value(summary.get("unified_unverified_depth_ahead_max_observed"), 0)
+        if ahead_limit <= 0:
+            errors.append("single-child-ahead mode requires positive max unverified depth ahead")
+        if ahead_limit > 0 and observed_ahead > ahead_limit:
+            errors.append(
+                "single-child-ahead observed unverified depth ahead exceeds configured limit: "
+                f"observed={observed_ahead} limit={ahead_limit}"
+            )
+        if int_value(summary.get("unified_single_child_ahead_violation_count"), 0) > 0:
+            errors.append(
+                "single-child-ahead violation examples: "
+                f"{summary.get('unified_single_child_ahead_violation_examples')}"
+            )
+        if int_value(summary.get("unified_generated_grandchild_before_parent_verified_count"), 0) > 0:
+            errors.append(
+                "generated grandchild before parent verification examples: "
+                f"{summary.get('unified_generated_grandchild_before_parent_verified_examples')}"
+            )
+    if max_depth > 4 and max_real <= 4 and not target_verified_reject_only and not single_child_ahead_enabled:
         errors.append("max real committed depth must exceed 4 when configured max depth exceeds 4")
 
     split_committed: dict[str, int] = {}
@@ -1294,6 +1494,7 @@ def synthetic_payload(total_output_tokens: int) -> dict[str, Any]:
             "enable_generic_rolling_runtime_loop": True,
             "enable_generic_rolling_apply_path": True,
             "max_rolling_continuous_depth": 6,
+            "unified_generic_max_unverified_depth_ahead": 0,
         },
         "metrics": {"total_output_tokens": int(total_output_tokens)},
     }
@@ -1747,6 +1948,171 @@ def synthetic_reject_partial_records() -> list[dict[str, Any]]:
     return [record]
 
 
+def synthetic_single_child_payload(*, max_depth: int = 8, max_unverified_ahead: int = 1) -> dict[str, Any]:
+    payload = synthetic_payload(total_output_tokens=0)
+    payload["args"]["max_rolling_continuous_depth"] = int(max_depth)
+    payload["args"]["unified_generic_max_unverified_depth_ahead"] = int(max_unverified_ahead)
+    return payload
+
+
+def synthetic_single_child_records(
+    steps: list[list[int]],
+    *,
+    max_depth: int = 8,
+    max_unverified_ahead: int = 1,
+    committed_depths: set[int] | None = None,
+    stop_reason: str = "target_verify_pending",
+) -> list[dict[str, Any]]:
+    committed_depths = set(committed_depths or set())
+    gamma = 4
+    proposal_id_by_depth = {depth: 9000 + depth for depths in steps for depth in depths}
+    if committed_depths:
+        for depth in committed_depths:
+            proposal_id_by_depth.setdefault(int(depth), 9000 + int(depth))
+    root_id = proposal_id_by_depth.get(1, 9001)
+    parent_by_id = {
+        proposal_id_by_depth[depth]: proposal_id_by_depth[depth - 1]
+        for depth in proposal_id_by_depth
+        if depth > 1 and (depth - 1) in proposal_id_by_depth
+    }
+    depth_by_id = {proposal_id: depth for depth, proposal_id in proposal_id_by_depth.items()}
+    total_full = int(len(committed_depths) * gamma)
+    records: list[dict[str, Any]] = []
+    for step_index, depths in enumerate(steps):
+        candidate_by_depth = {str(depth): [proposal_id_by_depth[depth]] for depth in depths}
+        ready_by_depth = {str(depth): [proposal_id_by_depth[depth]] for depth in depths}
+        committed_by_depth = {
+            str(depth): [proposal_id_by_depth[depth]]
+            for depth in depths
+            if int(depth) in committed_depths
+        }
+        ids_in_record = [proposal_id_by_depth[depth] for depth in depths]
+        committed_ids = [proposal_id_by_depth[depth] for depth in depths if int(depth) in committed_depths]
+        token_by_id = {proposal_id: gamma for proposal_id in ids_in_record}
+        token_by_id.update({proposal_id_by_depth[depth]: gamma for depth in committed_depths})
+        source_step_by_id = {proposal_id: step_index for proposal_id in ids_in_record}
+        record = {
+            "step_id": step_index,
+            "plan_id": 1,
+            "normal_gamma": gamma,
+            "unified_generic_rolling_enabled": True,
+            "enable_unified_generic_rolling_runtime": True,
+            "generic_full_continuous_enabled": True,
+            "enable_full_continuous_eager": True,
+            "generic_rolling_runtime_enabled": True,
+            "enable_generic_rolling_runtime_loop": True,
+            "generic_rolling_apply_path_enabled": True,
+            "enable_generic_rolling_apply_path": True,
+            "unified_single_child_ahead_enabled": bool(max_unverified_ahead == 1),
+            "unified_max_unverified_depth_ahead": int(max_unverified_ahead),
+            "unified_generic_max_depth": int(max_depth),
+            "unified_generic_max_observed_depth": max(depths or [0]),
+            "unified_generic_max_real_committed_depth": max(committed_depths or {0}),
+            "generic_full_continuous_max_depth": int(max_depth),
+            "generic_full_continuous_max_observed_depth": max(depths or [0]),
+            "generic_full_continuous_max_real_committed_depth": max(committed_depths or {0}),
+            "generic_rolling_candidate_proposal_ids_by_depth": candidate_by_depth,
+            "generic_rolling_candidate_seq_ids_by_depth": {str(depth): [7] for depth in depths},
+            "generic_rolling_ready_proposal_ids_by_depth": ready_by_depth,
+            "generic_rolling_ready_seq_ids_by_depth": {str(depth): [7] for depth in depths},
+            "generic_rolling_real_committed_proposal_ids_by_depth": committed_by_depth,
+            "generic_rolling_real_committed_seq_ids_by_depth": {
+                str(depth): [7] for depth in depths if int(depth) in committed_depths
+            },
+            "generic_rolling_parent_by_proposal_id": {
+                str(proposal_id): parent_id for proposal_id, parent_id in parent_by_id.items()
+            },
+            "generic_rolling_real_commit_parent_by_proposal_id": {
+                str(proposal_id): parent_id
+                for proposal_id, parent_id in parent_by_id.items()
+                if proposal_id in committed_ids
+            },
+            "generic_rolling_root_by_proposal_id": {
+                str(proposal_id): int(root_id) for proposal_id in proposal_id_by_depth.values()
+            },
+            "generic_rolling_real_commit_root_by_proposal_id": {
+                str(proposal_id): int(root_id) for proposal_id in committed_ids
+            },
+            "generic_rolling_depth_by_proposal_id": {
+                str(proposal_id): depth for proposal_id, depth in depth_by_id.items()
+            },
+            "generic_rolling_real_commit_depth_by_proposal_id": {
+                str(proposal_id): depth_by_id[proposal_id] for proposal_id in committed_ids
+            },
+            "generic_rolling_source_dual_step_id_by_proposal_id": {
+                str(proposal_id): step for proposal_id, step in source_step_by_id.items()
+            },
+            "generic_rolling_token_count_by_proposal_id": {
+                str(proposal_id): token_count for proposal_id, token_count in token_by_id.items()
+            },
+            "generic_rolling_proposal_token_ids_by_proposal_id": {
+                str(proposal_id): [proposal_id, proposal_id + 1, proposal_id + 2, proposal_id + 3]
+                for proposal_id in token_by_id
+            },
+            "generic_rolling_to_be_verified_token_ids_by_proposal_id": {
+                str(proposal_id): [proposal_id, proposal_id + 1, proposal_id + 2, proposal_id + 3]
+                for proposal_id in token_by_id
+            },
+            "generic_rolling_to_verify_equals_proposal_by_proposal_id": {
+                str(proposal_id): True for proposal_id in token_by_id
+            },
+            "generic_rolling_real_committed_token_count_by_proposal_id": {
+                str(proposal_id): gamma for proposal_id in committed_ids
+            },
+            "generic_rolling_real_committed_accept_len_by_proposal_id": {
+                str(proposal_id): gamma for proposal_id in committed_ids
+            },
+            "generic_rolling_real_commit_action_by_proposal_id": {
+                str(proposal_id): "append_full_accept_real_commit" for proposal_id in committed_ids
+            },
+            "generic_rolling_real_commit_verify_result_by_proposal_id": {
+                str(proposal_id): "full_accept" for proposal_id in committed_ids
+            },
+            "generic_rolling_real_committed_token_count_by_depth": {
+                str(depth): gamma for depth in depths if int(depth) in committed_depths
+            },
+            "generic_rolling_real_committed_proposal_count_by_depth": {
+                str(depth): 1 for depth in depths if int(depth) in committed_depths
+            },
+            "generic_full_continuous_depth_candidate_token_counts": {
+                str(depth): gamma for depth in depths
+            },
+            "generic_full_continuous_depth_ready_token_counts": {str(depth): gamma for depth in depths},
+            "generic_full_continuous_depth_commit_token_counts": {
+                str(depth): gamma for depth in committed_depths
+            },
+            "unified_generic_depth_candidate_token_counts": {str(depth): gamma for depth in depths},
+            "unified_generic_depth_ready_token_counts": {str(depth): gamma for depth in depths},
+            "unified_generic_depth_commit_token_counts": {
+                str(depth): gamma for depth in committed_depths
+            },
+            "generic_full_continuous_total_full_commit_token_count": total_full,
+            "generic_full_continuous_total_partial_recovered_token_count": 0,
+            "generic_full_continuous_total_revised_token_count": 0,
+            "generic_full_continuous_total_output_token_count": total_full,
+            "unified_generic_total_full_commit_token_count": total_full,
+            "unified_generic_total_partial_recovered_token_count": 0,
+            "unified_generic_total_revised_token_count": 0,
+            "unified_generic_total_output_token_count": total_full,
+            "combined_real_committed_token_count": total_full,
+            "partial_prefix_recovery_enabled": True,
+            "partial_prefix_recovered_proposal_ids": [],
+            "partial_prefix_accepted_len_by_proposal_id": {},
+            "partial_prefix_revised_token_count_by_proposal_id": {},
+            "partial_prefix_committed_token_count_by_proposal_id": {},
+            "generic_full_continuous_stop_reason_counts": {str(stop_reason): 1},
+            "generic_full_continuous_normal_lane_conflict_count": 0,
+            "generic_full_continuous_target_draft_mismatch_count": 0,
+            "generic_full_continuous_depth_gt_max_real_commit_count": 0,
+            "generic_full_continuous_parity_ok": True,
+            "unified_generic_normal_lane_conflict_count": 0,
+            "unified_generic_target_draft_mismatch_count": 0,
+            "unified_generic_parity_ok": True,
+        }
+        records.append(record)
+    return records
+
+
 def run_synthetic_tests() -> None:
     records = synthetic_records()
     payload = synthetic_payload(total_output_tokens=27)
@@ -1866,6 +2232,49 @@ def run_synthetic_tests() -> None:
     assert reject_partial_summary["total_partial_recovered_token_count"] == 2
     assert reject_partial_summary["unified_generic_target_verify_temp_append_used"] is True
 
+    single_child_pass = synthetic_single_child_records([[1], [2], [3]])
+    errors, single_child_summary = validate_records(single_child_pass, synthetic_single_child_payload())
+    assert not errors, f"single-child-ahead pass synthetic failed: {errors}\nsummary={single_child_summary}"
+    assert single_child_summary["unified_single_child_ahead_enabled"] is True
+    assert single_child_summary["unified_unverified_depth_ahead_max_observed"] <= 1
+
+    aggressive_under_flag = synthetic_single_child_records([[1, 2, 3, 4]])
+    errors, aggressive_summary = validate_records(aggressive_under_flag, synthetic_single_child_payload())
+    assert any("single-child-ahead" in error or "grandchild" in error for error in errors), (
+        f"aggressive burst under single-child flag should fail: errors={errors}\nsummary={aggressive_summary}"
+    )
+
+    parent_reject_one_child = synthetic_single_child_records([[1, 2]], stop_reason="parent_not_full_accept")
+    errors, reject_one_child_summary = validate_records(parent_reject_one_child, synthetic_single_child_payload())
+    assert not errors, f"parent reject with one child should pass: {errors}\nsummary={reject_one_child_summary}"
+    assert reject_one_child_summary["unified_unverified_depth_ahead_max_observed"] == 1
+
+    parent_partial_one_child = synthetic_single_child_records([[1, 2]], stop_reason="partial_recovery_selected")
+    errors, partial_one_child_summary = validate_records(parent_partial_one_child, synthetic_single_child_payload())
+    assert not errors, f"parent partial with one child should pass: {errors}\nsummary={partial_one_child_summary}"
+
+    parent_full_next_child = synthetic_single_child_records([[1], [2]], committed_depths={1, 2})
+    errors, full_next_summary = validate_records(parent_full_next_child, synthetic_single_child_payload())
+    assert not errors, f"parent full accept next child should pass: {errors}\nsummary={full_next_summary}"
+    assert full_next_summary["max_real_committed_depth"] == 2
+
+    default_aggressive = synthetic_single_child_records(
+        [[1, 2, 3, 4, 5]],
+        max_unverified_ahead=0,
+        committed_depths={1, 2, 3, 4, 5},
+    )
+    errors, default_aggressive_summary = validate_records(
+        default_aggressive,
+        synthetic_single_child_payload(max_unverified_ahead=0),
+    )
+    assert not errors, f"default aggressive compatibility should pass: {errors}\nsummary={default_aggressive_summary}"
+    assert default_aggressive_summary["unified_single_child_ahead_enabled"] is False
+
+    finished_one_child = synthetic_single_child_records([[1]], stop_reason="sequence_finished")
+    errors, finished_summary = validate_records(finished_one_child, synthetic_single_child_payload())
+    assert not errors, f"sequence finished single-child synthetic should pass: {errors}\nsummary={finished_summary}"
+    assert finished_summary["unified_sequence_finished_count_by_depth"]
+
     missing_target_verify = [dict(records[0])]
     missing_target_verify[0]["unified_raw_target_verification_available"] = False
     missing_target_verify[0]["unified_raw_verification_source"] = "draft_commit_decision_no_target_verify"
@@ -1939,6 +2348,20 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
         "unified_raw_no_mutation_reject_proposal_count_by_depth",
         "unified_raw_verified_to_committed_ratio_by_depth",
+        "unified_candidate_waste_ratio_by_depth",
+        "unified_invalidated_candidate_ratio_by_depth",
+        "unified_verified_candidate_ratio_by_depth",
+        "unified_committed_candidate_ratio_by_depth",
+        "unified_single_child_ahead_enabled",
+        "unified_max_unverified_depth_ahead",
+        "unified_unverified_depth_ahead_max_observed",
+        "unified_unverified_depth_ahead_by_chain",
+        "unified_single_child_ahead_violation_count",
+        "unified_single_child_ahead_violation_examples",
+        "unified_generated_grandchild_before_parent_verified_count",
+        "unified_generated_grandchild_before_parent_verified_examples",
+        "unified_candidate_depth_created_before_parent_verified_count_by_depth",
+        "unified_candidate_depth_created_after_parent_verified_count_by_depth",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
         "unified_generic_target_verify_temp_append_used",

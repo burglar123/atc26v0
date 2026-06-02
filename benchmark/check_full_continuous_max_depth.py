@@ -190,6 +190,12 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             "enable_generic_rolling_apply_path",
         )
         or bool(result_args.get("enable_generic_rolling_apply_path", False)),
+        "unified_single_child_ahead_enabled": _bool_any(records, "unified_single_child_ahead_enabled")
+        or int_value(result_args.get("unified_generic_max_unverified_depth_ahead"), 0) == 1,
+        "unified_max_unverified_depth_ahead": max(
+            _max_int(records, "unified_max_unverified_depth_ahead"),
+            int_value(result_args.get("unified_generic_max_unverified_depth_ahead"), 0),
+        ),
         "generic_full_continuous_parity_ok": all(
             bool(record.get("generic_full_continuous_parity_ok", True))
             for record in records
@@ -438,7 +444,8 @@ def validate_records(
         errors.append("stop reason counts must explain chains that stop before max depth")
     if not bool(summary.get("generic_full_continuous_parity_ok", False)):
         errors.append("generic_full_continuous_parity_ok must be true")
-    if require_depth_gt4_activity:
+    single_child_ahead_enabled = bool(summary.get("unified_single_child_ahead_enabled", False))
+    if require_depth_gt4_activity and not single_child_ahead_enabled:
         activity_depths: set[int] = set()
         for field in (
             "generic_full_continuous_depth_commit_token_counts",
@@ -471,6 +478,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_enabled",
         "generic_rolling_runtime_enabled",
         "generic_rolling_apply_path_enabled",
+        "unified_single_child_ahead_enabled",
+        "unified_max_unverified_depth_ahead",
         "generic_full_continuous_max_depth",
         "generic_full_continuous_max_observed_depth",
         "generic_full_continuous_max_real_committed_depth",
@@ -740,6 +749,29 @@ def run_synthetic() -> None:
     )
     if not any("depth>4" in error for error in errors):
         raise SystemExit(f"synthetic require depth>4 should fail\nerrors={errors}\nsummary={summary}")
+
+    conservative_depth4 = [_base_record(max_depth=8, max_observed=1, max_real=0, combined=0)]
+    conservative_depth4[0].update(
+        {
+            "unified_generic_rolling_enabled": True,
+            "enable_unified_generic_rolling_runtime": True,
+            "unified_single_child_ahead_enabled": True,
+            "unified_max_unverified_depth_ahead": 1,
+            "unified_generic_max_depth": 8,
+            "unified_generic_max_observed_depth": 1,
+            "unified_generic_max_real_committed_depth": 0,
+            "generic_full_continuous_depth_commit_token_counts": {},
+            "generic_full_continuous_total_full_commit_token_count": 0,
+            "generic_full_continuous_total_output_token_count": 0,
+        }
+    )
+    errors, summary = validate_records(
+        conservative_depth4,
+        synthetic_result_payload(),
+        require_depth_gt4_activity=True,
+    )
+    if errors:
+        raise SystemExit(f"synthetic single-child depth>4 exception should pass: {errors}\nsummary={summary}")
 
     target_reject_early = [
         _base_record(

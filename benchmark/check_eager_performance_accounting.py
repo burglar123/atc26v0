@@ -439,6 +439,18 @@ def sum_trace_counter_fields(records: list[dict[str, Any]], *fields: str) -> dic
     return dict(sorted(counter.items()))
 
 
+def max_trace_counter_fields(records: list[dict[str, Any]], *fields: str) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for record in records:
+        for field in fields:
+            value = record.get(field)
+            if not isinstance(value, dict):
+                continue
+            for key, count in value.items():
+                merged[str(key)] = max(int(merged.get(str(key), 0)), int_value(count, 0))
+    return dict(sorted(merged.items()))
+
+
 def sum_trace_depth_reason_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, dict[str, int]]:
     by_depth: dict[str, Counter[str]] = {}
     for record in records:
@@ -588,6 +600,28 @@ def unified_8z_diagnostics(records: list[dict[str, Any]]) -> dict[str, Any]:
         depth: safe_div(float(committed.get(depth, 0)), float(verified.get(depth, 0)))
         for depth in sorted(set(verified) | set(committed), key=int)
     }
+    candidate = diagnostics["unified_raw_candidate_proposal_count_by_depth"]
+    invalidated = diagnostics["unified_raw_invalidated_proposal_count_by_depth"]
+    wasted = {
+        depth: max(0, int_value(candidate.get(depth), 0) - int_value(committed.get(depth), 0))
+        for depth in sorted(set(candidate) | set(committed), key=int)
+    }
+    diagnostics["unified_candidate_waste_ratio_by_depth"] = {
+        depth: safe_div(float(wasted.get(depth, 0)), float(candidate.get(depth, 0)))
+        for depth in sorted(set(wasted) | set(candidate), key=int)
+    }
+    diagnostics["unified_invalidated_candidate_ratio_by_depth"] = {
+        depth: safe_div(float(invalidated.get(depth, 0)), float(candidate.get(depth, 0)))
+        for depth in sorted(set(invalidated) | set(candidate), key=int)
+    }
+    diagnostics["unified_verified_candidate_ratio_by_depth"] = {
+        depth: safe_div(float(verified.get(depth, 0)), float(candidate.get(depth, 0)))
+        for depth in sorted(set(verified) | set(candidate), key=int)
+    }
+    diagnostics["unified_committed_candidate_ratio_by_depth"] = {
+        depth: safe_div(float(committed.get(depth, 0)), float(candidate.get(depth, 0)))
+        for depth in sorted(set(committed) | set(candidate), key=int)
+    }
     sources = sorted(
         {
             str(record.get("unified_raw_verification_source"))
@@ -622,6 +656,34 @@ def unified_8z_diagnostics(records: list[dict[str, Any]]) -> dict[str, Any]:
             "unified_active_seq_count_by_step": sum_trace_counter_fields(records, "unified_active_seq_count_by_step"),
             "unified_ready_parent_count_by_step": sum_trace_counter_fields(records, "unified_ready_parent_count_by_step"),
             "unified_committed_seq_count_by_step": sum_trace_counter_fields(records, "unified_committed_seq_count_by_step"),
+            "unified_single_child_ahead_enabled": any(
+                bool(record.get("unified_single_child_ahead_enabled", False)) for record in records
+            ),
+            "unified_max_unverified_depth_ahead": max_trace_int(records, "unified_max_unverified_depth_ahead"),
+            "unified_unverified_depth_ahead_max_observed": max_trace_int(
+                records,
+                "unified_unverified_depth_ahead_max_observed",
+            ),
+            "unified_unverified_depth_ahead_by_chain": max_trace_counter_fields(
+                records,
+                "unified_unverified_depth_ahead_by_chain",
+            ),
+            "unified_single_child_ahead_violation_count": sum_trace_int(
+                records,
+                "unified_single_child_ahead_violation_count",
+            ),
+            "unified_generated_grandchild_before_parent_verified_count": sum_trace_int(
+                records,
+                "unified_generated_grandchild_before_parent_verified_count",
+            ),
+            "unified_candidate_depth_created_before_parent_verified_count_by_depth": sum_trace_depth_counts(
+                records,
+                "unified_candidate_depth_created_before_parent_verified_count_by_depth",
+            ),
+            "unified_candidate_depth_created_after_parent_verified_count_by_depth": sum_trace_depth_counts(
+                records,
+                "unified_candidate_depth_created_after_parent_verified_count_by_depth",
+            ),
         }
     )
     return diagnostics
@@ -3325,6 +3387,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
         "unified_raw_no_mutation_reject_proposal_count_by_depth",
         "unified_raw_verified_to_committed_ratio_by_depth",
+        "unified_candidate_waste_ratio_by_depth",
+        "unified_invalidated_candidate_ratio_by_depth",
+        "unified_verified_candidate_ratio_by_depth",
+        "unified_committed_candidate_ratio_by_depth",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",
         "unified_candidate_budget_saturated_step_count",
@@ -3345,6 +3411,14 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_active_seq_count_by_step",
         "unified_ready_parent_count_by_step",
         "unified_committed_seq_count_by_step",
+        "unified_single_child_ahead_enabled",
+        "unified_max_unverified_depth_ahead",
+        "unified_unverified_depth_ahead_max_observed",
+        "unified_unverified_depth_ahead_by_chain",
+        "unified_single_child_ahead_violation_count",
+        "unified_generated_grandchild_before_parent_verified_count",
+        "unified_candidate_depth_created_before_parent_verified_count_by_depth",
+        "unified_candidate_depth_created_after_parent_verified_count_by_depth",
         "generic_full_continuous_total_full_commit_token_count",
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",

@@ -171,6 +171,7 @@ class PEARLConfig:
     max_rolling_continuous_depth: int = 2
     max_rolling_continuous_draft_children_per_step: int = 2
     max_rolling_continuous_seqs_per_step: int = 2
+    unified_generic_max_unverified_depth_ahead: int = 0
     enable_cached_admission: bool = False
     cached_prefill_mode: str = "metadata_only"
     cached_admission_policy: str = "fifo"
@@ -362,6 +363,7 @@ class PEARLConfig:
             "max_rolling_continuous_depth",
             "max_rolling_continuous_draft_children_per_step",
             "max_rolling_continuous_seqs_per_step",
+            "unified_generic_max_unverified_depth_ahead",
         ):
             value = int(getattr(self, field_name))
             if value < 0:
@@ -537,6 +539,10 @@ class PEARLConfig:
             f"{self.max_rolling_continuous_draft_children_per_step}"
         )
         logger.info(f"Max_Rolling_Continuous_Seqs_Per_Step={self.max_rolling_continuous_seqs_per_step}")
+        logger.info(
+            "Unified_Generic_Max_Unverified_Depth_Ahead="
+            f"{self.unified_generic_max_unverified_depth_ahead}"
+        )
         logger.info(f"Enable_Cached_Admission={self.enable_cached_admission}")
         logger.info(f"Cached_Prefill_Mode={self.cached_prefill_mode}")
         logger.info(f"Cached_Admission_Policy={self.cached_admission_policy}")
