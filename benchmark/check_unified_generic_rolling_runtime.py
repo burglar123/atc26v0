@@ -1728,6 +1728,22 @@ def synthetic_reject_partial_records() -> list[dict[str, Any]]:
             "unified_generic_parity_ok": True,
         }
     add_synthetic_temp_append_trace(record, proposal_tokens_by_id)
+    shifted_accept_by_id = {proposal_id: 0 for proposal_id in proposal_ids}
+    shifted_accept_by_id[partial_id] = 1
+    shifted_accept_hist = {"1": {"0": len(proposal_ids) - 1, "1": 1}}
+    record["unified_generic_target_verify_shifted_mapping_accept_hist_by_depth"] = {
+        depth: dict(hist) for depth, hist in shifted_accept_hist.items()
+    }
+    record["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = {
+        depth: dict(hist) for depth, hist in shifted_accept_hist.items()
+    }
+    record["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] = True
+    record["unified_generic_target_verify_proposal_window_shadow_accepted_len_by_proposal_id"] = {
+        str(proposal_id): int(accepted_len) for proposal_id, accepted_len in shifted_accept_by_id.items()
+    }
+    record["unified_generic_target_verify_shifted_accepted_len_by_proposal_id"] = {
+        str(proposal_id): int(accepted_len) for proposal_id, accepted_len in shifted_accept_by_id.items()
+    }
     return [record]
 
 

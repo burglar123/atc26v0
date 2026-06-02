@@ -14684,8 +14684,9 @@ class ModelRunnerBase:
                     temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
                     torch.cuda.synchronize()
                     logits = self.run_model(input_ids, positions, False)
-                    target_verify_logits_rows += int(logits.shape[0])
-                    target_verify_logits_width = int(logits.shape[1]) if len(logits.shape) > 1 else 0
+                    target_verify_logits_width = (
+                        max(target_verify_logits_width, int(logits.shape[1])) if len(logits.shape) > 1 else 0
+                    )
                     if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
                         target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
                     aligned_logits_rows: list[torch.Tensor] = []
@@ -14721,8 +14722,12 @@ class ModelRunnerBase:
                         else None
                     )
                     target_verify_uses_shifted_logits = True
-                    target_verify_logits_rows = int(aligned_logits.shape[0])
-                    target_verify_logits_width = int(aligned_logits.shape[1]) if len(aligned_logits.shape) > 1 else 0
+                    target_verify_logits_rows += int(aligned_logits.shape[0])
+                    target_verify_logits_width = (
+                        max(target_verify_logits_width, int(aligned_logits.shape[1]))
+                        if len(aligned_logits.shape) > 1
+                        else target_verify_logits_width
+                    )
                     target_verify_rows_per_proposal = (
                         int(aligned_logits.shape[0]) // len(temp_entries)
                         if len(temp_entries) > 0 and int(aligned_logits.shape[0]) % len(temp_entries) == 0
