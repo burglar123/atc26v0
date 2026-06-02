@@ -152,6 +152,13 @@ def sum_counter_fields(records: list[dict[str, Any]], *fields: str) -> dict[str,
     return dict(sorted(counter.items()))
 
 
+def merge_int_lists(records: list[dict[str, Any]], field: str) -> list[int]:
+    values: set[int] = set()
+    for record in records:
+        values.update(as_int_list(record.get(field)))
+    return sorted(values)
+
+
 def sum_depth_reason_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, dict[str, int]]:
     by_depth: dict[str, Counter[str]] = defaultdict(Counter)
     for record in records:
@@ -340,6 +347,10 @@ def raw_and_budget_summary(
         "unified_raw_partial_recovery_eligible_count_by_depth",
         "unified_raw_candidate_proposal_count_by_depth",
         "unified_raw_committed_proposal_count_by_depth",
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+        "unified_raw_no_mutation_reject_proposal_count_by_depth",
     ]
     summary: dict[str, Any] = {}
     for field in raw_fields:
@@ -361,6 +372,18 @@ def raw_and_budget_summary(
         if has_trace_field(records, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth")
         else fallback["unified_raw_partial_recovery_ineligible_reason_counts_by_depth"]
     )
+    split_committed: dict[str, int] = {}
+    for field in (
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+    ):
+        for depth, count in summary.get(field, {}).items():
+            split_committed[str(depth)] = int(split_committed.get(str(depth), 0)) + int_value(count, 0)
+    if split_committed:
+        summary["unified_raw_committed_proposal_count_by_depth"] = dict(
+            sorted(split_committed.items(), key=lambda item: int(item[0]))
+        )
     verified = summary["unified_raw_verified_proposal_count_by_depth"]
     committed = summary["unified_raw_committed_proposal_count_by_depth"]
     summary["unified_raw_verified_to_committed_ratio_by_depth"] = {
@@ -405,6 +428,24 @@ def raw_and_budget_summary(
             "unified_commit_limited_by_seq_budget_count": sum_record_int(records, "unified_commit_limited_by_seq_budget_count"),
             "unified_commit_limited_by_no_ready_parent_count": sum_record_int(records, "unified_commit_limited_by_no_ready_parent_count"),
             "unified_commit_limited_by_parent_not_full_accept_count": sum_record_int(records, "unified_commit_limited_by_parent_not_full_accept_count"),
+            "unified_cascade_discard_count": len(merge_int_lists(records, "unified_cascade_discard_proposal_ids")),
+            "unified_cascade_discard_proposal_ids": merge_int_lists(records, "unified_cascade_discard_proposal_ids"),
+            "unified_cascade_discard_parent_proposal_ids": merge_int_lists(
+                records,
+                "unified_cascade_discard_parent_proposal_ids",
+            ),
+            "unified_cascade_discard_reason_counts": sum_counter_fields(
+                records,
+                "unified_cascade_discard_reason_counts",
+            ),
+            "unified_invalidated_due_to_parent_not_full_accept_count_by_depth": sum_depth_counts(
+                records,
+                "unified_invalidated_due_to_parent_not_full_accept_count_by_depth",
+            ),
+            "unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth": merge_depth_lists(
+                records,
+                "unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth",
+            ),
             "unified_no_candidate_step_count": (
                 sum_record_int(records, "unified_no_candidate_step_count")
                 if has_trace_field(records, "unified_no_candidate_step_count")
@@ -773,8 +814,36 @@ def validate_records(
         errors.append("max observed depth exceeds configured max depth")
     if max_real > max_depth:
         errors.append("max real committed depth exceeds configured max depth")
-    if max_depth > 4 and max_real <= 4:
+    raw_verified_total = sum(int_value(value, 0) for value in summary["unified_raw_verified_proposal_count_by_depth"].values())
+    raw_full_total = sum(int_value(value, 0) for value in summary["unified_raw_full_accept_proposal_count_by_depth"].values())
+    target_verified_reject_only = bool(
+        summary.get("unified_raw_target_verification_available")
+        and raw_verified_total > 0
+        and raw_full_total == 0
+    )
+    if max_depth > 4 and max_real <= 4 and not target_verified_reject_only:
         errors.append("max real committed depth must exceed 4 when configured max depth exceeds 4")
+
+    split_committed: dict[str, int] = {}
+    for field in (
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+    ):
+        for depth, count in summary.get(field, {}).items():
+            split_committed[str(depth)] = int(split_committed.get(str(depth), 0)) + int_value(count, 0)
+    if split_committed and split_committed != summary.get("unified_raw_committed_proposal_count_by_depth", {}):
+        errors.append("raw committed proposal count must equal applied full/partial/reject-correction counts")
+    reject_total = sum(int_value(value, 0) for value in summary["unified_raw_reject_proposal_count_by_depth"].values())
+    no_mutation_reject_total = sum(
+        int_value(value, 0) for value in summary.get("unified_raw_no_mutation_reject_proposal_count_by_depth", {}).values()
+    )
+    reject_correction_total = sum(
+        int_value(value, 0)
+        for value in summary.get("unified_raw_reject_revised_correction_applied_proposal_count_by_depth", {}).values()
+    )
+    if reject_total and no_mutation_reject_total + reject_correction_total > reject_total:
+        errors.append("reject apply counters must not exceed raw reject outcomes")
 
     total_full = int_value(summary["total_full_commit_token_count"], 0)
     total_partial = int_value(summary["total_partial_recovered_token_count"], 0)
@@ -946,7 +1015,99 @@ def synthetic_records() -> list[dict[str, Any]]:
             "unified_raw_committed_proposal_count_by_depth": {
                 str(depth): 1 for depth in ids_by_depth
             },
+            "unified_raw_full_commit_proposal_count_by_depth": {
+                str(depth): 1 for depth in ids_by_depth
+            },
+            "unified_raw_partial_recovery_applied_proposal_count_by_depth": {},
+            "unified_raw_reject_revised_correction_applied_proposal_count_by_depth": {},
+            "unified_raw_no_mutation_reject_proposal_count_by_depth": {},
             "generic_full_continuous_stop_reason_counts": {"max_depth_reached": 1},
+            "generic_full_continuous_normal_lane_conflict_count": 0,
+            "generic_full_continuous_target_draft_mismatch_count": 0,
+            "generic_full_continuous_depth_gt_max_real_commit_count": 0,
+            "generic_full_continuous_parity_ok": True,
+            "unified_generic_normal_lane_conflict_count": 0,
+            "unified_generic_target_draft_mismatch_count": 0,
+            "unified_generic_parity_ok": True,
+        }
+    ]
+
+
+def synthetic_reject_partial_records() -> list[dict[str, Any]]:
+    proposal_ids = list(range(3001, 3181))
+    partial_id = proposal_ids[-1]
+    token_by_id = {proposal_id: 4 for proposal_id in proposal_ids}
+    return [
+        {
+            "normal_gamma": 4,
+            "unified_generic_rolling_enabled": True,
+            "enable_unified_generic_rolling_runtime": True,
+            "generic_full_continuous_enabled": True,
+            "enable_full_continuous_eager": True,
+            "generic_rolling_runtime_enabled": True,
+            "enable_generic_rolling_runtime_loop": True,
+            "generic_rolling_apply_path_enabled": True,
+            "enable_generic_rolling_apply_path": True,
+            "unified_generic_max_depth": 8,
+            "unified_generic_max_observed_depth": 1,
+            "unified_generic_max_real_committed_depth": 0,
+            "generic_full_continuous_max_depth": 8,
+            "generic_full_continuous_max_observed_depth": 1,
+            "generic_full_continuous_max_real_committed_depth": 0,
+            "generic_rolling_candidate_proposal_ids_by_depth": {"1": proposal_ids},
+            "generic_rolling_candidate_seq_ids_by_depth": {"1": list(range(4001, 4181))},
+            "generic_rolling_ready_proposal_ids_by_depth": {"1": proposal_ids},
+            "generic_rolling_ready_seq_ids_by_depth": {"1": list(range(4001, 4181))},
+            "generic_rolling_real_committed_proposal_ids_by_depth": {},
+            "generic_rolling_real_committed_seq_ids_by_depth": {},
+            "generic_rolling_depth_by_proposal_id": {str(proposal_id): 1 for proposal_id in proposal_ids},
+            "generic_rolling_token_count_by_proposal_id": {
+                str(proposal_id): token_count for proposal_id, token_count in token_by_id.items()
+            },
+            "generic_full_continuous_depth_candidate_token_counts": {"1": 720},
+            "generic_full_continuous_depth_ready_token_counts": {"1": 720},
+            "unified_generic_depth_candidate_token_counts": {"1": 720},
+            "unified_generic_depth_ready_token_counts": {"1": 720},
+            "generic_full_continuous_total_full_commit_token_count": 0,
+            "generic_full_continuous_total_partial_recovered_token_count": 2,
+            "generic_full_continuous_total_revised_token_count": 1,
+            "generic_full_continuous_total_output_token_count": 2,
+            "unified_generic_total_full_commit_token_count": 0,
+            "unified_generic_total_partial_recovered_token_count": 2,
+            "unified_generic_total_revised_token_count": 1,
+            "unified_generic_total_output_token_count": 2,
+            "combined_real_committed_token_count": 2,
+            "partial_prefix_recovery_enabled": True,
+            "partial_prefix_recovered_proposal_ids": [partial_id],
+            "partial_prefix_recovered_seq_ids": [4180],
+            "partial_prefix_recovered_depth_by_proposal_id": {str(partial_id): 1},
+            "partial_prefix_accepted_len_by_proposal_id": {str(partial_id): 1},
+            "partial_prefix_revised_token_count_by_proposal_id": {str(partial_id): 1},
+            "partial_prefix_committed_token_count_by_proposal_id": {str(partial_id): 2},
+            "generic_full_continuous_depth_partial_recovered_token_counts": {"1": 2},
+            "generic_full_continuous_depth_revised_token_counts": {"1": 1},
+            "unified_generic_depth_partial_recovered_token_counts": {"1": 2},
+            "unified_generic_depth_revised_token_counts": {"1": 1},
+            "unified_raw_target_verification_available": True,
+            "unified_raw_verification_source": "target_verify_result",
+            "unified_raw_verified_proposal_count_by_depth": {"1": 180},
+            "unified_raw_full_accept_proposal_count_by_depth": {},
+            "unified_raw_partial_accept_proposal_count_by_depth": {"1": 1},
+            "unified_raw_reject_proposal_count_by_depth": {"1": 179},
+            "unified_raw_invalidated_proposal_count_by_depth": {},
+            "unified_raw_accepted_len_hist_by_depth": {"1": {"0": 179, "1": 1}},
+            "unified_raw_revised_token_count_by_depth": {"1": 180},
+            "unified_raw_partial_recovery_eligible_count_by_depth": {"1": 1},
+            "unified_raw_partial_recovery_ineligible_reason_counts_by_depth": {
+                "1": {"partial_recovery_not_selected": 179}
+            },
+            "unified_raw_candidate_proposal_count_by_depth": {"1": 180},
+            "unified_raw_committed_proposal_count_by_depth": {"1": 1},
+            "unified_raw_full_commit_proposal_count_by_depth": {},
+            "unified_raw_partial_recovery_applied_proposal_count_by_depth": {"1": 1},
+            "unified_raw_reject_revised_correction_applied_proposal_count_by_depth": {},
+            "unified_raw_no_mutation_reject_proposal_count_by_depth": {"1": 179},
+            "generic_full_continuous_stop_reason_counts": {"parent_not_full_accept": 179},
             "generic_full_continuous_normal_lane_conflict_count": 0,
             "generic_full_continuous_target_draft_mismatch_count": 0,
             "generic_full_continuous_depth_gt_max_real_commit_count": 0,
@@ -973,6 +1134,20 @@ def run_synthetic_tests() -> None:
     assert summary["num_steps"] == 1
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
+
+    reject_partial_records = synthetic_reject_partial_records()
+    errors, reject_partial_summary = validate_records(
+        reject_partial_records,
+        synthetic_payload(total_output_tokens=2),
+    )
+    assert not errors, f"reject/partial target synthetic failed: {errors}\nsummary={reject_partial_summary}"
+    assert reject_partial_summary["max_real_committed_depth"] == 0
+    assert reject_partial_summary["unified_raw_reject_proposal_count_by_depth"]["1"] == 179
+    assert reject_partial_summary["unified_raw_no_mutation_reject_proposal_count_by_depth"]["1"] == 179
+    assert reject_partial_summary["unified_raw_revised_token_count_by_depth"]["1"] == 180
+    assert reject_partial_summary["unified_raw_partial_recovery_applied_proposal_count_by_depth"]["1"] == 1
+    assert reject_partial_summary["partial_prefix_revised_token_count"] == 1
+    assert reject_partial_summary["total_partial_recovered_token_count"] == 2
 
     missing_target_verify = [dict(records[0])]
     missing_target_verify[0]["unified_raw_target_verification_available"] = False
@@ -1035,6 +1210,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
         "unified_raw_candidate_proposal_count_by_depth",
         "unified_raw_committed_proposal_count_by_depth",
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+        "unified_raw_no_mutation_reject_proposal_count_by_depth",
         "unified_raw_verified_to_committed_ratio_by_depth",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",
@@ -1049,6 +1228,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_commit_limited_by_seq_budget_count",
         "unified_commit_limited_by_no_ready_parent_count",
         "unified_commit_limited_by_parent_not_full_accept_count",
+        "unified_cascade_discard_count",
+        "unified_cascade_discard_proposal_ids",
+        "unified_cascade_discard_parent_proposal_ids",
+        "unified_cascade_discard_reason_counts",
+        "unified_invalidated_due_to_parent_not_full_accept_count_by_depth",
+        "unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth",
         "unified_no_candidate_step_count",
         "unified_no_commit_step_count",
         "unified_candidate_step_reason_counts",

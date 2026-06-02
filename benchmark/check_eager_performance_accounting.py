@@ -545,6 +545,10 @@ def unified_8z_diagnostics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "unified_raw_partial_recovery_eligible_count_by_depth",
         "unified_raw_candidate_proposal_count_by_depth",
         "unified_raw_committed_proposal_count_by_depth",
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+        "unified_raw_no_mutation_reject_proposal_count_by_depth",
     )
     diagnostics: dict[str, Any] = {}
     for field in raw_depth_fields:
@@ -566,6 +570,18 @@ def unified_8z_diagnostics(records: list[dict[str, Any]]) -> dict[str, Any]:
         if trace_has_field(records, "unified_raw_partial_recovery_ineligible_reason_counts_by_depth")
         else fallback["unified_raw_partial_recovery_ineligible_reason_counts_by_depth"]
     )
+    split_committed: dict[str, int] = {}
+    for field in (
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+    ):
+        for depth, count in diagnostics.get(field, {}).items():
+            split_committed[str(depth)] = int(split_committed.get(str(depth), 0)) + int_value(count, 0)
+    if split_committed:
+        diagnostics["unified_raw_committed_proposal_count_by_depth"] = dict(
+            sorted(split_committed.items(), key=lambda item: int(item[0]))
+        )
     verified = diagnostics["unified_raw_verified_proposal_count_by_depth"]
     committed = diagnostics["unified_raw_committed_proposal_count_by_depth"]
     diagnostics["unified_raw_verified_to_committed_ratio_by_depth"] = {
@@ -2667,6 +2683,26 @@ def generic_full_continuous_accounting_errors(accounting: dict[str, Any]) -> lis
         )
     ):
         errors.append("strict unified target verification must be available")
+    split_committed: dict[str, int] = {}
+    for field in (
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+    ):
+        raw = accounting.get(field)
+        if not isinstance(raw, dict):
+            continue
+        for depth, count in raw.items():
+            split_committed[str(depth)] = int(split_committed.get(str(depth), 0)) + int_value(count, 0)
+    if split_committed:
+        raw_committed = accounting.get("unified_raw_committed_proposal_count_by_depth")
+        raw_committed = raw_committed if isinstance(raw_committed, dict) else {}
+        committed = {
+            str(int(depth)): int_value(count, 0)
+            for depth, count in raw_committed.items()
+        }
+        if committed != dict(sorted(split_committed.items(), key=lambda item: int(item[0]))):
+            errors.append("raw committed proposal count must equal applied full/partial/reject-correction counts")
     total_full = int_value(accounting.get("generic_full_continuous_total_full_commit_token_count"), 0)
     total_partial = int_value(accounting.get("generic_full_continuous_total_partial_recovered_token_count"), 0)
     total_revised = int_value(accounting.get("generic_full_continuous_total_revised_token_count"), 0)
@@ -2715,7 +2751,10 @@ def generic_full_continuous_accounting_errors(accounting: dict[str, Any]) -> lis
     if accounting.get("repeated_commit_proposal_ids"):
         errors.append(f"duplicate commit proposal ids present: {accounting['repeated_commit_proposal_ids']}")
     if partial_enabled:
-        if int_value(accounting.get("partial_recovery_cascade_discard_count"), 0) != 0:
+        if (
+            not bool(accounting.get("unified_generic_rolling_enabled", False))
+            and int_value(accounting.get("partial_recovery_cascade_discard_count"), 0) != 0
+        ):
             errors.append("partial recovery cascade discard count must be zero in generic full continuous mode")
         if int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0) != 0:
             errors.append("partial recovery target/draft length mismatch count must be zero")
@@ -3178,6 +3217,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
         "unified_raw_candidate_proposal_count_by_depth",
         "unified_raw_committed_proposal_count_by_depth",
+        "unified_raw_full_commit_proposal_count_by_depth",
+        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+        "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
+        "unified_raw_no_mutation_reject_proposal_count_by_depth",
         "unified_raw_verified_to_committed_ratio_by_depth",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",

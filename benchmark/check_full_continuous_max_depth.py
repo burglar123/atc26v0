@@ -293,6 +293,21 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         records,
         "generic_full_continuous_stop_reason_counts",
     )
+    summary["unified_raw_target_verification_available"] = any(
+        bool(record.get("unified_raw_target_verification_available", False)) for record in records
+    )
+    summary["unified_raw_verified_proposal_count_by_depth"] = _merge_depth_counts(
+        records,
+        "unified_raw_verified_proposal_count_by_depth",
+    )
+    summary["unified_raw_full_accept_proposal_count_by_depth"] = _merge_depth_counts(
+        records,
+        "unified_raw_full_accept_proposal_count_by_depth",
+    )
+    summary["unified_raw_invalidated_proposal_count_by_depth"] = _merge_depth_counts(
+        records,
+        "unified_raw_invalidated_proposal_count_by_depth",
+    )
     return summary
 
 
@@ -330,6 +345,19 @@ def validate_records(
         errors.append("max observed depth must not exceed configured max depth")
     if max_real > max_depth:
         errors.append("max real committed depth must not exceed configured max depth")
+    raw_verified_total = sum(
+        int_value(value, 0)
+        for value in (summary.get("unified_raw_verified_proposal_count_by_depth") or {}).values()
+    )
+    raw_full_total = sum(
+        int_value(value, 0)
+        for value in (summary.get("unified_raw_full_accept_proposal_count_by_depth") or {}).values()
+    )
+    target_verified_no_full_accept = bool(
+        summary.get("unified_raw_target_verification_available")
+        and raw_verified_total > 0
+        and raw_full_total == 0
+    )
     if int_value(summary.get("generic_full_continuous_depth_gt_max_real_commit_count"), 0) != 0:
         errors.append("depth_gt_max real commit count must remain zero")
 
@@ -385,6 +413,8 @@ def validate_records(
             "generic_full_continuous_depth_ready_token_counts",
             "generic_full_continuous_depth_partial_recovered_token_counts",
             "generic_full_continuous_depth_revised_token_counts",
+            "unified_raw_verified_proposal_count_by_depth",
+            "unified_raw_invalidated_proposal_count_by_depth",
         ):
             raw = summary.get(field)
             if not isinstance(raw, dict):
@@ -397,7 +427,7 @@ def validate_records(
                     continue
                 if depth > 4 and count > 0:
                     activity_depths.add(depth)
-        if max(activity_depths or {0}) <= 4 and max_observed <= 4:
+        if max(activity_depths or {0}) <= 4 and max_observed <= 4 and not target_verified_no_full_accept:
             errors.append("full continuous mode must show real depth>4 candidate/ready/commit activity")
 
     return errors, summary
@@ -422,6 +452,10 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_total_revised_token_count",
         "generic_full_continuous_total_output_token_count",
         "generic_full_continuous_depth_gt_max_real_commit_count",
+        "unified_raw_target_verification_available",
+        "unified_raw_verified_proposal_count_by_depth",
+        "unified_raw_full_accept_proposal_count_by_depth",
+        "unified_raw_invalidated_proposal_count_by_depth",
         "generic_full_continuous_normal_lane_conflict_count",
         "generic_full_continuous_target_draft_mismatch_count",
         "generic_full_continuous_parity_ok",
@@ -673,6 +707,43 @@ def run_synthetic() -> None:
     )
     if not any("depth>4" in error for error in errors):
         raise SystemExit(f"synthetic require depth>4 should fail\nerrors={errors}\nsummary={summary}")
+
+    target_reject_early = [
+        _base_record(
+            max_depth=8,
+            max_observed=1,
+            max_real=0,
+            depth_commit_counts={"1": 0},
+            one_shot=0,
+            combined=0,
+            stop_reasons={"parent_not_full_accept": 1},
+        )
+    ]
+    target_reject_early[0].update(
+        {
+            "unified_generic_rolling_enabled": True,
+            "enable_unified_generic_rolling_runtime": True,
+            "unified_generic_max_depth": 8,
+            "unified_generic_max_observed_depth": 1,
+            "unified_generic_max_real_committed_depth": 0,
+            "unified_raw_target_verification_available": True,
+            "unified_raw_verified_proposal_count_by_depth": {"1": 180},
+            "unified_raw_full_accept_proposal_count_by_depth": {},
+            "unified_raw_reject_proposal_count_by_depth": {"1": 180},
+            "generic_full_continuous_depth_candidate_token_counts": {"1": 720},
+            "generic_full_continuous_depth_ready_token_counts": {"1": 720},
+            "generic_full_continuous_parity_ok": True,
+            "generic_full_continuous_total_full_commit_token_count": 0,
+            "generic_full_continuous_total_output_token_count": 0,
+        }
+    )
+    errors, summary = validate_records(
+        target_reject_early,
+        synthetic_result_payload(),
+        require_depth_gt4_activity=True,
+    )
+    if errors:
+        raise SystemExit(f"synthetic target-verified early reject should pass: {errors}\nsummary={summary}")
 
     errors, summary = validate_records(
         [_base_record(max_depth=100, max_observed=5, max_real=5, depth_commit_counts={"1": 8, "2": 8, "3": 8, "4": 8, "5": 4})],

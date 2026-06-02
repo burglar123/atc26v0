@@ -1566,7 +1566,17 @@ class ModelRunnerBase:
             "unified_raw_partial_recovery_ineligible_reason_counts_by_depth": {},
             "unified_raw_candidate_proposal_count_by_depth": {},
             "unified_raw_committed_proposal_count_by_depth": {},
+            "unified_raw_full_commit_proposal_count_by_depth": {},
+            "unified_raw_partial_recovery_applied_proposal_count_by_depth": {},
+            "unified_raw_reject_revised_correction_applied_proposal_count_by_depth": {},
+            "unified_raw_no_mutation_reject_proposal_count_by_depth": {},
             "unified_raw_verified_to_committed_ratio_by_depth": {},
+            "unified_cascade_discard_count": 0,
+            "unified_cascade_discard_proposal_ids": [],
+            "unified_cascade_discard_parent_proposal_ids": [],
+            "unified_cascade_discard_reason_counts": {},
+            "unified_invalidated_due_to_parent_not_full_accept_count_by_depth": {},
+            "unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth": {},
             "unified_candidate_budget_tokens_per_step": 0,
             "unified_candidate_budget_used_tokens_per_step": 0,
             "unified_candidate_budget_saturated_step_count": 0,
@@ -13958,6 +13968,76 @@ class ModelRunnerBase:
             "skip_reason": str(reason),
         }
 
+    def _record_unified_cascade_discard(
+        self,
+        trace_record: dict,
+        *,
+        proposal_id: int,
+        parent_id: int,
+        depth: int,
+        reason: str,
+    ) -> None:
+        if self.rank != self.global_config.target_config.master_rank:
+            return
+        proposal_id = int(proposal_id)
+        parent_id = int(parent_id)
+        depth = int(depth)
+        if proposal_id < 0 or depth < 1:
+            return
+        proposal_ids = set(self._trace_int_list(trace_record.get("unified_cascade_discard_proposal_ids")))
+        proposal_ids.add(proposal_id)
+        trace_record["unified_cascade_discard_proposal_ids"] = sorted(proposal_ids)
+        parent_ids = set(self._trace_int_list(trace_record.get("unified_cascade_discard_parent_proposal_ids")))
+        if parent_id >= 0:
+            parent_ids.add(parent_id)
+        trace_record["unified_cascade_discard_parent_proposal_ids"] = sorted(parent_ids)
+        trace_record["unified_cascade_discard_count"] = len(proposal_ids)
+        self._increment_trace_counter_map(
+            trace_record,
+            "unified_cascade_discard_reason_counts",
+            reason,
+        )
+        if reason == "parent_not_full_accept":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_invalidated_due_to_parent_not_full_accept_count_by_depth",
+                depth,
+                1,
+            )
+            by_depth = self._trace_depth_indexed_int_lists(
+                trace_record.get("unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth")
+            )
+            by_depth.setdefault(depth, [])
+            by_depth[depth] = sorted(set(by_depth[depth]) | {proposal_id})
+            trace_record["unified_invalidated_due_to_parent_not_full_accept_proposal_ids_by_depth"] = (
+                self._trace_depth_lists_to_json(by_depth)
+            )
+
+        # Existing partial-prefix checker consumes this legacy cascade field.
+        cascade_descendants = set(
+            self._trace_int_list(trace_record.get("partial_recovery_cascade_discarded_descendant_proposal_ids"))
+        )
+        cascade_descendants.add(proposal_id)
+        trace_record["partial_recovery_cascade_discarded_descendant_proposal_ids"] = sorted(cascade_descendants)
+        depth_by_id = self._trace_int_map(
+            trace_record.get("partial_recovery_cascade_discarded_descendant_depth_by_proposal_id")
+        )
+        depth_by_id[proposal_id] = depth
+        trace_record["partial_recovery_cascade_discarded_descendant_depth_by_proposal_id"] = (
+            self._trace_sorted_int_map(depth_by_id)
+        )
+        reason_by_id = {
+            int(k): str(v)
+            for k, v in (
+                trace_record.get("partial_recovery_cascade_discarded_descendant_reason_by_proposal_id") or {}
+            ).items()
+        }
+        reason_by_id[proposal_id] = str(reason)
+        trace_record["partial_recovery_cascade_discarded_descendant_reason_by_proposal_id"] = (
+            self._trace_sorted_str_map(reason_by_id)
+        )
+        trace_record["partial_recovery_cascade_discard_count"] = len(cascade_descendants)
+
     def _record_unified_raw_target_result(self, trace_record: dict, result: dict) -> None:
         if self.rank != self.global_config.target_config.master_rank:
             return
@@ -14118,6 +14198,14 @@ class ModelRunnerBase:
                     reason = "token_payload_missing"
                 if reason is not None:
                     result = self._generic_invalid_result(proposal, reason=reason)
+                    if reason == "parent_not_full_accept":
+                        self._record_unified_cascade_discard(
+                            trace_record,
+                            proposal_id=proposal_id,
+                            parent_id=parent_id,
+                            depth=depth,
+                            reason=reason,
+                        )
                     self._record_unified_raw_target_result(trace_record, result)
                     depth_results.append(result)
                     continue
@@ -14174,7 +14262,12 @@ class ModelRunnerBase:
                     if verify_result == "full_accept":
                         action = "append_full_accept_real_commit"
                         output_tokens = [int(token_id) for token_id in eager_proposal.proposal_token_ids]
-                    elif self._partial_prefix_recovery_enabled() and revised_token >= 0:
+                    elif (
+                        verify_result == "partial_accept"
+                        and 0 < accept_len < gamma
+                        and self._partial_prefix_recovery_enabled()
+                        and revised_token >= 0
+                    ):
                         action = "partial_prefix_recovery"
                         output_tokens = [
                             int(token_id) for token_id in eager_proposal.proposal_token_ids[:max(0, accept_len)]
@@ -14562,10 +14655,10 @@ class ModelRunnerBase:
             min_depth = 1 if unified_enabled else 5
             full_commit = verify_result == "full_accept" and action == "append_full_accept_real_commit"
             partial_recovery = (
-                verify_result in {"partial_accept", "reject_at_first_token"}
+                verify_result == "partial_accept"
                 and action == "partial_prefix_recovery"
                 and revised_token >= 0
-                and 0 <= accept_len < token_count
+                and 0 < accept_len < token_count
             )
             no_mutation_result = (
                 verify_result == "skipped_invalid"
@@ -14630,6 +14723,13 @@ class ModelRunnerBase:
                         trace_record["unified_commit_limited_by_no_ready_parent_count"] = int(
                             trace_record.get("unified_commit_limited_by_no_ready_parent_count", 0) or 0
                         ) + 1
+                    if verify_result == "reject_at_first_token" and action == "discard_reject_no_mutation":
+                        self._increment_trace_depth_counter(
+                            trace_record,
+                            "unified_raw_no_mutation_reject_proposal_count_by_depth",
+                            depth,
+                            1,
+                        )
                 continue
             if partial_recovery:
                 commit_tokens = proposal_tokens[:max(0, accept_len)] + [int(revised_token)]
@@ -14665,6 +14765,12 @@ class ModelRunnerBase:
                         depth,
                         1,
                     )
+                    self._increment_trace_depth_counter(
+                        trace_record,
+                        "unified_raw_partial_recovery_applied_proposal_count_by_depth",
+                        depth,
+                        1,
+                    )
                 continue
             seq.pre_verify = False
             seq.record_accepted(token_count)
@@ -14692,6 +14798,12 @@ class ModelRunnerBase:
                 self._increment_trace_depth_counter(
                     trace_record,
                     "unified_raw_committed_proposal_count_by_depth",
+                    depth,
+                    1,
+                )
+                self._increment_trace_depth_counter(
+                    trace_record,
+                    "unified_raw_full_commit_proposal_count_by_depth",
                     depth,
                     1,
                 )
