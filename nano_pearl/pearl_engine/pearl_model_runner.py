@@ -14520,7 +14520,7 @@ class ModelRunnerBase:
 
     def compute_unified_generic_verify_result_with_shifted_logits(
         self,
-        aligned_logits: torch.Tensor,
+        aligned_logits: torch.Tensor | None,
         seqs: list[Sequence],
         temperatures: torch.Tensor | None,
         proposals: list[EagerProposal],
@@ -14545,8 +14545,19 @@ class ModelRunnerBase:
         plan_context: dict[str, set[int]],
     ) -> list[dict]:
         gamma = int(self.gamma)
+        target_master_rank = int(self.global_config.target_config.master_rank)
+        logits_owner = bool(self.rank == target_master_rank and self.tp_params.local_rank == 0)
         trace_record["unified_raw_target_verification_available"] = True
         trace_record["unified_raw_verification_source"] = "target_verify_result"
+        trace_record["unified_generic_target_verify_logits_owner"] = bool(logits_owner)
+        trace_record["unified_generic_target_verify_frontier_logits_available"] = False
+        trace_record["unified_generic_target_verify_appended_logits_available"] = False
+        trace_record["unified_generic_target_verify_frontier_logits_none_allowed"] = bool(not logits_owner)
+        trace_record["unified_generic_target_verify_rank"] = int(self.rank)
+        trace_record["unified_generic_target_verify_tp_local_rank"] = int(self.tp_params.local_rank)
+        trace_record["unified_generic_target_verify_target_master_rank"] = int(target_master_rank)
+        trace_record["unified_generic_target_verify_num_proposals"] = int(len(proposals))
+        trace_record["unified_generic_target_verify_num_to_verify_tokens"] = 0
         proposal_window_verify_enabled = bool(
             getattr(self.global_config, "enable_unified_generic_proposal_window_verify", False)
         )
@@ -14615,6 +14626,7 @@ class ModelRunnerBase:
         first_position_top5_probs_by_id: dict[int, list[float]] = {}
         target_verify_uses_shifted_logits = False
         target_verify_frontier_logits_available = False
+        target_verify_appended_logits_available = False
         frontier_checkpoint_restored_by_id: dict[int, bool] = {}
         frontier_block_table_match_by_id: dict[int, bool] = {}
         current_mapping_accept_hist_by_depth: dict[str, dict[str, int]] = {}
@@ -14678,7 +14690,8 @@ class ModelRunnerBase:
                             depth=depth,
                             reason=reason,
                         )
-                    self._record_unified_raw_target_result(trace_record, result)
+                    if logits_owner:
+                        self._record_unified_raw_target_result(trace_record, result)
                     depth_results.append(result)
                     continue
                 executable.append((proposal, seq))
@@ -14736,16 +14749,29 @@ class ModelRunnerBase:
                         torch.cuda.synchronize()
                         frontier_logits = self.run_model(frontier_input_ids, frontier_positions, False)
                         torch.cuda.synchronize()
-                        frontier_row_index = int(frontier_logits.shape[0]) - 1
-                        if frontier_row_index < 0:
-                            raise AssertionError(
-                                "unified generic target verification missing frontier logits row: "
-                                f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}"
-                            )
-                        entry["frontier_logits"] = frontier_logits[frontier_row_index].clone()
-                        if frontier_temperatures is not None:
-                            entry["frontier_temperature"] = frontier_temperatures[frontier_row_index].clone()
-                        target_verify_frontier_logits_available = True
+                        if logits_owner:
+                            if frontier_logits is None:
+                                raise AssertionError(
+                                    "unified generic target verification owner missing frontier logits: "
+                                    f"rank={self.rank}, tp_local_rank={self.tp_params.local_rank}, "
+                                    f"target_master_rank={target_master_rank}, plan_id={plan.plan_id}, "
+                                    f"dual_step_id={-1 if plan.step_id is None else int(plan.step_id)}, "
+                                    f"num_proposals={len(executable)}"
+                                )
+                            frontier_row_index = int(frontier_logits.shape[0]) - 1
+                            if frontier_row_index < 0:
+                                raise AssertionError(
+                                    "unified generic target verification missing frontier logits row: "
+                                    f"rank={self.rank}, tp_local_rank={self.tp_params.local_rank}, "
+                                    f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, "
+                                    f"plan_id={plan.plan_id}, "
+                                    f"dual_step_id={-1 if plan.step_id is None else int(plan.step_id)}, "
+                                    f"num_proposals={len(executable)}"
+                                )
+                            entry["frontier_logits"] = frontier_logits[frontier_row_index].clone()
+                            if frontier_temperatures is not None:
+                                entry["frontier_temperature"] = frontier_temperatures[frontier_row_index].clone()
+                            target_verify_frontier_logits_available = True
                         frontier_checkpoint_restored_by_id[proposal_id] = self._sequence_matches_eager_apply_checkpoint(
                             seq,
                             checkpoint,
@@ -14851,207 +14877,237 @@ class ModelRunnerBase:
                     temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
                     torch.cuda.synchronize()
                     logits = self.run_model(input_ids, positions, False)
-                    target_verify_logits_width = (
-                        max(target_verify_logits_width, int(logits.shape[1])) if len(logits.shape) > 1 else 0
-                    )
-                    if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
-                        target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
-                    aligned_logits_rows: list[torch.Tensor] = []
-                    aligned_temperature_rows: list[torch.Tensor] = []
-                    append_offset = 0
-                    shifted_row_start = 0
-                    for entry in temp_entries:
-                        width = int(entry["input_width"])
-                        proposal_id = int(entry["proposal_id"])
-                        aligned_logits_rows.append(entry["frontier_logits"])
-                        if temperatures is not None and "frontier_temperature" in entry:
-                            aligned_temperature_rows.append(entry["frontier_temperature"])
-                        if gamma > 1:
-                            aligned_logits_rows.extend(
-                                logits[append_offset:append_offset + gamma - 1].unbind(dim=0)
-                            )
-                            if temperatures is not None:
-                                aligned_temperature_rows.extend(
-                                    temperatures[append_offset:append_offset + gamma - 1].unbind(dim=0)
-                                )
-                        entry["shifted_row_start"] = int(shifted_row_start)
-                        shifted_row_start += int(gamma)
-                        append_offset += width
-                        if len(aligned_logits_rows) < shifted_row_start:
+                    aligned_logits = None
+                    aligned_temperatures = None
+                    if logits_owner:
+                        if logits is None:
                             raise AssertionError(
-                                "unified generic shifted logits alignment produced too few rows: "
-                                f"proposal_id={proposal_id}, depth={depth}, gamma={gamma}"
+                                "unified generic target verification owner missing appended logits: "
+                                f"rank={self.rank}, tp_local_rank={self.tp_params.local_rank}, "
+                                f"target_master_rank={target_master_rank}, plan_id={plan.plan_id}, "
+                                f"dual_step_id={-1 if plan.step_id is None else int(plan.step_id)}, "
+                                f"num_proposals={len(temp_entries)}"
                             )
-                    aligned_logits = torch.stack(aligned_logits_rows, dim=0)
-                    aligned_temperatures = (
-                        torch.stack(aligned_temperature_rows, dim=0)
-                        if temperatures is not None and aligned_temperature_rows
-                        else None
-                    )
-                    target_verify_uses_shifted_logits = True
-                    target_verify_logits_rows += int(aligned_logits.shape[0])
-                    target_verify_logits_width = (
-                        max(target_verify_logits_width, int(aligned_logits.shape[1]))
-                        if len(aligned_logits.shape) > 1
-                        else target_verify_logits_width
-                    )
-                    target_verify_rows_per_proposal = (
-                        int(aligned_logits.shape[0]) // len(temp_entries)
-                        if len(temp_entries) > 0 and int(aligned_logits.shape[0]) % len(temp_entries) == 0
-                        else 0
-                    )
-                    current_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
-                        logits,
-                        temperatures,
-                        temp_entries,
-                        gamma=gamma,
-                    )
-                    shifted_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
-                        aligned_logits,
-                        aligned_temperatures,
-                        temp_entries,
-                        gamma=gamma,
-                    )
-                    window_diagnostics = shifted_mapping_diagnostics
-                    current_window_accepted_len_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in current_mapping_diagnostics["proposal_accept_len_by_id"].items()
-                        }
-                    )
-                    proposal_window_shadow_accepted_len_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["proposal_accept_len_by_id"].items()
-                        }
-                    )
-                    for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
-                        merged = current_window_accept_hist_by_depth.setdefault(str(depth_key), {})
-                        for bucket, count in hist.items():
-                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
-                    for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
-                        merged = proposal_window_shadow_accept_hist_by_depth.setdefault(str(depth_key), {})
-                        for bucket, count in hist.items():
-                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
-                    for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
-                        merged = current_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
-                        for bucket, count in hist.items():
-                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
-                    for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
-                        merged = shifted_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
-                        for bucket, count in hist.items():
-                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
-                    current_window_first_token_prob_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in current_mapping_diagnostics[
-                                "proposal_first_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    proposal_window_first_token_prob_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in shifted_mapping_diagnostics[
-                                "proposal_first_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    current_window_first_token_id_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["current_first_token_id_by_id"].items()
-                        }
-                    )
-                    proposal_window_first_token_id_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["proposal_first_token_id_by_id"].items()
-                        }
-                    )
-                    first_position_argmax_token_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
-                        }
-                    )
-                    first_position_top5_tokens_by_id.update(
-                        {
-                            int(proposal_id): [int(token_id) for token_id in value]
-                            for proposal_id, value in shifted_mapping_diagnostics["top5_tokens_by_id"].items()
-                        }
-                    )
-                    first_position_top5_probs_by_id.update(
-                        {
-                            int(proposal_id): [float(prob) for prob in value]
-                            for proposal_id, value in shifted_mapping_diagnostics["top5_probs_by_id"].items()
-                        }
-                    )
-                    frontier_top_token_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
-                        }
-                    )
-                    frontier_top_prob_by_id.update(
-                        {
-                            int(proposal_id): float(values[0])
-                            for proposal_id, values in shifted_mapping_diagnostics["top5_probs_by_id"].items()
-                            if values
-                        }
-                    )
-                    frontier_prob_for_p0_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in shifted_mapping_diagnostics[
-                                "proposal_first_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    appended_row0_top_token_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in current_mapping_diagnostics["first_argmax_by_id"].items()
-                        }
-                    )
-                    appended_row0_top_prob_by_id.update(
-                        {
-                            int(proposal_id): float(values[0])
-                            for proposal_id, values in current_mapping_diagnostics["top5_probs_by_id"].items()
-                            if values
-                        }
-                    )
-                    appended_row0_prob_for_p0_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in current_mapping_diagnostics[
-                                "proposal_first_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    appended_row0_prob_for_p1_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in current_mapping_diagnostics[
-                                "first_row_second_proposal_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    shifted_prob_for_p0_by_id.update(dict(frontier_prob_for_p0_by_id))
-                    shifted_prob_for_p1_by_id.update(
-                        {
-                            int(proposal_id): float(value)
-                            for proposal_id, value in shifted_mapping_diagnostics[
-                                "second_position_proposal_token_prob_by_id"
-                            ].items()
-                        }
-                    )
-                    shifted_accepted_len_by_id.update(
-                        {
-                            int(proposal_id): int(value)
-                            for proposal_id, value in shifted_mapping_diagnostics["proposal_accept_len_by_id"].items()
-                        }
-                    )
+                        target_verify_appended_logits_available = True
+                        target_verify_logits_width = (
+                            max(target_verify_logits_width, int(logits.shape[1])) if len(logits.shape) > 1 else 0
+                        )
+                        if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
+                            target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
+                        aligned_logits_rows: list[torch.Tensor] = []
+                        aligned_temperature_rows: list[torch.Tensor] = []
+                        append_offset = 0
+                        shifted_row_start = 0
+                        for entry in temp_entries:
+                            width = int(entry["input_width"])
+                            proposal_id = int(entry["proposal_id"])
+                            if "frontier_logits" not in entry:
+                                raise AssertionError(
+                                    "unified generic shifted logits alignment missing owner frontier row: "
+                                    f"rank={self.rank}, tp_local_rank={self.tp_params.local_rank}, "
+                                    f"proposal_id={proposal_id}, depth={depth}, gamma={gamma}, "
+                                    f"plan_id={plan.plan_id}, "
+                                    f"dual_step_id={-1 if plan.step_id is None else int(plan.step_id)}, "
+                                    f"num_proposals={len(temp_entries)}"
+                                )
+                            aligned_logits_rows.append(entry["frontier_logits"])
+                            if temperatures is not None and "frontier_temperature" in entry:
+                                aligned_temperature_rows.append(entry["frontier_temperature"])
+                            if gamma > 1:
+                                aligned_logits_rows.extend(
+                                    logits[append_offset:append_offset + gamma - 1].unbind(dim=0)
+                                )
+                                if temperatures is not None:
+                                    aligned_temperature_rows.extend(
+                                        temperatures[append_offset:append_offset + gamma - 1].unbind(dim=0)
+                                    )
+                            entry["shifted_row_start"] = int(shifted_row_start)
+                            shifted_row_start += int(gamma)
+                            append_offset += width
+                            if len(aligned_logits_rows) < shifted_row_start:
+                                raise AssertionError(
+                                    "unified generic shifted logits alignment produced too few rows: "
+                                    f"proposal_id={proposal_id}, depth={depth}, gamma={gamma}"
+                                )
+                        aligned_logits = torch.stack(aligned_logits_rows, dim=0)
+                        aligned_temperatures = (
+                            torch.stack(aligned_temperature_rows, dim=0)
+                            if temperatures is not None and aligned_temperature_rows
+                            else None
+                        )
+                        target_verify_uses_shifted_logits = True
+                        target_verify_logits_rows += int(aligned_logits.shape[0])
+                        target_verify_logits_width = (
+                            max(target_verify_logits_width, int(aligned_logits.shape[1]))
+                            if len(aligned_logits.shape) > 1
+                            else target_verify_logits_width
+                        )
+                        target_verify_rows_per_proposal = (
+                            int(aligned_logits.shape[0]) // len(temp_entries)
+                            if len(temp_entries) > 0 and int(aligned_logits.shape[0]) % len(temp_entries) == 0
+                            else 0
+                        )
+                        current_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
+                            logits,
+                            temperatures,
+                            temp_entries,
+                            gamma=gamma,
+                        )
+                        shifted_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
+                            aligned_logits,
+                            aligned_temperatures,
+                            temp_entries,
+                            gamma=gamma,
+                        )
+                        current_window_accepted_len_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in current_mapping_diagnostics[
+                                    "proposal_accept_len_by_id"
+                                ].items()
+                            }
+                        )
+                        proposal_window_shadow_accepted_len_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "proposal_accept_len_by_id"
+                                ].items()
+                            }
+                        )
+                        for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                            merged = current_window_accept_hist_by_depth.setdefault(str(depth_key), {})
+                            for bucket, count in hist.items():
+                                merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                        for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                            merged = proposal_window_shadow_accept_hist_by_depth.setdefault(str(depth_key), {})
+                            for bucket, count in hist.items():
+                                merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                        for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                            merged = current_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
+                            for bucket, count in hist.items():
+                                merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                        for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                            merged = shifted_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
+                            for bucket, count in hist.items():
+                                merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                        current_window_first_token_prob_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in current_mapping_diagnostics[
+                                    "proposal_first_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        proposal_window_first_token_prob_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "proposal_first_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        current_window_first_token_id_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "current_first_token_id_by_id"
+                                ].items()
+                            }
+                        )
+                        proposal_window_first_token_id_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "proposal_first_token_id_by_id"
+                                ].items()
+                            }
+                        )
+                        first_position_argmax_token_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
+                            }
+                        )
+                        first_position_top5_tokens_by_id.update(
+                            {
+                                int(proposal_id): [int(token_id) for token_id in value]
+                                for proposal_id, value in shifted_mapping_diagnostics["top5_tokens_by_id"].items()
+                            }
+                        )
+                        first_position_top5_probs_by_id.update(
+                            {
+                                int(proposal_id): [float(prob) for prob in value]
+                                for proposal_id, value in shifted_mapping_diagnostics["top5_probs_by_id"].items()
+                            }
+                        )
+                        frontier_top_token_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
+                            }
+                        )
+                        frontier_top_prob_by_id.update(
+                            {
+                                int(proposal_id): float(values[0])
+                                for proposal_id, values in shifted_mapping_diagnostics["top5_probs_by_id"].items()
+                                if values
+                            }
+                        )
+                        frontier_prob_for_p0_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "proposal_first_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        appended_row0_top_token_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in current_mapping_diagnostics["first_argmax_by_id"].items()
+                            }
+                        )
+                        appended_row0_top_prob_by_id.update(
+                            {
+                                int(proposal_id): float(values[0])
+                                for proposal_id, values in current_mapping_diagnostics["top5_probs_by_id"].items()
+                                if values
+                            }
+                        )
+                        appended_row0_prob_for_p0_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in current_mapping_diagnostics[
+                                    "proposal_first_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        appended_row0_prob_for_p1_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in current_mapping_diagnostics[
+                                    "first_row_second_proposal_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        shifted_prob_for_p0_by_id.update(dict(frontier_prob_for_p0_by_id))
+                        shifted_prob_for_p1_by_id.update(
+                            {
+                                int(proposal_id): float(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "second_position_proposal_token_prob_by_id"
+                                ].items()
+                            }
+                        )
+                        shifted_accepted_len_by_id.update(
+                            {
+                                int(proposal_id): int(value)
+                                for proposal_id, value in shifted_mapping_diagnostics[
+                                    "proposal_accept_len_by_id"
+                                ].items()
+                            }
+                        )
                     verify_maps = self.compute_unified_generic_verify_result_with_shifted_logits(
                         aligned_logits,
                         verify_seqs,
@@ -15141,7 +15197,8 @@ class ModelRunnerBase:
                             target_finish=bool(verify_maps.get("finish_by_seq_id", {}).get(seq_id, False)),
                         ),
                     }
-                    self._record_unified_raw_target_result(trace_record, result)
+                    if logits_owner:
+                        self._record_unified_raw_target_result(trace_record, result)
                     depth_results.append(result)
 
             if depth_results:
@@ -15202,6 +15259,14 @@ class ModelRunnerBase:
             trace_record["unified_generic_target_verify_frontier_logits_available"] = bool(
                 target_verify_frontier_logits_available
             )
+            trace_record["unified_generic_target_verify_appended_logits_available"] = bool(
+                target_verify_appended_logits_available
+            )
+            trace_record["unified_generic_target_verify_frontier_logits_none_allowed"] = bool(not logits_owner)
+            trace_record["unified_generic_target_verify_logits_owner"] = bool(logits_owner)
+            trace_record["unified_generic_target_verify_rank"] = int(self.rank)
+            trace_record["unified_generic_target_verify_tp_local_rank"] = int(self.tp_params.local_rank)
+            trace_record["unified_generic_target_verify_target_master_rank"] = int(target_master_rank)
             trace_record["unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id"] = (
                 self._trace_sorted_int_map(seq_len_before_temp_by_id)
             )
@@ -15367,7 +15432,8 @@ class ModelRunnerBase:
         trace_record: dict,
         results: list[dict],
     ) -> None:
-        payload_build_executed = bool(results)
+        result_owner = bool(self.rank == self.global_config.target_config.master_rank)
+        payload_build_executed = bool(result_owner and results)
         if payload_build_executed:
             meta_values, payload_values = self._serialize_generic_rolling_result_payload(results, plan)
         else:
@@ -15381,18 +15447,19 @@ class ModelRunnerBase:
                 int(self.gamma),
             ]
             payload_values = []
-        trace_record["generic_rolling_result_transfer_count"] = int(meta_values[4])
-        trace_record["generic_rolling_result_transfer_payload_len_units"] = int(meta_values[5])
         meta = (
             torch.tensor(meta_values, dtype=torch.int64, device="cuda")
-            if self.rank == self.global_config.target_config.master_rank
+            if result_owner
             else torch.zeros(GENERIC_ROLLING_RESULT_META_LEN, dtype=torch.int64, device="cuda")
         )
         dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        trace_record["generic_rolling_result_transfer_count"] = int(meta_values[4])
+        trace_record["generic_rolling_result_transfer_payload_len_units"] = int(meta_values[5])
         if int(meta_values[5]) > 0:
             payload = (
                 torch.tensor(payload_values, dtype=torch.int64, device="cuda")
-                if self.rank == self.global_config.target_config.master_rank
+                if result_owner
                 else torch.zeros(int(meta_values[5]), dtype=torch.int64, device="cuda")
             )
             dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)

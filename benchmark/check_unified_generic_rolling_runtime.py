@@ -1111,6 +1111,29 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         records,
         "unified_generic_target_verify_frontier_block_table_match_by_proposal_id",
     )
+    logits_owner_trace_present = has_trace_field(records, "unified_generic_target_verify_logits_owner")
+    logits_owner_records = [
+        record for record in records if bool(record.get("unified_generic_target_verify_logits_owner", False))
+    ]
+    logits_non_owner_records = [
+        record
+        for record in records
+        if "unified_generic_target_verify_logits_owner" in record
+        and not bool(record.get("unified_generic_target_verify_logits_owner", False))
+    ]
+    owner_target_input_shape = aggregate_shape(logits_owner_records, "unified_generic_target_verify_input_ids_shape")
+    owner_target_logits_shape = aggregate_shape(logits_owner_records, "unified_generic_target_verify_logits_shape")
+    non_owner_raw_result_count = sum(
+        sum(int_value(value, 0) for value in as_depth_int_map(record.get(field)).values())
+        for record in logits_non_owner_records
+        for field in (
+            "unified_raw_verified_proposal_count_by_depth",
+            "unified_raw_full_accept_proposal_count_by_depth",
+            "unified_raw_partial_accept_proposal_count_by_depth",
+            "unified_raw_reject_proposal_count_by_depth",
+            "unified_raw_invalidated_proposal_count_by_depth",
+        )
+    )
 
     return {
         "unified_generic_rolling_enabled": bool(unified_enabled),
@@ -1203,6 +1226,41 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             records,
             "unified_generic_target_verify_logits_rows_per_proposal",
         ),
+        "unified_generic_target_verify_logits_owner": any_record_bool(
+            records,
+            "unified_generic_target_verify_logits_owner",
+        ),
+        "unified_generic_target_verify_logits_owner_record_count": len(logits_owner_records),
+        "unified_generic_target_verify_owner_num_proposals": sum_record_int(
+            logits_owner_records,
+            "unified_generic_target_verify_num_proposals",
+        ),
+        "unified_generic_target_verify_owner_num_to_verify_tokens": sum_record_int(
+            logits_owner_records,
+            "unified_generic_target_verify_num_to_verify_tokens",
+        ),
+        "unified_generic_target_verify_owner_input_ids_shape": owner_target_input_shape,
+        "unified_generic_target_verify_owner_logits_shape": owner_target_logits_shape,
+        "unified_generic_target_verify_owner_uses_shifted_logits": any_record_bool(
+            logits_owner_records,
+            "unified_generic_target_verify_uses_shifted_logits",
+        ),
+        "unified_generic_target_verify_owner_frontier_logits_available": any_record_bool(
+            logits_owner_records,
+            "unified_generic_target_verify_frontier_logits_available",
+        ),
+        "unified_generic_target_verify_owner_appended_logits_available": any_record_bool(
+            logits_owner_records,
+            "unified_generic_target_verify_appended_logits_available",
+        ),
+        "unified_generic_target_verify_non_owner_record_count": len(logits_non_owner_records),
+        "unified_generic_target_verify_non_owner_frontier_none_allowed_count": sum(
+            1
+            for record in logits_non_owner_records
+            if bool(record.get("unified_generic_target_verify_frontier_logits_none_allowed", False))
+        ),
+        "unified_generic_target_verify_non_owner_raw_result_count": int(non_owner_raw_result_count),
+        "unified_generic_target_verify_logits_owner_trace_present": bool(logits_owner_trace_present),
         "unified_generic_target_verify_checkpoint_failed_proposal_ids": target_checkpoint_failed_ids,
         "unified_generic_target_verify_rollback_len_mismatch_proposal_ids": target_rollback_len_mismatch_ids,
         "unified_generic_target_verify_input_mismatch_proposal_ids": sorted(target_input_mismatch_ids),
@@ -1353,10 +1411,37 @@ def validate_records(
                 f"{summary['unified_generic_target_verify_next_round_mismatch_proposal_ids']}"
             )
         gamma = int_value(summary.get("normal_gamma"), 0)
-        num_proposals = int_value(summary.get("unified_generic_target_verify_num_proposals"), 0)
-        num_to_verify = int_value(summary.get("unified_generic_target_verify_num_to_verify_tokens"), 0)
-        input_shape = as_int_list(summary.get("unified_generic_target_verify_input_ids_shape"))
-        logits_shape = as_int_list(summary.get("unified_generic_target_verify_logits_shape"))
+        owner_trace_present = bool(summary.get("unified_generic_target_verify_logits_owner_trace_present", False))
+        num_proposals = int_value(
+            summary.get(
+                "unified_generic_target_verify_owner_num_proposals"
+                if owner_trace_present
+                else "unified_generic_target_verify_num_proposals"
+            ),
+            0,
+        )
+        num_to_verify = int_value(
+            summary.get(
+                "unified_generic_target_verify_owner_num_to_verify_tokens"
+                if owner_trace_present
+                else "unified_generic_target_verify_num_to_verify_tokens"
+            ),
+            0,
+        )
+        input_shape = as_int_list(
+            summary.get(
+                "unified_generic_target_verify_owner_input_ids_shape"
+                if owner_trace_present
+                else "unified_generic_target_verify_input_ids_shape"
+            )
+        )
+        logits_shape = as_int_list(
+            summary.get(
+                "unified_generic_target_verify_owner_logits_shape"
+                if owner_trace_present
+                else "unified_generic_target_verify_logits_shape"
+            )
+        )
         logits_rows = logits_shape[0] if logits_shape else 0
         input_rows = input_shape[0] if input_shape else 0
         if gamma > 0 and num_proposals > 0 and num_to_verify != gamma * num_proposals:
@@ -1380,10 +1465,39 @@ def validate_records(
                 )
         shifted_trace_present = has_trace_field(records, "unified_generic_target_verify_uses_shifted_logits")
         if shifted_trace_present:
-            if not bool(summary.get("unified_generic_target_verify_uses_shifted_logits", False)):
-                errors.append("unified generic target verification must use shifted logits")
-            if not bool(summary.get("unified_generic_target_verify_frontier_logits_available", False)):
-                errors.append("unified generic target verification must have frontier logits")
+            owner_trace_present = bool(summary.get("unified_generic_target_verify_logits_owner_trace_present", False))
+            owner_num_proposals = int_value(summary.get("unified_generic_target_verify_owner_num_proposals"), 0)
+            if owner_trace_present:
+                if int_value(summary.get("unified_generic_target_verify_logits_owner_record_count"), 0) <= 0:
+                    errors.append("unified generic target verification must have a logits owner record")
+                if owner_num_proposals > 0:
+                    if not bool(summary.get("unified_generic_target_verify_owner_uses_shifted_logits", False)):
+                        errors.append("unified generic target verification owner must use shifted logits")
+                    if not bool(
+                        summary.get("unified_generic_target_verify_owner_frontier_logits_available", False)
+                    ):
+                        errors.append("unified generic target verification owner must have frontier logits")
+                    if not bool(
+                        summary.get("unified_generic_target_verify_owner_appended_logits_available", False)
+                    ):
+                        errors.append("unified generic target verification owner must have appended logits")
+                non_owner_count = int_value(
+                    summary.get("unified_generic_target_verify_non_owner_record_count"),
+                    0,
+                )
+                non_owner_none_allowed = int_value(
+                    summary.get("unified_generic_target_verify_non_owner_frontier_none_allowed_count"),
+                    0,
+                )
+                if non_owner_count and non_owner_none_allowed < non_owner_count:
+                    errors.append("non-owner target TP records must allow missing frontier logits")
+                if int_value(summary.get("unified_generic_target_verify_non_owner_raw_result_count"), 0) > 0:
+                    errors.append("non-owner target TP ranks must not record raw verify result counters")
+            else:
+                if not bool(summary.get("unified_generic_target_verify_uses_shifted_logits", False)):
+                    errors.append("unified generic target verification must use shifted logits")
+                if not bool(summary.get("unified_generic_target_verify_frontier_logits_available", False)):
+                    errors.append("unified generic target verification must have frontier logits")
             if summary.get("unified_generic_target_verify_frontier_checkpoint_failed_proposal_ids"):
                 errors.append(
                     "frontier no-apply forward changed sequence checkpoint: "
@@ -1590,6 +1704,12 @@ def add_synthetic_temp_append_trace(
         proposal_hist[depth]["4"] = int(proposal_hist[depth].get("4", 0)) + 1
         current_mapping_hist[depth]["0"] = int(current_mapping_hist[depth].get("0", 0)) + 1
     record["unified_generic_proposal_window_verify_enabled"] = False
+    record["unified_generic_target_verify_logits_owner"] = True
+    record["unified_generic_target_verify_appended_logits_available"] = True
+    record["unified_generic_target_verify_frontier_logits_none_allowed"] = False
+    record["unified_generic_target_verify_rank"] = 1
+    record["unified_generic_target_verify_tp_local_rank"] = 0
+    record["unified_generic_target_verify_target_master_rank"] = 1
     record["unified_generic_target_verify_current_to_be_verified_by_proposal_id"] = {
         str(proposal_id): list(current_to_verify[proposal_id]) for proposal_id in sampled_ids
     }
@@ -2113,6 +2233,45 @@ def synthetic_single_child_records(
     return records
 
 
+NON_OWNER_TARGET_VERIFY_DETAIL_PREFIXES = (
+    "unified_generic_target_verify_current_window_",
+    "unified_generic_target_verify_current_mapping_",
+    "unified_generic_target_verify_proposal_window_",
+    "unified_generic_target_verify_first_position_",
+    "unified_generic_target_verify_frontier_",
+    "unified_generic_target_verify_appended_",
+    "unified_generic_target_verify_shifted_",
+)
+
+
+def synthetic_target_tp_worker_record(owner_record: dict[str, Any], *, rank: int, bad_raw: bool = False) -> dict[str, Any]:
+    worker = json.loads(json.dumps(owner_record))
+    for field in list(worker):
+        if field.startswith("unified_raw_") and field not in {
+            "unified_raw_target_verification_available",
+            "unified_raw_verification_source",
+        }:
+            worker.pop(field, None)
+            continue
+        if any(field.startswith(prefix) for prefix in NON_OWNER_TARGET_VERIFY_DETAIL_PREFIXES):
+            worker.pop(field, None)
+    worker["unified_generic_target_verify_logits_owner"] = False
+    worker["unified_generic_target_verify_frontier_logits_available"] = False
+    worker["unified_generic_target_verify_appended_logits_available"] = False
+    worker["unified_generic_target_verify_frontier_logits_none_allowed"] = True
+    worker["unified_generic_target_verify_uses_shifted_logits"] = False
+    worker["unified_generic_target_verify_rank"] = int(rank)
+    worker["unified_generic_target_verify_tp_local_rank"] = int(rank - 1)
+    worker["unified_generic_target_verify_target_master_rank"] = 1
+    worker["unified_generic_target_verify_logits_shape"] = [0, 0]
+    worker["unified_generic_target_verify_logits_rows_per_proposal"] = 0
+    if bad_raw:
+        worker["unified_raw_verified_proposal_count_by_depth"] = {"1": 1}
+        worker["unified_raw_full_accept_proposal_count_by_depth"] = {"1": 1}
+        worker["unified_raw_accepted_len_hist_by_depth"] = {"1": {"4": 1}}
+    return worker
+
+
 def run_synthetic_tests() -> None:
     records = synthetic_records()
     payload = synthetic_payload(total_output_tokens=27)
@@ -2231,6 +2390,86 @@ def run_synthetic_tests() -> None:
     assert reject_partial_summary["partial_prefix_revised_token_count"] == 1
     assert reject_partial_summary["total_partial_recovered_token_count"] == 2
     assert reject_partial_summary["unified_generic_target_verify_temp_append_used"] is True
+
+    target_tp1_owner = synthetic_records()
+    errors, tp1_summary = validate_records(target_tp1_owner, payload)
+    assert not errors, f"target_tp=1 owner logits synthetic failed: {errors}\nsummary={tp1_summary}"
+    assert tp1_summary["unified_generic_target_verify_logits_owner_record_count"] == 1
+    assert tp1_summary["unified_generic_target_verify_owner_frontier_logits_available"] is True
+    assert tp1_summary["unified_generic_target_verify_owner_appended_logits_available"] is True
+
+    target_tp3_records = synthetic_records()
+    target_tp3_records.extend(
+        [
+            synthetic_target_tp_worker_record(target_tp3_records[0], rank=2),
+            synthetic_target_tp_worker_record(target_tp3_records[0], rank=3),
+        ]
+    )
+    errors, tp3_summary = validate_records(target_tp3_records, payload)
+    assert not errors, f"target_tp=3 owner/workers synthetic failed: {errors}\nsummary={tp3_summary}"
+    assert tp3_summary["unified_generic_target_verify_logits_owner_record_count"] == 1
+    assert tp3_summary["unified_generic_target_verify_non_owner_record_count"] == 2
+    assert tp3_summary["unified_generic_target_verify_non_owner_frontier_none_allowed_count"] == 2
+
+    target_tp3_owner_missing = synthetic_records()
+    target_tp3_owner_missing[0]["unified_generic_target_verify_frontier_logits_available"] = False
+    target_tp3_owner_missing[0]["unified_generic_target_verify_appended_logits_available"] = False
+    target_tp3_owner_missing.extend(
+        [
+            synthetic_target_tp_worker_record(target_tp3_owner_missing[0], rank=2),
+            synthetic_target_tp_worker_record(target_tp3_owner_missing[0], rank=3),
+        ]
+    )
+    errors, _summary = validate_records(target_tp3_owner_missing, payload)
+    assert any("owner must have frontier logits" in error for error in errors), (
+        "target_tp=3 owner missing frontier logits should fail"
+    )
+
+    target_tp3_bad_worker = synthetic_records()
+    target_tp3_bad_worker.append(synthetic_target_tp_worker_record(target_tp3_bad_worker[0], rank=2, bad_raw=True))
+    errors, _summary = validate_records(target_tp3_bad_worker, payload)
+    assert any("non-owner target TP ranks" in error for error in errors), (
+        "worker raw result counters should fail"
+    )
+
+    zero_proposal_owner = synthetic_records()
+    for record in zero_proposal_owner:
+        for field in list(record):
+            if field.startswith("unified_raw_") and field not in {
+                "unified_raw_target_verification_available",
+                "unified_raw_verification_source",
+            }:
+                record.pop(field, None)
+            elif field.startswith("unified_generic_target_verify_") and field not in {
+                "unified_generic_target_verify_logits_owner",
+                "unified_generic_target_verify_frontier_logits_available",
+                "unified_generic_target_verify_appended_logits_available",
+                "unified_generic_target_verify_frontier_logits_none_allowed",
+                "unified_generic_target_verify_rank",
+                "unified_generic_target_verify_tp_local_rank",
+                "unified_generic_target_verify_target_master_rank",
+                "unified_generic_target_verify_num_proposals",
+                "unified_generic_target_verify_num_to_verify_tokens",
+            }:
+                record.pop(field, None)
+        record["unified_generic_target_verify_logits_owner"] = True
+        record["unified_generic_target_verify_frontier_logits_available"] = False
+        record["unified_generic_target_verify_appended_logits_available"] = False
+        record["unified_generic_target_verify_frontier_logits_none_allowed"] = False
+        record["unified_generic_target_verify_num_proposals"] = 0
+        record["unified_generic_target_verify_num_to_verify_tokens"] = 0
+    zero_proposal_owner.extend(
+        [
+            synthetic_target_tp_worker_record(zero_proposal_owner[0], rank=2),
+            synthetic_target_tp_worker_record(zero_proposal_owner[0], rank=3),
+        ]
+    )
+    for worker in zero_proposal_owner[1:]:
+        worker["unified_generic_target_verify_num_proposals"] = 0
+        worker["unified_generic_target_verify_num_to_verify_tokens"] = 0
+    errors, zero_summary = validate_records(zero_proposal_owner, payload)
+    assert not errors, f"target_tp=3 zero proposal synthetic failed: {errors}\nsummary={zero_summary}"
+    assert zero_summary["unified_generic_target_verify_owner_num_proposals"] == 0
 
     single_child_pass = synthetic_single_child_records([[1], [2], [3]])
     errors, single_child_summary = validate_records(single_child_pass, synthetic_single_child_payload())
@@ -2370,6 +2609,19 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_generic_target_verify_input_ids_shape",
         "unified_generic_target_verify_logits_shape",
         "unified_generic_target_verify_logits_rows_per_proposal",
+        "unified_generic_target_verify_logits_owner",
+        "unified_generic_target_verify_logits_owner_record_count",
+        "unified_generic_target_verify_owner_num_proposals",
+        "unified_generic_target_verify_owner_num_to_verify_tokens",
+        "unified_generic_target_verify_owner_input_ids_shape",
+        "unified_generic_target_verify_owner_logits_shape",
+        "unified_generic_target_verify_owner_uses_shifted_logits",
+        "unified_generic_target_verify_owner_frontier_logits_available",
+        "unified_generic_target_verify_owner_appended_logits_available",
+        "unified_generic_target_verify_non_owner_record_count",
+        "unified_generic_target_verify_non_owner_frontier_none_allowed_count",
+        "unified_generic_target_verify_non_owner_raw_result_count",
+        "unified_generic_target_verify_logits_owner_trace_present",
         "unified_generic_target_verify_checkpoint_failed_proposal_ids",
         "unified_generic_target_verify_rollback_len_mismatch_proposal_ids",
         "unified_generic_target_verify_input_mismatch_proposal_ids",
