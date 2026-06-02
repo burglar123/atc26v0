@@ -6,7 +6,7 @@ import time
 import random
 import tempfile
 import os
-from collections import deque
+from collections import Counter, deque
 from abc import abstractmethod
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
