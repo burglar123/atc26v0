@@ -83,6 +83,19 @@ def _partial_recovery_depth_counts(records: list[dict[str, Any]]) -> tuple[dict[
     )
 
 
+def _accounting_depth_counts(accounting: dict[str, Any], field: str) -> dict[str, int]:
+    raw = accounting.get(field)
+    if not isinstance(raw, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for depth, value in raw.items():
+        depth_key = str(int_value(depth, 0))
+        token_count = int_value(value, 0)
+        if int(depth_key) > 0 and token_count > 0:
+            counts[depth_key] = int(token_count)
+    return dict(sorted(counts.items(), key=lambda item: int(item[0])))
+
+
 def _merge_depth_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, int]:
     merged: dict[str, int] = {}
     for record in records:
@@ -134,6 +147,26 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     accounting_partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
     accounting_partial_revised = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
     partial_depth_counts, revised_depth_counts = _partial_recovery_depth_counts(records)
+    accounting_partial_depth_counts = _accounting_depth_counts(
+        accounting,
+        "partial_prefix_recovered_token_count_by_depth",
+    )
+    accounting_revised_depth_counts = _accounting_depth_counts(
+        accounting,
+        "partial_prefix_revised_token_count_by_depth",
+    )
+    if (
+        accounting_partial_total
+        and sum(int_value(value, 0) for value in accounting_partial_depth_counts.values())
+        == accounting_partial_total
+    ):
+        partial_depth_counts = accounting_partial_depth_counts
+    if (
+        accounting_partial_revised
+        and sum(int_value(value, 0) for value in accounting_revised_depth_counts.values())
+        == accounting_partial_revised
+    ):
+        revised_depth_counts = accounting_revised_depth_counts
 
     summary: dict[str, Any] = {
         "generic_full_continuous_enabled": _bool_any(

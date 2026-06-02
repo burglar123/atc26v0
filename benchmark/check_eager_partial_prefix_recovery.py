@@ -106,6 +106,25 @@ def _event_int(event: dict[str, Any], key: str, default: int = 0) -> int:
     return int_value(event.get(key), default)
 
 
+def _partial_prefix_authority_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    authority_roles = {"aggregate", "target", "verify", "dual_verify"}
+    partial_fields = (
+        "partial_prefix_recovered_proposal_ids",
+        "partial_prefix_accepted_len_by_proposal_id",
+        "partial_prefix_revised_token_count_by_proposal_id",
+        "partial_prefix_committed_token_count_by_proposal_id",
+        "partial_prefix_recovered_depth_by_proposal_id",
+        "partial_prefix_recovery_events",
+    )
+    authority_records = [
+        record
+        for record in records
+        if str(record.get("runner_role") or "") in authority_roles
+        and any(field in record for field in partial_fields)
+    ]
+    return authority_records or records
+
+
 def _normalize_partial_recovery_event(event: dict[str, Any]) -> dict[str, int]:
     before = _event_int(event, "before_len", _event_int(event, "frontier_before", -1))
     after = _event_int(event, "after_len", _event_int(event, "frontier_after", -1))
@@ -310,19 +329,20 @@ def validate_records(
         "partial_prefix_recovery_enabled",
         "enable_rolling_continuous_partial_prefix_recovery",
     )
-    recovered_ids = _merge_int_set(records, "partial_prefix_recovered_proposal_ids")
-    recovered_seq_ids = _merge_int_set(records, "partial_prefix_recovered_seq_ids")
-    depth_by_id = _merge_int_map(records, "partial_prefix_recovered_depth_by_proposal_id")
-    accepted_by_id = _merge_int_map(records, "partial_prefix_accepted_len_by_proposal_id")
-    reject_index_by_id = _merge_int_map(records, "partial_prefix_reject_index_by_proposal_id")
-    revised_by_id = _merge_int_map(records, "partial_prefix_revised_token_count_by_proposal_id")
-    committed_by_id = _merge_int_map(records, "partial_prefix_committed_token_count_by_proposal_id")
-    frontier_before_by_seq = _merge_int_map(records, "partial_prefix_recovery_frontier_before_by_seq_id")
-    frontier_after_by_seq = _merge_int_map(records, "partial_prefix_recovery_frontier_after_by_seq_id")
-    release_seq_ids = _merge_int_set(records, "partial_prefix_recovery_normal_release_seq_ids")
+    partial_records = _partial_prefix_authority_records(records)
+    recovered_ids = _merge_int_set(partial_records, "partial_prefix_recovered_proposal_ids")
+    recovered_seq_ids = _merge_int_set(partial_records, "partial_prefix_recovered_seq_ids")
+    depth_by_id = _merge_int_map(partial_records, "partial_prefix_recovered_depth_by_proposal_id")
+    accepted_by_id = _merge_int_map(partial_records, "partial_prefix_accepted_len_by_proposal_id")
+    reject_index_by_id = _merge_int_map(partial_records, "partial_prefix_reject_index_by_proposal_id")
+    revised_by_id = _merge_int_map(partial_records, "partial_prefix_revised_token_count_by_proposal_id")
+    committed_by_id = _merge_int_map(partial_records, "partial_prefix_committed_token_count_by_proposal_id")
+    frontier_before_by_seq = _merge_int_map(partial_records, "partial_prefix_recovery_frontier_before_by_seq_id")
+    frontier_after_by_seq = _merge_int_map(partial_records, "partial_prefix_recovery_frontier_after_by_seq_id")
+    release_seq_ids = _merge_int_set(partial_records, "partial_prefix_recovery_normal_release_seq_ids")
     cascade_descendant_ids = _merge_int_set(records, "partial_recovery_cascade_discarded_descendant_proposal_ids")
-    skip_reason_counts = _sum_reason_counts(records, "partial_prefix_recovery_skip_reason_counts")
-    partial_events = _partial_recovery_events(records, registry)
+    skip_reason_counts = _sum_reason_counts(partial_records, "partial_prefix_recovery_skip_reason_counts")
+    partial_events = _partial_recovery_events(partial_records, registry)
     event_by_proposal = {int(event["proposal_id"]): event for event in partial_events}
     events_by_seq: dict[int, list[dict[str, int]]] = {}
     for event in partial_events:

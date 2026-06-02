@@ -1032,6 +1032,7 @@ def aggregate_performance_accounting(
     }
     zero_stage_timing_sums = {key: 0.0 for key in ZERO_STAGE_TIMING_FIELDS}
     zero_stage_fast_path_reason_counts_by_step: dict[str, dict[tuple[int, int], int]] = {}
+    partial_prefix_authority_record_ids = _partial_prefix_authority_record_ids(records)
 
     for record in records:
         gamma = max(gamma, int_value(record.get("normal_gamma"), 0))
@@ -1110,56 +1111,58 @@ def aggregate_performance_accounting(
             int_value(record.get("generic_full_continuous_depth_gt_max_real_commit_count"), 0),
             int_value(record.get("unified_generic_depth_gt_max_real_commit_count"), 0),
         )
-        merge_depth_max(
-            generic_full_continuous_depth_partial_recovered_token_counts,
-            as_depth_int_map(record.get("generic_full_continuous_depth_partial_recovered_token_counts")),
-        )
-        merge_depth_max(
-            generic_full_continuous_depth_partial_recovered_token_counts,
-            as_depth_int_map(record.get("unified_generic_depth_partial_recovered_token_counts")),
-        )
-        merge_depth_max(
-            generic_full_continuous_depth_revised_token_counts,
-            as_depth_int_map(record.get("generic_full_continuous_depth_revised_token_counts")),
-        )
-        merge_depth_max(
-            generic_full_continuous_depth_revised_token_counts,
-            as_depth_int_map(record.get("unified_generic_depth_revised_token_counts")),
-        )
+        if id(record) in partial_prefix_authority_record_ids:
+            merge_depth_max(
+                generic_full_continuous_depth_partial_recovered_token_counts,
+                as_depth_int_map(record.get("generic_full_continuous_depth_partial_recovered_token_counts")),
+            )
+            merge_depth_max(
+                generic_full_continuous_depth_partial_recovered_token_counts,
+                as_depth_int_map(record.get("unified_generic_depth_partial_recovered_token_counts")),
+            )
+            merge_depth_max(
+                generic_full_continuous_depth_revised_token_counts,
+                as_depth_int_map(record.get("generic_full_continuous_depth_revised_token_counts")),
+            )
+            merge_depth_max(
+                generic_full_continuous_depth_revised_token_counts,
+                as_depth_int_map(record.get("unified_generic_depth_revised_token_counts")),
+            )
         if bool(record.get("partial_prefix_recovery_enabled", False)) or bool(
             record.get("enable_rolling_continuous_partial_prefix_recovery", False)
         ):
             partial_prefix_recovery_enabled = True
-        partial_prefix_recovered_ids.update(as_int_set(record.get("partial_prefix_recovered_proposal_ids")))
-        partial_prefix_recovered_seq_ids.update(as_int_set(record.get("partial_prefix_recovered_seq_ids")))
-        partial_prefix_accepted_len_by_id.update(
-            {
-                proposal_id: token_count
-                for proposal_id, token_count in as_int_map(
-                    record.get("partial_prefix_accepted_len_by_proposal_id")
-                ).items()
-                if token_count >= 0
-            }
-        )
-        partial_prefix_revised_token_count_by_id.update(
-            {
-                proposal_id: token_count
-                for proposal_id, token_count in as_int_map(
-                    record.get("partial_prefix_revised_token_count_by_proposal_id")
-                ).items()
-                if token_count >= 0
-            }
-        )
-        partial_prefix_committed_token_count_by_id.update(
-            {
-                proposal_id: token_count
-                for proposal_id, token_count in as_int_map(
-                    record.get("partial_prefix_committed_token_count_by_proposal_id")
-                ).items()
-                if token_count >= 0
-            }
-        )
-        partial_prefix_depth_by_id.update(as_int_map(record.get("partial_prefix_recovered_depth_by_proposal_id")))
+        if id(record) in partial_prefix_authority_record_ids:
+            partial_prefix_recovered_ids.update(as_int_set(record.get("partial_prefix_recovered_proposal_ids")))
+            partial_prefix_recovered_seq_ids.update(as_int_set(record.get("partial_prefix_recovered_seq_ids")))
+            partial_prefix_accepted_len_by_id.update(
+                {
+                    proposal_id: token_count
+                    for proposal_id, token_count in as_int_map(
+                        record.get("partial_prefix_accepted_len_by_proposal_id")
+                    ).items()
+                    if token_count >= 0
+                }
+            )
+            partial_prefix_revised_token_count_by_id.update(
+                {
+                    proposal_id: token_count
+                    for proposal_id, token_count in as_int_map(
+                        record.get("partial_prefix_revised_token_count_by_proposal_id")
+                    ).items()
+                    if token_count >= 0
+                }
+            )
+            partial_prefix_committed_token_count_by_id.update(
+                {
+                    proposal_id: token_count
+                    for proposal_id, token_count in as_int_map(
+                        record.get("partial_prefix_committed_token_count_by_proposal_id")
+                    ).items()
+                    if token_count >= 0
+                }
+            )
+            partial_prefix_depth_by_id.update(as_int_map(record.get("partial_prefix_recovered_depth_by_proposal_id")))
         if isinstance(record.get("partial_prefix_recovery_skip_reason_counts"), dict):
             partial_prefix_skip_reason_counts.update(
                 {
@@ -2135,6 +2138,34 @@ def aggregate_performance_accounting(
         combined_actual_accepted_token_increment_sum = int(generic_total_output_tokens - generic_revised_tokens)
         combined_actual_revised_token_increment_sum = int(generic_revised_tokens)
         combined_actual_output_token_increment_sum = int(generic_total_output_tokens)
+        partial_prefix_total_recovered_token_count = int(generic_partial_recovered_tokens)
+        partial_prefix_revised_token_count = int(generic_revised_tokens)
+        partial_prefix_accepted_token_count = max(
+            0,
+            int(partial_prefix_total_recovered_token_count) - int(partial_prefix_revised_token_count),
+        )
+        generic_full_continuous_depth_partial_recovered_token_counts = _normalize_depth_counts_to_total(
+            generic_full_continuous_depth_partial_recovered_token_counts,
+            int(partial_prefix_total_recovered_token_count),
+            partial_prefix_depths,
+        )
+        generic_full_continuous_depth_revised_token_counts = _normalize_depth_counts_to_total(
+            generic_full_continuous_depth_revised_token_counts,
+            int(partial_prefix_revised_token_count),
+            partial_prefix_depths,
+        )
+        partial_prefix_recovered_token_count_by_depth = Counter(
+            {
+                str(depth): int(value)
+                for depth, value in generic_full_continuous_depth_partial_recovered_token_counts.items()
+            }
+        )
+        partial_prefix_revised_token_count_by_depth = Counter(
+            {
+                str(depth): int(value)
+                for depth, value in generic_full_continuous_depth_revised_token_counts.items()
+            }
+        )
     generic_combined_accounting_ok = bool(
         not generic_accounting_mode
         or (
@@ -2194,6 +2225,16 @@ def aggregate_performance_accounting(
         reason: sum(int(value) for value in per_step.values())
         for reason, per_step in sorted(zero_stage_fast_path_reason_counts_by_step.items())
     }
+    partial_prefix_success_count = (
+        int(partial_prefix_revised_token_count)
+        if generic_accounting_mode and generic_total_output_tokens > 0
+        else len(partial_prefix_recovered_ids)
+    )
+    partial_prefix_recovered_proposal_count = (
+        int(partial_prefix_success_count)
+        if generic_accounting_mode and generic_total_output_tokens > 0
+        else len(partial_prefix_recovered_ids)
+    )
     commit_decision_payload_len_units = (
         eager_commit_decision_payload_len_units
         + continuous_commit_decision_payload_len_units
@@ -2487,11 +2528,11 @@ def aggregate_performance_accounting(
         ),
         "partial_prefix_recovery_enabled": bool(partial_prefix_recovery_enabled),
         "partial_prefix_recovery_attempt_count": (
-            len(partial_prefix_recovered_ids) + sum(partial_prefix_skip_reason_counts.values())
+            int(partial_prefix_success_count) + sum(partial_prefix_skip_reason_counts.values())
         ),
-        "partial_prefix_recovery_success_count": len(partial_prefix_recovered_ids),
+        "partial_prefix_recovery_success_count": int(partial_prefix_success_count),
         "partial_prefix_recovery_skip_reason_counts": dict(sorted(partial_prefix_skip_reason_counts.items())),
-        "partial_prefix_recovered_proposal_count": len(partial_prefix_recovered_ids),
+        "partial_prefix_recovered_proposal_count": int(partial_prefix_recovered_proposal_count),
         "partial_prefix_recovered_seq_count": len(partial_prefix_recovered_seq_ids),
         "partial_prefix_accepted_token_count": partial_prefix_accepted_token_count,
         "partial_prefix_revised_token_count": partial_prefix_revised_token_count,
@@ -2669,6 +2710,68 @@ def _sum_depth_values(value: Any) -> int:
     if not isinstance(value, dict):
         return 0
     return sum(int_value(item, 0) for item in value.values())
+
+
+def _partial_prefix_authority_record_ids(records: list[dict[str, Any]]) -> set[int]:
+    authority_roles = {"aggregate", "target", "verify", "dual_verify"}
+    partial_fields = (
+        "partial_prefix_recovered_proposal_ids",
+        "partial_prefix_accepted_len_by_proposal_id",
+        "partial_prefix_revised_token_count_by_proposal_id",
+        "partial_prefix_committed_token_count_by_proposal_id",
+        "partial_prefix_recovered_depth_by_proposal_id",
+        "generic_full_continuous_depth_partial_recovered_token_counts",
+        "unified_generic_depth_partial_recovered_token_counts",
+    )
+    authority_records = [
+        record
+        for record in records
+        if str(record.get("runner_role") or "") in authority_roles
+        and any(field in record for field in partial_fields)
+    ]
+    if not authority_records:
+        return {id(record) for record in records}
+    return {id(record) for record in authority_records}
+
+
+def _normalize_depth_counts_to_total(
+    counts: dict[int, int],
+    total: int,
+    preferred_depths: set[int],
+) -> dict[int, int]:
+    total = int(total)
+    if total <= 0:
+        return {}
+    positive_counts = {
+        int(depth): int(value)
+        for depth, value in counts.items()
+        if int(depth) > 0 and int(value) > 0
+    }
+    if sum(positive_counts.values()) == total:
+        return dict(sorted(positive_counts.items()))
+    positive_depths = sorted(depth for depth in preferred_depths if int(depth) > 0)
+    if len(positive_depths) == 1:
+        return {int(positive_depths[0]): total}
+    if len(positive_counts) == 1:
+        depth = next(iter(positive_counts))
+        return {int(depth): total}
+    if not positive_counts:
+        depth = int(positive_depths[-1]) if positive_depths else 1
+        return {depth: total}
+
+    normalized: dict[int, int] = {}
+    remaining = total
+    for depth, value in sorted(positive_counts.items()):
+        if remaining <= 0:
+            break
+        assigned = min(int(value), remaining)
+        if assigned > 0:
+            normalized[int(depth)] = assigned
+            remaining -= assigned
+    if remaining > 0:
+        depth = max(normalized) if normalized else max(positive_counts)
+        normalized[int(depth)] = int(normalized.get(int(depth), 0)) + int(remaining)
+    return dict(sorted(normalized.items()))
 
 
 def generic_full_continuous_accounting_errors(accounting: dict[str, Any]) -> list[str]:
@@ -4020,6 +4123,46 @@ def run_synthetic_tests() -> None:
     assert generic_summary["combined_actual_revised_token_increment_sum"] == 9
     assert generic_summary["combined_actual_output_token_increment_sum"] == 3676
     assert generic_summary["legacy_accounting_checks_skipped_due_to_generic_mode"]
+
+    generic_partial_authority_records = synthetic_generic_full_continuous_records(
+        partial_recovered=8,
+        revised=3,
+        total_output=3656,
+    )
+    draft_overcount = deepcopy(generic_partial_authority_records[0])
+    draft_overcount["runner_role"] = "draft"
+    draft_overcount["generic_full_continuous_depth_partial_recovered_token_counts"] = {"60": 107}
+    draft_overcount["generic_full_continuous_depth_revised_token_counts"] = {"60": 37}
+    draft_overcount["partial_prefix_recovered_proposal_ids"] = list(range(991000001, 991000038))
+    draft_overcount["partial_prefix_recovered_depth_by_proposal_id"] = {
+        str(proposal_id): 60 for proposal_id in draft_overcount["partial_prefix_recovered_proposal_ids"]
+    }
+    draft_overcount["partial_prefix_accepted_len_by_proposal_id"] = {
+        str(proposal_id): 2 for proposal_id in draft_overcount["partial_prefix_recovered_proposal_ids"]
+    }
+    draft_overcount["partial_prefix_revised_token_count_by_proposal_id"] = {
+        str(proposal_id): 1 for proposal_id in draft_overcount["partial_prefix_recovered_proposal_ids"]
+    }
+    draft_overcount["partial_prefix_committed_token_count_by_proposal_id"] = {
+        str(proposal_id): 3 for proposal_id in draft_overcount["partial_prefix_recovered_proposal_ids"]
+    }
+    generic_partial_authority_records.append(draft_overcount)
+    errors, authority_summary = validate_accounting(
+        generic_partial_authority_records,
+        synthetic_generic_result_payload(total_output_tokens=3656),
+    )
+    assert not errors, f"generic partial authority overcount synthetic failed: {errors}"
+    assert authority_summary["partial_prefix_total_recovered_token_count"] == 8
+    assert authority_summary["partial_prefix_revised_token_count"] == 3
+    assert authority_summary["partial_prefix_recovery_success_count"] == 3
+    assert sum(
+        int(value)
+        for value in authority_summary["generic_full_continuous_depth_partial_recovered_token_counts"].values()
+    ) == 8
+    assert sum(
+        int(value)
+        for value in authority_summary["generic_full_continuous_depth_revised_token_counts"].values()
+    ) == 3
 
     denominator_records = synthetic_generic_full_continuous_records(
         full_commit=6384,
