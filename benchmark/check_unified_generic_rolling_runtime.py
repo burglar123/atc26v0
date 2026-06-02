@@ -247,6 +247,51 @@ def sum_nested_int_hist(records: list[dict[str, Any]], *fields: str) -> dict[str
     return sum_depth_reason_counts(records, *fields)
 
 
+def nested_hist_total(hist_by_depth: dict[str, dict[str, int]]) -> int:
+    return sum(int_value(count, 0) for hist in hist_by_depth.values() for count in hist.values())
+
+
+def nested_hist_nonzero_accept_count(hist_by_depth: dict[str, dict[str, int]]) -> int:
+    total = 0
+    for hist in hist_by_depth.values():
+        for bucket, count in hist.items():
+            try:
+                accepted_len = int(bucket)
+            except Exception:
+                continue
+            if accepted_len > 0:
+                total += int_value(count, 0)
+    return total
+
+
+def nested_hist_reject_count(hist_by_depth: dict[str, dict[str, int]]) -> int:
+    return sum(int_value(hist.get("0"), 0) for hist in hist_by_depth.values())
+
+
+def nested_hist_all_first_token_reject(hist_by_depth: dict[str, dict[str, int]]) -> bool:
+    total = nested_hist_total(hist_by_depth)
+    return total > 0 and nested_hist_nonzero_accept_count(hist_by_depth) == 0
+
+
+def nested_hist_full_accept_count(hist_by_depth: dict[str, dict[str, int]], gamma: int) -> int:
+    if gamma <= 0:
+        return 0
+    return sum(int_value(hist.get(str(int(gamma))), 0) for hist in hist_by_depth.values())
+
+
+def nested_hist_partial_accept_count(hist_by_depth: dict[str, dict[str, int]], gamma: int) -> int:
+    total = 0
+    for hist in hist_by_depth.values():
+        for bucket, count in hist.items():
+            try:
+                accepted_len = int(bucket)
+            except Exception:
+                continue
+            if 0 < accepted_len < int(gamma):
+                total += int_value(count, 0)
+    return total
+
+
 def count_depth_lists(value: dict[int, list[int]]) -> dict[str, int]:
     return {
         str(int(depth)): len(set(int(item) for item in items))
@@ -830,6 +875,48 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             target_next_round_mismatch_ids.add(int(proposal_id))
     target_input_shape = aggregate_shape(records, "unified_generic_target_verify_input_ids_shape")
     target_logits_shape = aggregate_shape(records, "unified_generic_target_verify_logits_shape")
+    current_window_hist = sum_nested_int_hist(
+        records,
+        "unified_generic_target_verify_current_window_accept_hist_by_depth",
+    )
+    proposal_window_shadow_hist = sum_nested_int_hist(
+        records,
+        "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth",
+    )
+    proposal_window_verify_enabled = any_record_bool(
+        records,
+        "unified_generic_proposal_window_verify_enabled",
+    ) or bool(result_args.get("enable_unified_generic_proposal_window_verify", False))
+    gamma = max_record_int(records, "normal_gamma")
+    sampled_current_to_verify = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_current_to_be_verified_by_proposal_id",
+    )
+    sampled_proposal_to_verify = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_proposal_window_to_be_verified_by_proposal_id",
+    )
+    current_first_token_probs = {}
+    proposal_first_token_probs = {}
+    for record in records:
+        for raw_id, raw_value in (
+            record.get("unified_generic_target_verify_current_window_first_token_prob_by_proposal_id") or {}
+        ).items():
+            try:
+                current_first_token_probs.setdefault(int(raw_id), float(raw_value))
+            except Exception:
+                continue
+        for raw_id, raw_value in (
+            record.get("unified_generic_target_verify_proposal_window_first_token_prob_by_proposal_id") or {}
+        ).items():
+            try:
+                proposal_first_token_probs.setdefault(int(raw_id), float(raw_value))
+            except Exception:
+                continue
+    top5_tokens = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id",
+    )
 
     return {
         "unified_generic_rolling_enabled": bool(unified_enabled),
@@ -937,6 +1024,47 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             str(proposal_id): list(tokens)
             for proposal_id, tokens in sorted(target_original_proposals.items())
         },
+        "unified_generic_proposal_window_verify_enabled": bool(proposal_window_verify_enabled),
+        "unified_generic_target_verify_current_window_accept_hist_by_depth": current_window_hist,
+        "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth": proposal_window_shadow_hist,
+        "unified_generic_target_verify_current_window_all_first_token_reject": (
+            nested_hist_all_first_token_reject(current_window_hist)
+        ),
+        "unified_generic_target_verify_proposal_window_shadow_all_first_token_reject": (
+            nested_hist_all_first_token_reject(proposal_window_shadow_hist)
+        ),
+        "unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept": (
+            nested_hist_nonzero_accept_count(proposal_window_shadow_hist) > 0
+        ),
+        "unified_generic_target_verify_proposal_window_shadow_full_accept_count": (
+            nested_hist_full_accept_count(proposal_window_shadow_hist, gamma)
+        ),
+        "unified_generic_target_verify_proposal_window_shadow_partial_accept_count": (
+            nested_hist_partial_accept_count(proposal_window_shadow_hist, gamma)
+        ),
+        "unified_generic_target_verify_proposal_window_shadow_reject_count": (
+            nested_hist_reject_count(proposal_window_shadow_hist)
+        ),
+        "unified_generic_target_verify_sampled_current_to_be_verified_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(sampled_current_to_verify.items())
+        },
+        "unified_generic_target_verify_sampled_proposal_window_to_be_verified_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(sampled_proposal_to_verify.items())
+        },
+        "unified_generic_target_verify_sampled_current_window_first_token_prob_by_proposal_id": {
+            str(proposal_id): float(value)
+            for proposal_id, value in sorted(current_first_token_probs.items())
+        },
+        "unified_generic_target_verify_sampled_proposal_window_first_token_prob_by_proposal_id": {
+            str(proposal_id): float(value)
+            for proposal_id, value in sorted(proposal_first_token_probs.items())
+        },
+        "unified_generic_target_verify_sampled_first_position_target_top5_tokens_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(top5_tokens.items())
+        },
     }
 
 
@@ -1022,6 +1150,16 @@ def validate_records(
         rows_per_proposal = int_value(summary.get("unified_generic_target_verify_logits_rows_per_proposal"), 0)
         if gamma > 0 and rows_per_proposal and rows_per_proposal != gamma:
             errors.append("temporary target verification logits rows per proposal must equal gamma")
+        if bool(summary.get("unified_generic_proposal_window_verify_enabled", False)):
+            proposal_shadow_hist = summary.get(
+                "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth",
+                {},
+            )
+            actual_hist = summary.get("unified_raw_accepted_len_hist_by_depth", {})
+            if proposal_shadow_hist and actual_hist != proposal_shadow_hist:
+                errors.append(
+                    "proposal-window verify enabled but actual accepted_len hist does not match proposal-window shadow hist"
+                )
     target_verified_reject_only = bool(
         summary.get("unified_raw_target_verification_available")
         and raw_verified_total > 0
@@ -1111,6 +1249,9 @@ def add_synthetic_temp_append_trace(
 ) -> None:
     proposal_ids = sorted(int(proposal_id) for proposal_id in proposal_tokens_by_id)
     sampled_ids = proposal_ids[:sample_limit]
+    depth_by_id = as_int_map(record.get("generic_rolling_depth_by_proposal_id")) or {
+        proposal_id: 1 for proposal_id in proposal_ids
+    }
     before = {proposal_id: seq_len_base + index * 4 for index, proposal_id in enumerate(proposal_ids)}
     after = {proposal_id: before[proposal_id] + 4 for proposal_id in proposal_ids}
     record["unified_generic_target_verify_temp_append_used"] = True
@@ -1170,6 +1311,71 @@ def add_synthetic_temp_append_trace(
     record["unified_generic_target_verify_parent_proposal_id_by_proposal_id"] = {
         str(proposal_id): -1 if proposal_id == proposal_ids[0] else proposal_id - 1
         for proposal_id in proposal_ids
+    }
+    current_to_verify = {
+        proposal_id: [900 + index, 901 + index, 902 + index, proposal_tokens_by_id[proposal_id][0]]
+        for index, proposal_id in enumerate(proposal_ids)
+    }
+    current_accept_by_id = {proposal_id: 4 for proposal_id in proposal_ids}
+    proposal_accept_by_id = {proposal_id: 4 for proposal_id in proposal_ids}
+    current_hist: dict[str, dict[str, int]] = {}
+    proposal_hist: dict[str, dict[str, int]] = {}
+    for proposal_id in proposal_ids:
+        depth = str(int(depth_by_id.get(proposal_id, 1)))
+        current_hist.setdefault(depth, {})
+        proposal_hist.setdefault(depth, {})
+        current_hist[depth]["4"] = int(current_hist[depth].get("4", 0)) + 1
+        proposal_hist[depth]["4"] = int(proposal_hist[depth].get("4", 0)) + 1
+    record["unified_generic_proposal_window_verify_enabled"] = False
+    record["unified_generic_target_verify_current_to_be_verified_by_proposal_id"] = {
+        str(proposal_id): list(current_to_verify[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_proposal_window_to_be_verified_by_proposal_id"] = {
+        str(proposal_id): list(proposal_tokens_by_id[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_current_window_equals_proposal_by_proposal_id"] = {
+        str(proposal_id): current_to_verify[proposal_id] == proposal_tokens_by_id[proposal_id]
+        for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_proposal_window_equals_input_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_current_window_accepted_len_by_proposal_id"] = {
+        str(proposal_id): int(current_accept_by_id[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_proposal_window_shadow_accepted_len_by_proposal_id"] = {
+        str(proposal_id): int(proposal_accept_by_id[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_current_window_accept_hist_by_depth"] = current_hist
+    record["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = proposal_hist
+    record["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] = True
+    record["unified_generic_target_verify_current_window_first_token_prob_by_proposal_id"] = {
+        str(proposal_id): 0.05 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_proposal_window_first_token_prob_by_proposal_id"] = {
+        str(proposal_id): 0.85 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_current_window_first_token_id_by_proposal_id"] = {
+        str(proposal_id): int(current_to_verify[proposal_id][0]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_proposal_window_first_token_id_by_proposal_id"] = {
+        str(proposal_id): int(proposal_tokens_by_id[proposal_id][0]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_first_position_target_argmax_token_by_proposal_id"] = {
+        str(proposal_id): int(proposal_tokens_by_id[proposal_id][0]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id"] = {
+        str(proposal_id): [
+            int(proposal_tokens_by_id[proposal_id][0]),
+            int(proposal_tokens_by_id[proposal_id][1]),
+            int(current_to_verify[proposal_id][0]),
+            42,
+            43,
+        ]
+        for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id"] = {
+        str(proposal_id): [0.85, 0.05, 0.03, 0.02, 0.01] for proposal_id in sampled_ids
     }
 
 
@@ -1435,6 +1641,7 @@ def run_synthetic_tests() -> None:
     assert summary["unified_generic_target_verify_temp_append_used"] is True
     assert summary["unified_generic_target_verify_input_mismatch_proposal_ids"] == []
     assert summary["unified_generic_target_verify_next_round_mismatch_proposal_ids"] == []
+    assert summary["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] is True
 
     missing_temp_append = [json.loads(json.dumps(records[0]))]
     missing_temp_append[0]["unified_generic_target_verify_temp_append_used"] = False
@@ -1454,6 +1661,57 @@ def run_synthetic_tests() -> None:
     assert any("checkpoint" in error or "rollback length" in error for error in errors), (
         "checkpoint restore failure should fail"
     )
+
+    current_reject_shadow_accept = [json.loads(json.dumps(records[0]))]
+    current_reject_shadow_accept[0]["unified_generic_target_verify_current_window_accept_hist_by_depth"] = {
+        "1": {"0": 1}
+    }
+    current_reject_shadow_accept[0]["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = {
+        "1": {"2": 1}
+    }
+    errors, shadow_summary = validate_records(current_reject_shadow_accept, payload)
+    assert not errors, f"shadow nonzero diagnostic should pass: {errors}\nsummary={shadow_summary}"
+    assert shadow_summary["unified_generic_target_verify_current_window_all_first_token_reject"] is True
+    assert shadow_summary["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] is True
+    assert shadow_summary["unified_generic_target_verify_proposal_window_shadow_partial_accept_count"] == 1
+
+    both_windows_reject = [json.loads(json.dumps(records[0]))]
+    both_windows_reject[0]["unified_generic_target_verify_current_window_accept_hist_by_depth"] = {"1": {"0": 1}}
+    both_windows_reject[0]["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = {
+        "1": {"0": 1}
+    }
+    both_windows_reject[0]["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] = False
+    errors, both_reject_summary = validate_records(both_windows_reject, payload)
+    assert not errors, f"both windows reject diagnostic should pass: {errors}\nsummary={both_reject_summary}"
+    assert both_reject_summary["unified_generic_target_verify_current_window_all_first_token_reject"] is True
+    assert both_reject_summary["unified_generic_target_verify_proposal_window_shadow_all_first_token_reject"] is True
+
+    guarded_proposal_window = [json.loads(json.dumps(records[0]))]
+    guarded_proposal_window[0]["unified_generic_proposal_window_verify_enabled"] = True
+    guarded_proposal_window[0]["unified_raw_accepted_len_hist_by_depth"] = {
+        "1": {"4": 1},
+        "2": {"4": 1},
+        "3": {"4": 1},
+        "4": {"4": 1},
+        "5": {"4": 1},
+        "6": {"4": 1},
+    }
+    guarded_proposal_window[0]["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = (
+        guarded_proposal_window[0]["unified_raw_accepted_len_hist_by_depth"]
+    )
+    errors, guarded_summary = validate_records(guarded_proposal_window, payload)
+    assert not errors, f"guarded proposal-window synthetic should pass: {errors}\nsummary={guarded_summary}"
+    assert guarded_summary["unified_generic_proposal_window_verify_enabled"] is True
+
+    sampled_missing = [json.loads(json.dumps(records[0]))]
+    for field in (
+        "unified_generic_target_verify_current_to_be_verified_by_proposal_id",
+        "unified_generic_target_verify_proposal_window_to_be_verified_by_proposal_id",
+        "unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id",
+    ):
+        sampled_missing[0].pop(field, None)
+    errors, _summary = validate_records(sampled_missing, payload)
+    assert not errors, f"missing sampled debug fields should not fail: {errors}"
 
     reject_partial_records = synthetic_reject_partial_records()
     errors, reject_partial_summary = validate_records(
@@ -1560,6 +1818,20 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_generic_target_verify_sampled_input_ids_by_proposal_id",
         "unified_generic_target_verify_sampled_next_round_input_by_proposal_id",
         "unified_generic_target_verify_sampled_original_proposal_token_ids_by_proposal_id",
+        "unified_generic_proposal_window_verify_enabled",
+        "unified_generic_target_verify_current_window_accept_hist_by_depth",
+        "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth",
+        "unified_generic_target_verify_current_window_all_first_token_reject",
+        "unified_generic_target_verify_proposal_window_shadow_all_first_token_reject",
+        "unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept",
+        "unified_generic_target_verify_proposal_window_shadow_full_accept_count",
+        "unified_generic_target_verify_proposal_window_shadow_partial_accept_count",
+        "unified_generic_target_verify_proposal_window_shadow_reject_count",
+        "unified_generic_target_verify_sampled_current_to_be_verified_by_proposal_id",
+        "unified_generic_target_verify_sampled_proposal_window_to_be_verified_by_proposal_id",
+        "unified_generic_target_verify_sampled_current_window_first_token_prob_by_proposal_id",
+        "unified_generic_target_verify_sampled_proposal_window_first_token_prob_by_proposal_id",
+        "unified_generic_target_verify_sampled_first_position_target_top5_tokens_by_proposal_id",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",
         "unified_candidate_budget_saturated_step_count",

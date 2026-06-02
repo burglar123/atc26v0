@@ -158,6 +158,7 @@ class PEARLConfig:
     enable_generic_rolling_runtime_loop: bool = False
     enable_generic_rolling_apply_path: bool = False
     enable_full_continuous_eager: bool = False
+    enable_unified_generic_proposal_window_verify: bool = False
     eager_policy: str = "none"
     max_eager_requests_per_step: int = 0
     max_eager_tokens_per_step: int = 0
@@ -223,6 +224,9 @@ class PEARLConfig:
         self.enable_generic_rolling_runtime_loop = bool(self.enable_generic_rolling_runtime_loop)
         self.enable_generic_rolling_apply_path = bool(self.enable_generic_rolling_apply_path)
         self.enable_full_continuous_eager = bool(self.enable_full_continuous_eager)
+        self.enable_unified_generic_proposal_window_verify = bool(
+            self.enable_unified_generic_proposal_window_verify
+        )
         self.enable_cached_admission = bool(self.enable_cached_admission)
         self.cached_prefill_mode = str(self.cached_prefill_mode)
         if self.cached_prefill_mode not in CACHED_PREFILL_MODES:
@@ -514,6 +518,10 @@ class PEARLConfig:
         logger.info(f"Enable_Generic_Rolling_Runtime_Loop={self.enable_generic_rolling_runtime_loop}")
         logger.info(f"Enable_Generic_Rolling_Apply_Path={self.enable_generic_rolling_apply_path}")
         logger.info(f"Enable_Full_Continuous_Eager={self.enable_full_continuous_eager}")
+        logger.info(
+            "Enable_Unified_Generic_Proposal_Window_Verify="
+            f"{self.enable_unified_generic_proposal_window_verify}"
+        )
         logger.info(f"Eager_Policy={self.eager_policy}")
         logger.info(f"Eager_Trace_Level={self.eager_trace_level}")
         logger.info(f"Max_Eager_Requests_Per_Step={self.max_eager_requests_per_step}")

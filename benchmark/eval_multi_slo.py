@@ -240,6 +240,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
             args.enable_rolling_continuous_partial_prefix_recovery
         ),
         "enable_unified_generic_rolling_runtime": args.enable_unified_generic_rolling_runtime,
+        "enable_unified_generic_proposal_window_verify": args.enable_unified_generic_proposal_window_verify,
         "enable_generic_rolling_runtime_loop": args.enable_generic_rolling_runtime_loop,
         "enable_generic_rolling_apply_path": args.enable_generic_rolling_apply_path,
         "enable_full_continuous_eager": args.enable_full_continuous_eager,
@@ -301,6 +302,7 @@ def make_pearl_config(args: argparse.Namespace) -> PEARLConfig:
         "enable_rolling_continuous_depth4_commit_ready_only",
         "enable_rolling_continuous_partial_prefix_recovery",
         "enable_unified_generic_rolling_runtime",
+        "enable_unified_generic_proposal_window_verify",
         "enable_generic_rolling_runtime_loop",
         "enable_generic_rolling_apply_path",
         "enable_full_continuous_eager",
@@ -2456,6 +2458,14 @@ def main() -> None:
             "Enable Phase 1H-8x unified generic rolling runtime from depth 1. "
             "This bypasses legacy one-shot/depth1/depth2/depth3/depth4 eager "
             "runtime paths and implies full-continuous generic runtime/apply mode."
+        ),
+    )
+    parser.add_argument(
+        "--enable-unified-generic-proposal-window-verify",
+        action="store_true",
+        help=(
+            "Enable guarded Phase 1H-9B-debug3 actual unified generic target verification "
+            "against the proposal/next-round window instead of the legacy-derived window."
         ),
     )
     parser.add_argument(

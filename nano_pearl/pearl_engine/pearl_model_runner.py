@@ -1678,6 +1678,23 @@ class ModelRunnerBase:
             "unified_generic_target_verify_pre_verify_after_rollback_by_proposal_id": {},
             "unified_generic_target_verify_base_len_by_proposal_id": {},
             "unified_generic_target_verify_parent_proposal_id_by_proposal_id": {},
+            "unified_generic_proposal_window_verify_enabled": False,
+            "unified_generic_target_verify_current_to_be_verified_by_proposal_id": {},
+            "unified_generic_target_verify_proposal_window_to_be_verified_by_proposal_id": {},
+            "unified_generic_target_verify_current_window_equals_proposal_by_proposal_id": {},
+            "unified_generic_target_verify_proposal_window_equals_input_by_proposal_id": {},
+            "unified_generic_target_verify_current_window_accepted_len_by_proposal_id": {},
+            "unified_generic_target_verify_proposal_window_shadow_accepted_len_by_proposal_id": {},
+            "unified_generic_target_verify_current_window_accept_hist_by_depth": {},
+            "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth": {},
+            "unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept": False,
+            "unified_generic_target_verify_current_window_first_token_prob_by_proposal_id": {},
+            "unified_generic_target_verify_proposal_window_first_token_prob_by_proposal_id": {},
+            "unified_generic_target_verify_current_window_first_token_id_by_proposal_id": {},
+            "unified_generic_target_verify_proposal_window_first_token_id_by_proposal_id": {},
+            "unified_generic_target_verify_first_position_target_argmax_token_by_proposal_id": {},
+            "unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id": {},
+            "unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id": {},
             "generic_rolling_token_count_by_proposal_id": {},
             "generic_rolling_status_by_proposal_id": {},
             "generic_rolling_status_reason_by_proposal_id": {},
@@ -14211,6 +14228,98 @@ class ModelRunnerBase:
                 1,
             )
 
+    @torch.inference_mode()
+    def _compute_unified_target_verify_window_diagnostics(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor | None,
+        entries: list[dict],
+        *,
+        gamma: int,
+    ) -> dict:
+        diagnostics = {
+            "current_accept_len_by_id": {},
+            "proposal_accept_len_by_id": {},
+            "current_accept_hist_by_depth": {},
+            "proposal_accept_hist_by_depth": {},
+            "current_first_token_prob_by_id": {},
+            "proposal_first_token_prob_by_id": {},
+            "current_first_token_id_by_id": {},
+            "proposal_first_token_id_by_id": {},
+            "first_argmax_by_id": {},
+            "top5_tokens_by_id": {},
+            "top5_probs_by_id": {},
+        }
+        if not entries or self.tp_params.local_rank != 0 or temperatures is None:
+            return diagnostics
+
+        total_rows = int(logits.shape[0])
+        if total_rows <= 0:
+            return diagnostics
+        target_probs = norm_logits(logits, temperatures)
+        rng_state = torch.cuda.get_rng_state()
+        try:
+            thresholds = torch.rand(total_rows, device=logits.device)
+        finally:
+            torch.cuda.set_rng_state(rng_state)
+
+        def _hist_increment(hist: dict[str, dict[str, int]], depth: int, accepted_len: int) -> None:
+            depth_key = str(int(depth))
+            bucket = str(int(accepted_len))
+            hist.setdefault(depth_key, {})
+            hist[depth_key][bucket] = int(hist[depth_key].get(bucket, 0)) + 1
+
+        def _accept_len(tokens: list[int], row_start: int, max_rows: int) -> int:
+            accepted = 0
+            usable_len = min(len(tokens), int(max_rows))
+            for offset in range(usable_len):
+                row = int(row_start) + int(offset)
+                if row < 0 or row >= total_rows:
+                    break
+                token_id = int(tokens[offset])
+                if token_id < 0 or token_id >= int(target_probs.shape[1]):
+                    break
+                token_prob = float(target_probs[row, token_id].item())
+                if float(thresholds[row].item()) <= token_prob:
+                    accepted += 1
+                    continue
+                break
+            return int(accepted)
+
+        row_start = 0
+        for entry in entries:
+            proposal_id = int(entry["proposal_id"])
+            depth = int(entry["proposal"].get("depth", -1))
+            row_count = int(entry.get("input_width", gamma))
+            current_tokens = [int(token_id) for token_id in entry["actual_to_be_verified_tokens"]]
+            proposal_tokens = [int(token_id) for token_id in entry["proposal_window_to_verify"]]
+            current_accept_len = _accept_len(current_tokens, row_start, row_count)
+            proposal_accept_len = _accept_len(proposal_tokens, row_start, row_count)
+            diagnostics["current_accept_len_by_id"][proposal_id] = int(current_accept_len)
+            diagnostics["proposal_accept_len_by_id"][proposal_id] = int(proposal_accept_len)
+            _hist_increment(diagnostics["current_accept_hist_by_depth"], depth, current_accept_len)
+            _hist_increment(diagnostics["proposal_accept_hist_by_depth"], depth, proposal_accept_len)
+            if row_start < total_rows:
+                first_row_probs = target_probs[row_start]
+                current_token_id = int(current_tokens[0]) if current_tokens else -1
+                proposal_token_id = int(proposal_tokens[0]) if proposal_tokens else -1
+                diagnostics["current_first_token_id_by_id"][proposal_id] = int(current_token_id)
+                diagnostics["proposal_first_token_id_by_id"][proposal_id] = int(proposal_token_id)
+                if 0 <= current_token_id < int(first_row_probs.shape[0]):
+                    diagnostics["current_first_token_prob_by_id"][proposal_id] = float(
+                        first_row_probs[current_token_id].item()
+                    )
+                if 0 <= proposal_token_id < int(first_row_probs.shape[0]):
+                    diagnostics["proposal_first_token_prob_by_id"][proposal_id] = float(
+                        first_row_probs[proposal_token_id].item()
+                    )
+                topk = torch.topk(first_row_probs, k=min(5, int(first_row_probs.shape[0])))
+                diagnostics["first_argmax_by_id"][proposal_id] = int(topk.indices[0].item())
+                diagnostics["top5_tokens_by_id"][proposal_id] = [int(token_id) for token_id in topk.indices.tolist()]
+                diagnostics["top5_probs_by_id"][proposal_id] = [float(prob) for prob in topk.values.tolist()]
+            row_start += max(0, row_count)
+        return diagnostics
+
     def _run_unified_generic_target_verify_and_apply(
         self,
         plan: StepPlan,
@@ -14222,6 +14331,10 @@ class ModelRunnerBase:
         gamma = int(self.gamma)
         trace_record["unified_raw_target_verification_available"] = True
         trace_record["unified_raw_verification_source"] = "target_verify_result"
+        proposal_window_verify_enabled = bool(
+            getattr(self.global_config, "enable_unified_generic_proposal_window_verify", False)
+        )
+        trace_record["unified_generic_proposal_window_verify_enabled"] = bool(proposal_window_verify_enabled)
         if not proposals:
             self._update_unified_raw_verified_to_committed_ratio(trace_record)
             return []
@@ -14269,6 +14382,21 @@ class ModelRunnerBase:
         pre_verify_after_rollback_by_id: dict[int, bool] = {}
         base_len_by_target_verify_id: dict[int, int] = {}
         parent_by_target_verify_id: dict[int, int] = {}
+        current_to_verify_by_id: dict[int, list[int]] = {}
+        proposal_window_to_verify_by_id: dict[int, list[int]] = {}
+        current_window_equals_proposal_by_id: dict[int, bool] = {}
+        proposal_window_equals_input_by_id: dict[int, bool] = {}
+        current_window_accepted_len_by_id: dict[int, int] = {}
+        proposal_window_shadow_accepted_len_by_id: dict[int, int] = {}
+        current_window_accept_hist_by_depth: dict[str, dict[str, int]] = {}
+        proposal_window_shadow_accept_hist_by_depth: dict[str, dict[str, int]] = {}
+        current_window_first_token_prob_by_id: dict[int, float] = {}
+        proposal_window_first_token_prob_by_id: dict[int, float] = {}
+        current_window_first_token_id_by_id: dict[int, int] = {}
+        proposal_window_first_token_id_by_id: dict[int, int] = {}
+        first_position_argmax_token_by_id: dict[int, int] = {}
+        first_position_top5_tokens_by_id: dict[int, list[int]] = {}
+        first_position_top5_probs_by_id: dict[int, list[float]] = {}
 
         for depth in sorted(proposals_by_depth):
             depth_results: list[dict] = []
@@ -14391,8 +14519,19 @@ class ModelRunnerBase:
                                 f"legacy_to_verify_len={len(legacy_to_be_verified)}, "
                                 f"expected_to_verify_len={expected_to_verify_len}"
                             )
+                        proposal_window_to_verify = list(next_round_input)
+                        actual_to_be_verified = (
+                            list(proposal_window_to_verify)
+                            if proposal_window_verify_enabled
+                            else list(legacy_to_be_verified)
+                        )
                         next_round_input_by_id[proposal_id] = list(next_round_input)
                         legacy_to_verify_by_id[proposal_id] = list(legacy_to_be_verified)
+                        current_to_verify_by_id[proposal_id] = list(actual_to_be_verified)
+                        proposal_window_to_verify_by_id[proposal_id] = list(proposal_window_to_verify)
+                        current_window_equals_proposal_by_id[proposal_id] = (
+                            list(actual_to_be_verified) == list(proposal_window_to_verify)
+                        )
                         next_round_equals_original_by_id[proposal_id] = list(next_round_input) == list(proposal_window)
                         positions_by_id[proposal_id] = [
                             int(position) for position in range(int(len(seq)) - input_width, int(len(seq)))
@@ -14417,11 +14556,14 @@ class ModelRunnerBase:
                             base_pre_verify=bool(proposal.get("base_pre_verify", False)),
                             base_num_completion_tokens=int(checkpoint["num_completion_tokens"]),
                             proposal_token_ids=list(next_round_input),
-                            to_be_verified_token_ids=list(legacy_to_be_verified),
+                            to_be_verified_token_ids=list(actual_to_be_verified),
                             proposal_len=gamma,
                             state=EAGER_STATE_READY_TO_VERIFY,
                             valid=True,
                         )
+                        entry["actual_to_be_verified_tokens"] = list(actual_to_be_verified)
+                        entry["legacy_to_be_verified_tokens"] = list(legacy_to_be_verified)
+                        entry["proposal_window_to_verify"] = list(proposal_window_to_verify)
                         if len(sampled_target_verify_ids) < target_verify_sample_limit:
                             sampled_target_verify_ids.add(proposal_id)
 
@@ -14441,6 +14583,9 @@ class ModelRunnerBase:
                         input_equals_next_round_by_id[proposal_id] = (
                             list(input_slice) == list(next_round_input_by_id.get(proposal_id, []))
                         )
+                        proposal_window_equals_input_by_id[proposal_id] = (
+                            list(proposal_window_to_verify_by_id.get(proposal_id, [])) == list(input_slice)
+                        )
                         offset += width
                     target_verify_num_proposals += len(temp_entries)
                     target_verify_num_to_verify_tokens += sum(
@@ -14455,6 +14600,78 @@ class ModelRunnerBase:
                     target_verify_logits_width = int(logits.shape[1]) if len(logits.shape) > 1 else 0
                     if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
                         target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
+                    window_diagnostics = self._compute_unified_target_verify_window_diagnostics(
+                        logits,
+                        temperatures,
+                        temp_entries,
+                        gamma=gamma,
+                    )
+                    current_window_accepted_len_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in window_diagnostics["current_accept_len_by_id"].items()
+                        }
+                    )
+                    proposal_window_shadow_accepted_len_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in window_diagnostics["proposal_accept_len_by_id"].items()
+                        }
+                    )
+                    for depth_key, hist in window_diagnostics["current_accept_hist_by_depth"].items():
+                        merged = current_window_accept_hist_by_depth.setdefault(str(depth_key), {})
+                        for bucket, count in hist.items():
+                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                    for depth_key, hist in window_diagnostics["proposal_accept_hist_by_depth"].items():
+                        merged = proposal_window_shadow_accept_hist_by_depth.setdefault(str(depth_key), {})
+                        for bucket, count in hist.items():
+                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                    current_window_first_token_prob_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in window_diagnostics[
+                                "current_first_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    proposal_window_first_token_prob_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in window_diagnostics[
+                                "proposal_first_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    current_window_first_token_id_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in window_diagnostics["current_first_token_id_by_id"].items()
+                        }
+                    )
+                    proposal_window_first_token_id_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in window_diagnostics["proposal_first_token_id_by_id"].items()
+                        }
+                    )
+                    first_position_argmax_token_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in window_diagnostics["first_argmax_by_id"].items()
+                        }
+                    )
+                    first_position_top5_tokens_by_id.update(
+                        {
+                            int(proposal_id): [int(token_id) for token_id in value]
+                            for proposal_id, value in window_diagnostics["top5_tokens_by_id"].items()
+                        }
+                    )
+                    first_position_top5_probs_by_id.update(
+                        {
+                            int(proposal_id): [float(prob) for prob in value]
+                            for proposal_id, value in window_diagnostics["top5_probs_by_id"].items()
+                        }
+                    )
                     verify_maps = self.compute_pearl_verify_result_no_apply(
                         logits,
                         verify_seqs,
@@ -14574,9 +14791,32 @@ class ModelRunnerBase:
                 for proposal_id in sorted(sampled_target_verify_ids)
                 if proposal_id in mapping
             }
+        def _sampled_float_map(mapping: dict[int, float]) -> dict[str, float]:
+            return {
+                str(proposal_id): float(mapping[proposal_id])
+                for proposal_id in sorted(sampled_target_verify_ids)
+                if proposal_id in mapping
+            }
+        def _sampled_float_list_map(mapping: dict[int, list[float]]) -> dict[str, list[float]]:
+            return {
+                str(proposal_id): [float(value) for value in mapping[proposal_id]]
+                for proposal_id in sorted(sampled_target_verify_ids)
+                if proposal_id in mapping
+            }
+        def _sorted_nested_hist(mapping: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+            return {
+                str(depth): {
+                    str(bucket): int(count)
+                    for bucket, count in sorted(hist.items(), key=lambda item: int(item[0]))
+                }
+                for depth, hist in sorted(mapping.items(), key=lambda item: int(item[0]))
+            }
 
         if target_verify_num_proposals > 0:
             trace_record["unified_generic_target_verify_temp_append_used"] = bool(temp_append_used)
+            trace_record["unified_generic_proposal_window_verify_enabled"] = bool(
+                proposal_window_verify_enabled
+            )
             trace_record["unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id"] = (
                 self._trace_sorted_int_map(seq_len_before_temp_by_id)
             )
@@ -14633,6 +14873,56 @@ class ModelRunnerBase:
             )
             trace_record["unified_generic_target_verify_parent_proposal_id_by_proposal_id"] = (
                 self._trace_sorted_int_map(parent_by_target_verify_id)
+            )
+            trace_record["unified_generic_target_verify_current_to_be_verified_by_proposal_id"] = (
+                _sampled_token_map(current_to_verify_by_id)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_to_be_verified_by_proposal_id"] = (
+                _sampled_token_map(proposal_window_to_verify_by_id)
+            )
+            trace_record["unified_generic_target_verify_current_window_equals_proposal_by_proposal_id"] = (
+                self._trace_sorted_bool_map(current_window_equals_proposal_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_equals_input_by_proposal_id"] = (
+                self._trace_sorted_bool_map(proposal_window_equals_input_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_current_window_accepted_len_by_proposal_id"] = (
+                self._trace_sorted_int_map(current_window_accepted_len_by_id)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_shadow_accepted_len_by_proposal_id"] = (
+                self._trace_sorted_int_map(proposal_window_shadow_accepted_len_by_id)
+            )
+            trace_record["unified_generic_target_verify_current_window_accept_hist_by_depth"] = (
+                _sorted_nested_hist(current_window_accept_hist_by_depth)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = (
+                _sorted_nested_hist(proposal_window_shadow_accept_hist_by_depth)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] = any(
+                int(bucket) > 0 and int(count) > 0
+                for hist in proposal_window_shadow_accept_hist_by_depth.values()
+                for bucket, count in hist.items()
+            )
+            trace_record["unified_generic_target_verify_current_window_first_token_prob_by_proposal_id"] = (
+                _sampled_float_map(current_window_first_token_prob_by_id)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_first_token_prob_by_proposal_id"] = (
+                _sampled_float_map(proposal_window_first_token_prob_by_id)
+            )
+            trace_record["unified_generic_target_verify_current_window_first_token_id_by_proposal_id"] = (
+                self._trace_sorted_int_map(current_window_first_token_id_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_proposal_window_first_token_id_by_proposal_id"] = (
+                self._trace_sorted_int_map(proposal_window_first_token_id_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_first_position_target_argmax_token_by_proposal_id"] = (
+                self._trace_sorted_int_map(first_position_argmax_token_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id"] = (
+                _sampled_token_map(first_position_top5_tokens_by_id)
+            )
+            trace_record["unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id"] = (
+                _sampled_float_list_map(first_position_top5_probs_by_id)
             )
 
         self._update_unified_raw_verified_to_committed_ratio(trace_record)
