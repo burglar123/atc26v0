@@ -49,6 +49,33 @@ def as_int_map(value: Any) -> dict[int, int]:
     return result
 
 
+def as_bool_map(value: Any) -> dict[int, bool]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, bool] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = bool(item)
+        except Exception:
+            continue
+    return result
+
+
+def as_int_list_map(value: Any) -> dict[int, list[int]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, list[int]] = {}
+    for key, items in value.items():
+        try:
+            proposal_id = int(key)
+        except Exception:
+            continue
+        if not isinstance(items, list):
+            continue
+        result[proposal_id] = as_int_list(items)
+    return result
+
+
 def as_depth_int_lists(value: Any) -> dict[int, list[int]]:
     if not isinstance(value, dict):
         return {}
@@ -93,6 +120,22 @@ def merge_int_map(records: list[dict[str, Any]], *fields: str) -> dict[int, int]
         for field in fields:
             for key, value in as_int_map(record.get(field)).items():
                 merged.setdefault(key, value)
+    return merged
+
+
+def merge_bool_map(records: list[dict[str, Any]], field: str) -> dict[int, bool]:
+    merged: dict[int, bool] = {}
+    for record in records:
+        for key, value in as_bool_map(record.get(field)).items():
+            merged.setdefault(key, value)
+    return merged
+
+
+def merge_int_list_map(records: list[dict[str, Any]], field: str) -> dict[int, list[int]]:
+    merged: dict[int, list[int]] = {}
+    for record in records:
+        for key, value in as_int_list_map(record.get(field)).items():
+            merged.setdefault(key, value)
     return merged
 
 
@@ -704,6 +747,16 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     if total_output == 0:
         total_output = total_full + total_partial
 
+    proposal_tokens_by_id = merge_int_list_map(records, "generic_rolling_proposal_token_ids_by_proposal_id")
+    to_verify_tokens_by_id = merge_int_list_map(records, "generic_rolling_to_be_verified_token_ids_by_proposal_id")
+    to_verify_equals_by_id = merge_bool_map(records, "generic_rolling_to_verify_equals_proposal_by_proposal_id")
+    to_verify_mismatch_ids: set[int] = {
+        int(proposal_id) for proposal_id, is_equal in to_verify_equals_by_id.items() if not bool(is_equal)
+    }
+    for proposal_id in set(proposal_tokens_by_id) & set(to_verify_tokens_by_id):
+        if proposal_tokens_by_id[proposal_id] != to_verify_tokens_by_id[proposal_id]:
+            to_verify_mismatch_ids.add(int(proposal_id))
+
     return {
         "unified_generic_rolling_enabled": bool(unified_enabled),
         "configured_max_depth": configured_max,
@@ -773,6 +826,8 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             for proposal_id, depth in committed_depth_by_id.items()
             if configured_max and int(depth) > configured_max
         ),
+        "generic_rolling_to_verify_equals_proposal_all": not bool(to_verify_mismatch_ids),
+        "generic_rolling_to_verify_mismatch_proposal_ids": sorted(to_verify_mismatch_ids),
     }
 
 
@@ -796,6 +851,19 @@ def validate_records(
         or "draft_commit_decision_no_target_verify" in raw_source
     ):
         errors.append("strict unified target verification must be available")
+    token_window_trace_present = has_trace_field(
+        records,
+        "generic_rolling_to_verify_equals_proposal_by_proposal_id",
+    ) or (
+        has_trace_field(records, "generic_rolling_proposal_token_ids_by_proposal_id")
+        and has_trace_field(records, "generic_rolling_to_be_verified_token_ids_by_proposal_id")
+    )
+    if bool(summary.get("unified_raw_target_verification_available")) and token_window_trace_present:
+        if not bool(summary.get("generic_rolling_to_verify_equals_proposal_all", True)):
+            errors.append(
+                "unified generic to_be_verified_token_ids must equal proposal_token_ids for verified proposals: "
+                f"{summary['generic_rolling_to_verify_mismatch_proposal_ids']}"
+            )
 
     all_depths = set(summary["candidate_depths"]) | set(summary["ready_depths"]) | set(summary["committed_depths"])
     if not all_depths:
@@ -901,6 +969,10 @@ def synthetic_records() -> list[dict[str, Any]]:
     parent_by_id = {1000 + depth: 999 + depth for depth in range(2, 7)}
     depth_by_id = {1000 + depth: depth for depth in range(1, 7)}
     token_by_id = {1000 + depth: 4 for depth in range(1, 7)}
+    proposal_tokens_by_id = {
+        1000 + depth: [depth * 10 + offset for offset in range(4)]
+        for depth in range(1, 7)
+    }
     full = sum(token_by_id.values())
     partial = 3
     revised = 1
@@ -942,6 +1014,19 @@ def synthetic_records() -> list[dict[str, Any]]:
             "generic_rolling_depth_by_proposal_id": {str(k): v for k, v in depth_by_id.items()},
             "generic_rolling_real_commit_depth_by_proposal_id": {str(k): v for k, v in depth_by_id.items()},
             "generic_rolling_token_count_by_proposal_id": {str(k): v for k, v in token_by_id.items()},
+            "generic_rolling_proposal_token_ids_by_proposal_id": {
+                str(k): list(v) for k, v in proposal_tokens_by_id.items()
+            },
+            "generic_rolling_to_be_verified_token_ids_by_proposal_id": {
+                str(k): list(v) for k, v in proposal_tokens_by_id.items()
+            },
+            "generic_rolling_frontier_tail_token_ids_by_proposal_id": {
+                str(k): [max(0, token_id - 4) for token_id in v]
+                for k, v in proposal_tokens_by_id.items()
+            },
+            "generic_rolling_to_verify_equals_proposal_by_proposal_id": {
+                str(k): True for k in proposal_tokens_by_id
+            },
             "generic_rolling_real_committed_token_count_by_proposal_id": {
                 str(k): v for k, v in token_by_id.items()
             },
@@ -1135,6 +1220,22 @@ def run_synthetic_tests() -> None:
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
 
+    bad_token_window = [json.loads(json.dumps(records[0]))]
+    bad_token_window[0]["generic_rolling_proposal_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
+    bad_token_window[0]["generic_rolling_to_be_verified_token_ids_by_proposal_id"]["1001"] = [1, 2, 3, 4]
+    bad_token_window[0]["generic_rolling_to_verify_equals_proposal_by_proposal_id"]["1001"] = False
+    errors, _summary = validate_records(bad_token_window, payload)
+    assert any("to_be_verified_token_ids" in error for error in errors), (
+        "synthetic mismatched unified target verification window should fail"
+    )
+
+    equal_token_window = [json.loads(json.dumps(records[0]))]
+    equal_token_window[0]["generic_rolling_proposal_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
+    equal_token_window[0]["generic_rolling_to_be_verified_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
+    equal_token_window[0]["generic_rolling_to_verify_equals_proposal_by_proposal_id"]["1001"] = True
+    errors, equal_summary = validate_records(equal_token_window, payload)
+    assert not errors, f"synthetic equal unified target verification window should pass: {errors}\nsummary={equal_summary}"
+
     reject_partial_records = synthetic_reject_partial_records()
     errors, reject_partial_summary = validate_records(
         reject_partial_records,
@@ -1215,6 +1316,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_reject_revised_correction_applied_proposal_count_by_depth",
         "unified_raw_no_mutation_reject_proposal_count_by_depth",
         "unified_raw_verified_to_committed_ratio_by_depth",
+        "generic_rolling_to_verify_equals_proposal_all",
+        "generic_rolling_to_verify_mismatch_proposal_ids",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",
         "unified_candidate_budget_saturated_step_count",

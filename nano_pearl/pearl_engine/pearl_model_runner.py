@@ -1651,6 +1651,11 @@ class ModelRunnerBase:
             "generic_rolling_created_by_role_by_proposal_id": {},
             "generic_rolling_proposal_token_ids_by_proposal_id": {},
             "generic_rolling_to_be_verified_token_ids_by_proposal_id": {},
+            "generic_rolling_frontier_tail_token_ids_by_proposal_id": {},
+            "generic_rolling_to_verify_equals_proposal_by_proposal_id": {},
+            "unified_generic_parent_token_span_by_proposal_id": {},
+            "unified_generic_frontier_tail_token_ids_by_proposal_id": {},
+            "unified_generic_base_tail_token_ids_by_proposal_id": {},
             "generic_rolling_token_count_by_proposal_id": {},
             "generic_rolling_status_by_proposal_id": {},
             "generic_rolling_status_reason_by_proposal_id": {},
@@ -13480,6 +13485,30 @@ class ModelRunnerBase:
             for k, v in (trace_record.get("generic_rolling_to_be_verified_token_ids_by_proposal_id") or {}).items()
             if isinstance(v, list)
         }
+        frontier_tail_tokens_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("generic_rolling_frontier_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        to_verify_equals_by_id = {
+            int(k): bool(v)
+            for k, v in (trace_record.get("generic_rolling_to_verify_equals_proposal_by_proposal_id") or {}).items()
+        }
+        unified_parent_span_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_parent_token_span_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        unified_frontier_tail_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_frontier_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        unified_base_tail_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_base_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
         token_count_by_id: dict[int, int] = self._trace_int_map(trace_record.get("generic_rolling_token_count_by_proposal_id"))
         status_by_id = {int(k): str(v) for k, v in (trace_record.get("generic_rolling_status_by_proposal_id") or {}).items()}
         status_reason_by_id = {
@@ -13635,7 +13664,22 @@ class ModelRunnerBase:
                 if len(child_tokens) != gamma:
                     stop_reason = "budget_exhausted"
                     continue
-                to_be_verified = [int(token_id) for token_id in seq.token_ids[-gamma:]]
+                frontier_tail = [int(token_id) for token_id in seq.token_ids[-gamma:]]
+                to_be_verified = list(child_tokens) if unified_enabled else list(frontier_tail)
+                if unified_enabled:
+                    if len(child_tokens) != gamma or len(to_be_verified) != gamma:
+                        raise AssertionError(
+                            "unified generic proposal token window length mismatch: "
+                            f"proposal_id={child_id}, depth={depth}, gamma={gamma}, "
+                            f"proposal_len={len(child_tokens)}, to_verify_len={len(to_be_verified)}"
+                        )
+                    if to_be_verified != child_tokens:
+                        raise AssertionError(
+                            "unified generic proposal token window mismatch: "
+                            f"proposal_id={child_id}, depth={depth}, "
+                            f"proposal_token_ids={child_tokens}, "
+                            f"to_be_verified_token_ids={to_be_verified}"
+                        )
                 proposal = EagerProposal(
                     proposal_id=child_id,
                     seq_id=seq_id,
@@ -13681,6 +13725,12 @@ class ModelRunnerBase:
                 created_by_role_by_id[child_id] = "draft"
                 proposal_tokens_by_id[child_id] = list(child_tokens)
                 to_verify_tokens_by_id[child_id] = list(to_be_verified)
+                frontier_tail_tokens_by_id[child_id] = list(frontier_tail)
+                to_verify_equals_by_id[child_id] = list(to_be_verified) == list(child_tokens)
+                if unified_enabled:
+                    unified_parent_span_by_id[child_id] = list(frontier_tail)
+                    unified_frontier_tail_by_id[child_id] = list(frontier_tail)
+                    unified_base_tail_by_id[child_id] = list(frontier_tail)
                 token_count_by_id[child_id] = int(gamma)
                 status_by_id[child_id] = f"GENERIC_DEPTH{depth}_READY_AFTER_PARENT_COMMIT"
                 status_reason_by_id[child_id] = (
@@ -13887,6 +13937,25 @@ class ModelRunnerBase:
         trace_record["generic_rolling_to_be_verified_token_ids_by_proposal_id"] = {
             str(proposal_id): [int(token_id) for token_id in to_verify_tokens_by_id[proposal_id]]
             for proposal_id in sorted(to_verify_tokens_by_id)
+        }
+        trace_record["generic_rolling_frontier_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in frontier_tail_tokens_by_id[proposal_id]]
+            for proposal_id in sorted(frontier_tail_tokens_by_id)
+        }
+        trace_record["generic_rolling_to_verify_equals_proposal_by_proposal_id"] = self._trace_sorted_bool_map(
+            to_verify_equals_by_id
+        )
+        trace_record["unified_generic_parent_token_span_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_parent_span_by_id[proposal_id]]
+            for proposal_id in sorted(unified_parent_span_by_id)
+        }
+        trace_record["unified_generic_frontier_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_frontier_tail_by_id[proposal_id]]
+            for proposal_id in sorted(unified_frontier_tail_by_id)
+        }
+        trace_record["unified_generic_base_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_base_tail_by_id[proposal_id]]
+            for proposal_id in sorted(unified_base_tail_by_id)
         }
         trace_record["generic_rolling_token_count_by_proposal_id"] = self._trace_sorted_int_map(token_count_by_id)
         trace_record["generic_rolling_status_by_proposal_id"] = self._trace_sorted_str_map(status_by_id)
@@ -14209,6 +14278,21 @@ class ModelRunnerBase:
                     self._record_unified_raw_target_result(trace_record, result)
                     depth_results.append(result)
                     continue
+                proposal_window = proposal_tokens[:gamma]
+                verify_window = to_verify_tokens[:gamma]
+                if len(proposal_window) != gamma or len(verify_window) != gamma:
+                    raise AssertionError(
+                        "unified generic target verification token window length mismatch: "
+                        f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, gamma={gamma}, "
+                        f"proposal_len={len(proposal_window)}, to_verify_len={len(verify_window)}"
+                    )
+                if verify_window != proposal_window:
+                    raise AssertionError(
+                        "unified generic target verification token window mismatch: "
+                        f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, "
+                        f"proposal_token_ids={proposal_window}, "
+                        f"to_be_verified_token_ids={verify_window}"
+                    )
                 executable.append(
                     (
                         proposal,
@@ -14580,6 +14664,30 @@ class ModelRunnerBase:
             for k, v in (trace_record.get("generic_rolling_to_be_verified_token_ids_by_proposal_id") or {}).items()
             if isinstance(v, list)
         }
+        frontier_tail_tokens_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("generic_rolling_frontier_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        to_verify_equals_by_id = {
+            int(k): bool(v)
+            for k, v in (trace_record.get("generic_rolling_to_verify_equals_proposal_by_proposal_id") or {}).items()
+        }
+        unified_parent_span_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_parent_token_span_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        unified_frontier_tail_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_frontier_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
+        unified_base_tail_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("unified_generic_base_tail_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
         token_count_by_id = self._trace_int_map(trace_record.get("generic_rolling_token_count_by_proposal_id"))
         status_by_id = {int(k): str(v) for k, v in (trace_record.get("generic_rolling_status_by_proposal_id") or {}).items()}
         status_reason_by_id = {
@@ -14643,6 +14751,17 @@ class ModelRunnerBase:
             proposal_tokens_by_id[proposal_id] = list(proposal_tokens[:token_count])
             if to_verify_tokens:
                 to_verify_tokens_by_id[proposal_id] = list(to_verify_tokens)
+            frontier_tail_tokens = [int(token_id) for token_id in decision.get("frontier_tail_token_ids", [])]
+            if frontier_tail_tokens:
+                frontier_tail_tokens_by_id[proposal_id] = list(frontier_tail_tokens)
+                if unified_enabled:
+                    unified_parent_span_by_id[proposal_id] = list(frontier_tail_tokens)
+                    unified_frontier_tail_by_id[proposal_id] = list(frontier_tail_tokens)
+                    unified_base_tail_by_id[proposal_id] = list(frontier_tail_tokens)
+            if proposal_tokens and to_verify_tokens:
+                to_verify_equals_by_id[proposal_id] = (
+                    list(to_verify_tokens[:token_count]) == list(proposal_tokens[:token_count])
+                )
             token_count_by_id[proposal_id] = token_count
             status_by_id[proposal_id] = f"GENERIC_DEPTH{depth}_READY_AFTER_PARENT_COMMIT"
             status_reason_by_id[proposal_id] = (
@@ -14843,6 +14962,25 @@ class ModelRunnerBase:
         trace_record["generic_rolling_to_be_verified_token_ids_by_proposal_id"] = {
             str(proposal_id): [int(token_id) for token_id in to_verify_tokens_by_id[proposal_id]]
             for proposal_id in sorted(to_verify_tokens_by_id)
+        }
+        trace_record["generic_rolling_frontier_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in frontier_tail_tokens_by_id[proposal_id]]
+            for proposal_id in sorted(frontier_tail_tokens_by_id)
+        }
+        trace_record["generic_rolling_to_verify_equals_proposal_by_proposal_id"] = self._trace_sorted_bool_map(
+            to_verify_equals_by_id
+        )
+        trace_record["unified_generic_parent_token_span_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_parent_span_by_id[proposal_id]]
+            for proposal_id in sorted(unified_parent_span_by_id)
+        }
+        trace_record["unified_generic_frontier_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_frontier_tail_by_id[proposal_id]]
+            for proposal_id in sorted(unified_frontier_tail_by_id)
+        }
+        trace_record["unified_generic_base_tail_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in unified_base_tail_by_id[proposal_id]]
+            for proposal_id in sorted(unified_base_tail_by_id)
         }
         trace_record["generic_rolling_token_count_by_proposal_id"] = self._trace_sorted_int_map(token_count_by_id)
         trace_record["generic_rolling_status_by_proposal_id"] = self._trace_sorted_str_map(status_by_id)
