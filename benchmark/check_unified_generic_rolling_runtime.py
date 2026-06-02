@@ -147,6 +147,25 @@ def max_record_int(records: list[dict[str, Any]], *fields: str) -> int:
     return value
 
 
+def any_record_bool(records: list[dict[str, Any]], field: str) -> bool:
+    return any(bool(record.get(field, False)) for record in records)
+
+
+def aggregate_shape(records: list[dict[str, Any]], field: str) -> list[int]:
+    rows = 0
+    width = 0
+    saw_width = False
+    for record in records:
+        shape = as_int_list(record.get(field))
+        if not shape:
+            continue
+        rows += int(shape[0])
+        if len(shape) > 1:
+            width = max(width, int(shape[1]))
+            saw_width = True
+    return [rows, width] if saw_width else ([rows] if rows else [])
+
+
 def sum_depth_values(value: Any) -> int:
     return sum(int_value(item, 0) for item in (value or {}).values()) if isinstance(value, dict) else 0
 
@@ -757,8 +776,64 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         if proposal_tokens_by_id[proposal_id] != to_verify_tokens_by_id[proposal_id]:
             to_verify_mismatch_ids.add(int(proposal_id))
 
+    target_seq_len_before = merge_int_map(
+        records,
+        "unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id",
+    )
+    target_seq_len_after_rollback = merge_int_map(
+        records,
+        "unified_generic_target_verify_seq_len_after_rollback_by_proposal_id",
+    )
+    target_checkpoint_restored = merge_bool_map(
+        records,
+        "unified_generic_target_verify_checkpoint_restored_by_proposal_id",
+    )
+    target_input_ids = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_input_ids_by_proposal_id",
+    )
+    target_next_round = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_next_round_input_by_proposal_id",
+    )
+    target_original_proposals = merge_int_list_map(
+        records,
+        "unified_generic_target_verify_original_proposal_token_ids_by_proposal_id",
+    )
+    target_input_equals = merge_bool_map(
+        records,
+        "unified_generic_target_verify_input_equals_next_round_by_proposal_id",
+    )
+    target_next_round_equals = merge_bool_map(
+        records,
+        "unified_generic_target_verify_next_round_equals_original_proposal_by_proposal_id",
+    )
+    target_checkpoint_failed_ids = sorted(
+        int(proposal_id) for proposal_id, restored in target_checkpoint_restored.items() if not bool(restored)
+    )
+    target_rollback_len_mismatch_ids = sorted(
+        int(proposal_id)
+        for proposal_id in set(target_seq_len_before) & set(target_seq_len_after_rollback)
+        if int(target_seq_len_before[proposal_id]) != int(target_seq_len_after_rollback[proposal_id])
+    )
+    target_input_mismatch_ids = {
+        int(proposal_id) for proposal_id, is_equal in target_input_equals.items() if not bool(is_equal)
+    }
+    for proposal_id in set(target_input_ids) & set(target_next_round):
+        if target_input_ids[proposal_id] != target_next_round[proposal_id]:
+            target_input_mismatch_ids.add(int(proposal_id))
+    target_next_round_mismatch_ids = {
+        int(proposal_id) for proposal_id, is_equal in target_next_round_equals.items() if not bool(is_equal)
+    }
+    for proposal_id in set(target_next_round) & set(target_original_proposals):
+        if target_next_round[proposal_id] != target_original_proposals[proposal_id]:
+            target_next_round_mismatch_ids.add(int(proposal_id))
+    target_input_shape = aggregate_shape(records, "unified_generic_target_verify_input_ids_shape")
+    target_logits_shape = aggregate_shape(records, "unified_generic_target_verify_logits_shape")
+
     return {
         "unified_generic_rolling_enabled": bool(unified_enabled),
+        "normal_gamma": max_record_int(records, "normal_gamma"),
         "configured_max_depth": configured_max,
         "max_observed_depth": max_observed,
         "max_real_committed_depth": max_real,
@@ -828,6 +903,40 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         ),
         "generic_rolling_to_verify_equals_proposal_all": not bool(to_verify_mismatch_ids),
         "generic_rolling_to_verify_mismatch_proposal_ids": sorted(to_verify_mismatch_ids),
+        "unified_generic_target_verify_temp_append_used": any_record_bool(
+            records,
+            "unified_generic_target_verify_temp_append_used",
+        ),
+        "unified_generic_target_verify_num_proposals": sum_record_int(
+            records,
+            "unified_generic_target_verify_num_proposals",
+        ),
+        "unified_generic_target_verify_num_to_verify_tokens": sum_record_int(
+            records,
+            "unified_generic_target_verify_num_to_verify_tokens",
+        ),
+        "unified_generic_target_verify_input_ids_shape": target_input_shape,
+        "unified_generic_target_verify_logits_shape": target_logits_shape,
+        "unified_generic_target_verify_logits_rows_per_proposal": max_record_int(
+            records,
+            "unified_generic_target_verify_logits_rows_per_proposal",
+        ),
+        "unified_generic_target_verify_checkpoint_failed_proposal_ids": target_checkpoint_failed_ids,
+        "unified_generic_target_verify_rollback_len_mismatch_proposal_ids": target_rollback_len_mismatch_ids,
+        "unified_generic_target_verify_input_mismatch_proposal_ids": sorted(target_input_mismatch_ids),
+        "unified_generic_target_verify_next_round_mismatch_proposal_ids": sorted(target_next_round_mismatch_ids),
+        "unified_generic_target_verify_sampled_input_ids_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(target_input_ids.items())
+        },
+        "unified_generic_target_verify_sampled_next_round_input_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(target_next_round.items())
+        },
+        "unified_generic_target_verify_sampled_original_proposal_token_ids_by_proposal_id": {
+            str(proposal_id): list(tokens)
+            for proposal_id, tokens in sorted(target_original_proposals.items())
+        },
     }
 
 
@@ -851,19 +960,6 @@ def validate_records(
         or "draft_commit_decision_no_target_verify" in raw_source
     ):
         errors.append("strict unified target verification must be available")
-    token_window_trace_present = has_trace_field(
-        records,
-        "generic_rolling_to_verify_equals_proposal_by_proposal_id",
-    ) or (
-        has_trace_field(records, "generic_rolling_proposal_token_ids_by_proposal_id")
-        and has_trace_field(records, "generic_rolling_to_be_verified_token_ids_by_proposal_id")
-    )
-    if bool(summary.get("unified_raw_target_verification_available")) and token_window_trace_present:
-        if not bool(summary.get("generic_rolling_to_verify_equals_proposal_all", True)):
-            errors.append(
-                "unified generic to_be_verified_token_ids must equal proposal_token_ids for verified proposals: "
-                f"{summary['generic_rolling_to_verify_mismatch_proposal_ids']}"
-            )
 
     all_depths = set(summary["candidate_depths"]) | set(summary["ready_depths"]) | set(summary["committed_depths"])
     if not all_depths:
@@ -884,6 +980,48 @@ def validate_records(
         errors.append("max real committed depth exceeds configured max depth")
     raw_verified_total = sum(int_value(value, 0) for value in summary["unified_raw_verified_proposal_count_by_depth"].values())
     raw_full_total = sum(int_value(value, 0) for value in summary["unified_raw_full_accept_proposal_count_by_depth"].values())
+    temp_append_field_present = has_trace_field(records, "unified_generic_target_verify_temp_append_used")
+    if raw_verified_total > 0 and temp_append_field_present:
+        if not bool(summary.get("unified_generic_target_verify_temp_append_used", False)):
+            errors.append("unified generic target verification must use temporary append")
+        if int_value(summary.get("unified_generic_target_verify_num_proposals"), 0) <= 0:
+            errors.append("temporary target verification proposal count must be positive")
+        if summary.get("unified_generic_target_verify_checkpoint_failed_proposal_ids"):
+            errors.append(
+                "temporary target verification checkpoint restore failed: "
+                f"{summary['unified_generic_target_verify_checkpoint_failed_proposal_ids']}"
+            )
+        if summary.get("unified_generic_target_verify_rollback_len_mismatch_proposal_ids"):
+            errors.append(
+                "temporary target verification rollback length mismatch: "
+                f"{summary['unified_generic_target_verify_rollback_len_mismatch_proposal_ids']}"
+            )
+        if summary.get("unified_generic_target_verify_input_mismatch_proposal_ids"):
+            errors.append(
+                "temporary target verification input_ids must equal next_round_input for sampled proposals: "
+                f"{summary['unified_generic_target_verify_input_mismatch_proposal_ids']}"
+            )
+        if summary.get("unified_generic_target_verify_next_round_mismatch_proposal_ids"):
+            errors.append(
+                "temporary target verification next_round_input must equal original proposal tokens for sampled proposals: "
+                f"{summary['unified_generic_target_verify_next_round_mismatch_proposal_ids']}"
+            )
+        gamma = int_value(summary.get("normal_gamma"), 0)
+        num_proposals = int_value(summary.get("unified_generic_target_verify_num_proposals"), 0)
+        num_to_verify = int_value(summary.get("unified_generic_target_verify_num_to_verify_tokens"), 0)
+        input_shape = as_int_list(summary.get("unified_generic_target_verify_input_ids_shape"))
+        logits_shape = as_int_list(summary.get("unified_generic_target_verify_logits_shape"))
+        logits_rows = logits_shape[0] if logits_shape else 0
+        input_rows = input_shape[0] if input_shape else 0
+        if gamma > 0 and num_proposals > 0 and num_to_verify != gamma * num_proposals:
+            errors.append("temporary target verification to-verify token count must equal gamma * proposals")
+        if logits_rows != num_to_verify:
+            errors.append("temporary target verification logits rows must equal num_to_verify_tokens")
+        if input_rows != logits_rows:
+            errors.append("temporary target verification input rows must equal logits rows")
+        rows_per_proposal = int_value(summary.get("unified_generic_target_verify_logits_rows_per_proposal"), 0)
+        if gamma > 0 and rows_per_proposal and rows_per_proposal != gamma:
+            errors.append("temporary target verification logits rows per proposal must equal gamma")
     target_verified_reject_only = bool(
         summary.get("unified_raw_target_verification_available")
         and raw_verified_total > 0
@@ -964,6 +1102,77 @@ def synthetic_payload(total_output_tokens: int) -> dict[str, Any]:
     }
 
 
+def add_synthetic_temp_append_trace(
+    record: dict[str, Any],
+    proposal_tokens_by_id: dict[int, list[int]],
+    *,
+    seq_len_base: int = 32,
+    sample_limit: int = 8,
+) -> None:
+    proposal_ids = sorted(int(proposal_id) for proposal_id in proposal_tokens_by_id)
+    sampled_ids = proposal_ids[:sample_limit]
+    before = {proposal_id: seq_len_base + index * 4 for index, proposal_id in enumerate(proposal_ids)}
+    after = {proposal_id: before[proposal_id] + 4 for proposal_id in proposal_ids}
+    record["unified_generic_target_verify_temp_append_used"] = True
+    record["unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id"] = {
+        str(proposal_id): int(before[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_seq_len_after_temp_append_by_proposal_id"] = {
+        str(proposal_id): int(after[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_seq_len_after_rollback_by_proposal_id"] = {
+        str(proposal_id): int(before[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_checkpoint_restored_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_input_ids_shape"] = [4 * len(proposal_ids)]
+    record["unified_generic_target_verify_logits_shape"] = [4 * len(proposal_ids), 32000]
+    record["unified_generic_target_verify_num_proposals"] = len(proposal_ids)
+    record["unified_generic_target_verify_num_to_verify_tokens"] = 4 * len(proposal_ids)
+    record["unified_generic_target_verify_logits_rows_per_proposal"] = 4
+    record["unified_generic_target_verify_input_ids_by_proposal_id"] = {
+        str(proposal_id): list(proposal_tokens_by_id[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_positions_by_proposal_id"] = {
+        str(proposal_id): list(range(after[proposal_id] - 4, after[proposal_id]))
+        for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_context_lens_by_proposal_id"] = {
+        str(proposal_id): list(range(after[proposal_id] - 3, after[proposal_id] + 1))
+        for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_next_round_input_by_proposal_id"] = {
+        str(proposal_id): list(proposal_tokens_by_id[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_legacy_to_be_verified_by_proposal_id"] = {
+        str(proposal_id): [900 + index, 901 + index, 902 + index, proposal_tokens_by_id[proposal_id][0]]
+        for index, proposal_id in enumerate(sampled_ids)
+    }
+    record["unified_generic_target_verify_original_proposal_token_ids_by_proposal_id"] = {
+        str(proposal_id): list(proposal_tokens_by_id[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_input_equals_next_round_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_next_round_equals_original_proposal_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_pre_verify_before_by_proposal_id"] = {
+        str(proposal_id): False for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_pre_verify_after_rollback_by_proposal_id"] = {
+        str(proposal_id): False for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_base_len_by_proposal_id"] = {
+        str(proposal_id): int(before[proposal_id]) for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_parent_proposal_id_by_proposal_id"] = {
+        str(proposal_id): -1 if proposal_id == proposal_ids[0] else proposal_id - 1
+        for proposal_id in proposal_ids
+    }
+
+
 def synthetic_records() -> list[dict[str, Any]]:
     ids_by_depth = {depth: [1000 + depth] for depth in range(1, 7)}
     parent_by_id = {1000 + depth: 999 + depth for depth in range(2, 7)}
@@ -976,8 +1185,7 @@ def synthetic_records() -> list[dict[str, Any]]:
     full = sum(token_by_id.values())
     partial = 3
     revised = 1
-    return [
-        {
+    record = {
             "normal_gamma": 4,
             "unified_generic_rolling_enabled": True,
             "enable_unified_generic_rolling_runtime": True,
@@ -1115,15 +1323,19 @@ def synthetic_records() -> list[dict[str, Any]]:
             "unified_generic_target_draft_mismatch_count": 0,
             "unified_generic_parity_ok": True,
         }
-    ]
+    add_synthetic_temp_append_trace(record, proposal_tokens_by_id)
+    return [record]
 
 
 def synthetic_reject_partial_records() -> list[dict[str, Any]]:
     proposal_ids = list(range(3001, 3181))
     partial_id = proposal_ids[-1]
     token_by_id = {proposal_id: 4 for proposal_id in proposal_ids}
-    return [
-        {
+    proposal_tokens_by_id = {
+        proposal_id: [proposal_id, proposal_id + 1, proposal_id + 2, proposal_id + 3]
+        for proposal_id in proposal_ids
+    }
+    record = {
             "normal_gamma": 4,
             "unified_generic_rolling_enabled": True,
             "enable_unified_generic_rolling_runtime": True,
@@ -1201,7 +1413,8 @@ def synthetic_reject_partial_records() -> list[dict[str, Any]]:
             "unified_generic_target_draft_mismatch_count": 0,
             "unified_generic_parity_ok": True,
         }
-    ]
+    add_synthetic_temp_append_trace(record, proposal_tokens_by_id)
+    return [record]
 
 
 def run_synthetic_tests() -> None:
@@ -1219,22 +1432,28 @@ def run_synthetic_tests() -> None:
     assert summary["num_steps"] == 1
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
+    assert summary["unified_generic_target_verify_temp_append_used"] is True
+    assert summary["unified_generic_target_verify_input_mismatch_proposal_ids"] == []
+    assert summary["unified_generic_target_verify_next_round_mismatch_proposal_ids"] == []
 
-    bad_token_window = [json.loads(json.dumps(records[0]))]
-    bad_token_window[0]["generic_rolling_proposal_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
-    bad_token_window[0]["generic_rolling_to_be_verified_token_ids_by_proposal_id"]["1001"] = [1, 2, 3, 4]
-    bad_token_window[0]["generic_rolling_to_verify_equals_proposal_by_proposal_id"]["1001"] = False
-    errors, _summary = validate_records(bad_token_window, payload)
-    assert any("to_be_verified_token_ids" in error for error in errors), (
-        "synthetic mismatched unified target verification window should fail"
+    missing_temp_append = [json.loads(json.dumps(records[0]))]
+    missing_temp_append[0]["unified_generic_target_verify_temp_append_used"] = False
+    errors, _summary = validate_records(missing_temp_append, payload)
+    assert any("temporary append" in error for error in errors), "missing temporary append should fail"
+
+    input_not_proposal = [json.loads(json.dumps(records[0]))]
+    input_not_proposal[0]["unified_generic_target_verify_next_round_input_by_proposal_id"]["1001"] = [1, 2, 3, 4]
+    input_not_proposal[0]["unified_generic_target_verify_next_round_equals_original_proposal_by_proposal_id"]["1001"] = False
+    errors, _summary = validate_records(input_not_proposal, payload)
+    assert any("next_round_input" in error for error in errors), "next_round/proposal mismatch should fail"
+
+    checkpoint_not_restored = [json.loads(json.dumps(records[0]))]
+    checkpoint_not_restored[0]["unified_generic_target_verify_seq_len_after_rollback_by_proposal_id"]["1001"] += 1
+    checkpoint_not_restored[0]["unified_generic_target_verify_checkpoint_restored_by_proposal_id"]["1001"] = False
+    errors, _summary = validate_records(checkpoint_not_restored, payload)
+    assert any("checkpoint" in error or "rollback length" in error for error in errors), (
+        "checkpoint restore failure should fail"
     )
-
-    equal_token_window = [json.loads(json.dumps(records[0]))]
-    equal_token_window[0]["generic_rolling_proposal_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
-    equal_token_window[0]["generic_rolling_to_be_verified_token_ids_by_proposal_id"]["1001"] = [10, 11, 12, 13]
-    equal_token_window[0]["generic_rolling_to_verify_equals_proposal_by_proposal_id"]["1001"] = True
-    errors, equal_summary = validate_records(equal_token_window, payload)
-    assert not errors, f"synthetic equal unified target verification window should pass: {errors}\nsummary={equal_summary}"
 
     reject_partial_records = synthetic_reject_partial_records()
     errors, reject_partial_summary = validate_records(
@@ -1247,8 +1466,11 @@ def run_synthetic_tests() -> None:
     assert reject_partial_summary["unified_raw_no_mutation_reject_proposal_count_by_depth"]["1"] == 179
     assert reject_partial_summary["unified_raw_revised_token_count_by_depth"]["1"] == 180
     assert reject_partial_summary["unified_raw_partial_recovery_applied_proposal_count_by_depth"]["1"] == 1
+    assert reject_partial_summary["unified_raw_full_commit_proposal_count_by_depth"] == {}
+    assert reject_partial_summary["unified_raw_reject_revised_correction_applied_proposal_count_by_depth"] == {}
     assert reject_partial_summary["partial_prefix_revised_token_count"] == 1
     assert reject_partial_summary["total_partial_recovered_token_count"] == 2
+    assert reject_partial_summary["unified_generic_target_verify_temp_append_used"] is True
 
     missing_target_verify = [dict(records[0])]
     missing_target_verify[0]["unified_raw_target_verification_available"] = False
@@ -1262,6 +1484,13 @@ def run_synthetic_tests() -> None:
             old_trace_fallback[0].pop(field, None)
     errors, _summary = validate_records(old_trace_fallback, payload)
     assert not errors, f"old trace fallback should pass: {errors}"
+
+    old_target_trace_without_temp_append = [json.loads(json.dumps(records[0]))]
+    for field in list(old_target_trace_without_temp_append[0]):
+        if field.startswith("unified_generic_target_verify_"):
+            old_target_trace_without_temp_append[0].pop(field, None)
+    errors, _summary = validate_records(old_target_trace_without_temp_append, payload)
+    assert not errors, f"old target trace without temp append fields should pass: {errors}"
 
     bad_depth = [dict(records[0])]
     bad_depth[0]["generic_rolling_real_committed_proposal_ids_by_depth"] = {"2": [1002]}
@@ -1318,6 +1547,19 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_verified_to_committed_ratio_by_depth",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
+        "unified_generic_target_verify_temp_append_used",
+        "unified_generic_target_verify_num_proposals",
+        "unified_generic_target_verify_num_to_verify_tokens",
+        "unified_generic_target_verify_input_ids_shape",
+        "unified_generic_target_verify_logits_shape",
+        "unified_generic_target_verify_logits_rows_per_proposal",
+        "unified_generic_target_verify_checkpoint_failed_proposal_ids",
+        "unified_generic_target_verify_rollback_len_mismatch_proposal_ids",
+        "unified_generic_target_verify_input_mismatch_proposal_ids",
+        "unified_generic_target_verify_next_round_mismatch_proposal_ids",
+        "unified_generic_target_verify_sampled_input_ids_by_proposal_id",
+        "unified_generic_target_verify_sampled_next_round_input_by_proposal_id",
+        "unified_generic_target_verify_sampled_original_proposal_token_ids_by_proposal_id",
         "unified_candidate_budget_tokens_per_step",
         "unified_candidate_budget_used_tokens_per_step",
         "unified_candidate_budget_saturated_step_count",

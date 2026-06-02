@@ -1656,6 +1656,28 @@ class ModelRunnerBase:
             "unified_generic_parent_token_span_by_proposal_id": {},
             "unified_generic_frontier_tail_token_ids_by_proposal_id": {},
             "unified_generic_base_tail_token_ids_by_proposal_id": {},
+            "unified_generic_target_verify_temp_append_used": False,
+            "unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id": {},
+            "unified_generic_target_verify_seq_len_after_temp_append_by_proposal_id": {},
+            "unified_generic_target_verify_seq_len_after_rollback_by_proposal_id": {},
+            "unified_generic_target_verify_checkpoint_restored_by_proposal_id": {},
+            "unified_generic_target_verify_input_ids_shape": [],
+            "unified_generic_target_verify_logits_shape": [],
+            "unified_generic_target_verify_num_proposals": 0,
+            "unified_generic_target_verify_num_to_verify_tokens": 0,
+            "unified_generic_target_verify_logits_rows_per_proposal": 0,
+            "unified_generic_target_verify_input_ids_by_proposal_id": {},
+            "unified_generic_target_verify_positions_by_proposal_id": {},
+            "unified_generic_target_verify_context_lens_by_proposal_id": {},
+            "unified_generic_target_verify_next_round_input_by_proposal_id": {},
+            "unified_generic_target_verify_legacy_to_be_verified_by_proposal_id": {},
+            "unified_generic_target_verify_original_proposal_token_ids_by_proposal_id": {},
+            "unified_generic_target_verify_input_equals_next_round_by_proposal_id": {},
+            "unified_generic_target_verify_next_round_equals_original_proposal_by_proposal_id": {},
+            "unified_generic_target_verify_pre_verify_before_by_proposal_id": {},
+            "unified_generic_target_verify_pre_verify_after_rollback_by_proposal_id": {},
+            "unified_generic_target_verify_base_len_by_proposal_id": {},
+            "unified_generic_target_verify_parent_proposal_id_by_proposal_id": {},
             "generic_rolling_token_count_by_proposal_id": {},
             "generic_rolling_status_by_proposal_id": {},
             "generic_rolling_status_reason_by_proposal_id": {},
@@ -13673,13 +13695,6 @@ class ModelRunnerBase:
                             f"proposal_id={child_id}, depth={depth}, gamma={gamma}, "
                             f"proposal_len={len(child_tokens)}, to_verify_len={len(to_be_verified)}"
                         )
-                    if to_be_verified != child_tokens:
-                        raise AssertionError(
-                            "unified generic proposal token window mismatch: "
-                            f"proposal_id={child_id}, depth={depth}, "
-                            f"proposal_token_ids={child_tokens}, "
-                            f"to_be_verified_token_ids={to_be_verified}"
-                        )
                 proposal = EagerProposal(
                     proposal_id=child_id,
                     seq_id=seq_id,
@@ -14228,9 +14243,36 @@ class ModelRunnerBase:
 
         results: list[dict] = []
         full_committed_ids_by_depth: dict[int, set[int]] = {}
+        temp_append_used = False
+        target_verify_num_proposals = 0
+        target_verify_num_to_verify_tokens = 0
+        target_verify_input_rows = 0
+        target_verify_logits_rows = 0
+        target_verify_logits_width = 0
+        target_verify_rows_per_proposal = 0
+        target_verify_sample_limit = 8
+        sampled_target_verify_ids: set[int] = set()
+        reject_sampled_target_verify_ids: set[int] = set()
+        seq_len_before_temp_by_id: dict[int, int] = {}
+        seq_len_after_temp_by_id: dict[int, int] = {}
+        seq_len_after_rollback_by_id: dict[int, int] = {}
+        checkpoint_restored_by_id: dict[int, bool] = {}
+        input_ids_by_id: dict[int, list[int]] = {}
+        positions_by_id: dict[int, list[int]] = {}
+        context_lens_by_id: dict[int, list[int]] = {}
+        next_round_input_by_id: dict[int, list[int]] = {}
+        legacy_to_verify_by_id: dict[int, list[int]] = {}
+        original_proposal_tokens_by_id: dict[int, list[int]] = {}
+        input_equals_next_round_by_id: dict[int, bool] = {}
+        next_round_equals_original_by_id: dict[int, bool] = {}
+        pre_verify_before_by_id: dict[int, bool] = {}
+        pre_verify_after_rollback_by_id: dict[int, bool] = {}
+        base_len_by_target_verify_id: dict[int, int] = {}
+        parent_by_target_verify_id: dict[int, int] = {}
+
         for depth in sorted(proposals_by_depth):
             depth_results: list[dict] = []
-            executable: list[tuple[dict, EagerProposal, Sequence]] = []
+            executable: list[tuple[dict, Sequence]] = []
             for proposal in sorted(
                 proposals_by_depth[depth],
                 key=lambda item: (int(item.get("seq_id", -1)), int(item.get("proposal_id", -1))),
@@ -14240,7 +14282,6 @@ class ModelRunnerBase:
                 parent_id = int(proposal.get("parent_id", -1))
                 token_count = int(proposal.get("token_count", gamma))
                 proposal_tokens = [int(token_id) for token_id in proposal.get("proposal_token_ids", [])]
-                to_verify_tokens = [int(token_id) for token_id in proposal.get("to_be_verified_token_ids", [])]
                 seq = seq_by_id.get(seq_id)
                 reason = None
                 if depth < 1:
@@ -14263,7 +14304,7 @@ class ModelRunnerBase:
                     reason = "target_frontier_mismatch"
                 elif bool(proposal.get("base_pre_verify", False)):
                     reason = "invalid_base_pre_verify"
-                elif token_count != gamma or len(proposal_tokens) < gamma or len(to_verify_tokens) != gamma:
+                elif token_count != gamma or len(proposal_tokens) < gamma:
                     reason = "token_payload_missing"
                 if reason is not None:
                     result = self._generic_invalid_result(proposal, reason=reason)
@@ -14278,25 +14319,90 @@ class ModelRunnerBase:
                     self._record_unified_raw_target_result(trace_record, result)
                     depth_results.append(result)
                     continue
-                proposal_window = proposal_tokens[:gamma]
-                verify_window = to_verify_tokens[:gamma]
-                if len(proposal_window) != gamma or len(verify_window) != gamma:
-                    raise AssertionError(
-                        "unified generic target verification token window length mismatch: "
-                        f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, gamma={gamma}, "
-                        f"proposal_len={len(proposal_window)}, to_verify_len={len(verify_window)}"
-                    )
-                if verify_window != proposal_window:
-                    raise AssertionError(
-                        "unified generic target verification token window mismatch: "
-                        f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, "
-                        f"proposal_token_ids={proposal_window}, "
-                        f"to_be_verified_token_ids={verify_window}"
-                    )
-                executable.append(
-                    (
-                        proposal,
-                        EagerProposal(
+                executable.append((proposal, seq))
+
+            if executable:
+                temp_entries: list[dict] = []
+                verify_maps: dict[str, dict[int, int | bool]] = {
+                    "accepted_len_by_seq_id": {},
+                    "invalidated_len_by_seq_id": {},
+                    "reject_position_by_seq_id": {},
+                    "revised_token_by_seq_id": {},
+                    "full_accept_by_seq_id": {},
+                    "finish_by_seq_id": {},
+                }
+                logits = None
+                input_ids = None
+                positions = None
+                try:
+                    for proposal, seq in executable:
+                        proposal_id = int(proposal["proposal_id"])
+                        seq_id = int(seq.seq_id)
+                        parent_id = int(proposal.get("parent_id", -1))
+                        proposal_window = [
+                            int(token_id) for token_id in proposal.get("proposal_token_ids", [])[:gamma]
+                        ]
+                        if len(proposal_window) != gamma:
+                            raise AssertionError(
+                                "unified generic target verification proposal length mismatch: "
+                                f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, "
+                                f"gamma={gamma}, proposal_len={len(proposal_window)}"
+                            )
+                        checkpoint = self._make_eager_apply_checkpoint(seq)
+                        entry = {
+                            "proposal": proposal,
+                            "seq": seq,
+                            "checkpoint": checkpoint,
+                            "appended_count": 0,
+                            "proposal_id": proposal_id,
+                            "seq_id": seq_id,
+                            "parent_id": parent_id,
+                            "original_proposal_tokens": list(proposal_window),
+                        }
+                        temp_entries.append(entry)
+                        seq_len_before_temp_by_id[proposal_id] = int(len(seq))
+                        pre_verify_before = bool(getattr(seq, "pre_verify", True))
+                        pre_verify_before_by_id[proposal_id] = pre_verify_before
+                        base_len_by_target_verify_id[proposal_id] = int(proposal.get("base_len", -1))
+                        parent_by_target_verify_id[proposal_id] = parent_id
+                        original_proposal_tokens_by_id[proposal_id] = list(proposal_window)
+                        for token_id in proposal_window:
+                            seq.append_token(int(token_id))
+                            entry["appended_count"] = int(entry["appended_count"]) + 1
+                            self.scheduler.block_manager.may_append(seq)
+                        temp_append_used = True
+                        seq_len_after_temp_by_id[proposal_id] = int(len(seq))
+                        next_round_input = [int(token_id) for token_id in seq.token_ids[-gamma:]]
+                        if pre_verify_before:
+                            legacy_to_be_verified = [int(seq.token_ids[-gamma])]
+                            input_width = 1
+                        else:
+                            legacy_to_be_verified = [
+                                int(token_id)
+                                for token_id in seq.token_ids[-2 * gamma + 1 : -gamma + 1]
+                            ]
+                            input_width = gamma
+                        expected_to_verify_len = 1 if pre_verify_before else gamma
+                        if len(next_round_input) != gamma or len(legacy_to_be_verified) != expected_to_verify_len:
+                            raise AssertionError(
+                                "unified generic target verification legacy window length mismatch: "
+                                f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}, "
+                                f"next_round_len={len(next_round_input)}, "
+                                f"legacy_to_verify_len={len(legacy_to_be_verified)}, "
+                                f"expected_to_verify_len={expected_to_verify_len}"
+                            )
+                        next_round_input_by_id[proposal_id] = list(next_round_input)
+                        legacy_to_verify_by_id[proposal_id] = list(legacy_to_be_verified)
+                        next_round_equals_original_by_id[proposal_id] = list(next_round_input) == list(proposal_window)
+                        positions_by_id[proposal_id] = [
+                            int(position) for position in range(int(len(seq)) - input_width, int(len(seq)))
+                        ]
+                        context_lens_by_id[proposal_id] = [
+                            int(context_len)
+                            for context_len in range(int(len(seq)) - input_width + 1, int(len(seq)) + 1)
+                        ]
+                        entry["input_width"] = int(input_width)
+                        entry["temporary_verify_proposal"] = EagerProposal(
                             proposal_id=proposal_id,
                             seq_id=seq_id,
                             request_id=seq.request_id,
@@ -14309,40 +14415,91 @@ class ModelRunnerBase:
                             home_batch_id=-1 if seq.home_batch_id is None else int(seq.home_batch_id),
                             base_len=int(proposal.get("base_len", -1)),
                             base_pre_verify=bool(proposal.get("base_pre_verify", False)),
-                            base_num_completion_tokens=int(seq.num_completion_tokens),
-                            proposal_token_ids=proposal_tokens[:gamma],
-                            to_be_verified_token_ids=to_verify_tokens[:gamma],
+                            base_num_completion_tokens=int(checkpoint["num_completion_tokens"]),
+                            proposal_token_ids=list(next_round_input),
+                            to_be_verified_token_ids=list(legacy_to_be_verified),
                             proposal_len=gamma,
                             state=EAGER_STATE_READY_TO_VERIFY,
                             valid=True,
-                        ),
-                        seq,
-                    )
-                )
+                        )
+                        if len(sampled_target_verify_ids) < target_verify_sample_limit:
+                            sampled_target_verify_ids.add(proposal_id)
 
-            if executable:
-                verify_seqs = [seq for _proposal, _eager_proposal, seq in executable]
-                verify_proposals = [eager_proposal for _proposal, eager_proposal, _seq in executable]
-                self._allocate_decode_slots_for_dual(verify_seqs, plan, "unified_generic_target_verify")
-                input_ids, positions, temp_seqs = self.prepare_pearl_decode(verify_seqs)
-                temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
-                torch.cuda.synchronize()
-                logits = self.run_model(input_ids, positions, False)
-                verify_maps = self.compute_pearl_verify_result_no_apply(
-                    logits,
-                    verify_seqs,
-                    temperatures,
-                    verify_proposals,
-                    gamma=gamma,
-                    lane=LANE_EAGER,
-                )
-                torch.cuda.synchronize()
-                for proposal, eager_proposal, seq in executable:
+                    verify_seqs = [entry["seq"] for entry in temp_entries]
+                    verify_proposals = [entry["temporary_verify_proposal"] for entry in temp_entries]
+                    input_ids, positions, temp_seqs = self.prepare_pearl_decode(verify_seqs)
+                    input_id_values = [int(value) for value in input_ids.detach().cpu().tolist()]
+                    position_values = [int(value) for value in positions.detach().cpu().tolist()]
+                    offset = 0
+                    for entry in temp_entries:
+                        proposal_id = int(entry["proposal_id"])
+                        width = int(entry["input_width"])
+                        input_slice = input_id_values[offset:offset + width]
+                        position_slice = position_values[offset:offset + width]
+                        input_ids_by_id[proposal_id] = list(input_slice)
+                        positions_by_id[proposal_id] = list(position_slice)
+                        input_equals_next_round_by_id[proposal_id] = (
+                            list(input_slice) == list(next_round_input_by_id.get(proposal_id, []))
+                        )
+                        offset += width
+                    target_verify_num_proposals += len(temp_entries)
+                    target_verify_num_to_verify_tokens += sum(
+                        len(entry["temporary_verify_proposal"].to_be_verified_token_ids)
+                        for entry in temp_entries
+                    )
+                    target_verify_input_rows += int(input_ids.shape[0])
+                    temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+                    torch.cuda.synchronize()
+                    logits = self.run_model(input_ids, positions, False)
+                    target_verify_logits_rows += int(logits.shape[0])
+                    target_verify_logits_width = int(logits.shape[1]) if len(logits.shape) > 1 else 0
+                    if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
+                        target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
+                    verify_maps = self.compute_pearl_verify_result_no_apply(
+                        logits,
+                        verify_seqs,
+                        temperatures,
+                        verify_proposals,
+                        gamma=gamma,
+                        lane=LANE_EAGER,
+                    )
+                    torch.cuda.synchronize()
+                finally:
+                    for entry in temp_entries:
+                        proposal_id = int(entry["proposal_id"])
+                        seq = entry["seq"]
+                        checkpoint = entry["checkpoint"]
+                        rollback_len = int(len(seq)) - int(checkpoint["len"])
+                        if rollback_len > 0:
+                            self.scheduler.rollback(seq, rollback_len)
+                        restored = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                        if not restored:
+                            self._restore_eager_apply_checkpoint(seq, checkpoint)
+                            restored = self._sequence_matches_eager_apply_checkpoint(seq, checkpoint)
+                        seq_len_after_rollback_by_id[proposal_id] = int(len(seq))
+                        pre_verify_after_rollback_by_id[proposal_id] = bool(getattr(seq, "pre_verify", True))
+                        checkpoint_restored_by_id[proposal_id] = bool(restored)
+                        if not restored:
+                            raise AssertionError(
+                                "unified generic target verification temporary append rollback failed: "
+                                f"proposal_id={proposal_id}, seq_id={entry['seq_id']}, depth={depth}"
+                            )
+
+                proposal_by_seq_id = {
+                    int(entry["seq_id"]): (entry["proposal"], entry["temporary_verify_proposal"], entry["seq"])
+                    for entry in temp_entries
+                }
+                for seq_id_key in sorted(proposal_by_seq_id):
+                    proposal, eager_proposal, seq = proposal_by_seq_id[seq_id_key]
                     seq_id = int(seq.seq_id)
                     accept_len = int(verify_maps["accepted_len_by_seq_id"].get(seq_id, 0))
                     invalidated_len = int(verify_maps["invalidated_len_by_seq_id"].get(seq_id, gamma - accept_len))
                     revised_token = int(verify_maps["revised_token_by_seq_id"].get(seq_id, -1))
                     verify_result = self._verify_result_from_accept_len(accept_len, gamma)
+                    if verify_result == "reject_at_first_token" and len(reject_sampled_target_verify_ids) < target_verify_sample_limit:
+                        proposal_id = int(proposal["proposal_id"])
+                        reject_sampled_target_verify_ids.add(proposal_id)
+                        sampled_target_verify_ids.add(proposal_id)
                     if verify_result == "full_accept":
                         action = "append_full_accept_real_commit"
                         output_tokens = [int(token_id) for token_id in eager_proposal.proposal_token_ids]
@@ -14407,6 +14564,76 @@ class ModelRunnerBase:
                     int(proposal_id) for proposal_id in committed_by_depth.get(depth, [])
                 }
             results.extend(depth_results)
+
+        sampled_target_verify_ids = set(sorted(sampled_target_verify_ids)[:target_verify_sample_limit]) | set(
+            sorted(reject_sampled_target_verify_ids)[:target_verify_sample_limit]
+        )
+        def _sampled_token_map(mapping: dict[int, list[int]]) -> dict[str, list[int]]:
+            return {
+                str(proposal_id): [int(token_id) for token_id in mapping[proposal_id]]
+                for proposal_id in sorted(sampled_target_verify_ids)
+                if proposal_id in mapping
+            }
+
+        if target_verify_num_proposals > 0:
+            trace_record["unified_generic_target_verify_temp_append_used"] = bool(temp_append_used)
+            trace_record["unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id"] = (
+                self._trace_sorted_int_map(seq_len_before_temp_by_id)
+            )
+            trace_record["unified_generic_target_verify_seq_len_after_temp_append_by_proposal_id"] = (
+                self._trace_sorted_int_map(seq_len_after_temp_by_id)
+            )
+            trace_record["unified_generic_target_verify_seq_len_after_rollback_by_proposal_id"] = (
+                self._trace_sorted_int_map(seq_len_after_rollback_by_id)
+            )
+            trace_record["unified_generic_target_verify_checkpoint_restored_by_proposal_id"] = (
+                self._trace_sorted_bool_map(checkpoint_restored_by_id)
+            )
+            trace_record["unified_generic_target_verify_input_ids_shape"] = [int(target_verify_input_rows)]
+            trace_record["unified_generic_target_verify_logits_shape"] = [
+                int(target_verify_logits_rows),
+                int(target_verify_logits_width),
+            ]
+            trace_record["unified_generic_target_verify_num_proposals"] = int(target_verify_num_proposals)
+            trace_record["unified_generic_target_verify_num_to_verify_tokens"] = int(target_verify_num_to_verify_tokens)
+            trace_record["unified_generic_target_verify_logits_rows_per_proposal"] = (
+                int(target_verify_logits_rows) // int(target_verify_num_proposals)
+                if target_verify_num_proposals > 0 and target_verify_logits_rows % target_verify_num_proposals == 0
+                else int(target_verify_rows_per_proposal)
+            )
+            trace_record["unified_generic_target_verify_input_ids_by_proposal_id"] = _sampled_token_map(input_ids_by_id)
+            trace_record["unified_generic_target_verify_positions_by_proposal_id"] = _sampled_token_map(positions_by_id)
+            trace_record["unified_generic_target_verify_context_lens_by_proposal_id"] = _sampled_token_map(
+                context_lens_by_id
+            )
+            trace_record["unified_generic_target_verify_next_round_input_by_proposal_id"] = _sampled_token_map(
+                next_round_input_by_id
+            )
+            trace_record["unified_generic_target_verify_legacy_to_be_verified_by_proposal_id"] = _sampled_token_map(
+                legacy_to_verify_by_id
+            )
+            trace_record["unified_generic_target_verify_original_proposal_token_ids_by_proposal_id"] = (
+                _sampled_token_map(original_proposal_tokens_by_id)
+            )
+            sampled_bool_ids = {int(proposal_id) for proposal_id in sampled_target_verify_ids}
+            trace_record["unified_generic_target_verify_input_equals_next_round_by_proposal_id"] = (
+                self._trace_sorted_bool_map(input_equals_next_round_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_next_round_equals_original_proposal_by_proposal_id"] = (
+                self._trace_sorted_bool_map(next_round_equals_original_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_pre_verify_before_by_proposal_id"] = (
+                self._trace_sorted_bool_map(pre_verify_before_by_id)
+            )
+            trace_record["unified_generic_target_verify_pre_verify_after_rollback_by_proposal_id"] = (
+                self._trace_sorted_bool_map(pre_verify_after_rollback_by_id)
+            )
+            trace_record["unified_generic_target_verify_base_len_by_proposal_id"] = self._trace_sorted_int_map(
+                base_len_by_target_verify_id
+            )
+            trace_record["unified_generic_target_verify_parent_proposal_id_by_proposal_id"] = (
+                self._trace_sorted_int_map(parent_by_target_verify_id)
+            )
 
         self._update_unified_raw_verified_to_committed_ratio(trace_record)
         return results
