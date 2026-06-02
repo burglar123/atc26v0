@@ -157,6 +157,33 @@ class Controller:
                     invalidated_by_req[k] = invalidated_by_req.get(k, 0) + v
             if not invalidated_by_req:
                 invalidated_by_req = primary.get("per_seq_invalidated_predraft_len", {})
+
+            # Normalize invalidated_predraft using accepted/rejected semantics.
+            # Derive gamma from accepted + rejected for any seq that was rejected.
+            _gamma = 4  # fallback
+            for _sid in accepted_by_req:
+                _r = rejected_by_req.get(_sid, 0)
+                _a = accepted_by_req[_sid]
+                if _r > 0:
+                    _gamma = _a + _r
+                    break
+                elif _a > _gamma:
+                    _gamma = _a
+
+            for _sid in list(invalidated_by_req.keys()):
+                # Remove entries whose sid is not in accepted_by_req
+                if _sid not in accepted_by_req:
+                    del invalidated_by_req[_sid]
+                    continue
+                _accepted = accepted_by_req[_sid]
+                _rejected = rejected_by_req.get(_sid, _gamma - _accepted)
+                if _accepted == _gamma and _rejected == 0:
+                    invalidated_by_req[_sid] = 0
+                else:
+                    _existing = invalidated_by_req[_sid]
+                    if _existing not in (0, _gamma):
+                        invalidated_by_req[_sid] = _gamma
+
             slo_class_by_req = primary.get("slo_class_by_request", {})
             slo_tpot_by_req = primary.get("slo_tpot_ms_by_request", {})
             # Fill SLO info from draft records if verify side is missing them.

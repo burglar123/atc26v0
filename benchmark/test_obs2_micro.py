@@ -670,3 +670,83 @@ def test_merge_aggregates_invalidated_from_drafts():
     assert 'per_seq_invalidated_predraft_len' in merge_fn
     # Must not take invalidated_predraft only from primary (target) record
     assert 'invalidated_by_req = {}' in merge_fn
+
+
+def test_merge_invalidated_normalization():
+    """Merge normalizes invalidated_predraft_tokens_by_request from accepted/rejected.
+
+    accepted=gamma → invalidated=0.
+    accepted<gamma → invalidated stays gamma (snapped from intermediate values).
+    Unknown rids are removed from invalidated.
+    """
+    engine_src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    ms = engine_src.index('def _merge_decode_iterations')
+    rest = engine_src[ms:]
+    lines = rest.split('\n')
+    fn_lines = []
+    for line in lines:
+        fn_lines.append(line)
+        if fn_lines and line.startswith('    def ') and len(fn_lines) > 1:
+            fn_lines.pop()
+            break
+    fn_src = '\n'.join(fn_lines).replace('    @staticmethod\n', '')
+    env = {}
+    exec(fn_src, env)
+    merge = env['_merge_decode_iterations']
+
+    # Draft records with invalidated_predraft data (aggregated).
+    # seq 10 (a): fully accepted → invalidated=0 from draft
+    # seq 20 (b): rejected → W_k invalidated → invalidated=gamma from draft
+    draft_with_invalidated = {
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'parallel_pearl',
+        'decode_iteration_group': 0, 'runner_role': 'draft',
+        'scheduled_seq_ids': [10, 20], 'request_ids': ['a', 'b'],
+        'num_seqs_in_batch': 2, 'is_prefill': False,
+        'draft_start_ts': 10.0, 'draft_end_ts': 10.01,
+        'drafted_tokens_total': 2,
+        'per_seq_invalidated_predraft_len': {'10': 0, '20': 4},
+        'slo_class_by_request': {}, 'slo_tpot_ms_by_request': {},
+    }
+    # Verify record: accepted=4 for 'a' (full accept), accepted=1 for 'b' (rejection)
+    verify = {
+        'trace_type': 'decode_iteration', 'record_level': 'runner_substep',
+        'execution_mode': 'parallel_pearl',
+        'decode_iteration_group': 0, 'runner_role': 'verify',
+        'scheduled_seq_ids': [10, 20], 'request_ids': ['a', 'b'],
+        'num_seqs_in_batch': 2, 'is_prefill': False,
+        'verify_start_ts': 10.02, 'verify_end_ts': 10.03,
+        'verify_time_ms': 10.0,
+        'verified_tokens_total': 8,
+        'total_accepted_tokens': 5,
+        'accepted_tokens_per_seq': {'10': 4, '20': 1},
+        'rejected_tokens_by_request': {'10': 0, '20': 3},
+        'per_seq_invalidated_predraft_len': {'10': 0, '20': 0},
+        'slo_class_by_request': {}, 'slo_tpot_ms_by_request': {},
+    }
+    m = merge([draft_with_invalidated, verify])[0]
+    # 'a' (seq 10): accepted=4, rejected=0 → invalidated=0
+    assert m['invalidated_predraft_tokens_by_request']['a'] == 0
+    # 'b' (seq 20): accepted=1, rejected=3 → invalidated=4 (gamma, from draft)
+    assert m['invalidated_predraft_tokens_by_request']['b'] == 4
+    # accepted and rejected are correct
+    assert m['accepted_tokens_by_request'] == {'a': 4, 'b': 1}
+    assert m['rejected_tokens_by_request'] == {'a': 0, 'b': 3}
+
+    # --- Test: unknown rid in invalidated is removed ---
+    draft_unknown_rid = dict(draft_with_invalidated)
+    draft_unknown_rid['per_seq_invalidated_predraft_len'] = {'10': 0, '20': 4, '999': 4}
+    verify2 = dict(verify)
+    m2 = merge([draft_unknown_rid, verify2])[0]
+    # Unknown rid 999 must not appear in output
+    assert '999' not in m2['invalidated_predraft_tokens_by_request']
+    # 'a' should still be normalized to 0 (accepted=gamma)
+    assert m2['invalidated_predraft_tokens_by_request']['a'] == 0
+
+    # --- Test: intermediate invalidated value snapped to gamma ---
+    # Simulate a seq where the draft's aggregate produced a non-0, non-gamma value
+    draft_intermediate = dict(draft_with_invalidated)
+    draft_intermediate['per_seq_invalidated_predraft_len'] = {'10': 0, '20': 3}
+    m3 = merge([draft_intermediate, verify])[0]
+    # 'b': accepted=1 < gamma=4, invalidated was 3 (intermediate) → snaps to gamma=4
+    assert m3['invalidated_predraft_tokens_by_request']['b'] == 4
