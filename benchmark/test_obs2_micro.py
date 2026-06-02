@@ -200,9 +200,10 @@ def test_ar_step_counter():
 
 
 def test_no_semantic_changes():
+    """Core infrastructure unchanged: verify methods, barriers, full-gamma postprocess exist."""
     src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
     assert 'def verify(self' in src
-    assert '.verify(seqs)' in src
+    assert 'def _full_gamma_postprocess' in src
     assert 'dist.barrier()' in src
 
 
@@ -230,7 +231,7 @@ def test_serialized_protocol_methods():
     draft_serialized = draft_section.split('def serialized_pearl_step')[1]
     draft_serialized = draft_serialized.split('\n    def ')[0]
     assert 'send_serialized_draft_window' in draft_serialized
-    assert '_serialized_postprocess' in draft_serialized
+    assert '_full_gamma_postprocess' in draft_serialized
     # Must NOT call the old PEARL verify
     assert 'self.verify(seqs)' not in draft_serialized
 
@@ -242,7 +243,7 @@ def test_serialized_protocol_methods():
     assert 'recv_serialized_draft_window' in target_serialized
     assert 'prepare_serialized_verify_decode' in target_serialized
     assert 'serialized_verify_full_gamma' in target_serialized
-    assert '_serialized_postprocess' in target_serialized
+    assert '_full_gamma_postprocess' in target_serialized
     # Must NOT call the old PEARL verify
     assert 'self.verify(logits, seqs, temperatures)' not in target_serialized
 
@@ -357,3 +358,248 @@ def test_accepted_tokens_range_unconstrained():
     assert m['drafted_tokens_total'] == 16  # 4 per draft step × 4 steps
     # Verify 0-4 range is also handled
     assert 4 <= 4  # sanity: max accepted is gamma
+
+
+# ---------------------------------------------------------------------------
+# Tests for parallel_pearl full-gamma verification fix
+# ---------------------------------------------------------------------------
+
+def _extract_method_body(src: str, method_name: str) -> str:
+    """Extract a method body from source by splitting on 'def method_name'."""
+    parts = src.split(f'def {method_name}')
+    if len(parts) < 2:
+        return ''
+    body = parts[1].split('\n    def ')[0]
+    return body
+
+
+def _extract_class_section(src: str, class_name: str) -> str:
+    """Extract the source of a class from the file."""
+    idx = src.index(f'class {class_name}')
+    return src[idx:]
+
+
+def test_prepare_parallel_verify_decode_exists():
+    """prepare_parallel_verify_decode is defined in TargetModelRunner."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def prepare_parallel_verify_decode' in src
+
+
+def test_parallel_verify_full_gamma_exists():
+    """parallel_verify_full_gamma is defined in TargetModelRunner."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def parallel_verify_full_gamma' in src
+
+
+def test_prepare_parallel_verify_decode_bounds():
+    """prepare_parallel_verify_decode uses start = len(seq) - gamma - 1 and end = len(seq) - 1."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'prepare_parallel_verify_decode')
+    assert 'start = len(seq) - num_tokens - 1' in fn_body
+    assert 'end = len(seq) - 1' in fn_body
+    assert 'num_tokens = self.gamma' in fn_body
+    assert 'size mismatch' in fn_body
+
+
+def test_prepare_parallel_verify_decode_no_pre_verify():
+    """prepare_parallel_verify_decode does NOT reference seq.pre_verify."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'prepare_parallel_verify_decode')
+    assert 'seq.pre_verify' not in fn_body
+    assert 'if not seq.pre_verify else 1' not in fn_body
+
+
+def test_parallel_verify_full_gamma_no_pre_verify():
+    """parallel_verify_full_gamma does NOT reference seq.pre_verify."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'parallel_verify_full_gamma')
+    assert 'seq.pre_verify' not in fn_body
+
+
+def test_parallel_verify_full_gamma_accepted_len_range():
+    """parallel_verify_full_gamma allows accepted_len ∈ [0, gamma]."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'parallel_verify_full_gamma')
+    # Must have gamma-length loop for verification
+    assert 'for j in range(self.gamma)' in fn_body
+    # Must break on first rejection
+    assert 'n = j' in fn_body
+    assert 'break' in fn_body
+
+
+def test_parallel_postprocess_exists():
+    """_parallel_postprocess is defined in DraftModelRunner."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def _parallel_postprocess' in src
+
+
+def test_parallel_postprocess_rollback():
+    """_parallel_postprocess rolls back rejected_suffix + gamma on rejection."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_parallel_postprocess')
+    assert 'rejected_tokens = self.gamma - accepted_len' in fn_body
+    assert 'total_rollback = rejected_tokens + self.gamma' in fn_body
+
+
+def test_invalidated_vs_rejected():
+    """Draft-side: invalidated_predraft=gamma on rejection, 0 on accept."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_parallel_postprocess')
+    # Accept branch: invalidated_predraft = 0
+    assert 'invalidated_predraft = 0' in fn_body
+    # Reject branch: invalidated_predraft = self.gamma
+    assert 'invalidated_predraft = self.gamma' in fn_body
+    # Finish branch: invalidated_predraft = self.gamma
+    assert "W_k was generated but request finished" in fn_body
+
+
+def test_rejection_is_not_finish():
+    """_parallel_postprocess does NOT call mark_finished in rejection branch."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_parallel_postprocess')
+    assert 'Rejection ≠ finish' in fn_body
+    # Check that after the rejection branch comment, no mark_finished appears
+    reject_start = fn_body.index('Rejection ≠ finish')
+    reject_section = fn_body[reject_start:]
+    # The next meaningful code should not contain mark_finished (only the finish branch above has it)
+    next_def = reject_section.find('def ')
+    next_class = reject_section.find('class ')
+    end_of_method = min(next_def if next_def > 0 else 99999, next_class if next_class > 0 else 99999)
+    reject_body = reject_section[:end_of_method]
+    assert 'mark_finished()' not in reject_body.replace('Do NOT call seq.mark_finished()', '')
+
+
+def test_pending_draft_tokens_field():
+    """Sequence has pending_draft_tokens attribute, defaults to 0."""
+    seq_src = (ROOT / "nano_pearl/pearl_engine/sequence.py").read_text()
+    assert 'self.pending_draft_tokens = 0' in seq_src
+
+
+def test_pending_draft_tokens_invariant():
+    """pending_draft_tokens is asserted to be 0 or gamma after each postprocess."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'pending_draft_tokens in (0, self.gamma)' in src
+
+
+def test_draft_pearl_step_no_old_verify():
+    """Draft.pearl_step does NOT call self.verify(seqs)."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    draft_class = _extract_class_section(src, 'DraftModelRunner')
+    draft_pearl = _extract_method_body(draft_class, 'pearl_step')
+    assert 'self.verify(seqs)' not in draft_pearl
+
+
+def test_target_pearl_step_no_old_prepare():
+    """Target.pearl_step does NOT call self.prepare_pearl_decode."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    target_class = _extract_class_section(src, 'TargetModelRunner')
+    target_pearl = _extract_method_body(target_class, 'pearl_step')
+    assert 'self.prepare_pearl_decode(seqs)' not in target_pearl
+
+
+def test_target_pearl_step_uses_verify_seqs_for_trace():
+    """Target.pearl_step builds trace from verify_seqs, not broader scheduled seqs."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    target_class = _extract_class_section(src, 'TargetModelRunner')
+    target_pearl = _extract_method_body(target_class, 'pearl_step')
+    assert 'self._trace_schedule(verify_seqs' in target_pearl
+
+
+def test_draft_trace_uses_drafted_tokens_len_seqs():
+    """Draft generation loop uses drafted_tokens=len(seqs)."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    draft_class = _extract_class_section(src, 'DraftModelRunner')
+    draft_pearl = _extract_method_body(draft_class, 'pearl_step')
+    # In the draft generation for loop
+    assert 'drafted_tokens=len(seqs)' in draft_pearl
+
+
+def test_send_parallel_draft_window_exists():
+    """send_parallel_draft_window is defined in DraftModelRunner."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def send_parallel_draft_window' in src
+
+
+def test_recv_parallel_draft_window_exists():
+    """recv_parallel_draft_window is defined in TargetModelRunner."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def recv_parallel_draft_window' in src
+
+
+def test_recv_parallel_draft_window_lookup():
+    """recv_parallel_draft_window looks up seq_ids in running set."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'recv_parallel_draft_window')
+    assert 'running_by_id' in fn_body
+    assert 'not in running set' in fn_body
+
+
+def test_send_parallel_draft_window_asserts():
+    """send_parallel_draft_window asserts pending_draft_tokens == gamma."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, 'send_parallel_draft_window')
+    assert 'pending_draft_tokens == self.gamma' in fn_body
+
+
+def test_first_iteration_handler_exists():
+    """_first_iteration_sync_verify_and_build_pending exists."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    assert 'def _first_iteration_sync_verify_and_build_pending' in src
+
+
+def test_first_iteration_resets_pending():
+    """First-iteration handler resets pending_draft_tokens = 0 before building W1."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_first_iteration_sync_verify_and_build_pending')
+    assert 'pending_draft_tokens = 0' in fn_body
+
+
+def test_phase1_validate_pearl_step_exists():
+    """_validate_full_gamma_pearl_step exists on both runners."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    # Count occurrences (one in Draft, one in Target)
+    count = src.count('def _validate_full_gamma_pearl_step')
+    assert count == 2, f"Expected 2 definitions, found {count}"
+
+
+def test_phase1_toggle_env_var():
+    """pearl_step checks PEARL_FULL_GAMMA_VALIDATE env var."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    draft_class = _extract_class_section(src, 'DraftModelRunner')
+    draft_pearl = _extract_method_body(draft_class, 'pearl_step')
+    assert 'PEARL_FULL_GAMMA_VALIDATE' in draft_pearl
+
+    target_class = _extract_class_section(src, 'TargetModelRunner')
+    target_pearl = _extract_method_body(target_class, 'pearl_step')
+    assert 'PEARL_FULL_GAMMA_VALIDATE' in target_pearl
+
+
+def test_pending_draft_tokens_in_pickle():
+    """pending_draft_tokens is included in __getstate__ serialization."""
+    seq_src = (ROOT / "nano_pearl/pearl_engine/sequence.py").read_text()
+    getstate = seq_src.split('def __getstate__')[1].split('def __setstate__')[0]
+    assert 'self.pending_draft_tokens' in getstate
+    setstate = seq_src.split('def __setstate__')[1]
+    assert 'self.pending_draft_tokens' in setstate
+
+
+def test_pending_draft_tokens_in_snapshot():
+    """pending_draft_tokens is in _build_cached_seq_snapshot and _restore."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    build_fn = _extract_method_body(src, '_build_cached_seq_snapshot')
+    assert 'pending_draft_tokens' in build_fn
+    restore_fn = _extract_method_body(src, '_restore_sequence_from_snapshot')
+    assert 'pending_draft_tokens' in restore_fn
+
+
+def test_verified_tokens_total_in_trace():
+    """verified_tokens_total is initialized in _trace_schedule."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_trace_schedule')
+    assert '"verified_tokens_total"' in fn_body
+
+
+def test_verified_tokens_total_in_merge():
+    """Merge logic prefers explicit verified_tokens_total over fallback."""
+    engine_src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    assert 'primary.get("verified_tokens_total"' in engine_src

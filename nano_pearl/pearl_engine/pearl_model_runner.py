@@ -326,6 +326,7 @@ class ModelRunnerBase:
             "num_tokens": int(seq.num_tokens),
             "last_token": int(seq.last_token),
             "pre_verify": bool(seq.pre_verify),
+            "pending_draft_tokens": int(seq.pending_draft_tokens),
             "max_tokens": int(seq.max_tokens),
             "temperature": float(seq.temperature),
             "ignore_eos": bool(seq.ignore_eos),
@@ -358,6 +359,7 @@ class ModelRunnerBase:
         seq.num_tokens = int(snapshot["num_tokens"])
         seq.last_token = int(snapshot["last_token"])
         seq.pre_verify = bool(snapshot["pre_verify"])
+        seq.pending_draft_tokens = int(snapshot.get("pending_draft_tokens", 0))
         seq.decode_ready_mode = bool(snapshot.get("decode_ready_mode", False))
         seq.num_decode_ready_prefill_tokens = int(snapshot.get("num_decode_ready_prefill_tokens", 0))
         seq.trace_stats = snapshot.get("trace_stats", seq.trace_stats)
@@ -480,6 +482,7 @@ class ModelRunnerBase:
             "per_seq_invalidated_predraft_len": dict(per_seq_zeros),
             "total_accepted_tokens": 0,
             "drafted_tokens_total": 0,
+            "verified_tokens_total": 0,
             "rejected_tokens_by_request": {},
             "slo_class_by_request": {
                 seq.request_id: getattr(seq, "slo_class", None)
@@ -523,7 +526,7 @@ class ModelRunnerBase:
             invalidated_lens = {seq_id: int(invalidated_len) for seq_id, invalidated_len in invalidated_lens.items()}
             record["per_seq_invalidated_predraft_len"].update(invalidated_lens)
 
-    def _mark_trace_end(self, record: dict, accepted_lens: dict[int, int] | None = None, invalidated_lens: dict[int, int] | None = None, drafted_tokens: int = 0):
+    def _mark_trace_end(self, record: dict, accepted_lens: dict[int, int] | None = None, invalidated_lens: dict[int, int] | None = None, drafted_tokens: int = 0, verified_tokens: int = 0):
         if self.tp_params.local_rank == 0:
             now = time.time()
             key = "draft_end_ts" if self.is_draft else "verify_end_ts"
@@ -537,6 +540,8 @@ class ModelRunnerBase:
                 record["total_iteration_time_ms"] = (now - record["total_iteration_start_ts"]) * 1000
         if drafted_tokens:
             record["drafted_tokens_total"] = record.get("drafted_tokens_total", 0) + drafted_tokens
+        if verified_tokens:
+            record["verified_tokens_total"] = record.get("verified_tokens_total", 0) + verified_tokens
         self._update_trace_token_stats(record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     def _service_metadata(self):
@@ -1141,8 +1146,8 @@ class ModelRunnerBase:
 
         self.clear_requests()
 
-    def _serialized_postprocess(self, seqs: list[Sequence], verify_res: torch.Tensor):
-        """Serialized speculative decoding postprocess — shared by draft and target.
+    def _full_gamma_postprocess(self, seqs: list[Sequence], verify_res: torch.Tensor):
+        """Full-gamma speculative decoding postprocess — shared by draft and target.
 
         Full-gamma semantics: accepted_len ∈ [0, gamma]. No pre_verify state.
         On rejection, rollback the unaccepted draft suffix and append the
@@ -1231,7 +1236,164 @@ class DraftModelRunner(ModelRunnerBase):
             msg = torch.tensor(flat, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
 
-    def pearl_step(self):
+    def send_parallel_draft_window(self, verify_seqs: list[Sequence]):
+        """Broadcast verify windows to target using two-phase protocol.
+
+        Phase 1: count (number of verify_seqs).
+        Phase 2: seq_ids (for ordering check on target side).
+        Phase 3: gamma draft tokens per verify_seq (seq.token_ids[-gamma:]).
+
+        Asserts every verify_seq has pending_draft_tokens == gamma and the
+        window tokens are exactly gamma long.
+        """
+        if self.tp_params.local_rank == 0:
+            # Phase 1: count
+            count_t = torch.tensor([len(verify_seqs)], dtype=torch.int64, device="cuda")
+            dist.broadcast(count_t, src=self.rank, group=self.verify_group)
+
+            if verify_seqs:
+                # Phase 2: seq_ids
+                ids_t = torch.tensor([s.seq_id for s in verify_seqs], dtype=torch.int64, device="cuda")
+                dist.broadcast(ids_t, src=self.rank, group=self.verify_group)
+                # Phase 3: draft tokens
+                flat = []
+                for s in verify_seqs:
+                    assert s.pending_draft_tokens == self.gamma, (
+                        f"send_parallel_draft_window: seq {s.seq_id} "
+                        f"pending_draft_tokens={s.pending_draft_tokens}, expected gamma={self.gamma}"
+                    )
+                    toks = s.token_ids[-self.gamma:]
+                    assert len(toks) == self.gamma, (
+                        f"send_parallel_draft_window: seq {s.seq_id} "
+                        f"has {len(toks)} tokens in draft window, expected {self.gamma}"
+                    )
+                    flat.extend(toks)
+                msg_t = torch.tensor(flat, dtype=torch.int64, device="cuda")
+                dist.broadcast(msg_t, src=self.rank, group=self.verify_group)
+
+    def _parallel_postprocess(self, verify_seqs: list[Sequence], verify_res: torch.Tensor,
+                              drafted_this_iter: dict[int, int]):
+        """Draft-side full-gamma postprocess with pending-window awareness.
+
+        For each verified seq:
+        - Applies accepted_len from W_{k-1} verification.
+        - On full accept: W_k stays as pending (pending_draft_tokens = gamma).
+        - On rejection: rollback rejected suffix of W_{k-1} + all of W_k,
+          append correction token (pending_draft_tokens = 0).
+        - On finish: W_k is invalidated (pending_draft_tokens = 0).
+
+        invalidated_predraft_tokens = gamma when W_k is discarded (rejection
+        or finish), else 0. rejected_tokens (suffix of W_{k-1}) is tracked
+        separately in trace via _update_trace_token_stats.
+        """
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        accepted_lens: dict[int, int] = {}
+        invalidated_lens: dict[int, int] = {}
+
+        for idx, seq in enumerate(verify_seqs):
+            accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
+            accepted_lens[seq.seq_id] = accepted_len
+            seq.record_accepted(accepted_len)
+
+            w_k_generated = drafted_this_iter.get(seq.seq_id, 0)
+            assert w_k_generated == self.gamma, (
+                f"_parallel_postprocess: seq {seq.seq_id} "
+                f"drafted_this_iter={w_k_generated}, expected gamma={self.gamma}"
+            )
+
+            if finish[idx]:
+                seq.mark_finished()
+                seq.num_acc_tokens.append(seq.cur_acc_tokens)
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                # W_k was generated but request finished: invalidate W_k
+                invalidated_predraft = self.gamma
+                seq.pending_draft_tokens = 0
+                seq.record_invalidated_predraft(invalidated_predraft)
+                invalidated_lens[seq.seq_id] = invalidated_predraft
+                continue
+
+            if acc[idx]:
+                # W_{k-1} fully accepted. W_k stays as pending.
+                invalidated_predraft = 0
+                seq.pending_draft_tokens = self.gamma
+            else:
+                # W_{k-1} rejected at position accepted_len.
+                # Rollback: rejected suffix of W_{k-1} + all of W_k
+                rejected_tokens = self.gamma - accepted_len
+                total_rollback = rejected_tokens + self.gamma
+                self.scheduler.rollback(seq, total_rollback)
+                seq.append_token(revise_token[idx])
+                self._ensure_block_table_covers_sequence(seq)
+                invalidated_predraft = self.gamma
+                seq.pending_draft_tokens = 0
+                # Rejection ≠ finish. Do NOT call seq.mark_finished().
+
+            seq.record_invalidated_predraft(invalidated_predraft)
+            invalidated_lens[seq.seq_id] = invalidated_predraft
+
+        return accepted_lens, invalidated_lens
+
+    def _first_iteration_sync_verify_and_build_pending(self, all_seqs: list[Sequence],
+                                                        trace_record: dict,
+                                                        drafted_this_iter: dict[int, int]):
+        """First-iteration handler: verify W₀ synchronously, then build W₁ as pending.
+
+        W₀ was already generated on all_seqs (tracked in drafted_this_iter).
+        After postprocessing W₀, resets pending_draft_tokens=0, then generates
+        W₁ for ALL non-finished seqs so they have pending windows for the next
+        parallel iteration.
+        """
+        # Send W₀ for all seqs
+        self.send_parallel_draft_window(all_seqs)
+
+        # Receive verify_res
+        verify_res = torch.zeros((4, len(all_seqs)), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Postprocess W₀ (synchronous, no W_k to invalidate → target-side semantics)
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(all_seqs, verify_res)
+
+        if trace_record is not None:
+            self._update_trace_token_stats(trace_record,
+                accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+        # Reset pending_draft_tokens: W₀ was verified, no longer pending
+        for s in all_seqs:
+            s.pending_draft_tokens = 0
+
+        # Build W₁ as pending for ALL non-finished seqs
+        non_finished = [s for s in all_seqs if not s.is_finished]
+        if non_finished:
+            for _ in range(self.gamma):
+                seqs, is_prefill = self.scheduler.schedule()
+                assert not is_prefill, "wrong match. current stage is prefill."
+                input_ids, positions = self.prepare_pearl_decode(seqs)
+                torch.cuda.synchronize()
+                logits = self.run_model(input_ids, positions, is_prefill)
+                sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                torch.cuda.synchronize()
+                token_ids = sample_tokens.tolist()
+                reset_context(self.tp_params)
+                for seq, token_id in zip(seqs, token_ids):
+                    seq.append_token(token_id)
+                    seq.pending_draft_tokens += 1
+
+        # Assert invariant: pending_draft_tokens ∈ {0, gamma} for all running
+        for s in self.scheduler.running:
+            assert s.pending_draft_tokens in (0, self.gamma), (
+                f"_first_iteration: seq {s.seq_id} pending_draft_tokens={s.pending_draft_tokens}, "
+                f"expected 0 or {self.gamma}"
+            )
+
+    def _validate_full_gamma_pearl_step(self):
+        """Synchronous full-gamma PEARL step for Phase 1 validation.
+
+        Reuses serialized full-gamma protocol. Keeps parallel_pearl execution
+        mode for traces. NOT the performance path.
+        """
         self._decode_iteration_group += 1
         trace_record = None
         for _ in range(self.gamma):
@@ -1242,20 +1404,105 @@ class DraftModelRunner(ModelRunnerBase):
             torch.cuda.synchronize()
             self._mark_trace_start(trace_record)
             logits = self.run_model(input_ids, positions, is_prefill)
-            # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
-            # We will support temperature in the future.
             sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
             dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             torch.cuda.synchronize()
             token_ids = sample_tokens.tolist()
             reset_context(self.tp_params)
 
-            # append the sample tokens to the seqs. Do not use postprocess to avoid early exiting when the draft tokens contain EOS.
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record, drafted_tokens=len(seqs))
 
-        accepted_lens, invalidated_lens = self.verify(seqs)
+        dist.barrier()
+        self.send_serialized_draft_window(seqs)
+
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(seqs, verify_res)
+        if trace_record is not None:
+            self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+    def pearl_step(self):
+        self._decode_iteration_group += 1
+
+        # Phase 1 toggle: synchronous full-gamma validation mode
+        if os.environ.get("PEARL_FULL_GAMMA_VALIDATE"):
+            return self._validate_full_gamma_pearl_step()
+
+        trace_record = None
+        all_seqs = list(self.scheduler.running)
+
+        # Partition: verify_seqs have full pending windows
+        verify_seqs = [s for s in all_seqs if s.pending_draft_tokens >= self.gamma]
+        draft_seqs = all_seqs
+
+        # Assert: every verify_seq has exactly gamma pending tokens
+        for s in verify_seqs:
+            assert s.pending_draft_tokens == self.gamma, (
+                f"pearl_step: seq {s.seq_id} pending_draft_tokens={s.pending_draft_tokens}, "
+                f"expected gamma={self.gamma}"
+            )
+
+        drafted_this_iter: dict[int, int] = {}
+
+        # Phase A: send pending windows
+        if verify_seqs:
+            self.send_parallel_draft_window(verify_seqs)
+
+        # Phase B: generate gamma tokens for all draft_seqs
+        for _ in range(self.gamma):
+            seqs, is_prefill = self.scheduler.schedule()
+            if trace_record is None:
+                trace_record = self._trace_schedule(seqs, is_prefill, "draft")
+            assert not is_prefill, "wrong match. current stage is prefill."
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            torch.cuda.synchronize()
+            self._mark_trace_start(trace_record)
+            logits = self.run_model(input_ids, positions, is_prefill)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            torch.cuda.synchronize()
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+                seq.pending_draft_tokens += 1
+                drafted_this_iter[seq.seq_id] = drafted_this_iter.get(seq.seq_id, 0) + 1
+            self._mark_trace_end(trace_record, drafted_tokens=len(seqs))
+
+        # Assert: every draft_seq got exactly gamma new tokens
+        for s in draft_seqs:
+            if not s.is_finished:
+                assert drafted_this_iter.get(s.seq_id, 0) == self.gamma, (
+                    f"pearl_step: seq {s.seq_id} drafted_this_iter={drafted_this_iter.get(s.seq_id, 0)}, "
+                    f"expected gamma={self.gamma}"
+                )
+
+        # Phase C: receive verify_res
+        if verify_seqs:
+            verify_res = torch.zeros((4, len(verify_seqs)), dtype=torch.int64, device="cuda")
+            dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+            accepted_lens, invalidated_lens = self._parallel_postprocess(
+                verify_seqs, verify_res, drafted_this_iter
+            )
+            if trace_record is not None:
+                self._update_trace_token_stats(trace_record,
+                    accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+        else:
+            # First iteration: verify W₀ synchronously, then build W₁ as pending
+            self._first_iteration_sync_verify_and_build_pending(
+                all_seqs, trace_record, drafted_this_iter
+            )
+
+        # Strict invariant: pending_draft_tokens ∈ {0, gamma} for all running seqs
+        for s in self.scheduler.running:
+            assert s.pending_draft_tokens in (0, self.gamma), (
+                f"pearl_step end: seq {s.seq_id} pending_draft_tokens={s.pending_draft_tokens}, "
+                f"expected 0 or {self.gamma}"
+            )
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1300,7 +1547,7 @@ class DraftModelRunner(ModelRunnerBase):
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
 
         # Apply serialized full-gamma postprocess.
-        accepted_lens, invalidated_lens = self._serialized_postprocess(seqs, verify_res)
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(seqs, verify_res)
         if trace_record is not None:
             self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1534,17 +1781,242 @@ class TargetModelRunner(ModelRunnerBase):
 
         return verify_res
 
-    def pearl_step(self):
+    def prepare_parallel_verify_decode(self, seqs: list[Sequence]):
+        """Target preparation for parallel full-gamma speculative decoding.
+
+        Feeds gamma input tokens per sequence: [last_confirmed, d_0, …, d_{γ-2}].
+        This produces gamma logits that predict d_0 through d_{γ-1}, enabling
+        full-gamma verification of all γ draft tokens.
+
+        Identical semantics to prepare_serialized_verify_decode. Does NOT use
+        PEARL's pre_verify state machine.
+        """
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        temp_seqs = []
+        for seq in seqs:
+            num_tokens = self.gamma
+            start = len(seq) - num_tokens - 1   # last confirmed token position
+            end = len(seq) - 1                    # position before the last draft token
+            to_append_tokens = seq.token_ids[start:end]
+            assert len(to_append_tokens) == num_tokens, (
+                f"prepare_parallel_verify_decode: seq {seq.seq_id} request_id={seq.request_id} "
+                f"len(seq)={len(seq)} num_prompt_tokens={seq.num_prompt_tokens} "
+                f"num_completion_tokens={seq.num_completion_tokens} "
+                f"gamma={self.gamma} start={start} end={end} "
+                f"expected {num_tokens} tokens, got {len(to_append_tokens)}"
+            )
+            input_ids.extend(to_append_tokens)
+            positions.extend(range(start, end))
+            context_lens.extend(range(start + 1, end + 1))
+            assert len(seq.block_table) >= seq.num_blocks, (
+                f"prepare_parallel_verify_decode: block_table too short for seq {seq.seq_id} "
+                f"request_id={seq.request_id} len(seq)={len(seq)} "
+                f"num_blocks={seq.num_blocks} block_table_len={len(seq.block_table)}"
+            )
+            slot_mapping.extend([seq.token_to_slot(i) for i in range(start, end)])
+            temp_seqs.extend([seq] * num_tokens)
+
+        n = len(input_ids)
+        assert n == len(positions) == len(slot_mapping) == len(context_lens) == len(temp_seqs), (
+            f"prepare_parallel_verify_decode: size mismatch "
+            f"input_ids={n} positions={len(positions)} slot_mapping={len(slot_mapping)} "
+            f"context_lens={len(context_lens)} temp_seqs={len(temp_seqs)}"
+        )
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(temp_seqs)
+        set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions, temp_seqs
+
+    @torch.inference_mode()
+    def parallel_verify_full_gamma(self, logits: torch.Tensor, seqs: list[Sequence],
+                                   temperatures: torch.Tensor):
+        """Full-gamma verification for parallel speculative decoding.
+
+        Verifies exactly gamma draft tokens per active sequence. Does NOT use
+        PEARL's pre_verify state machine. accepted_len ∈ [0, gamma].
+
+        Returns verify_res tensor [4, len(seqs)]: acc, rollout, revise_token, finish.
+        The caller must broadcast verify_res to the draft group and call
+        _full_gamma_postprocess on both sides.
+        """
+        num_to_verify = self.gamma * len(seqs)
+        to_be_verified_tokens = []
+        for seq in seqs:
+            toks = seq.token_ids[-self.gamma:]
+            assert len(toks) == self.gamma, (
+                f"parallel_verify_full_gamma: seq {seq.seq_id} "
+                f"has {len(toks)} draft tokens, expected {self.gamma}"
+            )
+            to_be_verified_tokens.extend(toks)
+
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+
+        if self.tp_params.local_rank == 0:
+            r = torch.rand(num_to_verify, device="cuda")
+            target_logits = norm_logits(logits, temperatures)
+
+            draft_t = torch.tensor(to_be_verified_tokens, dtype=torch.int64, device="cuda")
+            target_prob = target_logits.gather(dim=1, index=draft_t.unsqueeze(1)).squeeze(1)
+            judge = (r <= target_prob).tolist()
+
+            logits.scatter_(1, draft_t.unsqueeze(1), -float("inf"))
+            revised_tokens = self.sampler(logits, temperatures)
+
+            acc, rollout, revise_token, finish = [], [], [], []
+
+            for i, seq in enumerate(seqs):
+                n = self.gamma
+                finish_flag = False
+                offset = i * self.gamma
+                for j in range(self.gamma):
+                    tok = to_be_verified_tokens[offset + j]
+                    if not seq.ignore_eos and judge[offset + j] and is_eos(tok, self.scheduler.eos):
+                        finish_flag = True
+                    if not judge[offset + j]:
+                        n = j
+                        break
+                acc.append(n == self.gamma)
+                rollout.append(self.gamma - n)
+                revise_token.append(revised_tokens[offset + n] if n < self.gamma else -1)
+                finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, self.gamma))
+
+                if n == self.gamma:
+                    seq.cur_acc_tokens += n
+                else:
+                    seq.num_acc_tokens.append(seq.cur_acc_tokens + n + 1)
+                    seq.cur_acc_tokens = 0
+
+            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+
+        return verify_res
+
+    def recv_parallel_draft_window(self, seqs: list[Sequence]):
+        """Receive gamma draft tokens from draft master and build verify_seqs.
+
+        Uses two-phase protocol: count, then seq_ids, then tokens.
+        Builds verify_seqs by looking up received seq_ids in running set.
+        Preserves received order. Asserts all received ids exist in running.
+        Does NOT set pending_draft_tokens on target side.
+        """
+        count_t = torch.zeros(1, dtype=torch.int64, device="cuda")
+        dist.broadcast(count_t, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        num_verify = int(count_t.item())
+
+        if num_verify == 0:
+            return []
+
+        ids_t = torch.zeros(num_verify, dtype=torch.int64, device="cuda")
+        dist.broadcast(ids_t, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        received_ids = ids_t.tolist()
+
+        running_by_id = {s.seq_id: s for s in self.scheduler.running}
+        verify_seqs = []
+        for sid in received_ids:
+            seq = running_by_id.get(sid)
+            assert seq is not None, (
+                f"recv_parallel_draft_window: seq_id {sid} not in running set "
+                f"(running_ids={sorted(running_by_id.keys())})"
+            )
+            verify_seqs.append(seq)
+
+        total_tokens = self.gamma * num_verify
+        msg_t = torch.empty(total_tokens, dtype=torch.int64, device="cuda")
+        dist.broadcast(msg_t, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        flat = msg_t.tolist()
+        for i, seq in enumerate(verify_seqs):
+            toks = flat[i * self.gamma : (i + 1) * self.gamma]
+            assert len(toks) == self.gamma, (
+                f"recv_parallel_draft_window: seq {seq.seq_id} "
+                f"expected {self.gamma} tokens, got {len(toks)}"
+            )
+            for tok in toks:
+                seq.append_token(tok)
+            self._ensure_block_table_covers_sequence(seq)
+            # Do NOT set pending_draft_tokens on target side.
+
+        return verify_seqs
+
+    def _validate_full_gamma_pearl_step(self):
+        """Synchronous full-gamma PEARL step for Phase 1 validation.
+
+        Reuses serialized full-gamma preparation, verification, and postprocess.
+        Keeps parallel_pearl execution mode for traces. NOT the performance path.
+        """
         self._decode_iteration_group += 1
+        dist.barrier()
         seqs, is_prefill = self.scheduler.schedule()
         trace_record = self._trace_schedule(seqs, is_prefill, "verify")
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+
+        # Receive draft window (reuses serialized recv — same protocol).
+        self.recv_serialized_draft_window(seqs)
+
+        # Full-gamma preparation and verification.
+        input_ids, positions, temp_seqs = self.prepare_serialized_verify_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         torch.cuda.synchronize()
         self._mark_trace_start(trace_record)
         logits = self.run_model(input_ids, positions, is_prefill)
-        accepted_lens, invalidated_lens = self.verify(logits, seqs, temperatures)
+        verify_res = self.serialized_verify_full_gamma(logits, seqs, temperatures)
+
+        # Broadcast verify_res so draft ranks can apply postprocess.
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Full-gamma postprocess.
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(seqs, verify_res)
+
+        verified_tokens = self.gamma * len(seqs)
+        trace_record["verified_tokens_total"] = verified_tokens
+        torch.cuda.synchronize()
+        self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+
+    def pearl_step(self):
+        self._decode_iteration_group += 1
+
+        # Phase 1 toggle: synchronous full-gamma validation mode
+        if os.environ.get("PEARL_FULL_GAMMA_VALIDATE"):
+            return self._validate_full_gamma_pearl_step()
+
+        seqs, is_prefill = self.scheduler.schedule()
+        assert not is_prefill, "wrong match. current stage is prefill."
+
+        # Phase A: receive verify windows from draft (two-phase broadcast)
+        verify_seqs = self.recv_parallel_draft_window(seqs)
+
+        if not verify_seqs:
+            # First iteration: nothing to verify yet
+            return
+
+        # Build trace from verify_seqs (not the broader scheduled seqs)
+        trace_record = self._trace_schedule(verify_seqs, is_prefill, "verify")
+
+        # Phase B: full-gamma verification
+        input_ids, positions, temp_seqs = self.prepare_parallel_verify_decode(verify_seqs)
+        temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+
+        torch.cuda.synchronize()
+        self._mark_trace_start(trace_record)
+        logits = self.run_model(input_ids, positions, is_prefill)
+        verify_res = self.parallel_verify_full_gamma(logits, verify_seqs, temperatures)
+
+        # Phase C: broadcast results back to draft
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Phase D: postprocess (target-side: invalidated_predraft=0 by definition)
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(verify_seqs, verify_res)
+
+        # Runtime assert
+        verified_tokens = self.gamma * len(verify_seqs)
+        assert verified_tokens == self.gamma * len(verify_seqs)
+        trace_record["verified_tokens_total"] = verified_tokens
+
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -1590,7 +2062,7 @@ class TargetModelRunner(ModelRunnerBase):
         dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
 
         # Postprocess (same logic as draft side).
-        accepted_lens, invalidated_lens = self._serialized_postprocess(seqs, verify_res)
+        accepted_lens, invalidated_lens = self._full_gamma_postprocess(seqs, verify_res)
         torch.cuda.synchronize()
         self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 

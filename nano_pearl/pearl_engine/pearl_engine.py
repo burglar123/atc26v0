@@ -138,9 +138,11 @@ class Controller:
             # Token stats: aggregate across all draft records + use verify record's stats.
             drafted_tokens_total = sum(r.get("drafted_tokens_total", 0) for r in drafts)
             accepted_tokens_total = primary.get("total_accepted_tokens", 0)
-            verified_tokens_total = drafted_tokens_total if drafted_tokens_total > 0 else (
-                primary.get("num_seqs_in_batch", 0) * 4  # fallback: gamma * batch
-            )
+            verified_tokens_total = primary.get("verified_tokens_total", 0)
+            if verified_tokens_total <= 0:
+                verified_tokens_total = drafted_tokens_total if drafted_tokens_total > 0 else (
+                    primary.get("num_seqs_in_batch", 0) * 4  # fallback: gamma * batch
+                )
 
             # Per-request maps: prefer verify side (has accepted + rejected),
             # fall back to draft side for slo info.

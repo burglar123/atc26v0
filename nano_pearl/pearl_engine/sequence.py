@@ -58,6 +58,7 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.pre_verify = True
+        self.pending_draft_tokens = 0  # ∈ {0, gamma} in parallel_pearl full-gamma; always 0 otherwise
         self.num_acc_tokens = []
         self.cur_acc_tokens = 0
 
@@ -185,6 +186,7 @@ class Sequence:
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+                self.pending_draft_tokens,
                 self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
                 self.arrival_offset_sec,
                 self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
@@ -195,6 +197,7 @@ class Sequence:
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
          self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
+         self.pending_draft_tokens,
          self.num_acc_tokens, self.cur_acc_tokens, self.request_id, self.arrival_ts,
          self.arrival_offset_sec,
          self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
