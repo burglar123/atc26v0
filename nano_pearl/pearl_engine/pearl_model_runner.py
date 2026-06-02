@@ -1153,6 +1153,11 @@ class ModelRunnerBase:
         On rejection, rollback the unaccepted draft suffix and append the
         target correction token. Both sides must end the iteration with
         consistent seq.token_ids lengths.
+
+        invalidated_predraft_tokens is always 0 — this function only operates
+        on W_{k-1} (no overlapped W_k exists in synchronous/serialized paths).
+        rejected_tokens (gamma - accepted_len) is tracked separately via
+        _update_trace_token_stats in the caller.
         """
         acc, rollout, revise_token, finish = verify_res.tolist()
         accepted_lens: dict[int, int] = {}
@@ -1160,7 +1165,8 @@ class ModelRunnerBase:
 
         for idx, seq in enumerate(seqs):
             accepted_len = self.gamma if acc[idx] else self.gamma - rollout[idx]
-            invalidated_len = 0 if acc[idx] else rollout[idx]
+            # No W_k in synchronous paths: invalidated_predraft is always 0.
+            invalidated_len = 0
             accepted_lens[seq.seq_id] = accepted_len
             invalidated_lens[seq.seq_id] = invalidated_len
             seq.record_accepted(accepted_len)

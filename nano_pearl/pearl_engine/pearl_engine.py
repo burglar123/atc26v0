@@ -148,7 +148,15 @@ class Controller:
             # fall back to draft side for slo info.
             accepted_by_req = primary.get("accepted_tokens_per_seq", {})
             rejected_by_req = primary.get("rejected_tokens_by_request", {})
-            invalidated_by_req = primary.get("per_seq_invalidated_predraft_len", {})
+            # invalidated_predraft comes from draft records (only draft side
+            # has W_k to invalidate in parallel full-gamma; target side always
+            # reports 0). Aggregate across all draft records.
+            invalidated_by_req = {}
+            for r in drafts:
+                for k, v in r.get("per_seq_invalidated_predraft_len", {}).items():
+                    invalidated_by_req[k] = invalidated_by_req.get(k, 0) + v
+            if not invalidated_by_req:
+                invalidated_by_req = primary.get("per_seq_invalidated_predraft_len", {})
             slo_class_by_req = primary.get("slo_class_by_request", {})
             slo_tpot_by_req = primary.get("slo_tpot_ms_by_request", {})
             # Fill SLO info from draft records if verify side is missing them.

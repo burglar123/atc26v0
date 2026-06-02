@@ -637,3 +637,36 @@ def test_first_iteration_handler_returns_accepted_lens():
     assert 'return accepted_lens, invalidated_lens' in fn_body
     # Should NOT internally call _update_trace_token_stats (caller handles it)
     assert '_update_trace_token_stats' not in fn_body
+
+
+def test_full_gamma_postprocess_invalidated_always_zero():
+    """_full_gamma_postprocess sets invalidated_len = 0 always (no W_k in sync paths)."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_full_gamma_postprocess')
+    assert 'invalidated_len = 0' in fn_body
+    # Must NOT set invalidated_len = rollout (that would equal rejected_tokens)
+    assert 'invalidated_len = 0 if acc' not in fn_body
+
+
+def test_parallel_postprocess_rejected_vs_invalidated():
+    """_parallel_postprocess computes rejected_tokens and invalidated_predraft correctly.
+
+    On full accept: rejected_tokens = 0, invalidated_predraft = 0.
+    On rejection: rejected_tokens = gamma - accepted_len, invalidated_predraft = gamma.
+    """
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_parallel_postprocess')
+    assert 'rejected_tokens = self.gamma - accepted_len' in fn_body
+    assert 'invalidated_predraft = 0' in fn_body       # accept branch
+    assert 'invalidated_predraft = self.gamma' in fn_body  # reject branch
+
+
+def test_merge_aggregates_invalidated_from_drafts():
+    """Merge logic aggregates per_seq_invalidated_predraft_len from draft records."""
+    engine_src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
+    merge_fn = _extract_method_body(engine_src, '_merge_decode_iterations')
+    # Must iterate over draft records to aggregate invalidated_predraft
+    assert 'for r in drafts' in merge_fn
+    assert 'per_seq_invalidated_predraft_len' in merge_fn
+    # Must not take invalidated_predraft only from primary (target) record
+    assert 'invalidated_by_req = {}' in merge_fn
