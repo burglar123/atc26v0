@@ -603,3 +603,37 @@ def test_verified_tokens_total_in_merge():
     """Merge logic prefers explicit verified_tokens_total over fallback."""
     engine_src = (ROOT / "nano_pearl/pearl_engine/pearl_engine.py").read_text()
     assert 'primary.get("verified_tokens_total"' in engine_src
+
+
+def test_pearl_step_accepted_lens_assigned_in_both_branches():
+    """Draft.pearl_step assigns accepted_lens/invalidated_lens in both verify_seqs and first-iteration branches."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    draft_class = _extract_class_section(src, 'DraftModelRunner')
+    draft_pearl = _extract_method_body(draft_class, 'pearl_step')
+
+    # Must initialize accepted_lens/invalidated_lens before the if/else
+    assert 'accepted_lens: dict[int, int] = {}' in draft_pearl
+    assert 'invalidated_lens: dict[int, int] = {}' in draft_pearl
+
+    # Both branches must assign accepted_lens, invalidated_lens
+    # if-branch assigns from _parallel_postprocess
+    assert 'accepted_lens, invalidated_lens = self._parallel_postprocess(' in draft_pearl
+    # else-branch assigns from _first_iteration_sync_verify_and_build_pending
+    assert 'accepted_lens, invalidated_lens = self._first_iteration_sync_verify_and_build_pending(' in draft_pearl
+
+    # Exactly one _update_trace_token_stats call after the if/else (not inside either branch)
+    post_branch = draft_pearl.split('# Phase C: receive verify_res')[1]
+    # The _update_trace_token_stats in post_branch should appear exactly once
+    assert post_branch.count('_update_trace_token_stats') == 1, (
+        f"Expected exactly 1 _update_trace_token_stats call after Phase C branch, "
+        f"found {post_branch.count('_update_trace_token_stats')}"
+    )
+
+
+def test_first_iteration_handler_returns_accepted_lens():
+    """_first_iteration_sync_verify_and_build_pending returns (accepted_lens, invalidated_lens)."""
+    src = (ROOT / "nano_pearl/pearl_engine/pearl_model_runner.py").read_text()
+    fn_body = _extract_method_body(src, '_first_iteration_sync_verify_and_build_pending')
+    assert 'return accepted_lens, invalidated_lens' in fn_body
+    # Should NOT internally call _update_trace_token_stats (caller handles it)
+    assert '_update_trace_token_stats' not in fn_body

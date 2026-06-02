@@ -1344,6 +1344,8 @@ class DraftModelRunner(ModelRunnerBase):
         After postprocessing W₀, resets pending_draft_tokens=0, then generates
         W₁ for ALL non-finished seqs so they have pending windows for the next
         parallel iteration.
+
+        Returns (accepted_lens, invalidated_lens) for the caller to record in trace.
         """
         # Send W₀ for all seqs
         self.send_parallel_draft_window(all_seqs)
@@ -1354,10 +1356,6 @@ class DraftModelRunner(ModelRunnerBase):
 
         # Postprocess W₀ (synchronous, no W_k to invalidate → target-side semantics)
         accepted_lens, invalidated_lens = self._full_gamma_postprocess(all_seqs, verify_res)
-
-        if trace_record is not None:
-            self._update_trace_token_stats(trace_record,
-                accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
         # Reset pending_draft_tokens: W₀ was verified, no longer pending
         for s in all_seqs:
@@ -1387,6 +1385,8 @@ class DraftModelRunner(ModelRunnerBase):
                 f"_first_iteration: seq {s.seq_id} pending_draft_tokens={s.pending_draft_tokens}, "
                 f"expected 0 or {self.gamma}"
             )
+
+        return accepted_lens, invalidated_lens
 
     def _validate_full_gamma_pearl_step(self):
         """Synchronous full-gamma PEARL step for Phase 1 validation.
@@ -1482,18 +1482,17 @@ class DraftModelRunner(ModelRunnerBase):
                 )
 
         # Phase C: receive verify_res
+        accepted_lens: dict[int, int] = {}
+        invalidated_lens: dict[int, int] = {}
         if verify_seqs:
             verify_res = torch.zeros((4, len(verify_seqs)), dtype=torch.int64, device="cuda")
             dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
             accepted_lens, invalidated_lens = self._parallel_postprocess(
                 verify_seqs, verify_res, drafted_this_iter
             )
-            if trace_record is not None:
-                self._update_trace_token_stats(trace_record,
-                    accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
         else:
             # First iteration: verify W₀ synchronously, then build W₁ as pending
-            self._first_iteration_sync_verify_and_build_pending(
+            accepted_lens, invalidated_lens = self._first_iteration_sync_verify_and_build_pending(
                 all_seqs, trace_record, drafted_this_iter
             )
 
@@ -1503,8 +1502,10 @@ class DraftModelRunner(ModelRunnerBase):
                 f"pearl_step end: seq {s.seq_id} pending_draft_tokens={s.pending_draft_tokens}, "
                 f"expected 0 or {self.gamma}"
             )
+
         if trace_record is not None:
-            self._update_trace_token_stats(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
+            self._update_trace_token_stats(trace_record,
+                accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
     def serialized_pearl_step(self):
         """Serialized speculative decoding draft phase.
