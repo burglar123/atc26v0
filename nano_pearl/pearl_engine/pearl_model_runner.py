@@ -104,7 +104,11 @@ ROLLING_DEPTH4_COMMIT_FIXED_PAYLOAD_WIDTH = 8
 GENERIC_ROLLING_COMMIT_MAGIC = 0x1A8FC
 GENERIC_ROLLING_COMMIT_OP = 0x1A8FC1
 GENERIC_ROLLING_COMMIT_META_LEN = 7
-GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH = 8
+GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH = 13
+GENERIC_ROLLING_RESULT_MAGIC = 0x1A8FD
+GENERIC_ROLLING_RESULT_OP = 0x1A8FD1
+GENERIC_ROLLING_RESULT_META_LEN = 7
+GENERIC_ROLLING_RESULT_FIXED_PAYLOAD_WIDTH = 15
 INT64_TRACE_UNIT_BYTES = 8
 ZERO_STAGE_COUNTER_PREFIX_BY_STAGE = {
     "eager_proposal": "zero_eager_proposal",
@@ -3662,6 +3666,42 @@ class ModelRunnerBase:
             5: "partial_prefix_recovery",
         }.get(int(action_code), "unknown")
 
+    def _generic_result_action_code(self, action: str) -> int:
+        return {
+            "append_full_accept_real_commit": 1,
+            "partial_prefix_recovery": 2,
+            "discard_partial_no_mutation": 3,
+            "discard_reject_no_mutation": 4,
+            "skipped_invalid_no_mutation": 5,
+        }.get(str(action), 0)
+
+    def _generic_result_action_from_code(self, action_code: int) -> str:
+        return {
+            1: "append_full_accept_real_commit",
+            2: "partial_prefix_recovery",
+            3: "discard_partial_no_mutation",
+            4: "discard_reject_no_mutation",
+            5: "skipped_invalid_no_mutation",
+        }.get(int(action_code), "unknown")
+
+    def _generic_finish_code(self, reason: str | None) -> int:
+        return {
+            "eos": 1,
+            "max_tokens": 2,
+            "target_verified_finish": 3,
+            "draft_proposed_finish": 4,
+            "unknown": 5,
+        }.get(str(reason or "unknown"), 0)
+
+    def _generic_finish_from_code(self, code: int) -> str:
+        return {
+            1: "eos",
+            2: "max_tokens",
+            3: "target_verified_finish",
+            4: "draft_proposed_finish",
+            5: "unknown",
+        }.get(int(code), "unknown")
+
     def _result_verify_code(self, result: str) -> int:
         return {
             "full_accept": 1,
@@ -6015,6 +6055,7 @@ class ModelRunnerBase:
         reject_position_by_seq_id: dict[int, int] = {}
         revised_token_by_seq_id: dict[int, int] = {}
         full_accept_by_seq_id: dict[int, bool] = {}
+        finish_by_seq_id: dict[int, bool] = {}
         for idx, seq in enumerate(seqs):
             seq_id = int(seq.seq_id)
             if seq.pre_verify:
@@ -6027,6 +6068,7 @@ class ModelRunnerBase:
             reject_position_by_seq_id[seq_id] = -1 if acc[idx] else int(accepted_len)
             revised_token_by_seq_id[seq_id] = int(revise_token[idx])
             full_accept_by_seq_id[seq_id] = bool(accepted_len == int(gamma))
+            finish_by_seq_id[seq_id] = bool(_finish[idx])
 
         return {
             "accepted_len_by_seq_id": accepted_len_by_seq_id,
@@ -6034,6 +6076,7 @@ class ModelRunnerBase:
             "reject_position_by_seq_id": reject_position_by_seq_id,
             "revised_token_by_seq_id": revised_token_by_seq_id,
             "full_accept_by_seq_id": full_accept_by_seq_id,
+            "finish_by_seq_id": finish_by_seq_id,
         }
 
     def _run_eager_verify_dry_run(
@@ -12812,6 +12855,12 @@ class ModelRunnerBase:
         for decision in decisions:
             proposal_tokens = [int(token_id) for token_id in decision.get("proposal_token_ids", [])]
             padded_tokens = proposal_tokens[:gamma] + [0 for _ in range(max(0, gamma - len(proposal_tokens)))]
+            to_verify_tokens = [int(token_id) for token_id in decision.get("to_be_verified_token_ids", [])]
+            padded_to_verify = to_verify_tokens[:gamma] + [0 for _ in range(max(0, gamma - len(to_verify_tokens)))]
+            source_plan_id = int(decision.get("source_plan_id", plan.plan_id))
+            source_step_id = int(
+                decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))
+            )
             payload_values.extend(
                 [
                     int(decision["proposal_id"]),
@@ -12822,7 +12871,13 @@ class ModelRunnerBase:
                     int(decision.get("base_len", -1)),
                     int(decision.get("token_count", gamma)),
                     int(decision.get("accept_len", gamma)),
+                    int(decision.get("request_id", -1)),
+                    source_plan_id,
+                    source_step_id,
+                    int(bool(decision.get("base_pre_verify", False))),
+                    int(len(to_verify_tokens[:gamma])),
                     *padded_tokens,
+                    *padded_to_verify,
                 ]
             )
         meta_values = [
@@ -12850,7 +12905,7 @@ class ModelRunnerBase:
         num_decisions = int(meta_values[4])
         payload_len = int(meta_values[5])
         gamma = int(meta_values[6])
-        width = int(GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH) + gamma
+        width = int(GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH) + 2 * gamma
         expected_len = num_decisions * width
         if payload_len != expected_len or len(payload_values) != expected_len:
             raise ValueError(
@@ -12869,9 +12924,16 @@ class ModelRunnerBase:
                 base_len,
                 token_count,
                 accept_len,
+                request_id,
+                source_plan_id,
+                source_step_id,
+                base_pre_verify,
+                to_verify_len,
             ) = payload_values[base:base + GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH]
             token_start = base + GENERIC_ROLLING_COMMIT_FIXED_PAYLOAD_WIDTH
             proposal_tokens = payload_values[token_start:token_start + gamma]
+            to_verify_start = token_start + gamma
+            to_verify_tokens = payload_values[to_verify_start:to_verify_start + gamma]
             decisions.append(
                 {
                     "proposal_id": int(proposal_id),
@@ -12882,12 +12944,137 @@ class ModelRunnerBase:
                     "base_len": int(base_len),
                     "token_count": int(token_count),
                     "accept_len": int(accept_len),
+                    "request_id": int(request_id),
+                    "source_plan_id": int(source_plan_id),
+                    "source_step_id": int(source_step_id),
+                    "base_pre_verify": bool(base_pre_verify),
+                    "to_verify_len": int(to_verify_len),
                     "proposal_token_ids": [int(token_id) for token_id in proposal_tokens],
+                    "to_be_verified_token_ids": [
+                        int(token_id) for token_id in to_verify_tokens[:max(0, int(to_verify_len))]
+                    ],
                     "action": "append_full_accept_real_commit",
                     "verify_result": "full_accept",
                 }
             )
         return decisions
+
+    def _serialize_generic_rolling_result_payload(
+        self,
+        results: list[dict],
+        plan: StepPlan,
+    ) -> tuple[list[int], list[int]]:
+        gamma = int(self.gamma)
+        payload_values: list[int] = []
+        for result in results:
+            proposal_tokens = [int(token_id) for token_id in result.get("proposal_token_ids", [])]
+            padded_tokens = proposal_tokens[:gamma] + [0 for _ in range(max(0, gamma - len(proposal_tokens)))]
+            to_verify_tokens = [int(token_id) for token_id in result.get("to_be_verified_token_ids", [])]
+            padded_to_verify = to_verify_tokens[:gamma] + [0 for _ in range(max(0, gamma - len(to_verify_tokens)))]
+            token_count = int(result.get("token_count", gamma))
+            accept_len = int(result.get("accept_len", result.get("accepted_len", 0)))
+            payload_values.extend(
+                [
+                    int(result["proposal_id"]),
+                    int(result["seq_id"]),
+                    int(result.get("parent_id", -1)),
+                    int(result.get("root_id", -1)),
+                    int(result.get("depth", -1)),
+                    int(result.get("base_len", -1)),
+                    token_count,
+                    accept_len,
+                    int(self._result_verify_code(result.get("verify_result", "unknown"))),
+                    int(self._generic_result_action_code(result.get("action", "unknown"))),
+                    int(result.get("revised_token", -1)),
+                    int(result.get("invalidated_len", max(0, token_count - max(0, accept_len)))),
+                    int(self._generic_finish_code(result.get("finish_reason", "unknown"))),
+                    int(bool(result.get("base_pre_verify", False))),
+                    int(len(to_verify_tokens[:gamma])),
+                    *padded_tokens,
+                    *padded_to_verify,
+                ]
+            )
+        meta_values = [
+            int(GENERIC_ROLLING_RESULT_MAGIC),
+            int(GENERIC_ROLLING_RESULT_OP),
+            int(plan.plan_id),
+            -1 if plan.step_id is None else int(plan.step_id),
+            len(results),
+            len(payload_values),
+            gamma,
+        ]
+        return meta_values, payload_values
+
+    def _deserialize_generic_rolling_result_payload(
+        self,
+        meta_values: list[int],
+        payload_values: list[int],
+    ) -> list[dict]:
+        if len(meta_values) != GENERIC_ROLLING_RESULT_META_LEN:
+            raise ValueError(f"generic rolling result meta length mismatch: {len(meta_values)}")
+        if int(meta_values[0]) != int(GENERIC_ROLLING_RESULT_MAGIC):
+            raise ValueError(f"generic rolling result magic mismatch: got={meta_values[0]}")
+        if int(meta_values[1]) != int(GENERIC_ROLLING_RESULT_OP):
+            raise ValueError(f"generic rolling result op mismatch: got={meta_values[1]}")
+        num_results = int(meta_values[4])
+        payload_len = int(meta_values[5])
+        gamma = int(meta_values[6])
+        width = int(GENERIC_ROLLING_RESULT_FIXED_PAYLOAD_WIDTH) + 2 * gamma
+        expected_len = num_results * width
+        if payload_len != expected_len or len(payload_values) != expected_len:
+            raise ValueError(
+                "generic rolling result payload length mismatch: "
+                f"num_results={num_results}, payload_len={payload_len}, actual={len(payload_values)}"
+            )
+        results: list[dict] = []
+        for index in range(num_results):
+            base = index * width
+            (
+                proposal_id,
+                seq_id,
+                parent_id,
+                root_id,
+                depth,
+                base_len,
+                token_count,
+                accept_len,
+                verify_code,
+                action_code,
+                revised_token,
+                invalidated_len,
+                finish_code,
+                base_pre_verify,
+                to_verify_len,
+            ) = payload_values[base:base + GENERIC_ROLLING_RESULT_FIXED_PAYLOAD_WIDTH]
+            token_start = base + GENERIC_ROLLING_RESULT_FIXED_PAYLOAD_WIDTH
+            proposal_tokens = payload_values[token_start:token_start + gamma]
+            to_verify_start = token_start + gamma
+            to_verify_tokens = payload_values[to_verify_start:to_verify_start + gamma]
+            results.append(
+                {
+                    "proposal_id": int(proposal_id),
+                    "seq_id": int(seq_id),
+                    "parent_id": int(parent_id),
+                    "root_id": int(root_id),
+                    "depth": int(depth),
+                    "base_len": int(base_len),
+                    "token_count": int(token_count),
+                    "accept_len": int(accept_len),
+                    "accepted_len": int(accept_len),
+                    "verify_result": self._result_verify_from_code(int(verify_code)),
+                    "action": self._generic_result_action_from_code(int(action_code)),
+                    "revised_token": int(revised_token),
+                    "invalidated_len": int(invalidated_len),
+                    "finish_reason": self._generic_finish_from_code(int(finish_code)),
+                    "base_pre_verify": bool(base_pre_verify),
+                    "to_verify_len": int(to_verify_len),
+                    "proposal_token_ids": [int(token_id) for token_id in proposal_tokens],
+                    "to_be_verified_token_ids": [
+                        int(token_id) for token_id in to_verify_tokens[:max(0, int(to_verify_len))]
+                    ],
+                }
+            )
+        return results
 
     def _generic_depth_trace_maps(self, trace_record: dict) -> tuple[dict[int, list[int]], dict[int, list[int]], dict[int, list[int]], dict[int, list[int]]]:
         candidate_ids_by_depth = self._trace_depth_indexed_int_lists(
@@ -13316,6 +13503,7 @@ class ModelRunnerBase:
             trace_record.get("generic_rolling_real_committed_proposal_count_by_depth")
         )
         stop_reason: str | None = None
+        provisional_checkpoints_by_seq_id: dict[int, dict] = {}
 
         for depth in range(start_depth, max_depth + 1):
             selected = []
@@ -13491,6 +13679,47 @@ class ModelRunnerBase:
                     else "parent_committed_full_accept"
                 )
                 commit_tokens = child_tokens[:gamma]
+                proposal_frame = {
+                    "proposal_id": child_id,
+                    "seq_id": seq_id,
+                    "request_id": self._numeric_request_id(seq.request_id),
+                    "parent_id": -1 if parent_id is None else int(parent_id),
+                    "root_id": int(root_id),
+                    "depth": int(depth),
+                    "base_len": int(base_len),
+                    "base_pre_verify": bool(checkpoint["pre_verify"]),
+                    "source_plan_id": int(plan.plan_id),
+                    "source_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "token_count": int(gamma),
+                    "accept_len": int(gamma),
+                    "proposal_token_ids": list(commit_tokens),
+                    "to_be_verified_token_ids": list(to_be_verified),
+                    "action": "target_verify_pending" if unified_enabled else "append_full_accept_real_commit",
+                    "verify_result": "pending" if unified_enabled else "full_accept",
+                }
+                decisions.append(proposal_frame)
+                if unified_enabled:
+                    if seq_id not in provisional_checkpoints_by_seq_id:
+                        provisional_checkpoints_by_seq_id[seq_id] = checkpoint
+                    for token_id in commit_tokens:
+                        seq.append_token(int(token_id))
+                        self.scheduler.block_manager.may_append(seq)
+                    seq.pre_verify = False
+                    proposed_finish = (
+                        (not seq.ignore_eos)
+                        and any(is_eos(int(token_id), self.scheduler.eos) for token_id in commit_tokens)
+                    ) or int(seq.num_completion_tokens) >= int(seq.max_tokens)
+                    if not proposed_finish:
+                        next_parents.append(
+                            {
+                                "proposal_id": child_id,
+                                "seq_id": seq_id,
+                                "root_id": int(root_id),
+                                "depth": int(depth),
+                                "proposal": proposal,
+                            }
+                        )
+                    continue
                 for token_id in commit_tokens:
                     seq.append_token(int(token_id))
                     self.scheduler.block_manager.may_append(seq)
@@ -13511,21 +13740,6 @@ class ModelRunnerBase:
                     committed_parent_by_id[child_id] = int(parent_id)
                 committed_root_by_id[child_id] = int(root_id)
                 committed_depth_by_id[child_id] = int(depth)
-                decisions.append(
-                    {
-                        "proposal_id": child_id,
-                        "seq_id": seq_id,
-                        "parent_id": -1 if parent_id is None else int(parent_id),
-                        "root_id": int(root_id),
-                        "depth": int(depth),
-                        "base_len": int(base_len),
-                        "token_count": int(gamma),
-                        "accept_len": int(gamma),
-                        "proposal_token_ids": list(commit_tokens),
-                        "action": "append_full_accept_real_commit",
-                        "verify_result": "full_accept",
-                    }
-                )
                 if not local_finished:
                     next_parents.append(
                         {
@@ -13537,21 +13751,22 @@ class ModelRunnerBase:
                         }
                     )
             if candidate_ids or committed_ids:
-                if unified_enabled and candidate_ids:
+                if (
+                    unified_enabled
+                    and candidate_ids
+                    and self.rank == self.global_config.draft_config.master_rank
+                ):
                     self._increment_trace_depth_counter(
                         trace_record,
                         "unified_raw_candidate_proposal_count_by_depth",
                         depth,
                         len(set(candidate_ids)),
                     )
-                    self._increment_trace_depth_reason_counter(
-                        trace_record,
-                        "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
-                        depth,
-                        "target_verification_not_run",
-                        len(set(candidate_ids)),
-                    )
-                if unified_enabled and committed_ids:
+                if (
+                    unified_enabled
+                    and committed_ids
+                    and self.rank == self.global_config.draft_config.master_rank
+                ):
                     committed_seq_count = len(set(committed_seq_ids))
                     max_committed_seq_count = max(max_committed_seq_count, committed_seq_count)
                     committed_tokens = int(len(set(committed_ids)) * gamma)
@@ -13588,6 +13803,17 @@ class ModelRunnerBase:
             if depth >= max_depth:
                 self._increment_generic_stop_reason(trace_record, "max_depth_reached")
                 break
+
+        if unified_enabled:
+            for seq_id, checkpoint in provisional_checkpoints_by_seq_id.items():
+                seq = seq_by_id.get(int(seq_id))
+                if seq is None:
+                    continue
+                rollback_len = int(len(seq)) - int(checkpoint["len"])
+                if rollback_len > 0:
+                    self.scheduler.rollback(seq, rollback_len)
+                if not self._sequence_matches_eager_apply_checkpoint(seq, checkpoint):
+                    self._restore_eager_apply_checkpoint(seq, checkpoint)
 
         if unified_enabled:
             trace_record["unified_candidate_budget_used_tokens_per_step"] = int(max_candidate_budget_used_tokens)
@@ -13685,6 +13911,386 @@ class ModelRunnerBase:
         self._record_elapsed_ms(trace_record, "generic_rolling_commit_decision_time_ms", timer_start)
         return decisions
 
+    def _generic_result_finish_reason(
+        self,
+        seq: Sequence | None,
+        tokens: list[int],
+        *,
+        target_finish: bool = False,
+    ) -> str:
+        if target_finish:
+            return "target_verified_finish"
+        if seq is None or not tokens:
+            return "unknown"
+        if (not seq.ignore_eos) and any(is_eos(int(token_id), self.scheduler.eos) for token_id in tokens):
+            return "eos"
+        if int(seq.num_completion_tokens) + len(tokens) >= int(seq.max_tokens):
+            return "max_tokens"
+        return "unknown"
+
+    def _generic_invalid_result(
+        self,
+        proposal: dict,
+        *,
+        reason: str,
+    ) -> dict:
+        token_count = int(proposal.get("token_count", self.gamma))
+        return {
+            "proposal_id": int(proposal["proposal_id"]),
+            "seq_id": int(proposal["seq_id"]),
+            "parent_id": int(proposal.get("parent_id", -1)),
+            "root_id": int(proposal.get("root_id", -1)),
+            "depth": int(proposal.get("depth", -1)),
+            "base_len": int(proposal.get("base_len", -1)),
+            "base_pre_verify": bool(proposal.get("base_pre_verify", False)),
+            "token_count": token_count,
+            "accept_len": 0,
+            "accepted_len": 0,
+            "invalidated_len": token_count,
+            "proposal_token_ids": [int(token_id) for token_id in proposal.get("proposal_token_ids", [])],
+            "to_be_verified_token_ids": [
+                int(token_id) for token_id in proposal.get("to_be_verified_token_ids", [])
+            ],
+            "verify_result": "skipped_invalid",
+            "action": "skipped_invalid_no_mutation",
+            "revised_token": -1,
+            "finish_reason": "unknown",
+            "skip_reason": str(reason),
+        }
+
+    def _record_unified_raw_target_result(self, trace_record: dict, result: dict) -> None:
+        if self.rank != self.global_config.target_config.master_rank:
+            return
+        depth = int(result.get("depth", -1))
+        if depth < 1:
+            return
+        verify_result = str(result.get("verify_result", "unknown"))
+        token_count = int(result.get("token_count", self.gamma))
+        accept_len = int(result.get("accept_len", result.get("accepted_len", 0)))
+        if verify_result == "skipped_invalid":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_invalidated_proposal_count_by_depth",
+                depth,
+                1,
+            )
+            self._increment_trace_depth_reason_counter(
+                trace_record,
+                "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
+                depth,
+                str(result.get("skip_reason", "invalidated")),
+                1,
+            )
+            return
+        self._increment_trace_depth_counter(
+            trace_record,
+            "unified_raw_verified_proposal_count_by_depth",
+            depth,
+            1,
+        )
+        self._increment_trace_depth_reason_counter(
+            trace_record,
+            "unified_raw_accepted_len_hist_by_depth",
+            depth,
+            str(max(0, accept_len)),
+            1,
+        )
+        if verify_result == "full_accept":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_full_accept_proposal_count_by_depth",
+                depth,
+                1,
+            )
+        elif verify_result == "partial_accept":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_partial_accept_proposal_count_by_depth",
+                depth,
+                1,
+            )
+        elif verify_result == "reject_at_first_token":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_reject_proposal_count_by_depth",
+                depth,
+                1,
+            )
+        revised_token = int(result.get("revised_token", -1))
+        if revised_token >= 0 and verify_result != "full_accept":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_revised_token_count_by_depth",
+                depth,
+                1,
+            )
+        if str(result.get("action", "")) == "partial_prefix_recovery":
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_raw_partial_recovery_eligible_count_by_depth",
+                depth,
+                1,
+            )
+        elif verify_result != "full_accept":
+            reason = (
+                "partial_recovery_missing_revised_token"
+                if revised_token < 0
+                else "partial_recovery_disabled"
+                if not self._partial_prefix_recovery_enabled()
+                else "partial_recovery_not_selected"
+            )
+            self._increment_trace_depth_reason_counter(
+                trace_record,
+                "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
+                depth,
+                reason,
+                1,
+            )
+
+    def _run_unified_generic_target_verify_and_apply(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        proposals: list[dict],
+        seq_by_id: dict[int, Sequence],
+        plan_context: dict[str, set[int]],
+    ) -> list[dict]:
+        gamma = int(self.gamma)
+        trace_record["unified_raw_target_verification_available"] = True
+        trace_record["unified_raw_verification_source"] = "target_verify_result"
+        if not proposals:
+            self._update_unified_raw_verified_to_committed_ratio(trace_record)
+            return []
+
+        proposals_by_depth: dict[int, list[dict]] = {}
+        for proposal in proposals:
+            depth = int(proposal.get("depth", -1))
+            proposals_by_depth.setdefault(depth, []).append(proposal)
+            self._update_generic_depth_trace_lists(
+                trace_record,
+                depth=depth,
+                candidate_ids=[int(proposal["proposal_id"])],
+                candidate_seq_ids=[int(proposal["seq_id"])],
+                ready_ids=[int(proposal["proposal_id"])],
+                ready_seq_ids=[int(proposal["seq_id"])],
+                committed_ids=[],
+                committed_seq_ids=[],
+            )
+
+        results: list[dict] = []
+        full_committed_ids_by_depth: dict[int, set[int]] = {}
+        for depth in sorted(proposals_by_depth):
+            depth_results: list[dict] = []
+            executable: list[tuple[dict, EagerProposal, Sequence]] = []
+            for proposal in sorted(
+                proposals_by_depth[depth],
+                key=lambda item: (int(item.get("seq_id", -1)), int(item.get("proposal_id", -1))),
+            ):
+                proposal_id = int(proposal["proposal_id"])
+                seq_id = int(proposal["seq_id"])
+                parent_id = int(proposal.get("parent_id", -1))
+                token_count = int(proposal.get("token_count", gamma))
+                proposal_tokens = [int(token_id) for token_id in proposal.get("proposal_token_ids", [])]
+                to_verify_tokens = [int(token_id) for token_id in proposal.get("to_be_verified_token_ids", [])]
+                seq = seq_by_id.get(seq_id)
+                reason = None
+                if depth < 1:
+                    reason = "depth_below_generic_unified"
+                elif depth > int(getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0):
+                    reason = "max_depth_exceeded"
+                elif depth > 1 and parent_id not in full_committed_ids_by_depth.get(depth - 1, set()):
+                    reason = "parent_not_full_accept"
+                elif seq is None:
+                    reason = "seq_not_found"
+                elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                    reason = "sequence_finished"
+                elif self.is_request_level_finished(seq, plan_context):
+                    reason = "sequence_finished"
+                elif bool(getattr(seq, "pre_verify", True)):
+                    reason = "seq_pre_verify"
+                elif self.is_speculative_span_invalidated(seq, plan_context):
+                    reason = "invalidated_ancestor"
+                elif int(len(seq)) != int(proposal.get("base_len", -1)):
+                    reason = "target_frontier_mismatch"
+                elif bool(proposal.get("base_pre_verify", False)):
+                    reason = "invalid_base_pre_verify"
+                elif token_count != gamma or len(proposal_tokens) < gamma or len(to_verify_tokens) != gamma:
+                    reason = "token_payload_missing"
+                if reason is not None:
+                    result = self._generic_invalid_result(proposal, reason=reason)
+                    self._record_unified_raw_target_result(trace_record, result)
+                    depth_results.append(result)
+                    continue
+                executable.append(
+                    (
+                        proposal,
+                        EagerProposal(
+                            proposal_id=proposal_id,
+                            seq_id=seq_id,
+                            request_id=seq.request_id,
+                            lane=LANE_EAGER,
+                            parent_proposal_id=None if parent_id < 0 else parent_id,
+                            parent_kind=LANE_NORMAL if parent_id < 0 else LANE_EAGER,
+                            parent_step_id=None,
+                            source_step_id=int(proposal.get("source_step_id", -1)),
+                            source_plan_id=int(proposal.get("source_plan_id", plan.plan_id)),
+                            home_batch_id=-1 if seq.home_batch_id is None else int(seq.home_batch_id),
+                            base_len=int(proposal.get("base_len", -1)),
+                            base_pre_verify=bool(proposal.get("base_pre_verify", False)),
+                            base_num_completion_tokens=int(seq.num_completion_tokens),
+                            proposal_token_ids=proposal_tokens[:gamma],
+                            to_be_verified_token_ids=to_verify_tokens[:gamma],
+                            proposal_len=gamma,
+                            state=EAGER_STATE_READY_TO_VERIFY,
+                            valid=True,
+                        ),
+                        seq,
+                    )
+                )
+
+            if executable:
+                verify_seqs = [seq for _proposal, _eager_proposal, seq in executable]
+                verify_proposals = [eager_proposal for _proposal, eager_proposal, _seq in executable]
+                self._allocate_decode_slots_for_dual(verify_seqs, plan, "unified_generic_target_verify")
+                input_ids, positions, temp_seqs = self.prepare_pearl_decode(verify_seqs)
+                temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+                torch.cuda.synchronize()
+                logits = self.run_model(input_ids, positions, False)
+                verify_maps = self.compute_pearl_verify_result_no_apply(
+                    logits,
+                    verify_seqs,
+                    temperatures,
+                    verify_proposals,
+                    gamma=gamma,
+                    lane=LANE_EAGER,
+                )
+                torch.cuda.synchronize()
+                for proposal, eager_proposal, seq in executable:
+                    seq_id = int(seq.seq_id)
+                    accept_len = int(verify_maps["accepted_len_by_seq_id"].get(seq_id, 0))
+                    invalidated_len = int(verify_maps["invalidated_len_by_seq_id"].get(seq_id, gamma - accept_len))
+                    revised_token = int(verify_maps["revised_token_by_seq_id"].get(seq_id, -1))
+                    verify_result = self._verify_result_from_accept_len(accept_len, gamma)
+                    if verify_result == "full_accept":
+                        action = "append_full_accept_real_commit"
+                        output_tokens = [int(token_id) for token_id in eager_proposal.proposal_token_ids]
+                    elif self._partial_prefix_recovery_enabled() and revised_token >= 0:
+                        action = "partial_prefix_recovery"
+                        output_tokens = [
+                            int(token_id) for token_id in eager_proposal.proposal_token_ids[:max(0, accept_len)]
+                        ] + [int(revised_token)]
+                    else:
+                        action = (
+                            "discard_partial_no_mutation"
+                            if verify_result == "partial_accept"
+                            else "discard_reject_no_mutation"
+                        )
+                        output_tokens = []
+                    result = {
+                        "proposal_id": int(proposal["proposal_id"]),
+                        "seq_id": seq_id,
+                        "parent_id": int(proposal.get("parent_id", -1)),
+                        "root_id": int(proposal.get("root_id", -1)),
+                        "depth": int(proposal.get("depth", depth)),
+                        "base_len": int(proposal.get("base_len", -1)),
+                        "base_pre_verify": bool(proposal.get("base_pre_verify", False)),
+                        "token_count": gamma,
+                        "accept_len": accept_len,
+                        "accepted_len": accept_len,
+                        "invalidated_len": invalidated_len,
+                        "proposal_token_ids": [int(token_id) for token_id in eager_proposal.proposal_token_ids],
+                        "to_be_verified_token_ids": [
+                            int(token_id) for token_id in eager_proposal.to_be_verified_token_ids
+                        ],
+                        "verify_result": verify_result,
+                        "action": action,
+                        "revised_token": revised_token,
+                        "finish_reason": self._generic_result_finish_reason(
+                            seq,
+                            output_tokens,
+                            target_finish=bool(verify_maps.get("finish_by_seq_id", {}).get(seq_id, False)),
+                        ),
+                    }
+                    self._record_unified_raw_target_result(trace_record, result)
+                    depth_results.append(result)
+
+            if depth_results:
+                self._run_generic_rolling_commit_ready_only(
+                    plan,
+                    trace_record,
+                    depth_results,
+                    seq_by_id,
+                    plan_context,
+                    side="target",
+                )
+                committed_by_depth = self._trace_depth_indexed_int_lists(
+                    trace_record.get("generic_rolling_real_committed_proposal_ids_by_depth")
+                )
+                full_committed_ids_by_depth[depth] = {
+                    int(proposal_id) for proposal_id in committed_by_depth.get(depth, [])
+                }
+            results.extend(depth_results)
+
+        self._update_unified_raw_verified_to_committed_ratio(trace_record)
+        return results
+
+    def _send_generic_rolling_result_transfer(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+        results: list[dict],
+    ) -> None:
+        payload_build_executed = bool(results)
+        if payload_build_executed:
+            meta_values, payload_values = self._serialize_generic_rolling_result_payload(results, plan)
+        else:
+            meta_values = [
+                int(GENERIC_ROLLING_RESULT_MAGIC),
+                int(GENERIC_ROLLING_RESULT_OP),
+                int(plan.plan_id),
+                -1 if plan.step_id is None else int(plan.step_id),
+                0,
+                0,
+                int(self.gamma),
+            ]
+            payload_values = []
+        trace_record["generic_rolling_result_transfer_count"] = int(meta_values[4])
+        trace_record["generic_rolling_result_transfer_payload_len_units"] = int(meta_values[5])
+        meta = (
+            torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+            if self.rank == self.global_config.target_config.master_rank
+            else torch.zeros(GENERIC_ROLLING_RESULT_META_LEN, dtype=torch.int64, device="cuda")
+        )
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        if int(meta_values[5]) > 0:
+            payload = (
+                torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+                if self.rank == self.global_config.target_config.master_rank
+                else torch.zeros(int(meta_values[5]), dtype=torch.int64, device="cuda")
+            )
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+
+    def _receive_generic_rolling_result_transfer(
+        self,
+        plan: StepPlan,
+        trace_record: dict,
+    ) -> list[dict]:
+        meta = torch.zeros(GENERIC_ROLLING_RESULT_META_LEN, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=self.global_config.target_config.master_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        payload_len = int(meta_values[5])
+        payload_values: list[int] = []
+        if payload_len > 0:
+            payload = torch.zeros(payload_len, dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=self.global_config.target_config.master_rank, group=self.verify_group)
+            payload_values = [int(value) for value in payload.tolist()]
+        results = [] if payload_len == 0 and int(meta_values[4]) == 0 else self._deserialize_generic_rolling_result_payload(meta_values, payload_values)
+        trace_record["generic_rolling_result_transfer_count"] = int(meta_values[4])
+        trace_record["generic_rolling_result_transfer_payload_len_units"] = payload_len
+        trace_record["unified_raw_target_verification_available"] = True
+        trace_record["unified_raw_verification_source"] = "target_verify_result"
+        return results
+
     def _send_generic_rolling_commit_decision(
         self,
         plan: StepPlan,
@@ -13754,6 +14360,16 @@ class ModelRunnerBase:
                 elapsed_ms=broadcast_elapsed_ms,
             )
             self._record_zero_stage_fast_path(trace_record, meta_broadcast_kept=True)
+        if self._unified_generic_rolling_runtime_enabled():
+            results = self._receive_generic_rolling_result_transfer(plan, trace_record)
+            self._run_generic_rolling_commit_ready_only(
+                plan,
+                trace_record,
+                results,
+                {} if not results else self._local_sequence_by_id(),
+                self._eager_transfer_plan_context(plan, trace_record),
+                side="draft",
+            )
 
     def _receive_generic_rolling_commit_decision(
         self,
@@ -13803,6 +14419,16 @@ class ModelRunnerBase:
                 registry_scan_skipped=True,
                 meta_broadcast_kept=True,
             )
+        if self._unified_generic_rolling_runtime_enabled():
+            results = self._run_unified_generic_target_verify_and_apply(
+                plan,
+                trace_record,
+                decisions,
+                {} if not decisions else self._local_sequence_by_id(),
+                self._eager_transfer_plan_context(plan, trace_record),
+            )
+            self._send_generic_rolling_result_transfer(plan, trace_record, results)
+            return
         self._run_generic_rolling_commit_ready_only(
             plan,
             trace_record,
@@ -13856,6 +14482,11 @@ class ModelRunnerBase:
             for k, v in (trace_record.get("generic_rolling_proposal_token_ids_by_proposal_id") or {}).items()
             if isinstance(v, list)
         }
+        to_verify_tokens_by_id = {
+            int(k): [int(token_id) for token_id in v]
+            for k, v in (trace_record.get("generic_rolling_to_be_verified_token_ids_by_proposal_id") or {}).items()
+            if isinstance(v, list)
+        }
         token_count_by_id = self._trace_int_map(trace_record.get("generic_rolling_token_count_by_proposal_id"))
         status_by_id = {int(k): str(v) for k, v in (trace_record.get("generic_rolling_status_by_proposal_id") or {}).items()}
         status_reason_by_id = {
@@ -13894,7 +14525,12 @@ class ModelRunnerBase:
             base_len = int(decision.get("base_len", -1))
             token_count = int(decision.get("token_count", gamma))
             accept_len = int(decision.get("accept_len", token_count))
+            invalidated_len = int(decision.get("invalidated_len", max(0, token_count - max(0, accept_len))))
+            action = str(decision.get("action", "append_full_accept_real_commit"))
+            verify_result = str(decision.get("verify_result", "full_accept"))
+            revised_token = int(decision.get("revised_token", -1))
             proposal_tokens = [int(token_id) for token_id in decision.get("proposal_token_ids", [])]
+            to_verify_tokens = [int(token_id) for token_id in decision.get("to_be_verified_token_ids", [])]
             candidate_ids_by_depth.setdefault(depth, []).append(proposal_id)
             candidate_seq_ids_by_depth.setdefault(depth, []).append(seq_id)
             ready_ids_by_depth.setdefault(depth, []).append(proposal_id)
@@ -13905,11 +14541,15 @@ class ModelRunnerBase:
             root_by_id[proposal_id] = root_id
             depth_by_id[proposal_id] = depth
             base_len_by_id[proposal_id] = base_len
-            base_pre_verify_by_id.setdefault(proposal_id, False)
-            source_plan_by_id[proposal_id] = int(plan.plan_id)
-            source_dual_step_by_id[proposal_id] = -1 if plan.step_id is None else int(plan.step_id)
+            base_pre_verify_by_id[proposal_id] = bool(decision.get("base_pre_verify", False))
+            source_plan_by_id[proposal_id] = int(decision.get("source_plan_id", plan.plan_id))
+            source_dual_step_by_id[proposal_id] = int(
+                decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))
+            )
             created_by_role_by_id[proposal_id] = "draft"
             proposal_tokens_by_id[proposal_id] = list(proposal_tokens[:token_count])
+            if to_verify_tokens:
+                to_verify_tokens_by_id[proposal_id] = list(to_verify_tokens)
             token_count_by_id[proposal_id] = token_count
             status_by_id[proposal_id] = f"GENERIC_DEPTH{depth}_READY_AFTER_PARENT_COMMIT"
             status_reason_by_id[proposal_id] = (
@@ -13920,6 +14560,17 @@ class ModelRunnerBase:
             seq = seq_by_id.get(seq_id)
             reason = None
             min_depth = 1 if unified_enabled else 5
+            full_commit = verify_result == "full_accept" and action == "append_full_accept_real_commit"
+            partial_recovery = (
+                verify_result in {"partial_accept", "reject_at_first_token"}
+                and action == "partial_prefix_recovery"
+                and revised_token >= 0
+                and 0 <= accept_len < token_count
+            )
+            no_mutation_result = (
+                verify_result == "skipped_invalid"
+                or action in {"discard_partial_no_mutation", "discard_reject_no_mutation", "skipped_invalid_no_mutation"}
+            )
             if depth < min_depth:
                 reason = "depth_below_generic_unified" if unified_enabled else "depth_below_generic_tail"
             elif depth > int(getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0):
@@ -13942,13 +14593,21 @@ class ModelRunnerBase:
                 reason = "seq_pre_verify"
             elif self.is_speculative_span_invalidated(seq, plan_context):
                 reason = "invalidated_ancestor"
-            elif len(proposal_tokens) < token_count or token_count != accept_len or token_count != gamma:
+            elif len(proposal_tokens) < token_count or token_count != gamma:
                 reason = "token_payload_missing"
             elif int(len(seq)) != base_len:
                 reason = "target_draft_frontier_mismatch"
+            elif not (full_commit or partial_recovery) and not no_mutation_result:
+                reason = "unsupported_target_result"
+            elif no_mutation_result:
+                reason = str(decision.get("skip_reason", verify_result if verify_result != "full_accept" else action))
             if reason is not None:
                 self._increment_generic_stop_reason(trace_record, reason)
-                if unified_enabled and side == "target":
+                if (
+                    unified_enabled
+                    and side == "target"
+                    and self.rank == self.global_config.target_config.master_rank
+                ):
                     self._increment_trace_depth_counter(
                         trace_record,
                         "unified_ready_but_not_committed_by_depth",
@@ -13972,10 +14631,41 @@ class ModelRunnerBase:
                             trace_record.get("unified_commit_limited_by_no_ready_parent_count", 0) or 0
                         ) + 1
                 continue
-            commit_tokens = proposal_tokens[:token_count]
+            if partial_recovery:
+                commit_tokens = proposal_tokens[:max(0, accept_len)] + [int(revised_token)]
+            else:
+                commit_tokens = proposal_tokens[:token_count]
+            frontier_before = int(len(seq))
             for token_id in commit_tokens:
                 seq.append_token(int(token_id))
                 self.scheduler.block_manager.may_append(seq)
+            if partial_recovery:
+                seq.pre_verify = True
+                seq.record_accepted(max(0, accept_len))
+                self._mark_eager_commit_finished_if_needed(seq, commit_tokens)
+                self._record_partial_prefix_recovery_success(
+                    trace_record,
+                    proposal_id=proposal_id,
+                    seq_id=seq_id,
+                    depth=depth,
+                    accepted_prefix_len=max(0, accept_len),
+                    reject_index=max(0, accept_len),
+                    revised_token_id=int(revised_token),
+                    frontier_before=frontier_before,
+                    frontier_after=int(len(seq)),
+                )
+                if (
+                    unified_enabled
+                    and side == "target"
+                    and self.rank == self.global_config.target_config.master_rank
+                ):
+                    self._increment_trace_depth_counter(
+                        trace_record,
+                        "unified_raw_committed_proposal_count_by_depth",
+                        depth,
+                        1,
+                    )
+                continue
             seq.pre_verify = False
             seq.record_accepted(token_count)
             self._mark_eager_commit_finished_if_needed(seq, commit_tokens)
@@ -13986,14 +14676,25 @@ class ModelRunnerBase:
             committed_seq_ids_by_depth.setdefault(depth, []).append(seq_id)
             committed_token_by_id[proposal_id] = token_count
             committed_accept_by_id[proposal_id] = accept_len
-            committed_action_by_id[proposal_id] = "append_full_accept_real_commit"
-            committed_result_by_id[proposal_id] = "full_accept"
+            committed_action_by_id[proposal_id] = action
+            committed_result_by_id[proposal_id] = verify_result
             if parent_id >= 0:
                 committed_parent_by_id[proposal_id] = parent_id
             committed_root_by_id[proposal_id] = root_id
             committed_depth_by_id[proposal_id] = depth
             depth_token_counts[depth] = int(depth_token_counts.get(depth, 0)) + int(token_count)
             depth_proposal_counts[depth] = int(depth_proposal_counts.get(depth, 0)) + 1
+            if (
+                unified_enabled
+                and side == "target"
+                and self.rank == self.global_config.target_config.master_rank
+            ):
+                self._increment_trace_depth_counter(
+                    trace_record,
+                    "unified_raw_committed_proposal_count_by_depth",
+                    depth,
+                    1,
+                )
 
         for depth in sorted(set(candidate_ids_by_depth) | set(committed_ids_by_depth)):
             self._update_generic_depth_trace_lists(
@@ -14027,6 +14728,10 @@ class ModelRunnerBase:
             str(proposal_id): [int(token_id) for token_id in proposal_tokens_by_id[proposal_id]]
             for proposal_id in sorted(proposal_tokens_by_id)
         }
+        trace_record["generic_rolling_to_be_verified_token_ids_by_proposal_id"] = {
+            str(proposal_id): [int(token_id) for token_id in to_verify_tokens_by_id[proposal_id]]
+            for proposal_id in sorted(to_verify_tokens_by_id)
+        }
         trace_record["generic_rolling_token_count_by_proposal_id"] = self._trace_sorted_int_map(token_count_by_id)
         trace_record["generic_rolling_status_by_proposal_id"] = self._trace_sorted_str_map(status_by_id)
         trace_record["generic_rolling_status_reason_by_proposal_id"] = self._trace_sorted_str_map(status_reason_by_id)
@@ -14059,6 +14764,30 @@ class ModelRunnerBase:
             set(self._trace_int_list(trace_record.get("generic_rolling_commit_depths")))
             | {int(decision.get("depth", 0)) for decision in decisions}
         )
+        if unified_enabled:
+            full_commit_tokens = sum(
+                int(decision.get("token_count", 0))
+                for decision in decisions
+                if str(decision.get("verify_result", "")) == "full_accept"
+                and str(decision.get("action", "")) == "append_full_accept_real_commit"
+            )
+            partial_commit_tokens = sum(
+                max(0, int(decision.get("accept_len", decision.get("accepted_len", 0)))) + 1
+                for decision in decisions
+                if str(decision.get("action", "")) == "partial_prefix_recovery"
+            )
+            output_tokens = int(full_commit_tokens + partial_commit_tokens)
+            if output_tokens > 0:
+                trace_record["unified_no_commit_step_count"] = 0
+                trace_record["unified_commit_budget_used_tokens_per_step"] = max(
+                    int(trace_record.get("unified_commit_budget_used_tokens_per_step", 0) or 0),
+                    output_tokens,
+                )
+                if int(trace_record.get("unified_commit_budget_tokens_per_step", 0) or 0) > 0:
+                    trace_record["unified_commit_budget_saturated_step_count"] = int(
+                        output_tokens >= int(trace_record.get("unified_commit_budget_tokens_per_step", 0) or 0)
+                    )
+            self._update_unified_raw_verified_to_committed_ratio(trace_record)
 
     def _run_rolling_depth4_commit_ready_only(
         self,

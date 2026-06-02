@@ -744,6 +744,17 @@ def validate_records(
     if not summary["unified_generic_rolling_enabled"]:
         errors.append("unified generic rolling runtime must be enabled")
         return errors, summary
+    raw_target_field_present = any(
+        "unified_raw_target_verification_available" in record
+        or "unified_raw_verification_source" in record
+        for record in records
+    )
+    raw_source = str(summary.get("unified_raw_verification_source") or "")
+    if raw_target_field_present and (
+        not bool(summary.get("unified_raw_target_verification_available"))
+        or "draft_commit_decision_no_target_verify" in raw_source
+    ):
+        errors.append("strict unified target verification must be available")
 
     all_depths = set(summary["candidate_depths"]) | set(summary["ready_depths"]) | set(summary["committed_depths"])
     if not all_depths:
@@ -912,6 +923,29 @@ def synthetic_records() -> list[dict[str, Any]]:
             "generic_full_continuous_depth_revised_token_counts": {"2": revised},
             "unified_generic_depth_partial_recovered_token_counts": {"2": partial},
             "unified_generic_depth_revised_token_counts": {"2": revised},
+            "unified_raw_target_verification_available": True,
+            "unified_raw_verification_source": "target_verify_result",
+            "unified_raw_verified_proposal_count_by_depth": {
+                str(depth): 1 for depth in ids_by_depth
+            },
+            "unified_raw_full_accept_proposal_count_by_depth": {
+                str(depth): 1 for depth in ids_by_depth
+            },
+            "unified_raw_partial_accept_proposal_count_by_depth": {},
+            "unified_raw_reject_proposal_count_by_depth": {},
+            "unified_raw_invalidated_proposal_count_by_depth": {},
+            "unified_raw_accepted_len_hist_by_depth": {
+                str(depth): {"4": 1} for depth in ids_by_depth
+            },
+            "unified_raw_revised_token_count_by_depth": {},
+            "unified_raw_partial_recovery_eligible_count_by_depth": {},
+            "unified_raw_partial_recovery_ineligible_reason_counts_by_depth": {},
+            "unified_raw_candidate_proposal_count_by_depth": {
+                str(depth): 1 for depth in ids_by_depth
+            },
+            "unified_raw_committed_proposal_count_by_depth": {
+                str(depth): 1 for depth in ids_by_depth
+            },
             "generic_full_continuous_stop_reason_counts": {"max_depth_reached": 1},
             "generic_full_continuous_normal_lane_conflict_count": 0,
             "generic_full_continuous_target_draft_mismatch_count": 0,
@@ -939,6 +973,19 @@ def run_synthetic_tests() -> None:
     assert summary["num_steps"] == 1
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
+
+    missing_target_verify = [dict(records[0])]
+    missing_target_verify[0]["unified_raw_target_verification_available"] = False
+    missing_target_verify[0]["unified_raw_verification_source"] = "draft_commit_decision_no_target_verify"
+    errors, _summary = validate_records(missing_target_verify, payload)
+    assert any("target verification" in error for error in errors), "missing target verification should fail"
+
+    old_trace_fallback = [dict(records[0])]
+    for field in list(old_trace_fallback[0]):
+        if field.startswith("unified_raw_"):
+            old_trace_fallback[0].pop(field, None)
+    errors, _summary = validate_records(old_trace_fallback, payload)
+    assert not errors, f"old trace fallback should pass: {errors}"
 
     bad_depth = [dict(records[0])]
     bad_depth[0]["generic_rolling_real_committed_proposal_ids_by_depth"] = {"2": [1002]}

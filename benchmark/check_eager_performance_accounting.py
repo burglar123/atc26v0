@@ -2657,6 +2657,16 @@ def _sum_depth_values(value: Any) -> int:
 
 def generic_full_continuous_accounting_errors(accounting: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    raw_source = str(accounting.get("unified_raw_verification_source") or "")
+    if (
+        bool(accounting.get("unified_generic_rolling_enabled", False))
+        and raw_source != "legacy_committed_result_fallback"
+        and (
+            not bool(accounting.get("unified_raw_target_verification_available", False))
+            or "draft_commit_decision_no_target_verify" in raw_source
+        )
+    ):
+        errors.append("strict unified target verification must be available")
     total_full = int_value(accounting.get("generic_full_continuous_total_full_commit_token_count"), 0)
     total_partial = int_value(accounting.get("generic_full_continuous_total_partial_recovered_token_count"), 0)
     total_revised = int_value(accounting.get("generic_full_continuous_total_revised_token_count"), 0)
