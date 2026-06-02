@@ -883,6 +883,14 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         records,
         "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth",
     )
+    current_mapping_hist = sum_nested_int_hist(
+        records,
+        "unified_generic_target_verify_current_mapping_accept_hist_by_depth",
+    )
+    shifted_mapping_hist = sum_nested_int_hist(
+        records,
+        "unified_generic_target_verify_shifted_mapping_accept_hist_by_depth",
+    )
     proposal_window_verify_enabled = any_record_bool(
         records,
         "unified_generic_proposal_window_verify_enabled",
@@ -916,6 +924,14 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     top5_tokens = merge_int_list_map(
         records,
         "unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id",
+    )
+    frontier_checkpoint_restored = merge_bool_map(
+        records,
+        "unified_generic_target_verify_frontier_checkpoint_restored_by_proposal_id",
+    )
+    frontier_block_table_match = merge_bool_map(
+        records,
+        "unified_generic_target_verify_frontier_block_table_match_by_proposal_id",
     )
 
     return {
@@ -1045,6 +1061,29 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "unified_generic_target_verify_proposal_window_shadow_reject_count": (
             nested_hist_reject_count(proposal_window_shadow_hist)
         ),
+        "unified_generic_target_verify_uses_shifted_logits": any_record_bool(
+            records,
+            "unified_generic_target_verify_uses_shifted_logits",
+        ),
+        "unified_generic_target_verify_frontier_logits_available": any_record_bool(
+            records,
+            "unified_generic_target_verify_frontier_logits_available",
+        ),
+        "unified_generic_target_verify_current_mapping_accept_hist_by_depth": current_mapping_hist,
+        "unified_generic_target_verify_shifted_mapping_accept_hist_by_depth": shifted_mapping_hist,
+        "unified_generic_target_verify_shifted_mapping_has_nonzero_accept": (
+            nested_hist_nonzero_accept_count(shifted_mapping_hist) > 0
+        ),
+        "unified_generic_target_verify_frontier_checkpoint_failed_proposal_ids": sorted(
+            int(proposal_id)
+            for proposal_id, restored in frontier_checkpoint_restored.items()
+            if not bool(restored)
+        ),
+        "unified_generic_target_verify_frontier_block_table_mismatch_proposal_ids": sorted(
+            int(proposal_id)
+            for proposal_id, matches in frontier_block_table_match.items()
+            if not bool(matches)
+        ),
         "unified_generic_target_verify_sampled_current_to_be_verified_by_proposal_id": {
             str(proposal_id): list(tokens)
             for proposal_id, tokens in sorted(sampled_current_to_verify.items())
@@ -1160,6 +1199,26 @@ def validate_records(
                 errors.append(
                     "proposal-window verify enabled but actual accepted_len hist does not match proposal-window shadow hist"
                 )
+        shifted_trace_present = has_trace_field(records, "unified_generic_target_verify_uses_shifted_logits")
+        if shifted_trace_present:
+            if not bool(summary.get("unified_generic_target_verify_uses_shifted_logits", False)):
+                errors.append("unified generic target verification must use shifted logits")
+            if not bool(summary.get("unified_generic_target_verify_frontier_logits_available", False)):
+                errors.append("unified generic target verification must have frontier logits")
+            if summary.get("unified_generic_target_verify_frontier_checkpoint_failed_proposal_ids"):
+                errors.append(
+                    "frontier no-apply forward changed sequence checkpoint: "
+                    f"{summary['unified_generic_target_verify_frontier_checkpoint_failed_proposal_ids']}"
+                )
+            if summary.get("unified_generic_target_verify_frontier_block_table_mismatch_proposal_ids"):
+                errors.append(
+                    "frontier no-apply forward changed block table: "
+                    f"{summary['unified_generic_target_verify_frontier_block_table_mismatch_proposal_ids']}"
+                )
+            shifted_hist = summary.get("unified_generic_target_verify_shifted_mapping_accept_hist_by_depth", {})
+            actual_hist = summary.get("unified_raw_accepted_len_hist_by_depth", {})
+            if shifted_hist and actual_hist != shifted_hist:
+                errors.append("unified raw accepted_len hist must match shifted mapping hist")
     target_verified_reject_only = bool(
         summary.get("unified_raw_target_verification_available")
         and raw_verified_total > 0
@@ -1320,12 +1379,15 @@ def add_synthetic_temp_append_trace(
     proposal_accept_by_id = {proposal_id: 4 for proposal_id in proposal_ids}
     current_hist: dict[str, dict[str, int]] = {}
     proposal_hist: dict[str, dict[str, int]] = {}
+    current_mapping_hist: dict[str, dict[str, int]] = {}
     for proposal_id in proposal_ids:
         depth = str(int(depth_by_id.get(proposal_id, 1)))
         current_hist.setdefault(depth, {})
         proposal_hist.setdefault(depth, {})
+        current_mapping_hist.setdefault(depth, {})
         current_hist[depth]["4"] = int(current_hist[depth].get("4", 0)) + 1
         proposal_hist[depth]["4"] = int(proposal_hist[depth].get("4", 0)) + 1
+        current_mapping_hist[depth]["0"] = int(current_mapping_hist[depth].get("0", 0)) + 1
     record["unified_generic_proposal_window_verify_enabled"] = False
     record["unified_generic_target_verify_current_to_be_verified_by_proposal_id"] = {
         str(proposal_id): list(current_to_verify[proposal_id]) for proposal_id in sampled_ids
@@ -1349,6 +1411,22 @@ def add_synthetic_temp_append_trace(
     record["unified_generic_target_verify_current_window_accept_hist_by_depth"] = current_hist
     record["unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth"] = proposal_hist
     record["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] = True
+    record["unified_generic_target_verify_uses_shifted_logits"] = True
+    record["unified_generic_target_verify_frontier_logits_available"] = True
+    record["unified_generic_target_verify_frontier_checkpoint_restored_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_frontier_block_table_match_by_proposal_id"] = {
+        str(proposal_id): True for proposal_id in proposal_ids
+    }
+    record["unified_generic_target_verify_current_mapping_accept_hist_by_depth"] = current_mapping_hist
+    record["unified_generic_target_verify_shifted_mapping_accept_hist_by_depth"] = proposal_hist
+    record["unified_raw_current_verify_token_ids_by_proposal_id"] = {
+        str(proposal_id): list(proposal_tokens_by_id[proposal_id]) for proposal_id in sampled_ids
+    }
+    record["unified_raw_precondition_token_ids_by_proposal_id"] = {
+        str(proposal_id): list(current_to_verify[proposal_id]) for proposal_id in sampled_ids
+    }
     record["unified_generic_target_verify_current_window_first_token_prob_by_proposal_id"] = {
         str(proposal_id): 0.05 for proposal_id in sampled_ids
     }
@@ -1376,6 +1454,36 @@ def add_synthetic_temp_append_trace(
     }
     record["unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id"] = {
         str(proposal_id): [0.85, 0.05, 0.03, 0.02, 0.01] for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_frontier_top_token_by_proposal_id"] = {
+        str(proposal_id): int(proposal_tokens_by_id[proposal_id][0]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_frontier_top_prob_by_proposal_id"] = {
+        str(proposal_id): 0.85 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_frontier_prob_for_p0_by_proposal_id"] = {
+        str(proposal_id): 0.85 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_appended_row0_top_token_by_proposal_id"] = {
+        str(proposal_id): int(proposal_tokens_by_id[proposal_id][1]) for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_appended_row0_top_prob_by_proposal_id"] = {
+        str(proposal_id): 0.80 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_appended_row0_prob_for_p0_by_proposal_id"] = {
+        str(proposal_id): 0.01 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_appended_row0_prob_for_p1_by_proposal_id"] = {
+        str(proposal_id): 0.80 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_shifted_prob_for_p0_by_proposal_id"] = {
+        str(proposal_id): 0.85 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_shifted_prob_for_p1_by_proposal_id"] = {
+        str(proposal_id): 0.80 for proposal_id in sampled_ids
+    }
+    record["unified_generic_target_verify_shifted_accepted_len_by_proposal_id"] = {
+        str(proposal_id): int(proposal_accept_by_id[proposal_id]) for proposal_id in sampled_ids
     }
 
 
@@ -1642,6 +1750,18 @@ def run_synthetic_tests() -> None:
     assert summary["unified_generic_target_verify_input_mismatch_proposal_ids"] == []
     assert summary["unified_generic_target_verify_next_round_mismatch_proposal_ids"] == []
     assert summary["unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept"] is True
+    assert summary["unified_generic_target_verify_uses_shifted_logits"] is True
+    assert summary["unified_generic_target_verify_frontier_logits_available"] is True
+    assert summary["unified_generic_target_verify_current_mapping_accept_hist_by_depth"]["1"]["0"] == 1
+    assert summary["unified_generic_target_verify_shifted_mapping_accept_hist_by_depth"]["1"]["4"] == 1
+    sampled_inputs = summary["unified_generic_target_verify_sampled_input_ids_by_proposal_id"]
+    sampled_precondition = records[0]["unified_raw_precondition_token_ids_by_proposal_id"]
+    sampled_current_verify = records[0]["unified_raw_current_verify_token_ids_by_proposal_id"]
+    assert sampled_current_verify["1001"] == sampled_inputs["1001"]
+    assert sampled_precondition["1001"] != sampled_current_verify["1001"]
+    assert records[0]["unified_generic_target_verify_appended_row0_top_token_by_proposal_id"]["1001"] == (
+        sampled_inputs["1001"][1]
+    )
 
     missing_temp_append = [json.loads(json.dumps(records[0]))]
     missing_temp_append[0]["unified_generic_target_verify_temp_append_used"] = False
@@ -1827,6 +1947,13 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_generic_target_verify_proposal_window_shadow_full_accept_count",
         "unified_generic_target_verify_proposal_window_shadow_partial_accept_count",
         "unified_generic_target_verify_proposal_window_shadow_reject_count",
+        "unified_generic_target_verify_uses_shifted_logits",
+        "unified_generic_target_verify_frontier_logits_available",
+        "unified_generic_target_verify_current_mapping_accept_hist_by_depth",
+        "unified_generic_target_verify_shifted_mapping_accept_hist_by_depth",
+        "unified_generic_target_verify_shifted_mapping_has_nonzero_accept",
+        "unified_generic_target_verify_frontier_checkpoint_failed_proposal_ids",
+        "unified_generic_target_verify_frontier_block_table_mismatch_proposal_ids",
         "unified_generic_target_verify_sampled_current_to_be_verified_by_proposal_id",
         "unified_generic_target_verify_sampled_proposal_window_to_be_verified_by_proposal_id",
         "unified_generic_target_verify_sampled_current_window_first_token_prob_by_proposal_id",

@@ -1688,6 +1688,14 @@ class ModelRunnerBase:
             "unified_generic_target_verify_current_window_accept_hist_by_depth": {},
             "unified_generic_target_verify_proposal_window_shadow_accept_hist_by_depth": {},
             "unified_generic_target_verify_proposal_window_shadow_has_nonzero_accept": False,
+            "unified_generic_target_verify_uses_shifted_logits": False,
+            "unified_generic_target_verify_frontier_logits_available": False,
+            "unified_generic_target_verify_frontier_checkpoint_restored_by_proposal_id": {},
+            "unified_generic_target_verify_frontier_block_table_match_by_proposal_id": {},
+            "unified_generic_target_verify_current_mapping_accept_hist_by_depth": {},
+            "unified_generic_target_verify_shifted_mapping_accept_hist_by_depth": {},
+            "unified_raw_current_verify_token_ids_by_proposal_id": {},
+            "unified_raw_precondition_token_ids_by_proposal_id": {},
             "unified_generic_target_verify_current_window_first_token_prob_by_proposal_id": {},
             "unified_generic_target_verify_proposal_window_first_token_prob_by_proposal_id": {},
             "unified_generic_target_verify_current_window_first_token_id_by_proposal_id": {},
@@ -1695,6 +1703,16 @@ class ModelRunnerBase:
             "unified_generic_target_verify_first_position_target_argmax_token_by_proposal_id": {},
             "unified_generic_target_verify_first_position_target_top5_tokens_by_proposal_id": {},
             "unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id": {},
+            "unified_generic_target_verify_frontier_top_token_by_proposal_id": {},
+            "unified_generic_target_verify_frontier_top_prob_by_proposal_id": {},
+            "unified_generic_target_verify_frontier_prob_for_p0_by_proposal_id": {},
+            "unified_generic_target_verify_appended_row0_top_token_by_proposal_id": {},
+            "unified_generic_target_verify_appended_row0_top_prob_by_proposal_id": {},
+            "unified_generic_target_verify_appended_row0_prob_for_p0_by_proposal_id": {},
+            "unified_generic_target_verify_appended_row0_prob_for_p1_by_proposal_id": {},
+            "unified_generic_target_verify_shifted_prob_for_p0_by_proposal_id": {},
+            "unified_generic_target_verify_shifted_prob_for_p1_by_proposal_id": {},
+            "unified_generic_target_verify_shifted_accepted_len_by_proposal_id": {},
             "generic_rolling_token_count_by_proposal_id": {},
             "generic_rolling_status_by_proposal_id": {},
             "generic_rolling_status_reason_by_proposal_id": {},
@@ -14249,6 +14267,8 @@ class ModelRunnerBase:
             "first_argmax_by_id": {},
             "top5_tokens_by_id": {},
             "top5_probs_by_id": {},
+            "first_row_second_proposal_token_prob_by_id": {},
+            "second_position_proposal_token_prob_by_id": {},
         }
         if not entries or self.tp_params.local_rank != 0 or temperatures is None:
             return diagnostics
@@ -14313,12 +14333,41 @@ class ModelRunnerBase:
                     diagnostics["proposal_first_token_prob_by_id"][proposal_id] = float(
                         first_row_probs[proposal_token_id].item()
                     )
+                if len(proposal_tokens) > 1:
+                    second_token_id = int(proposal_tokens[1])
+                    if 0 <= second_token_id < int(first_row_probs.shape[0]):
+                        diagnostics["first_row_second_proposal_token_prob_by_id"][proposal_id] = float(
+                            first_row_probs[second_token_id].item()
+                        )
+                    second_row = int(row_start) + 1
+                    if 0 <= second_row < total_rows and 0 <= second_token_id < int(target_probs.shape[1]):
+                        diagnostics["second_position_proposal_token_prob_by_id"][proposal_id] = float(
+                            target_probs[second_row, second_token_id].item()
+                        )
                 topk = torch.topk(first_row_probs, k=min(5, int(first_row_probs.shape[0])))
                 diagnostics["first_argmax_by_id"][proposal_id] = int(topk.indices[0].item())
                 diagnostics["top5_tokens_by_id"][proposal_id] = [int(token_id) for token_id in topk.indices.tolist()]
                 diagnostics["top5_probs_by_id"][proposal_id] = [float(prob) for prob in topk.values.tolist()]
             row_start += max(0, row_count)
         return diagnostics
+
+    def compute_unified_generic_verify_result_with_shifted_logits(
+        self,
+        aligned_logits: torch.Tensor,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor | None,
+        proposals: list[EagerProposal],
+        *,
+        gamma: int,
+    ) -> dict[str, dict[int, int | bool]]:
+        return self.compute_pearl_verify_result_no_apply(
+            aligned_logits,
+            seqs,
+            temperatures,
+            proposals,
+            gamma=int(gamma),
+            lane=LANE_EAGER,
+        )
 
     def _run_unified_generic_target_verify_and_apply(
         self,
@@ -14397,6 +14446,24 @@ class ModelRunnerBase:
         first_position_argmax_token_by_id: dict[int, int] = {}
         first_position_top5_tokens_by_id: dict[int, list[int]] = {}
         first_position_top5_probs_by_id: dict[int, list[float]] = {}
+        target_verify_uses_shifted_logits = False
+        target_verify_frontier_logits_available = False
+        frontier_checkpoint_restored_by_id: dict[int, bool] = {}
+        frontier_block_table_match_by_id: dict[int, bool] = {}
+        current_mapping_accept_hist_by_depth: dict[str, dict[str, int]] = {}
+        shifted_mapping_accept_hist_by_depth: dict[str, dict[str, int]] = {}
+        shifted_accepted_len_by_id: dict[int, int] = {}
+        raw_current_verify_token_ids_by_id: dict[int, list[int]] = {}
+        raw_precondition_token_ids_by_id: dict[int, list[int]] = {}
+        frontier_top_token_by_id: dict[int, int] = {}
+        frontier_top_prob_by_id: dict[int, float] = {}
+        frontier_prob_for_p0_by_id: dict[int, float] = {}
+        appended_row0_top_token_by_id: dict[int, int] = {}
+        appended_row0_top_prob_by_id: dict[int, float] = {}
+        appended_row0_prob_for_p0_by_id: dict[int, float] = {}
+        appended_row0_prob_for_p1_by_id: dict[int, float] = {}
+        shifted_prob_for_p0_by_id: dict[int, float] = {}
+        shifted_prob_for_p1_by_id: dict[int, float] = {}
 
         for depth in sorted(proposals_by_depth):
             depth_results: list[dict] = []
@@ -14494,6 +14561,29 @@ class ModelRunnerBase:
                         base_len_by_target_verify_id[proposal_id] = int(proposal.get("base_len", -1))
                         parent_by_target_verify_id[proposal_id] = parent_id
                         original_proposal_tokens_by_id[proposal_id] = list(proposal_window)
+                        frontier_block_table_before = list(seq.block_table)
+                        frontier_input_ids, frontier_positions, frontier_temp_seqs = self.prepare_pearl_decode([seq])
+                        frontier_temperatures = (
+                            self.prepare_sample(frontier_temp_seqs) if self.tp_params.local_rank == 0 else None
+                        )
+                        torch.cuda.synchronize()
+                        frontier_logits = self.run_model(frontier_input_ids, frontier_positions, False)
+                        torch.cuda.synchronize()
+                        frontier_row_index = int(frontier_logits.shape[0]) - 1
+                        if frontier_row_index < 0:
+                            raise AssertionError(
+                                "unified generic target verification missing frontier logits row: "
+                                f"proposal_id={proposal_id}, seq_id={seq_id}, depth={depth}"
+                            )
+                        entry["frontier_logits"] = frontier_logits[frontier_row_index].clone()
+                        if frontier_temperatures is not None:
+                            entry["frontier_temperature"] = frontier_temperatures[frontier_row_index].clone()
+                        target_verify_frontier_logits_available = True
+                        frontier_checkpoint_restored_by_id[proposal_id] = self._sequence_matches_eager_apply_checkpoint(
+                            seq,
+                            checkpoint,
+                        )
+                        frontier_block_table_match_by_id[proposal_id] = list(seq.block_table) == frontier_block_table_before
                         for token_id in proposal_window:
                             seq.append_token(int(token_id))
                             entry["appended_count"] = int(entry["appended_count"]) + 1
@@ -14520,15 +14610,13 @@ class ModelRunnerBase:
                                 f"expected_to_verify_len={expected_to_verify_len}"
                             )
                         proposal_window_to_verify = list(next_round_input)
-                        actual_to_be_verified = (
-                            list(proposal_window_to_verify)
-                            if proposal_window_verify_enabled
-                            else list(legacy_to_be_verified)
-                        )
+                        actual_to_be_verified = list(proposal_window_to_verify)
                         next_round_input_by_id[proposal_id] = list(next_round_input)
                         legacy_to_verify_by_id[proposal_id] = list(legacy_to_be_verified)
                         current_to_verify_by_id[proposal_id] = list(actual_to_be_verified)
                         proposal_window_to_verify_by_id[proposal_id] = list(proposal_window_to_verify)
+                        raw_current_verify_token_ids_by_id[proposal_id] = list(actual_to_be_verified)
+                        raw_precondition_token_ids_by_id[proposal_id] = list(legacy_to_be_verified)
                         current_window_equals_proposal_by_id[proposal_id] = (
                             list(actual_to_be_verified) == list(proposal_window_to_verify)
                         )
@@ -14600,44 +14688,99 @@ class ModelRunnerBase:
                     target_verify_logits_width = int(logits.shape[1]) if len(logits.shape) > 1 else 0
                     if len(temp_entries) > 0 and int(logits.shape[0]) % len(temp_entries) == 0:
                         target_verify_rows_per_proposal = int(logits.shape[0]) // len(temp_entries)
-                    window_diagnostics = self._compute_unified_target_verify_window_diagnostics(
+                    aligned_logits_rows: list[torch.Tensor] = []
+                    aligned_temperature_rows: list[torch.Tensor] = []
+                    append_offset = 0
+                    shifted_row_start = 0
+                    for entry in temp_entries:
+                        width = int(entry["input_width"])
+                        proposal_id = int(entry["proposal_id"])
+                        aligned_logits_rows.append(entry["frontier_logits"])
+                        if temperatures is not None and "frontier_temperature" in entry:
+                            aligned_temperature_rows.append(entry["frontier_temperature"])
+                        if gamma > 1:
+                            aligned_logits_rows.extend(
+                                logits[append_offset:append_offset + gamma - 1].unbind(dim=0)
+                            )
+                            if temperatures is not None:
+                                aligned_temperature_rows.extend(
+                                    temperatures[append_offset:append_offset + gamma - 1].unbind(dim=0)
+                                )
+                        entry["shifted_row_start"] = int(shifted_row_start)
+                        shifted_row_start += int(gamma)
+                        append_offset += width
+                        if len(aligned_logits_rows) < shifted_row_start:
+                            raise AssertionError(
+                                "unified generic shifted logits alignment produced too few rows: "
+                                f"proposal_id={proposal_id}, depth={depth}, gamma={gamma}"
+                            )
+                    aligned_logits = torch.stack(aligned_logits_rows, dim=0)
+                    aligned_temperatures = (
+                        torch.stack(aligned_temperature_rows, dim=0)
+                        if temperatures is not None and aligned_temperature_rows
+                        else None
+                    )
+                    target_verify_uses_shifted_logits = True
+                    target_verify_logits_rows = int(aligned_logits.shape[0])
+                    target_verify_logits_width = int(aligned_logits.shape[1]) if len(aligned_logits.shape) > 1 else 0
+                    target_verify_rows_per_proposal = (
+                        int(aligned_logits.shape[0]) // len(temp_entries)
+                        if len(temp_entries) > 0 and int(aligned_logits.shape[0]) % len(temp_entries) == 0
+                        else 0
+                    )
+                    current_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
                         logits,
                         temperatures,
                         temp_entries,
                         gamma=gamma,
                     )
+                    shifted_mapping_diagnostics = self._compute_unified_target_verify_window_diagnostics(
+                        aligned_logits,
+                        aligned_temperatures,
+                        temp_entries,
+                        gamma=gamma,
+                    )
+                    window_diagnostics = shifted_mapping_diagnostics
                     current_window_accepted_len_by_id.update(
                         {
                             int(proposal_id): int(value)
-                            for proposal_id, value in window_diagnostics["current_accept_len_by_id"].items()
+                            for proposal_id, value in current_mapping_diagnostics["proposal_accept_len_by_id"].items()
                         }
                     )
                     proposal_window_shadow_accepted_len_by_id.update(
                         {
                             int(proposal_id): int(value)
-                            for proposal_id, value in window_diagnostics["proposal_accept_len_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["proposal_accept_len_by_id"].items()
                         }
                     )
-                    for depth_key, hist in window_diagnostics["current_accept_hist_by_depth"].items():
+                    for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
                         merged = current_window_accept_hist_by_depth.setdefault(str(depth_key), {})
                         for bucket, count in hist.items():
                             merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
-                    for depth_key, hist in window_diagnostics["proposal_accept_hist_by_depth"].items():
+                    for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
                         merged = proposal_window_shadow_accept_hist_by_depth.setdefault(str(depth_key), {})
+                        for bucket, count in hist.items():
+                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                    for depth_key, hist in current_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                        merged = current_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
+                        for bucket, count in hist.items():
+                            merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
+                    for depth_key, hist in shifted_mapping_diagnostics["proposal_accept_hist_by_depth"].items():
+                        merged = shifted_mapping_accept_hist_by_depth.setdefault(str(depth_key), {})
                         for bucket, count in hist.items():
                             merged[str(bucket)] = int(merged.get(str(bucket), 0)) + int(count)
                     current_window_first_token_prob_by_id.update(
                         {
                             int(proposal_id): float(value)
-                            for proposal_id, value in window_diagnostics[
-                                "current_first_token_prob_by_id"
+                            for proposal_id, value in current_mapping_diagnostics[
+                                "proposal_first_token_prob_by_id"
                             ].items()
                         }
                     )
                     proposal_window_first_token_prob_by_id.update(
                         {
                             int(proposal_id): float(value)
-                            for proposal_id, value in window_diagnostics[
+                            for proposal_id, value in shifted_mapping_diagnostics[
                                 "proposal_first_token_prob_by_id"
                             ].items()
                         }
@@ -14645,40 +14788,104 @@ class ModelRunnerBase:
                     current_window_first_token_id_by_id.update(
                         {
                             int(proposal_id): int(value)
-                            for proposal_id, value in window_diagnostics["current_first_token_id_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["current_first_token_id_by_id"].items()
                         }
                     )
                     proposal_window_first_token_id_by_id.update(
                         {
                             int(proposal_id): int(value)
-                            for proposal_id, value in window_diagnostics["proposal_first_token_id_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["proposal_first_token_id_by_id"].items()
                         }
                     )
                     first_position_argmax_token_by_id.update(
                         {
                             int(proposal_id): int(value)
-                            for proposal_id, value in window_diagnostics["first_argmax_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
                         }
                     )
                     first_position_top5_tokens_by_id.update(
                         {
                             int(proposal_id): [int(token_id) for token_id in value]
-                            for proposal_id, value in window_diagnostics["top5_tokens_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["top5_tokens_by_id"].items()
                         }
                     )
                     first_position_top5_probs_by_id.update(
                         {
                             int(proposal_id): [float(prob) for prob in value]
-                            for proposal_id, value in window_diagnostics["top5_probs_by_id"].items()
+                            for proposal_id, value in shifted_mapping_diagnostics["top5_probs_by_id"].items()
                         }
                     )
-                    verify_maps = self.compute_pearl_verify_result_no_apply(
-                        logits,
+                    frontier_top_token_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in shifted_mapping_diagnostics["first_argmax_by_id"].items()
+                        }
+                    )
+                    frontier_top_prob_by_id.update(
+                        {
+                            int(proposal_id): float(values[0])
+                            for proposal_id, values in shifted_mapping_diagnostics["top5_probs_by_id"].items()
+                            if values
+                        }
+                    )
+                    frontier_prob_for_p0_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in shifted_mapping_diagnostics[
+                                "proposal_first_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    appended_row0_top_token_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in current_mapping_diagnostics["first_argmax_by_id"].items()
+                        }
+                    )
+                    appended_row0_top_prob_by_id.update(
+                        {
+                            int(proposal_id): float(values[0])
+                            for proposal_id, values in current_mapping_diagnostics["top5_probs_by_id"].items()
+                            if values
+                        }
+                    )
+                    appended_row0_prob_for_p0_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in current_mapping_diagnostics[
+                                "proposal_first_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    appended_row0_prob_for_p1_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in current_mapping_diagnostics[
+                                "first_row_second_proposal_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    shifted_prob_for_p0_by_id.update(dict(frontier_prob_for_p0_by_id))
+                    shifted_prob_for_p1_by_id.update(
+                        {
+                            int(proposal_id): float(value)
+                            for proposal_id, value in shifted_mapping_diagnostics[
+                                "second_position_proposal_token_prob_by_id"
+                            ].items()
+                        }
+                    )
+                    shifted_accepted_len_by_id.update(
+                        {
+                            int(proposal_id): int(value)
+                            for proposal_id, value in shifted_mapping_diagnostics["proposal_accept_len_by_id"].items()
+                        }
+                    )
+                    verify_maps = self.compute_unified_generic_verify_result_with_shifted_logits(
+                        aligned_logits,
                         verify_seqs,
-                        temperatures,
+                        aligned_temperatures,
                         verify_proposals,
                         gamma=gamma,
-                        lane=LANE_EAGER,
                     )
                     torch.cuda.synchronize()
                 finally:
@@ -14817,6 +15024,12 @@ class ModelRunnerBase:
             trace_record["unified_generic_proposal_window_verify_enabled"] = bool(
                 proposal_window_verify_enabled
             )
+            trace_record["unified_generic_target_verify_uses_shifted_logits"] = bool(
+                target_verify_uses_shifted_logits
+            )
+            trace_record["unified_generic_target_verify_frontier_logits_available"] = bool(
+                target_verify_frontier_logits_available
+            )
             trace_record["unified_generic_target_verify_seq_len_before_temp_append_by_proposal_id"] = (
                 self._trace_sorted_int_map(seq_len_before_temp_by_id)
             )
@@ -14828,6 +15041,12 @@ class ModelRunnerBase:
             )
             trace_record["unified_generic_target_verify_checkpoint_restored_by_proposal_id"] = (
                 self._trace_sorted_bool_map(checkpoint_restored_by_id)
+            )
+            trace_record["unified_generic_target_verify_frontier_checkpoint_restored_by_proposal_id"] = (
+                self._trace_sorted_bool_map(frontier_checkpoint_restored_by_id)
+            )
+            trace_record["unified_generic_target_verify_frontier_block_table_match_by_proposal_id"] = (
+                self._trace_sorted_bool_map(frontier_block_table_match_by_id)
             )
             trace_record["unified_generic_target_verify_input_ids_shape"] = [int(target_verify_input_rows)]
             trace_record["unified_generic_target_verify_logits_shape"] = [
@@ -14903,6 +15122,18 @@ class ModelRunnerBase:
                 for hist in proposal_window_shadow_accept_hist_by_depth.values()
                 for bucket, count in hist.items()
             )
+            trace_record["unified_generic_target_verify_current_mapping_accept_hist_by_depth"] = (
+                _sorted_nested_hist(current_mapping_accept_hist_by_depth)
+            )
+            trace_record["unified_generic_target_verify_shifted_mapping_accept_hist_by_depth"] = (
+                _sorted_nested_hist(shifted_mapping_accept_hist_by_depth)
+            )
+            trace_record["unified_raw_current_verify_token_ids_by_proposal_id"] = _sampled_token_map(
+                raw_current_verify_token_ids_by_id
+            )
+            trace_record["unified_raw_precondition_token_ids_by_proposal_id"] = _sampled_token_map(
+                raw_precondition_token_ids_by_id
+            )
             trace_record["unified_generic_target_verify_current_window_first_token_prob_by_proposal_id"] = (
                 _sampled_float_map(current_window_first_token_prob_by_id)
             )
@@ -14923,6 +15154,36 @@ class ModelRunnerBase:
             )
             trace_record["unified_generic_target_verify_first_position_target_top5_probs_by_proposal_id"] = (
                 _sampled_float_list_map(first_position_top5_probs_by_id)
+            )
+            trace_record["unified_generic_target_verify_frontier_top_token_by_proposal_id"] = (
+                self._trace_sorted_int_map(frontier_top_token_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_frontier_top_prob_by_proposal_id"] = (
+                _sampled_float_map(frontier_top_prob_by_id)
+            )
+            trace_record["unified_generic_target_verify_frontier_prob_for_p0_by_proposal_id"] = (
+                _sampled_float_map(frontier_prob_for_p0_by_id)
+            )
+            trace_record["unified_generic_target_verify_appended_row0_top_token_by_proposal_id"] = (
+                self._trace_sorted_int_map(appended_row0_top_token_by_id, sampled_bool_ids)
+            )
+            trace_record["unified_generic_target_verify_appended_row0_top_prob_by_proposal_id"] = (
+                _sampled_float_map(appended_row0_top_prob_by_id)
+            )
+            trace_record["unified_generic_target_verify_appended_row0_prob_for_p0_by_proposal_id"] = (
+                _sampled_float_map(appended_row0_prob_for_p0_by_id)
+            )
+            trace_record["unified_generic_target_verify_appended_row0_prob_for_p1_by_proposal_id"] = (
+                _sampled_float_map(appended_row0_prob_for_p1_by_id)
+            )
+            trace_record["unified_generic_target_verify_shifted_prob_for_p0_by_proposal_id"] = (
+                _sampled_float_map(shifted_prob_for_p0_by_id)
+            )
+            trace_record["unified_generic_target_verify_shifted_prob_for_p1_by_proposal_id"] = (
+                _sampled_float_map(shifted_prob_for_p1_by_id)
+            )
+            trace_record["unified_generic_target_verify_shifted_accepted_len_by_proposal_id"] = (
+                self._trace_sorted_int_map(shifted_accepted_len_by_id, sampled_bool_ids)
             )
 
         self._update_unified_raw_verified_to_committed_ratio(trace_record)
