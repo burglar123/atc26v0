@@ -242,6 +242,20 @@ def merge_int_lists(records: list[dict[str, Any]], field: str) -> list[int]:
     return sorted(values)
 
 
+def collect_dict_examples(records: list[dict[str, Any]], field: str, *, limit: int = 8) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    for record in records:
+        value = record.get(field)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if len(examples) >= limit:
+                return examples
+            if isinstance(item, dict):
+                examples.append(dict(item))
+    return examples
+
+
 def sum_depth_reason_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, dict[str, int]]:
     by_depth: dict[str, Counter[str]] = defaultdict(Counter)
     for record in records:
@@ -1854,6 +1868,80 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         ),
         "generic_rolling_to_verify_equals_proposal_all": not bool(to_verify_mismatch_ids),
         "generic_rolling_to_verify_mismatch_proposal_ids": sorted(to_verify_mismatch_ids),
+        "normal_proposal_generated_seq_ids": merge_int_lists(records, "normal_proposal_generated_seq_ids"),
+        "normal_proposal_generated_request_ids": {
+            str(seq_id): request_id
+            for seq_id, request_id in sorted(
+                merge_str_map(records, "normal_proposal_generated_request_ids").items()
+            )
+        },
+        "normal_proposal_transfer_sent_seq_ids": merge_int_lists(
+            records,
+            "normal_proposal_transfer_sent_seq_ids",
+        ),
+        "normal_proposal_transfer_received_seq_ids": merge_int_lists(
+            records,
+            "normal_proposal_transfer_received_seq_ids",
+        ),
+        "dual_proposal_buffer_store_seq_ids": merge_int_lists(records, "dual_proposal_buffer_store_seq_ids"),
+        "dual_proposal_buffer_discard_seq_ids": merge_int_lists(
+            records,
+            "dual_proposal_buffer_discard_seq_ids",
+        ),
+        "dual_proposal_buffer_available_seq_ids_before_target_verify": merge_int_lists(
+            records,
+            "dual_proposal_buffer_available_seq_ids_before_target_verify",
+        ),
+        "target_normal_verify_seq_ids_before_buffer_filter": merge_int_lists(
+            records,
+            "target_normal_verify_seq_ids_before_buffer_filter",
+        ),
+        "target_normal_verify_seq_ids_after_buffer_filter": merge_int_lists(
+            records,
+            "target_normal_verify_seq_ids_after_buffer_filter",
+        ),
+        "target_normal_verify_missing_buffer_seq_ids": merge_int_lists(
+            records,
+            "target_normal_verify_missing_buffer_seq_ids",
+        ),
+        "target_normal_verify_deferred_missing_buffer_seq_ids": merge_int_lists(
+            records,
+            "target_normal_verify_deferred_missing_buffer_seq_ids",
+        ),
+        "target_normal_verify_missing_buffer_request_ids": {
+            str(seq_id): request_id
+            for seq_id, request_id in sorted(
+                merge_str_map(records, "target_normal_verify_missing_buffer_request_ids").items()
+            )
+        },
+        "target_normal_verify_missing_buffer_reason_by_seq_id": {
+            str(seq_id): reason
+            for seq_id, reason in sorted(
+                merge_str_map(records, "target_normal_verify_missing_buffer_reason_by_seq_id").items()
+            )
+        },
+        "target_normal_verify_deferred_missing_buffer_reason_counts": sum_counter_fields(
+            records,
+            "target_normal_verify_deferred_missing_buffer_reason_counts",
+        ),
+        "target_normal_verify_missing_buffer_details": collect_dict_examples(
+            records,
+            "target_normal_verify_missing_buffer_details",
+        ),
+        "normal_proposal_buffer_event_history": collect_dict_examples(
+            records,
+            "normal_proposal_buffer_event_history",
+        ),
+        "unified_ready_child_owner_cleared_seq_ids": merge_int_lists(
+            records,
+            "unified_ready_child_owner_cleared_seq_ids",
+        ),
+        "unified_ready_child_owner_clear_reason_by_seq_id": {
+            str(seq_id): reason
+            for seq_id, reason in sorted(
+                merge_str_map(records, "unified_ready_child_owner_clear_reason_by_seq_id").items()
+            )
+        },
         "unified_generic_target_verify_temp_append_used": any_record_bool(
             records,
             "unified_generic_target_verify_temp_append_used",
@@ -1990,12 +2078,139 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     }
 
 
+def validate_normal_proposal_buffer_filter(records: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    new_trace_fields = {
+        "dual_proposal_buffer_available_seq_ids_before_target_verify",
+        "target_normal_verify_seq_ids_before_buffer_filter",
+        "target_normal_verify_seq_ids_after_buffer_filter",
+        "target_normal_verify_missing_buffer_seq_ids",
+        "target_normal_verify_deferred_missing_buffer_seq_ids",
+        "target_normal_verify_missing_buffer_reason_by_seq_id",
+    }
+    terminal_discard_reasons = {
+        "sequence_finished",
+        "request_finished",
+        "cached_admission_completed",
+        "eager_owned",
+        "unified_ready_child_owned",
+        "owned_by_eager",
+        "owned_by_unified_ready_child",
+    }
+    for index, record in enumerate(records):
+        if not any(field in record for field in new_trace_fields):
+            continue
+        before = as_int_list(
+            record.get("target_normal_verify_seq_ids_before_buffer_filter")
+            if "target_normal_verify_seq_ids_before_buffer_filter" in record
+            else record.get("target_normal_verify_seq_ids")
+        )
+        after = as_int_list(
+            record.get("target_normal_verify_seq_ids_after_buffer_filter")
+            if "target_normal_verify_seq_ids_after_buffer_filter" in record
+            else record.get("target_normal_verify_seq_ids")
+        )
+        available = set(as_int_list(record.get("dual_proposal_buffer_available_seq_ids_before_target_verify")))
+        eager_owned = set(as_int_list(record.get("target_eager_verify_seq_ids_dry_run")))
+        eager_owned.update(as_int_list(record.get("excluded_from_target_normal_verify_for_eager_dry_run")))
+        eager_owned.update(as_int_list(record.get("missing_buffered_proposal_allowed_by_eager_seq_ids")))
+        unified_owned = set(as_int_list(record.get("unified_ready_child_lane_owner_seq_ids")))
+        unified_owned.update(as_int_list(record.get("unified_ready_child_excluded_from_target_normal_verify_seq_ids")))
+        unified_owned.update(as_int_list(record.get("unified_ready_child_missing_normal_proposal_allowed_seq_ids")))
+        unified_owned.update(as_int_list(record.get("missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids")))
+        owned = eager_owned | unified_owned
+        reason_by_seq_id = as_str_map(record.get("target_normal_verify_missing_buffer_reason_by_seq_id"))
+        fallback_pending = {
+            seq_id
+            for seq_id, reason in reason_by_seq_id.items()
+            if str(reason) == "fallback_pending_receive"
+        }
+
+        after_set = set(after)
+        owned_after = sorted(after_set & owned)
+        if owned_after:
+            errors.append(
+                "target normal verify after buffer filter retained owned seqs: "
+                f"record_index={index}, seq_ids={owned_after}"
+            )
+        missing_after = sorted(seq_id for seq_id in after if seq_id not in available and seq_id not in fallback_pending)
+        if missing_after:
+            errors.append(
+                "target normal verify after buffer filter includes seqs without buffered proposals: "
+                f"record_index={index}, after={after}, available={sorted(available)}, missing={missing_after}"
+            )
+
+        missing_before = as_int_list(record.get("target_normal_verify_missing_buffer_seq_ids"))
+        if missing_before:
+            missing_without_reason = sorted(seq_id for seq_id in missing_before if not reason_by_seq_id.get(seq_id))
+            if missing_without_reason:
+                errors.append(
+                    "target normal verify missing-buffer seqs require explicit reasons: "
+                    f"record_index={index}, missing={missing_without_reason}"
+                )
+            deferred = set(as_int_list(record.get("target_normal_verify_deferred_missing_buffer_seq_ids")))
+            deferred_without_reason = sorted(
+                seq_id
+                for seq_id in deferred
+                if str(reason_by_seq_id.get(seq_id, "")) != "missing_normal_proposal_deferred"
+            )
+            if deferred_without_reason:
+                errors.append(
+                    "target normal verify deferred missing-buffer seqs require missing_normal_proposal_deferred reason: "
+                    f"record_index={index}, missing={deferred_without_reason}"
+                )
+            if deferred & after_set:
+                errors.append(
+                    "target normal verify after buffer filter retained deferred missing-buffer seqs: "
+                    f"record_index={index}, seq_ids={sorted(deferred & after_set)}"
+                )
+            reason_counts = record.get("target_normal_verify_deferred_missing_buffer_reason_counts")
+            if deferred and not isinstance(reason_counts, dict):
+                errors.append(
+                    "target normal verify deferred missing-buffer seqs require reason counts: "
+                    f"record_index={index}, deferred={sorted(deferred)}"
+                )
+
+        details = record.get("target_normal_verify_missing_buffer_details")
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict) or not bool(detail.get("was_buffer_discarded", False)):
+                    continue
+                discard_reason = str(detail.get("discard_reason") or "")
+                terminal_or_owned = (
+                    bool(detail.get("was_sequence_finished", False))
+                    or bool(detail.get("was_eager_owned", False))
+                    or bool(detail.get("was_unified_ready_child_owned", False))
+                    or discard_reason in terminal_discard_reasons
+                )
+                if not terminal_or_owned:
+                    errors.append(
+                        "normal proposal buffer was discarded before target verify without terminal/owned reason: "
+                        f"record_index={index}, seq_id={detail.get('seq_id')}, discard_reason={discard_reason}"
+                    )
+
+        if before and "target_normal_verify_seq_ids_after_buffer_filter" in record:
+            missing_not_available = sorted(seq_id for seq_id in before if seq_id not in available)
+            unexplained = [
+                seq_id
+                for seq_id in missing_not_available
+                if seq_id not in owned and seq_id not in fallback_pending and not reason_by_seq_id.get(seq_id)
+            ]
+            if unexplained:
+                errors.append(
+                    "target normal verify before buffer filter had missing seqs without deferral/ownership reason: "
+                    f"record_index={index}, seq_ids={unexplained}"
+                )
+    return errors
+
+
 def validate_records(
     records: list[dict[str, Any]],
     result_payload: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     summary = build_summary(records, result_payload)
     errors: list[str] = []
+    errors.extend(validate_normal_proposal_buffer_filter(records))
     if not summary["unified_generic_rolling_enabled"]:
         errors.append("unified generic rolling runtime must be enabled")
         return errors, summary
@@ -3660,6 +3875,158 @@ def run_synthetic_tests() -> None:
         "non-owned target-normal seq missing buffer should fail"
     )
 
+    def normal_buffer_filter_record(updates: dict[str, Any]) -> list[dict[str, Any]]:
+        record = json.loads(json.dumps(ready_owner_base))
+        record.update(
+            {
+                "target_home_set": [2],
+                "target_normal_verify_seq_ids": [2],
+                "target_normal_verify_seq_ids_before_buffer_filter": [2],
+                "target_normal_verify_seq_ids_after_buffer_filter": [2],
+                "dual_proposal_buffer_available_seq_ids_before_target_verify": [2],
+                "target_normal_verify_missing_buffer_seq_ids": [],
+                "target_normal_verify_deferred_missing_buffer_seq_ids": [],
+                "target_normal_verify_missing_buffer_reason_by_seq_id": {},
+                "target_normal_verify_deferred_missing_buffer_reason_counts": {},
+                "missing_buffered_proposal_unexpected_seq_ids": [],
+                "unified_single_child_ahead_enabled": True,
+                "unified_max_unverified_depth_ahead": 1,
+            }
+        )
+        record.update(updates)
+        return [record]
+
+    buffer_hit = normal_buffer_filter_record({})
+    errors, buffer_hit_summary = validate_records(buffer_hit, ready_owner_payload)
+    assert not errors, f"target normal verify seq with buffered proposal should pass: {errors}\nsummary={buffer_hit_summary}"
+
+    missing_deferred = normal_buffer_filter_record(
+        {
+            "target_home_set": [9],
+            "target_normal_verify_seq_ids": [],
+            "target_normal_verify_seq_ids_before_buffer_filter": [9],
+            "target_normal_verify_seq_ids_after_buffer_filter": [],
+            "dual_proposal_buffer_available_seq_ids_before_target_verify": [],
+            "target_normal_verify_missing_buffer_seq_ids": [9],
+            "target_normal_verify_deferred_missing_buffer_seq_ids": [9],
+            "target_normal_verify_missing_buffer_reason_by_seq_id": {"9": "missing_normal_proposal_deferred"},
+            "target_normal_verify_deferred_missing_buffer_reason_counts": {
+                "missing_normal_proposal_deferred": 1
+            },
+        }
+    )
+    errors, missing_deferred_summary = validate_records(missing_deferred, ready_owner_payload)
+    assert not errors, (
+        "target normal verify seq missing buffer should pass when deferred with explicit reason: "
+        f"{errors}\nsummary={missing_deferred_summary}"
+    )
+
+    missing_still_targeted = normal_buffer_filter_record(
+        {
+            "target_home_set": [9],
+            "target_normal_verify_seq_ids": [9],
+            "target_normal_verify_seq_ids_before_buffer_filter": [9],
+            "target_normal_verify_seq_ids_after_buffer_filter": [9],
+            "dual_proposal_buffer_available_seq_ids_before_target_verify": [],
+            "target_normal_verify_missing_buffer_seq_ids": [9],
+            "target_normal_verify_deferred_missing_buffer_seq_ids": [9],
+            "target_normal_verify_missing_buffer_reason_by_seq_id": {"9": "missing_normal_proposal_deferred"},
+            "target_normal_verify_deferred_missing_buffer_reason_counts": {
+                "missing_normal_proposal_deferred": 1
+            },
+        }
+    )
+    errors, _summary = validate_records(missing_still_targeted, ready_owner_payload)
+    assert any("after buffer filter includes seqs without buffered proposals" in error for error in errors), (
+        "target normal verify seq missing buffer and not owned must not remain after filter"
+    )
+
+    unified_owner_missing_removed = normal_buffer_filter_record(
+        {
+            "target_home_set": [1],
+            "target_normal_verify_seq_ids": [],
+            "target_normal_verify_seq_ids_before_buffer_filter": [1],
+            "target_normal_verify_seq_ids_after_buffer_filter": [],
+            "dual_proposal_buffer_available_seq_ids_before_target_verify": [],
+            "target_normal_verify_missing_buffer_seq_ids": [1],
+            "target_normal_verify_missing_buffer_reason_by_seq_id": {"1": "unified_ready_child_owned"},
+            "target_normal_verify_deferred_missing_buffer_reason_counts": {"unified_ready_child_owned": 1},
+            "unified_ready_child_lane_owner_seq_ids": [1],
+            "unified_ready_child_excluded_from_target_normal_verify_seq_ids": [1],
+            "unified_ready_child_missing_normal_proposal_allowed_seq_ids": [1],
+            "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids": [1],
+        }
+    )
+    errors, unified_owner_removed_summary = validate_records(unified_owner_missing_removed, ready_owner_payload)
+    assert not errors, (
+        "missing buffer due unified ready-child ownership should pass only when removed from target normal verify: "
+        f"{errors}\nsummary={unified_owner_removed_summary}"
+    )
+
+    raw_target_home_filtered = normal_buffer_filter_record(
+        {
+            "target_home_set": [1, 2],
+            "target_normal_verify_seq_ids": [2],
+            "target_normal_verify_seq_ids_before_buffer_filter": [1, 2],
+            "target_normal_verify_seq_ids_after_buffer_filter": [2],
+            "dual_proposal_buffer_available_seq_ids_before_target_verify": [2],
+            "target_normal_verify_missing_buffer_seq_ids": [1],
+            "target_normal_verify_deferred_missing_buffer_seq_ids": [1],
+            "target_normal_verify_missing_buffer_reason_by_seq_id": {"1": "missing_normal_proposal_deferred"},
+            "target_normal_verify_deferred_missing_buffer_reason_counts": {
+                "missing_normal_proposal_deferred": 1
+            },
+        }
+    )
+    errors, raw_target_home_summary = validate_records(raw_target_home_filtered, ready_owner_payload)
+    assert not errors, (
+        "raw target_home_set seq without buffered proposal should be filtered/deferred with reason: "
+        f"{errors}\nsummary={raw_target_home_summary}"
+    )
+
+    discarded_before_verify = normal_buffer_filter_record(
+        {
+            "target_home_set": [3],
+            "target_normal_verify_seq_ids": [],
+            "target_normal_verify_seq_ids_before_buffer_filter": [3],
+            "target_normal_verify_seq_ids_after_buffer_filter": [],
+            "dual_proposal_buffer_available_seq_ids_before_target_verify": [],
+            "target_normal_verify_missing_buffer_seq_ids": [3],
+            "target_normal_verify_deferred_missing_buffer_seq_ids": [3],
+            "target_normal_verify_missing_buffer_reason_by_seq_id": {"3": "missing_normal_proposal_deferred"},
+            "target_normal_verify_deferred_missing_buffer_reason_counts": {
+                "missing_normal_proposal_deferred": 1
+            },
+            "target_normal_verify_missing_buffer_details": [
+                {
+                    "seq_id": 3,
+                    "was_buffer_discarded": True,
+                    "discard_reason": "manual_drop",
+                    "was_sequence_finished": False,
+                    "was_eager_owned": False,
+                    "was_unified_ready_child_owned": False,
+                }
+            ],
+        }
+    )
+    errors, _summary = validate_records(discarded_before_verify, ready_owner_payload)
+    assert any("discarded before target verify" in error for error in errors), (
+        "buffer store then discard before target verify should fail without terminal/owned reason"
+    )
+
+    terminal_discarded_before_verify = json.loads(json.dumps(discarded_before_verify))
+    terminal_discarded_before_verify[0]["target_normal_verify_missing_buffer_details"][0].update(
+        {
+            "discard_reason": "sequence_finished",
+            "was_sequence_finished": True,
+        }
+    )
+    errors, terminal_discard_summary = validate_records(terminal_discarded_before_verify, ready_owner_payload)
+    assert not errors, (
+        "buffer discard before target verify should pass with terminal sequence-finished reason: "
+        f"{errors}\nsummary={terminal_discard_summary}"
+    )
+
     ready_owner_scheduled = [json.loads(json.dumps(ready_owner_ok[0]))]
     ready_owner_scheduled[0]["unified_child_scheduled_for_target_verify_count_by_depth"] = {"2": 1}
     ready_owner_scheduled[0]["unified_child_target_verify_inflight_count_by_depth"] = {"2": 1}
@@ -4157,6 +4524,21 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_full_accept_parent_expected_frontier_len_source_counts",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
+        "normal_proposal_generated_seq_ids",
+        "normal_proposal_transfer_sent_seq_ids",
+        "normal_proposal_transfer_received_seq_ids",
+        "dual_proposal_buffer_store_seq_ids",
+        "dual_proposal_buffer_discard_seq_ids",
+        "dual_proposal_buffer_available_seq_ids_before_target_verify",
+        "target_normal_verify_seq_ids_before_buffer_filter",
+        "target_normal_verify_seq_ids_after_buffer_filter",
+        "target_normal_verify_missing_buffer_seq_ids",
+        "target_normal_verify_deferred_missing_buffer_seq_ids",
+        "target_normal_verify_missing_buffer_reason_by_seq_id",
+        "target_normal_verify_deferred_missing_buffer_reason_counts",
+        "target_normal_verify_missing_buffer_details",
+        "unified_ready_child_owner_cleared_seq_ids",
+        "unified_ready_child_owner_clear_reason_by_seq_id",
         "unified_generic_target_verify_temp_append_used",
         "unified_generic_target_verify_num_proposals",
         "unified_generic_target_verify_num_to_verify_tokens",

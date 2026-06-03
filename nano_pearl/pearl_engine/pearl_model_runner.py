@@ -360,6 +360,10 @@ class ModelRunnerBase:
         self._unified_promoted_child_proposal_ids = set()
         self._unified_ready_child_proposal_ids = set()
         self._unified_ready_child_lane_owner_by_seq_id = {}
+        self._unified_ready_child_owner_clear_reason_by_seq_id = {}
+        self._normal_proposal_lifecycle_by_seq_id = {}
+        self._normal_proposal_buffer_event_history = deque(maxlen=128)
+        self._normal_proposal_previous_draft_home_seq_ids = set()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -3125,11 +3129,41 @@ class ModelRunnerBase:
                 "parent_proposal_id": int(parent_id),
                 "base_len": int(base_len),
             }
+        previous_owner_seq_ids = set(int(seq_id) for seq_id in self._unified_ready_child_lane_owner_by_seq_id)
+        next_owner_seq_ids = set(int(seq_id) for seq_id in owner_by_seq)
+        cleared_seq_ids = sorted(previous_owner_seq_ids - next_owner_seq_ids)
+        clear_reason_by_seq_id: dict[int, str] = {}
+        for seq_id in cleared_seq_ids:
+            previous_owner = self._unified_ready_child_lane_owner_by_seq_id.get(int(seq_id), {})
+            child_id = int(previous_owner.get("proposal_id", -1))
+            record = self._generic_rolling_proposal_outcomes_by_id.get(child_id, {})
+            if bool(record.get("invalidated", False)):
+                reason = str(record.get("invalidation_reason", "child_invalidated") or "child_invalidated")
+            elif int(record.get("accepted_len", -1)) >= 0:
+                reason = "child_terminal_result_consumed"
+            elif bool(record.get("applied_full_commit", False)):
+                reason = "child_full_commit_applied"
+            elif bool(record.get("applied_partial_recovery", False)):
+                reason = "child_partial_recovery_applied"
+            elif bool(record.get("no_mutation_reject", False)):
+                reason = "child_reject_no_mutation"
+            elif bool(record.get("target_verify_inflight", False)):
+                reason = "child_target_verify_inflight_not_owned"
+            else:
+                reason = "owner_not_broadcast_by_draft_master"
+            clear_reason_by_seq_id[int(seq_id)] = str(reason)
+        self._unified_ready_child_owner_clear_reason_by_seq_id = clear_reason_by_seq_id
         self._unified_ready_child_lane_owner_by_seq_id = owner_by_seq
 
     def _apply_unified_ready_child_lane_ownership_to_plan(self, plan: StepPlan) -> None:
         ready_by_seq = self._unified_ready_child_records_by_seq_id()
         owner_seq_ids = sorted(int(seq_id) for seq_id in self._unified_ready_child_lane_owner_by_seq_id)
+        plan.unified_ready_child_owner_cleared_seq_ids = sorted(
+            int(seq_id) for seq_id in self._unified_ready_child_owner_clear_reason_by_seq_id
+        )
+        plan.unified_ready_child_owner_clear_reason_by_seq_id = dict(
+            self._unified_ready_child_owner_clear_reason_by_seq_id
+        )
         for seq_id, owner in self._unified_ready_child_lane_owner_by_seq_id.items():
             if int(seq_id) in ready_by_seq:
                 continue
@@ -3371,6 +3405,246 @@ class ModelRunnerBase:
         if hasattr(plan, "target_normal_verify_ids"):
             return [int(seq_id) for seq_id in plan.target_normal_verify_ids()]
         return [int(seq_id) for seq_id in (plan.target_normal_verify_seq_ids or plan.target_home_set)]
+
+    def _normal_proposal_lifecycle_record(self, seq_id: int, request_id: str | int | None = None) -> dict:
+        seq_id = int(seq_id)
+        record = self._normal_proposal_lifecycle_by_seq_id.setdefault(
+            seq_id,
+            {
+                "seq_id": seq_id,
+                "request_id": "" if request_id is None else str(request_id),
+                "generated": False,
+                "sent": False,
+                "received": False,
+                "buffered": False,
+                "discarded": False,
+                "discard_reason": "",
+                "last_event_type": "",
+                "last_event_step_id": -1,
+                "last_event_plan_id": -1,
+            },
+        )
+        if request_id is not None and not record.get("request_id"):
+            record["request_id"] = str(request_id)
+        return record
+
+    def _normal_proposal_request_id_for_seq(
+        self,
+        seq_id: int,
+        proposal: BufferedProposal | None = None,
+    ) -> str:
+        if proposal is not None:
+            return str(getattr(proposal, "request_id", ""))
+        request_id = self._seq_request_id_map().get(int(seq_id))
+        if request_id is not None:
+            return str(request_id)
+        lifecycle = self._normal_proposal_lifecycle_by_seq_id.get(int(seq_id), {})
+        return str(lifecycle.get("request_id", ""))
+
+    def _record_normal_proposal_event(
+        self,
+        plan: StepPlan,
+        *,
+        event_type: str,
+        seq_ids: list[int] | None = None,
+        proposals: list[BufferedProposal] | None = None,
+        reason: str = "",
+    ) -> None:
+        event_seq_ids = [int(seq_id) for seq_id in (seq_ids or [])]
+        proposal_by_seq = {}
+        if proposals is not None:
+            proposal_by_seq = {int(proposal.seq_id): proposal for proposal in proposals}
+            event_seq_ids = [int(proposal.seq_id) for proposal in proposals]
+        for seq_id in event_seq_ids:
+            proposal = proposal_by_seq.get(int(seq_id))
+            request_id = self._normal_proposal_request_id_for_seq(seq_id, proposal)
+            lifecycle = self._normal_proposal_lifecycle_record(seq_id, request_id)
+            if event_type == "generate":
+                lifecycle["generated"] = True
+                lifecycle["discarded"] = False
+                lifecycle["discard_reason"] = ""
+            elif event_type == "send":
+                lifecycle["sent"] = True
+            elif event_type == "receive":
+                lifecycle["received"] = True
+            elif event_type == "store":
+                lifecycle["buffered"] = True
+                lifecycle["discarded"] = False
+                lifecycle["discard_reason"] = ""
+            elif event_type in {"discard", "consume"}:
+                lifecycle["buffered"] = False
+                lifecycle["discarded"] = True
+                lifecycle["discard_reason"] = str(reason)
+            lifecycle["last_event_type"] = str(event_type)
+            lifecycle["last_event_step_id"] = -1 if plan.step_id is None else int(plan.step_id)
+            lifecycle["last_event_plan_id"] = int(plan.plan_id)
+            if event_type in {"store", "discard", "consume"}:
+                self._normal_proposal_buffer_event_history.append(
+                    {
+                        "step_id": -1 if plan.step_id is None else int(plan.step_id),
+                        "plan_id": int(plan.plan_id),
+                        "seq_id": int(seq_id),
+                        "request_id": str(request_id),
+                        "proposal_id": int(getattr(proposal, "proposal_id", -1)) if proposal is not None else -1,
+                        "event_type": str(event_type),
+                        "reason": str(reason),
+                        "buffer_size_after": int(self.dual_proposal_buffer.size()),
+                    }
+                )
+
+    def _normal_proposal_trace_fields(
+        self,
+        plan: StepPlan,
+        seq_ids: list[int] | None = None,
+    ) -> dict:
+        selected_seq_ids = [int(seq_id) for seq_id in (seq_ids or [])]
+        if not selected_seq_ids:
+            selected_seq_ids = sorted(self._normal_proposal_lifecycle_by_seq_id)
+        generated = []
+        sent = []
+        received = []
+        buffered = []
+        discarded = []
+        discard_reason_by_seq_id = {}
+        request_ids = {}
+        for seq_id in selected_seq_ids:
+            lifecycle = self._normal_proposal_lifecycle_by_seq_id.get(int(seq_id), {})
+            request_ids[str(int(seq_id))] = self._normal_proposal_request_id_for_seq(seq_id)
+            if bool(lifecycle.get("generated", False)):
+                generated.append(int(seq_id))
+            if bool(lifecycle.get("sent", False)):
+                sent.append(int(seq_id))
+            if bool(lifecycle.get("received", False)):
+                received.append(int(seq_id))
+            if bool(lifecycle.get("buffered", False)):
+                buffered.append(int(seq_id))
+            if bool(lifecycle.get("discarded", False)):
+                discarded.append(int(seq_id))
+                discard_reason_by_seq_id[str(int(seq_id))] = str(lifecycle.get("discard_reason", ""))
+        return {
+            "normal_proposal_generated_seq_ids": sorted(generated),
+            "normal_proposal_generated_request_ids": {
+                str(seq_id): request_ids.get(str(seq_id), "") for seq_id in sorted(generated)
+            },
+            "normal_proposal_transfer_sent_seq_ids": sorted(sent),
+            "normal_proposal_transfer_received_seq_ids": sorted(received),
+            "dual_proposal_buffer_store_seq_ids": sorted(buffered),
+            "dual_proposal_buffer_discard_seq_ids": sorted(discarded),
+            "dual_proposal_buffer_discard_reason_by_seq_id": dict(sorted(discard_reason_by_seq_id.items())),
+            "normal_proposal_buffer_event_history": list(self._normal_proposal_buffer_event_history),
+        }
+
+    def _target_missing_normal_proposal_details(
+        self,
+        plan: StepPlan,
+        missing_seq_ids: list[int],
+        *,
+        reason_by_seq_id: dict[int, str],
+        buffered_seq_ids: list[int],
+    ) -> list[dict]:
+        seq_to_request_id = self._seq_request_id_map()
+        active_seq_by_id = {int(seq.seq_id): seq for seq in self.scheduler.running}
+        previous_draft_home = {int(seq_id) for seq_id in self._normal_proposal_previous_draft_home_seq_ids}
+        current_draft_home = set(self._actual_normal_draft_seq_ids(plan))
+        unified_owned = {
+            int(seq_id) for seq_id in getattr(plan, "unified_ready_child_lane_owner_seq_ids", [])
+        }
+        eager_owned = set(int(seq_id) for seq_id in getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
+        eager_owned.update(int(seq_id) for seq_id in getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", []))
+        buffered_set = {int(seq_id) for seq_id in buffered_seq_ids}
+        details = []
+        for seq_id in [int(seq_id) for seq_id in missing_seq_ids]:
+            lifecycle = self._normal_proposal_lifecycle_by_seq_id.get(seq_id, {})
+            seq = active_seq_by_id.get(seq_id)
+            request_id = (
+                seq_to_request_id.get(seq_id)
+                or lifecycle.get("request_id")
+                or "<missing>"
+            )
+            details.append(
+                {
+                    "seq_id": int(seq_id),
+                    "request_id": str(request_id),
+                    "plan_id": int(plan.plan_id),
+                    "dual_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "target_home_set": list(plan.target_home_set),
+                    "draft_home_set": list(plan.draft_home_set),
+                    "actual_draft_home_set_for_normal_draft": self._actual_normal_draft_seq_ids(plan),
+                    "target_normal_verify_seq_ids": list(
+                        getattr(plan, "target_normal_verify_seq_ids_before_buffer_filter", [])
+                        or self._target_normal_verify_seq_ids(plan)
+                    ),
+                    "buffered_proposal_seq_ids": sorted(buffered_set),
+                    "was_in_previous_draft_home_set": bool(seq_id in previous_draft_home or seq_id in current_draft_home),
+                    "was_normal_proposal_generated": bool(lifecycle.get("generated", False)),
+                    "was_normal_proposal_sent": bool(lifecycle.get("sent", False)),
+                    "was_normal_proposal_received": bool(lifecycle.get("received", False)),
+                    "was_buffered": bool(seq_id in buffered_set or lifecycle.get("buffered", False)),
+                    "was_buffer_discarded": bool(lifecycle.get("discarded", False)),
+                    "discard_reason": str(lifecycle.get("discard_reason", "")),
+                    "was_unified_ready_child_owned": bool(seq_id in unified_owned),
+                    "was_eager_owned": bool(seq_id in eager_owned),
+                    "was_sequence_finished": bool(
+                        seq is None
+                        or getattr(seq, "status", None) != SequenceStatus.RUNNING
+                        or getattr(seq, "is_finished", False)
+                    ),
+                    "was_cached_admission_active": bool(getattr(self.global_config, "enable_cached_admission", False)),
+                    "reason": str(reason_by_seq_id.get(seq_id, "")),
+                }
+            )
+        return details
+
+    def _attach_normal_proposal_lifecycle_trace(self, trace_record: dict, plan: StepPlan) -> None:
+        interesting_seq_ids = sorted(
+            set(self._actual_normal_draft_seq_ids(plan))
+            | set(self._target_normal_verify_seq_ids(plan))
+            | set(getattr(plan, "target_normal_verify_seq_ids_before_buffer_filter", []))
+            | set(getattr(plan, "target_normal_verify_missing_buffer_seq_ids", []))
+            | set(self.dual_proposal_buffer.pending_seq_ids())
+        )
+        trace_record.update(self._normal_proposal_trace_fields(plan, interesting_seq_ids))
+        for field in (
+            "dual_proposal_buffer_available_seq_ids_before_target_verify",
+            "target_normal_verify_seq_ids_before_buffer_filter",
+            "target_normal_verify_seq_ids_after_buffer_filter",
+            "target_normal_verify_missing_buffer_seq_ids",
+            "target_normal_verify_deferred_missing_buffer_seq_ids",
+        ):
+            values = getattr(plan, field, None)
+            if values is not None:
+                trace_record[field] = [int(seq_id) for seq_id in values]
+        request_ids = getattr(plan, "target_normal_verify_missing_buffer_request_ids", None)
+        if request_ids is not None:
+            trace_record["target_normal_verify_missing_buffer_request_ids"] = {
+                str(int(seq_id)): str(request_id)
+                for seq_id, request_id in request_ids.items()
+            }
+        reason_by_seq_id = getattr(plan, "target_normal_verify_missing_buffer_reason_by_seq_id", None)
+        if reason_by_seq_id is not None:
+            trace_record["target_normal_verify_missing_buffer_reason_by_seq_id"] = {
+                str(int(seq_id)): str(reason)
+                for seq_id, reason in reason_by_seq_id.items()
+            }
+        reason_counts = getattr(plan, "target_normal_verify_deferred_missing_buffer_reason_counts", None)
+        if reason_counts is not None:
+            trace_record["target_normal_verify_deferred_missing_buffer_reason_counts"] = {
+                str(reason): int(count) for reason, count in reason_counts.items()
+            }
+        details = getattr(plan, "target_normal_verify_missing_buffer_details", None)
+        if details is not None:
+            trace_record["target_normal_verify_missing_buffer_details"] = list(details)
+        for field in (
+            "unified_ready_child_owner_cleared_seq_ids",
+            "unified_ready_child_owner_clear_reason_by_seq_id",
+        ):
+            values = getattr(plan, field, None)
+            if values is None:
+                continue
+            if isinstance(values, dict):
+                trace_record[field] = {str(int(seq_id)): str(reason) for seq_id, reason in values.items()}
+            else:
+                trace_record[field] = [int(seq_id) for seq_id in values]
 
     def _lane_exclusion_step_id_before_plan(self) -> int:
         return int(self.dual_batch_manager.step_id)
@@ -3704,36 +3978,36 @@ class ModelRunnerBase:
             enable_eager_lane_exclusion_dry_run=self._eager_lane_exclusion_dry_run_enabled(),
             running_seqs=list(self.scheduler.running),
         )
+        if dropped_seq_ids:
+            self._record_normal_proposal_event(
+                plan,
+                event_type="discard",
+                seq_ids=[int(seq_id) for seq_id in dropped_seq_ids],
+                reason="discard_inactive",
+            )
         self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
         self._apply_unified_ready_child_lane_ownership_to_plan(plan)
         self._validate_unified_ready_child_lane_ownership_plan(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
-        target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        target_normal_verify_seq_ids_before_filter = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
-        buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
-        allowed_missing = sorted(
-            set(buffer_inspect["miss_seq_ids"])
-            & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
-        )
-        allowed_missing = sorted(
-            set(allowed_missing)
-            | (
-                set(buffer_inspect["miss_seq_ids"])
-                & set(getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", []))
-            )
-        )
+        buffer_inspect_before_filter = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids_before_filter)
         fallback_same_batch = (
-            bool(target_normal_verify_seq_ids)
+            bool(target_normal_verify_seq_ids_before_filter)
             and plan.plan_phase == "fallback"
-            and target_normal_verify_seq_ids == actual_normal_draft_seq_ids
+            and target_normal_verify_seq_ids_before_filter == actual_normal_draft_seq_ids
         )
         fallback_pending_receive = (
-            sorted(set(raw_buffer_inspect["miss_seq_ids"]) & set(target_normal_verify_seq_ids))
+            sorted(set(raw_buffer_inspect["miss_seq_ids"]) & set(target_normal_verify_seq_ids_before_filter))
             if fallback_same_batch
             else []
+        )
+        eager_owned_seq_ids = set(int(seq_id) for seq_id in getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
+        eager_owned_seq_ids.update(
+            int(seq_id) for seq_id in getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", [])
         )
         allowed_by_unified_ready_child = set(
             int(seq_id)
@@ -3742,6 +4016,66 @@ class ModelRunnerBase:
         allowed_unified_missing = sorted(
             set(raw_buffer_inspect["miss_seq_ids"]) & allowed_by_unified_ready_child
         )
+        missing_before_filter = sorted(set(buffer_inspect_before_filter["miss_seq_ids"]))
+        invalid_before_filter = sorted(set(buffer_inspect_before_filter["invalid_seq_ids"]))
+        reason_by_missing_seq_id: dict[int, str] = {}
+        for seq_id in missing_before_filter:
+            if int(seq_id) in eager_owned_seq_ids:
+                reason = "eager_owned"
+            elif int(seq_id) in allowed_by_unified_ready_child:
+                reason = "unified_ready_child_owned"
+            elif int(seq_id) in set(fallback_pending_receive):
+                reason = "fallback_pending_receive"
+            else:
+                reason = "missing_normal_proposal_deferred"
+            reason_by_missing_seq_id[int(seq_id)] = reason
+        for seq_id in invalid_before_filter:
+            reason_by_missing_seq_id.setdefault(int(seq_id), "buffer_invalid")
+
+        if fallback_same_batch:
+            target_normal_verify_seq_ids_after_filter = list(target_normal_verify_seq_ids_before_filter)
+            deferred_missing = []
+        else:
+            allowed_owned = set(eager_owned_seq_ids) | set(allowed_by_unified_ready_child)
+            target_normal_verify_seq_ids_after_filter = [
+                int(seq_id)
+                for seq_id in target_normal_verify_seq_ids_before_filter
+                if int(seq_id) in set(buffer_inspect_before_filter["hit_seq_ids"])
+                and int(seq_id) not in allowed_owned
+            ]
+            deferred_missing = [
+                int(seq_id)
+                for seq_id, reason in sorted(reason_by_missing_seq_id.items())
+                if str(reason) == "missing_normal_proposal_deferred"
+            ]
+
+        plan.target_normal_verify_seq_ids_before_buffer_filter = list(target_normal_verify_seq_ids_before_filter)
+        plan.target_normal_verify_seq_ids_after_buffer_filter = list(target_normal_verify_seq_ids_after_filter)
+        plan.target_normal_verify_missing_buffer_seq_ids = list(missing_before_filter)
+        plan.target_normal_verify_deferred_missing_buffer_seq_ids = list(deferred_missing)
+        missing_request_ids = {
+            int(seq_id): self._normal_proposal_request_id_for_seq(seq_id)
+            for seq_id in missing_before_filter
+        }
+        plan.target_normal_verify_missing_buffer_request_ids = dict(missing_request_ids)
+        plan.target_normal_verify_missing_buffer_reason_by_seq_id = dict(reason_by_missing_seq_id)
+        plan.target_normal_verify_deferred_missing_buffer_reason_counts = dict(
+            Counter(reason for reason in reason_by_missing_seq_id.values())
+        )
+        plan.dual_proposal_buffer_available_seq_ids_before_target_verify = list(
+            self.dual_proposal_buffer.pending_seq_ids()
+        )
+        plan.target_normal_verify_missing_buffer_details = self._target_missing_normal_proposal_details(
+            plan,
+            missing_before_filter,
+            reason_by_seq_id=reason_by_missing_seq_id,
+            buffered_seq_ids=self.dual_proposal_buffer.pending_seq_ids(),
+        )
+        if not fallback_same_batch:
+            plan.target_normal_verify_seq_ids = list(target_normal_verify_seq_ids_after_filter)
+        target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
+        buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
+        allowed_missing = sorted(set(buffer_inspect["miss_seq_ids"]) & eager_owned_seq_ids)
         unexpected_missing = sorted(
             set(buffer_inspect["miss_seq_ids"])
             - set(allowed_missing)
@@ -3773,6 +4107,7 @@ class ModelRunnerBase:
         plan.proposal_buffer_miss_count = len(plan.proposal_buffer_miss_seq_ids)
         plan.proposal_buffer_invalid_count = len(plan.proposal_buffer_invalid_seq_ids)
         plan.proposal_buffer_dropped_count = len(plan.proposal_buffer_dropped_seq_ids)
+        self._normal_proposal_previous_draft_home_seq_ids = set(actual_normal_draft_seq_ids)
         if plan.plan_phase == "fallback":
             plan.fallback_buffer_hit_count = plan.proposal_buffer_hit_count
             plan.fallback_buffer_miss_count = plan.proposal_buffer_miss_count
@@ -3876,6 +4211,7 @@ class ModelRunnerBase:
         )
         record.update(self._profile_defaults(seqs, plan))
         self._attach_unified_ready_child_lane_ownership_trace(record, plan)
+        self._attach_normal_proposal_lifecycle_trace(record, plan)
         self.trace_records.append(record)
         return record
 
@@ -3892,6 +4228,16 @@ class ModelRunnerBase:
             f"{self.dual_proposal_buffer.pending_seq_ids()}, target_normal_verify_seq_ids="
             f"{self._target_normal_verify_seq_ids(plan)}, target_eager_verify_seq_ids_dry_run="
             f"{getattr(plan, 'target_eager_verify_seq_ids_dry_run', [])}, "
+            f"target_normal_verify_seq_ids_before_buffer_filter="
+            f"{getattr(plan, 'target_normal_verify_seq_ids_before_buffer_filter', [])}, "
+            f"target_normal_verify_seq_ids_after_buffer_filter="
+            f"{getattr(plan, 'target_normal_verify_seq_ids_after_buffer_filter', [])}, "
+            f"target_normal_verify_missing_buffer_seq_ids="
+            f"{getattr(plan, 'target_normal_verify_missing_buffer_seq_ids', [])}, "
+            f"target_normal_verify_deferred_missing_buffer_seq_ids="
+            f"{getattr(plan, 'target_normal_verify_deferred_missing_buffer_seq_ids', [])}, "
+            f"target_normal_verify_missing_buffer_reason_by_seq_id="
+            f"{getattr(plan, 'target_normal_verify_missing_buffer_reason_by_seq_id', {})}, "
             f"missing_buffered_proposal_allowed_by_eager_seq_ids="
             f"{getattr(plan, 'missing_buffered_proposal_allowed_by_eager_seq_ids', [])}, "
             f"missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids="
@@ -4068,6 +4414,12 @@ class ModelRunnerBase:
     def _send_dual_proposals(self, proposals: list[BufferedProposal], plan: StepPlan):
         if self.tp_params.local_rank != 0:
             return
+        self._record_normal_proposal_event(
+            plan,
+            event_type="send",
+            proposals=proposals,
+            reason="normal_proposal_transfer_send",
+        )
         meta, payload = self._serialize_proposals(proposals, plan)
         dist.broadcast(meta, src=self.global_config.draft_config.master_rank, group=self.verify_group)
         if int(meta[1].item()) > 0:
@@ -4116,6 +4468,12 @@ class ModelRunnerBase:
         assert received_seq_ids == list(expected_seq_ids), self._proposal_assertion_message(
             plan,
             f"proposal seq_id mismatch: expected={expected_seq_ids}, received={received_seq_ids}, batch_id={batch_id}",
+        )
+        self._record_normal_proposal_event(
+            plan,
+            event_type="receive",
+            proposals=proposals,
+            reason="normal_proposal_transfer_receive",
         )
         return proposals
 
@@ -21719,8 +22077,18 @@ class DraftModelRunner(ModelRunnerBase):
                 seq.append_token(token_id)
             self._mark_trace_end(trace_record)
         proposals = self._build_buffered_proposals(seqs, plan)
+        self._record_normal_proposal_event(
+            plan,
+            event_type="generate",
+            proposals=proposals,
+            reason="normal_draft_generated",
+        )
         for trace_record in draft_records:
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            trace_record["normal_proposal_generated_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
+            trace_record["normal_proposal_generated_request_ids"] = {
+                str(int(proposal.seq_id)): str(proposal.request_id) for proposal in proposals
+            }
         return proposals, draft_records
 
     def _next_eager_proposal_id(self) -> int:
@@ -22096,16 +22464,26 @@ class DraftModelRunner(ModelRunnerBase):
             proposals, draft_records = self._draft_dual_batch_proposals(draft_seqs, plan)
             if plan.plan_phase in {"priming", "steady"}:
                 self.dual_proposal_buffer.store(proposals)
+                self._record_normal_proposal_event(
+                    plan,
+                    event_type="store",
+                    proposals=proposals,
+                    reason="draft_normal_proposal_store",
+                )
             for trace_record in draft_records:
                 trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+                trace_record["dual_proposal_buffer_store_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
                 self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=proposals)
+                self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
                 self._finalize_record_profile(trace_record)
             self._send_dual_proposals(proposals, plan)
             for trace_record in draft_records:
                 trace_record["normal_proposal_transfer_called"] = True
+                trace_record["normal_proposal_transfer_sent_seq_ids"] = [int(proposal.seq_id) for proposal in proposals]
         elif self._eager_lane_exclusion_dry_run_enabled() and plan.lane_excluded_seq_ids:
             trace_record = self._trace_dual_batch_schedule([], plan, "dual_draft_lane_exclusion")
             self._update_lane_exclusion_proposal_trace(trace_record, plan, sent_proposals=[])
+            self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
             self._finalize_record_profile(trace_record)
 
         if self._eager_draft_dry_run_enabled() and eager_draft_seqs:
@@ -22135,9 +22513,17 @@ class DraftModelRunner(ModelRunnerBase):
                     eager_trace_record or trace_record,
                 )
             consumed_seq_ids = self.dual_proposal_buffer.discard([seq.seq_id for seq in target_seqs])
+            self._record_normal_proposal_event(
+                plan,
+                event_type="consume",
+                seq_ids=[int(seq_id) for seq_id in consumed_seq_ids],
+                reason="draft_apply_verify_consumed",
+            )
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            trace_record["dual_proposal_buffer_discard_seq_ids"] = [int(seq_id) for seq_id in consumed_seq_ids]
+            self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
             torch.cuda.synchronize()
             self._mark_trace_end(trace_record, accepted_lens=accepted_lens, invalidated_lens=invalidated_lens)
 
@@ -22364,6 +22750,9 @@ class TargetModelRunner(ModelRunnerBase):
                     plan,
                     received_proposals=received_proposals,
                 )
+                trace_record["normal_proposal_transfer_received_seq_ids"] = [
+                    int(proposal.seq_id) for proposal in received_proposals
+                ]
             if fallback_same_batch:
                 target_proposals = received_proposals
                 assert not plan.fallback_missing_after_receive_seq_ids, self._proposal_assertion_message(
@@ -22376,15 +22765,34 @@ class TargetModelRunner(ModelRunnerBase):
                     trace_record["proposal_tokens_verified"] = trace_record["proposal_tokens_available"]
             else:
                 self.dual_proposal_buffer.store(received_proposals)
+                self._record_normal_proposal_event(
+                    plan,
+                    event_type="store",
+                    proposals=received_proposals,
+                    reason="target_received_normal_proposal_store",
+                )
+                if trace_record is not None:
+                    trace_record["dual_proposal_buffer_store_seq_ids"] = [
+                        int(proposal.seq_id) for proposal in received_proposals
+                    ]
+                    self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
 
         if target_seqs:
             self._validate_proposals_for_target(target_proposals, target_seqs, plan)
             consumed_seq_ids = self.dual_proposal_buffer.discard(target_seq_ids)
+            self._record_normal_proposal_event(
+                plan,
+                event_type="consume",
+                seq_ids=[int(seq_id) for seq_id in consumed_seq_ids],
+                reason="target_normal_verify_consumed",
+            )
             if fallback_same_batch:
                 consumed_seq_ids = [proposal.seq_id for proposal in target_proposals]
             trace_record["proposal_buffer_consumed_seq_ids"] = consumed_seq_ids
             trace_record["proposal_buffer_consumed_count"] = len(consumed_seq_ids)
             trace_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            trace_record["dual_proposal_buffer_discard_seq_ids"] = [int(seq_id) for seq_id in consumed_seq_ids]
+            self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
             accepted_lens, invalidated_lens = self.verify_from_proposals(
                 logits,
                 target_seqs,
@@ -22415,9 +22823,14 @@ class TargetModelRunner(ModelRunnerBase):
             priming_record = self._trace_dual_batch_schedule([], plan, "dual_verify_idle")
             priming_record["normal_proposal_transfer_called"] = True
             priming_record["proposal_buffer_size_after"] = self.dual_proposal_buffer.size()
+            priming_record["normal_proposal_transfer_received_seq_ids"] = [
+                int(proposal.seq_id) for proposal in received_proposals
+            ]
+            self._attach_normal_proposal_lifecycle_trace(priming_record, plan)
             self._finalize_record_profile(priming_record)
         elif trace_record is not None and self._eager_lane_exclusion_dry_run_enabled():
             self._update_lane_exclusion_proposal_trace(trace_record, plan, received_proposals=[])
+            self._attach_normal_proposal_lifecycle_trace(trace_record, plan)
 
         if (
             self._eager_verify_dry_run_enabled()
