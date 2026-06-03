@@ -353,6 +353,7 @@ class ModelRunnerBase:
         self._generic_rolling_shadow_proposals_by_id = {}
         self._generic_rolling_shadow_proposals_by_depth = {}
         self._generic_rolling_committed_proposal_ids_by_depth = {}
+        self._generic_rolling_proposal_outcomes_by_id = {}
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -1612,6 +1613,49 @@ class ModelRunnerBase:
             "unified_generated_grandchild_before_parent_verified_examples": [],
             "unified_candidate_depth_created_before_parent_verified_count_by_depth": {},
             "unified_candidate_depth_created_after_parent_verified_count_by_depth": {},
+            "unified_single_child_parent_full_accept_guard_enabled": bool(
+                getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
+                and int(getattr(self.global_config, "unified_generic_max_unverified_depth_ahead", 0) or 0) == 1
+            ),
+            "unified_child_generation_parent_lookup_found_by_proposal_id": {},
+            "unified_child_generation_allowed_by_proposal_id": {},
+            "unified_child_generation_block_reason_by_proposal_id": {},
+            "unified_child_generation_parent_state_by_proposal_id": {},
+            "unified_child_generation_depth_by_proposal_id": {},
+            "unified_child_generation_seq_id_by_proposal_id": {},
+            "unified_child_generation_root_id_by_proposal_id": {},
+            "unified_child_generation_created_step_by_proposal_id": {},
+            "unified_child_generation_parent_proposal_id_by_proposal_id": {},
+            "unified_child_generation_parent_depth_by_proposal_id": {},
+            "unified_child_generation_parent_created_step_by_proposal_id": {},
+            "unified_child_generation_parent_verified_step_by_proposal_id": {},
+            "unified_child_generation_parent_accepted_len_by_proposal_id": {},
+            "unified_child_generation_parent_proposal_len_by_proposal_id": {},
+            "unified_child_generation_parent_full_accept_by_proposal_id": {},
+            "unified_child_generation_parent_partial_accept_by_proposal_id": {},
+            "unified_child_generation_parent_reject_by_proposal_id": {},
+            "unified_child_generation_parent_invalidated_by_proposal_id": {},
+            "unified_child_generation_parent_applied_full_commit_by_proposal_id": {},
+            "unified_child_generation_parent_applied_partial_recovery_by_proposal_id": {},
+            "unified_child_generation_parent_no_mutation_reject_by_proposal_id": {},
+            "unified_proposal_registry_seq_id_by_proposal_id": {},
+            "unified_proposal_registry_root_id_by_proposal_id": {},
+            "unified_proposal_registry_depth_by_proposal_id": {},
+            "unified_proposal_registry_parent_proposal_id_by_proposal_id": {},
+            "unified_proposal_registry_created_step_by_proposal_id": {},
+            "unified_proposal_registry_verified_step_by_proposal_id": {},
+            "unified_proposal_registry_accepted_len_by_proposal_id": {},
+            "unified_proposal_registry_proposal_len_by_proposal_id": {},
+            "unified_proposal_registry_base_len_by_proposal_id": {},
+            "unified_proposal_registry_output_tokens_committed_by_proposal_id": {},
+            "unified_proposal_registry_full_accept_by_proposal_id": {},
+            "unified_proposal_registry_partial_accept_by_proposal_id": {},
+            "unified_proposal_registry_reject_by_proposal_id": {},
+            "unified_proposal_registry_invalidated_by_proposal_id": {},
+            "unified_proposal_registry_applied_full_commit_by_proposal_id": {},
+            "unified_proposal_registry_applied_partial_recovery_by_proposal_id": {},
+            "unified_proposal_registry_no_mutation_reject_by_proposal_id": {},
+            "unified_proposal_registry_invalidation_reason_by_proposal_id": {},
             "unified_generic_legacy_runtime_bypassed": bool(
                 getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
             ),
@@ -13312,6 +13356,248 @@ class ModelRunnerBase:
             ratios[str(int(depth))] = (float(committed.get(depth, 0)) / float(denom)) if denom else 0.0
         trace_record["unified_raw_verified_to_committed_ratio_by_depth"] = ratios
 
+    def _upsert_unified_generic_proposal_outcome(self, proposal_id: int, **updates) -> dict:
+        proposal_id = int(proposal_id)
+        if proposal_id < 0:
+            return {}
+        record = self._generic_rolling_proposal_outcomes_by_id.setdefault(
+            proposal_id,
+            {
+                "proposal_id": proposal_id,
+                "seq_id": -1,
+                "root_id": -1,
+                "depth": -1,
+                "parent_proposal_id": -1,
+                "created_step": -1,
+                "verified_step": -1,
+                "accepted_len": -1,
+                "proposal_len": int(self.gamma),
+                "base_len": -1,
+                "full_accept": False,
+                "partial_accept": False,
+                "reject": False,
+                "invalidated": False,
+                "applied_full_commit": False,
+                "applied_partial_recovery": False,
+                "no_mutation_reject": False,
+                "output_tokens_committed": 0,
+                "invalidation_reason": "",
+            },
+        )
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if key in {
+                "full_accept",
+                "partial_accept",
+                "reject",
+                "invalidated",
+                "applied_full_commit",
+                "applied_partial_recovery",
+                "no_mutation_reject",
+            }:
+                record[key] = bool(value)
+            elif key == "invalidation_reason":
+                record[key] = str(value)
+            else:
+                record[key] = int(value)
+        return record
+
+    def _unified_generic_parent_outcome_state(
+        self,
+        parent_id: int | None,
+        *,
+        seq: Sequence | None = None,
+        child_depth: int | None = None,
+        child_base_len: int | None = None,
+        root_id: int | None = None,
+    ) -> tuple[bool, str, dict]:
+        parent_id = -1 if parent_id is None else int(parent_id)
+        record = dict(self._generic_rolling_proposal_outcomes_by_id.get(parent_id) or {})
+        if parent_id < 0 or not record:
+            return False, "parent_outcome_missing", {
+                "proposal_id": parent_id,
+                "lookup_found": False,
+                "state": "missing",
+            }
+
+        state = dict(record)
+        state["lookup_found"] = True
+        proposal_len = int(state.get("proposal_len", self.gamma))
+        accepted_len = int(state.get("accepted_len", -1))
+        output_tokens = int(state.get("output_tokens_committed", 0))
+        base_len = int(state.get("base_len", -1))
+        expected_frontier_len = base_len + output_tokens if base_len >= 0 and output_tokens >= 0 else -1
+
+        reason = None
+        if child_depth is not None and int(state.get("depth", -1)) != int(child_depth) - 1:
+            reason = "parent_depth_mismatch"
+        elif seq is not None and int(state.get("seq_id", -1)) != int(getattr(seq, "seq_id", -1)):
+            reason = "parent_seq_mismatch"
+        elif root_id is not None and int(state.get("root_id", -1)) not in {-1, int(root_id)}:
+            reason = "parent_root_mismatch"
+        elif bool(state.get("invalidated", False)):
+            reason = "parent_invalidated"
+        elif not bool(state.get("full_accept", False)):
+            if bool(state.get("partial_accept", False)):
+                reason = "parent_partial_accept"
+            elif bool(state.get("reject", False)):
+                reason = "parent_reject"
+            else:
+                reason = "parent_not_full_accept"
+        elif not bool(state.get("applied_full_commit", False)):
+            reason = "parent_full_accept_not_applied"
+        elif proposal_len != int(self.gamma) or accepted_len != proposal_len:
+            reason = "parent_accept_len_mismatch"
+        elif child_base_len is not None and expected_frontier_len >= 0 and int(child_base_len) != expected_frontier_len:
+            reason = "parent_frontier_mismatch"
+        elif seq is not None and expected_frontier_len >= 0 and int(len(seq)) != expected_frontier_len:
+            reason = "parent_frontier_mismatch"
+
+        if reason is not None:
+            state["state"] = str(reason)
+            return False, str(reason), state
+        state["state"] = "full_accept_applied"
+        return True, "full_accept_applied", state
+
+    def _record_unified_child_generation_provenance(
+        self,
+        trace_record: dict,
+        *,
+        child_id: int,
+        child_depth: int,
+        child_seq_id: int,
+        child_root_id: int,
+        child_created_step: int,
+        parent_id: int | None,
+        parent_allowed: bool,
+        parent_reason: str,
+        parent_state: dict,
+    ) -> None:
+        child_id = int(child_id)
+        if child_id < 0:
+            return
+        bool_fields = {
+            "unified_child_generation_parent_lookup_found_by_proposal_id": bool(
+                parent_state.get("lookup_found", False)
+            ),
+            "unified_child_generation_allowed_by_proposal_id": bool(parent_allowed),
+            "unified_child_generation_parent_full_accept_by_proposal_id": bool(
+                parent_state.get("full_accept", False)
+            ),
+            "unified_child_generation_parent_partial_accept_by_proposal_id": bool(
+                parent_state.get("partial_accept", False)
+            ),
+            "unified_child_generation_parent_reject_by_proposal_id": bool(parent_state.get("reject", False)),
+            "unified_child_generation_parent_invalidated_by_proposal_id": bool(
+                parent_state.get("invalidated", False)
+            ),
+            "unified_child_generation_parent_applied_full_commit_by_proposal_id": bool(
+                parent_state.get("applied_full_commit", False)
+            ),
+            "unified_child_generation_parent_applied_partial_recovery_by_proposal_id": bool(
+                parent_state.get("applied_partial_recovery", False)
+            ),
+            "unified_child_generation_parent_no_mutation_reject_by_proposal_id": bool(
+                parent_state.get("no_mutation_reject", False)
+            ),
+        }
+        for field, value in bool_fields.items():
+            mapping = {
+                int(key): bool(item)
+                for key, item in (trace_record.get(field) or {}).items()
+            }
+            mapping[child_id] = bool(value)
+            trace_record[field] = self._trace_sorted_bool_map(mapping)
+
+        int_fields = {
+            "unified_child_generation_depth_by_proposal_id": int(child_depth),
+            "unified_child_generation_seq_id_by_proposal_id": int(child_seq_id),
+            "unified_child_generation_root_id_by_proposal_id": int(child_root_id),
+            "unified_child_generation_created_step_by_proposal_id": int(child_created_step),
+            "unified_child_generation_parent_proposal_id_by_proposal_id": -1
+            if parent_id is None
+            else int(parent_id),
+            "unified_child_generation_parent_depth_by_proposal_id": int(parent_state.get("depth", -1)),
+            "unified_child_generation_parent_created_step_by_proposal_id": int(
+                parent_state.get("created_step", -1)
+            ),
+            "unified_child_generation_parent_verified_step_by_proposal_id": int(
+                parent_state.get("verified_step", -1)
+            ),
+            "unified_child_generation_parent_accepted_len_by_proposal_id": int(
+                parent_state.get("accepted_len", -1)
+            ),
+            "unified_child_generation_parent_proposal_len_by_proposal_id": int(
+                parent_state.get("proposal_len", self.gamma)
+            ),
+        }
+        for field, value in int_fields.items():
+            mapping = self._trace_int_map(trace_record.get(field))
+            mapping[child_id] = int(value)
+            trace_record[field] = self._trace_sorted_int_map(mapping)
+
+        state_by_id = {
+            int(key): str(value)
+            for key, value in (trace_record.get("unified_child_generation_parent_state_by_proposal_id") or {}).items()
+        }
+        state_by_id[child_id] = str(parent_state.get("state", parent_reason))
+        trace_record["unified_child_generation_parent_state_by_proposal_id"] = self._trace_sorted_str_map(state_by_id)
+        block_by_id = {
+            int(key): str(value)
+            for key, value in (trace_record.get("unified_child_generation_block_reason_by_proposal_id") or {}).items()
+        }
+        block_by_id[child_id] = "" if parent_allowed else str(parent_reason)
+        trace_record["unified_child_generation_block_reason_by_proposal_id"] = self._trace_sorted_str_map(block_by_id)
+
+    def _emit_unified_generic_proposal_outcome_registry_trace(self, trace_record: dict) -> None:
+        records = {
+            int(proposal_id): dict(record)
+            for proposal_id, record in self._generic_rolling_proposal_outcomes_by_id.items()
+            if int(proposal_id) >= 0
+        }
+        int_field_map = {
+            "unified_proposal_registry_seq_id_by_proposal_id": "seq_id",
+            "unified_proposal_registry_root_id_by_proposal_id": "root_id",
+            "unified_proposal_registry_depth_by_proposal_id": "depth",
+            "unified_proposal_registry_parent_proposal_id_by_proposal_id": "parent_proposal_id",
+            "unified_proposal_registry_created_step_by_proposal_id": "created_step",
+            "unified_proposal_registry_verified_step_by_proposal_id": "verified_step",
+            "unified_proposal_registry_accepted_len_by_proposal_id": "accepted_len",
+            "unified_proposal_registry_proposal_len_by_proposal_id": "proposal_len",
+            "unified_proposal_registry_base_len_by_proposal_id": "base_len",
+            "unified_proposal_registry_output_tokens_committed_by_proposal_id": "output_tokens_committed",
+        }
+        for trace_field, record_field in int_field_map.items():
+            trace_record[trace_field] = self._trace_sorted_int_map(
+                {
+                    proposal_id: int(record.get(record_field, -1))
+                    for proposal_id, record in records.items()
+                }
+            )
+        bool_field_map = {
+            "unified_proposal_registry_full_accept_by_proposal_id": "full_accept",
+            "unified_proposal_registry_partial_accept_by_proposal_id": "partial_accept",
+            "unified_proposal_registry_reject_by_proposal_id": "reject",
+            "unified_proposal_registry_invalidated_by_proposal_id": "invalidated",
+            "unified_proposal_registry_applied_full_commit_by_proposal_id": "applied_full_commit",
+            "unified_proposal_registry_applied_partial_recovery_by_proposal_id": "applied_partial_recovery",
+            "unified_proposal_registry_no_mutation_reject_by_proposal_id": "no_mutation_reject",
+        }
+        for trace_field, record_field in bool_field_map.items():
+            trace_record[trace_field] = self._trace_sorted_bool_map(
+                {
+                    proposal_id: bool(record.get(record_field, False))
+                    for proposal_id, record in records.items()
+                }
+            )
+        trace_record["unified_proposal_registry_invalidation_reason_by_proposal_id"] = self._trace_sorted_str_map(
+            {
+                proposal_id: str(record.get("invalidation_reason", ""))
+                for proposal_id, record in records.items()
+            }
+        )
+
     def _select_unified_generic_depth1_seed_parents(
         self,
         plan: StepPlan,
@@ -13397,6 +13683,8 @@ class ModelRunnerBase:
         selected: list[dict] = []
         reject_reason_by_parent_id: dict[int, str] = {}
         seen_seq_ids: set[int] = set()
+        strict_parent_guard = bool(self._unified_generic_max_unverified_depth_ahead() == 1)
+        trace_record["unified_single_child_parent_full_accept_guard_enabled"] = bool(strict_parent_guard)
         for parent_depth in range(max(1, int(max_depth) - 1), 0, -1):
             candidate_parent_ids = sorted(
                 int(proposal_id)
@@ -13416,9 +13704,31 @@ class ModelRunnerBase:
                 root_id = int(getattr(parent_proposal, "generic_rolling_root_id", parent_id))
                 child_depth = int(parent_depth) + 1
                 child_id = int(self._continuous_shadow_proposal_id(root_id, child_depth))
+                parent_allowed, parent_reason, parent_state = self._unified_generic_parent_outcome_state(
+                    parent_id,
+                    seq=seq,
+                    child_depth=child_depth,
+                    child_base_len=-1 if seq is None else int(len(seq)),
+                    root_id=root_id,
+                )
+                if strict_parent_guard:
+                    self._record_unified_child_generation_provenance(
+                        trace_record,
+                        child_id=child_id,
+                        child_depth=child_depth,
+                        child_seq_id=seq_id,
+                        child_root_id=root_id,
+                        child_created_step=-1 if plan.step_id is None else int(plan.step_id),
+                        parent_id=parent_id,
+                        parent_allowed=parent_allowed,
+                        parent_reason=parent_reason,
+                        parent_state=parent_state,
+                    )
                 reason = None
                 if child_depth > int(max_depth):
                     reason = "max_depth_reached"
+                elif strict_parent_guard and not parent_allowed:
+                    reason = parent_reason
                 elif seq is None:
                     reason = "seq_not_found"
                 elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
@@ -13522,6 +13832,7 @@ class ModelRunnerBase:
             self._increment_trace_histogram(trace_record, "unified_active_seq_count_by_step", active_seq_count)
             self._increment_trace_histogram(trace_record, "unified_ready_parent_count_by_step", 0)
             self._increment_trace_histogram(trace_record, "unified_committed_seq_count_by_step", 0)
+            self._emit_unified_generic_proposal_outcome_registry_trace(trace_record)
             return []
         if not unified_enabled and max_depth <= 4:
             self._increment_generic_stop_reason(trace_record, "max_depth_reached")
@@ -13630,6 +13941,7 @@ class ModelRunnerBase:
                 self._increment_trace_histogram(trace_record, "unified_ready_parent_count_by_step", 0)
                 self._increment_trace_histogram(trace_record, "unified_committed_seq_count_by_step", 0)
                 self._update_unified_raw_verified_to_committed_ratio(trace_record)
+                self._emit_unified_generic_proposal_outcome_registry_trace(trace_record)
             return []
 
         decisions: list[dict] = []
@@ -13743,9 +14055,40 @@ class ModelRunnerBase:
                 root_id = int(parent["root_id"])
                 child_id = int(parent.get("next_child_id", self._continuous_shadow_proposal_id(root_id, depth)))
                 base_len = -1 if seq is None else int(len(seq))
+                parent_allowed = True
+                parent_guard_reason = "root_depth1"
+                parent_state = {
+                    "lookup_found": parent_id is None,
+                    "state": "root_depth1" if parent_id is None else "unchecked",
+                    "proposal_id": -1 if parent_id is None else int(parent_id),
+                }
+                if unified_enabled and single_child_ahead_enabled and parent_id is not None:
+                    parent_allowed, parent_guard_reason, parent_state = (
+                        self._unified_generic_parent_outcome_state(
+                            parent_id,
+                            seq=seq,
+                            child_depth=depth,
+                            child_base_len=base_len,
+                            root_id=root_id,
+                        )
+                    )
+                    self._record_unified_child_generation_provenance(
+                        trace_record,
+                        child_id=child_id,
+                        child_depth=depth,
+                        child_seq_id=seq_id,
+                        child_root_id=root_id,
+                        child_created_step=-1 if plan.step_id is None else int(plan.step_id),
+                        parent_id=parent_id,
+                        parent_allowed=parent_allowed,
+                        parent_reason=parent_guard_reason,
+                        parent_state=parent_state,
+                    )
                 reason = None
                 if parent["depth"] != depth - 1:
                     reason = "parent_depth_mismatch"
+                elif unified_enabled and single_child_ahead_enabled and parent_id is not None and not parent_allowed:
+                    reason = parent_guard_reason
                 elif seq is None:
                     reason = "seq_not_found"
                 elif getattr(seq, "status", None) != SequenceStatus.RUNNING:
@@ -13762,7 +14105,9 @@ class ModelRunnerBase:
                     stop_reason = str(reason)
                     continue
                 checkpoint = self._make_eager_apply_checkpoint(seq)
-                selected.append((child_id, parent_id, root_id, base_len, seq, checkpoint, parent.get("proposal")))
+                selected.append(
+                    (child_id, parent_id, root_id, base_len, seq, checkpoint, parent.get("proposal"), parent_state)
+                )
                 seen_seq_ids.add(seq_id)
 
             if unified_enabled:
@@ -13788,7 +14133,10 @@ class ModelRunnerBase:
                 break
 
             generated_by_child_id: dict[int, list[int]] = {int(child_id): [] for child_id, *_rest in selected}
-            valid_seqs = [seq for _child_id, _parent_id, _root_id, _base_len, seq, _checkpoint, _parent in selected]
+            valid_seqs = [
+                seq
+                for _child_id, _parent_id, _root_id, _base_len, seq, _checkpoint, _parent, _state in selected
+            ]
             draft_error: BaseException | None = None
             try:
                 for _ in range(gamma):
@@ -13809,7 +14157,7 @@ class ModelRunnerBase:
                     dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
                     torch.cuda.synchronize()
                     reset_context(self.tp_params)
-                    for (child_id, _parent_id, _root_id, _base_len, seq, _checkpoint, _parent), token_id in zip(
+                    for (child_id, _parent_id, _root_id, _base_len, seq, _checkpoint, _parent, _state), token_id in zip(
                         selected,
                         sample_tokens.tolist(),
                     ):
@@ -13819,7 +14167,7 @@ class ModelRunnerBase:
             except BaseException as exc:
                 draft_error = exc
             finally:
-                for _child_id, _parent_id, _root_id, _base_len, seq, checkpoint, _parent in selected:
+                for _child_id, _parent_id, _root_id, _base_len, seq, checkpoint, _parent, _state in selected:
                     rollback_len = int(len(seq)) - int(checkpoint["len"])
                     if rollback_len > 0:
                         self.scheduler.rollback(seq, rollback_len)
@@ -13835,7 +14183,7 @@ class ModelRunnerBase:
             ready_seq_ids: list[int] = []
             committed_ids: list[int] = []
             committed_seq_ids: list[int] = []
-            for child_id, parent_id, root_id, base_len, seq, checkpoint, parent_proposal in selected:
+            for child_id, parent_id, root_id, base_len, seq, checkpoint, parent_proposal, parent_state in selected:
                 child_id = int(child_id)
                 seq_id = int(seq.seq_id)
                 child_tokens = [int(token_id) for token_id in generated_by_child_id[child_id]]
@@ -13879,6 +14227,27 @@ class ModelRunnerBase:
                 setattr(proposal, "generic_rolling_depth", int(depth))
                 self._generic_rolling_shadow_proposals_by_id[child_id] = proposal
                 self._generic_rolling_shadow_proposals_by_depth.setdefault(depth, {})[child_id] = proposal
+                if unified_enabled:
+                    self._upsert_unified_generic_proposal_outcome(
+                        child_id,
+                        seq_id=seq_id,
+                        root_id=root_id,
+                        depth=depth,
+                        parent_proposal_id=-1 if parent_id is None else int(parent_id),
+                        created_step=-1 if plan.step_id is None else int(plan.step_id),
+                        proposal_len=gamma,
+                        accepted_len=-1,
+                        base_len=base_len,
+                        full_accept=False,
+                        partial_accept=False,
+                        reject=False,
+                        invalidated=False,
+                        applied_full_commit=False,
+                        applied_partial_recovery=False,
+                        no_mutation_reject=False,
+                        output_tokens_committed=0,
+                        invalidation_reason="",
+                    )
                 candidate_ids.append(child_id)
                 candidate_seq_ids.append(seq_id)
                 ready_ids.append(child_id)
@@ -14119,6 +14488,7 @@ class ModelRunnerBase:
                 trace_record["unified_generated_grandchild_before_parent_verified_examples"] = []
                 trace_record["unified_candidate_depth_created_before_parent_verified_count_by_depth"] = {}
                 trace_record["unified_candidate_depth_created_after_parent_verified_count_by_depth"] = {}
+            self._emit_unified_generic_proposal_outcome_registry_trace(trace_record)
             self._update_unified_raw_verified_to_committed_ratio(trace_record)
 
         trace_record["generic_rolling_parent_by_proposal_id"] = self._trace_sorted_int_map(parent_by_id)
@@ -15643,6 +16013,7 @@ class ModelRunnerBase:
     ) -> None:
         gamma = int(self.gamma)
         unified_enabled = self._unified_generic_rolling_runtime_enabled()
+        strict_parent_guard = bool(unified_enabled and self._unified_generic_max_unverified_depth_ahead() == 1)
         parent_committed_by_depth = self._trace_depth_indexed_int_lists(
             trace_record.get("generic_rolling_real_committed_proposal_ids_by_depth")
         )
@@ -15780,6 +16151,17 @@ class ModelRunnerBase:
                     list(to_verify_tokens[:token_count]) == list(proposal_tokens[:token_count])
                 )
             token_count_by_id[proposal_id] = token_count
+            if unified_enabled:
+                self._upsert_unified_generic_proposal_outcome(
+                    proposal_id,
+                    seq_id=seq_id,
+                    root_id=root_id,
+                    depth=depth,
+                    parent_proposal_id=parent_id,
+                    created_step=int(decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))),
+                    proposal_len=token_count,
+                    base_len=base_len,
+                )
             status_by_id[proposal_id] = f"GENERIC_DEPTH{depth}_READY_AFTER_PARENT_COMMIT"
             status_reason_by_id[proposal_id] = (
                 "normal_frontier"
@@ -15800,15 +16182,50 @@ class ModelRunnerBase:
                 verify_result == "skipped_invalid"
                 or action in {"discard_partial_no_mutation", "discard_reject_no_mutation", "skipped_invalid_no_mutation"}
             )
+            parent_allowed = True
+            parent_guard_reason = "root_depth1"
+            parent_state = {
+                "lookup_found": parent_id < 0,
+                "state": "root_depth1" if parent_id < 0 else "unchecked",
+                "proposal_id": int(parent_id),
+            }
+            if strict_parent_guard and depth > 1:
+                parent_allowed, parent_guard_reason, parent_state = self._unified_generic_parent_outcome_state(
+                    parent_id,
+                    seq=seq,
+                    child_depth=depth,
+                    child_base_len=base_len,
+                    root_id=root_id,
+                )
+                self._record_unified_child_generation_provenance(
+                    trace_record,
+                    child_id=proposal_id,
+                    child_depth=depth,
+                    child_seq_id=seq_id,
+                    child_root_id=root_id,
+                    child_created_step=int(
+                        decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))
+                    ),
+                    parent_id=parent_id,
+                    parent_allowed=parent_allowed,
+                    parent_reason=parent_guard_reason,
+                    parent_state=parent_state,
+                )
             if depth < min_depth:
                 reason = "depth_below_generic_unified" if unified_enabled else "depth_below_generic_tail"
             elif depth > int(getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0):
                 reason = "max_depth_exceeded"
-            elif not (unified_enabled and depth == 1 and parent_id < 0) and parent_id not in set(
+            elif strict_parent_guard and depth > 1 and not parent_allowed:
+                reason = "parent_not_full_accept"
+            elif not (unified_enabled and depth == 1 and parent_id < 0) and not (
+                strict_parent_guard and depth > 1
+            ) and parent_id not in set(
                 parent_committed_by_depth.get(depth - 1, [])
             ):
                 reason = "parent_not_full_accept"
-            elif not (unified_enabled and depth == 1 and parent_id < 0) and int(
+            elif not (unified_enabled and depth == 1 and parent_id < 0) and not (
+                strict_parent_guard and depth > 1
+            ) and int(
                 parent_depth_by_id.get(parent_id, depth - 1)
             ) != depth - 1:
                 reason = "parent_depth_mismatch"
@@ -15831,6 +16248,25 @@ class ModelRunnerBase:
             elif no_mutation_result:
                 reason = str(decision.get("skip_reason", verify_result if verify_result != "full_accept" else action))
             if reason is not None:
+                if unified_enabled:
+                    self._upsert_unified_generic_proposal_outcome(
+                        proposal_id,
+                        verified_step=-1 if plan.step_id is None else int(plan.step_id),
+                        accepted_len=accept_len,
+                        proposal_len=token_count,
+                        full_accept=verify_result == "full_accept",
+                        partial_accept=verify_result == "partial_accept",
+                        reject=verify_result == "reject_at_first_token",
+                        invalidated=True,
+                        applied_full_commit=False,
+                        applied_partial_recovery=False,
+                        no_mutation_reject=bool(
+                            verify_result == "reject_at_first_token"
+                            or action in {"discard_reject_no_mutation", "skipped_invalid_no_mutation"}
+                        ),
+                        output_tokens_committed=0,
+                        invalidation_reason=reason,
+                    )
                 self._increment_generic_stop_reason(trace_record, reason)
                 if (
                     unified_enabled
@@ -15876,6 +16312,22 @@ class ModelRunnerBase:
                 seq.append_token(int(token_id))
                 self.scheduler.block_manager.may_append(seq)
             if partial_recovery:
+                if unified_enabled:
+                    self._upsert_unified_generic_proposal_outcome(
+                        proposal_id,
+                        verified_step=-1 if plan.step_id is None else int(plan.step_id),
+                        accepted_len=accept_len,
+                        proposal_len=token_count,
+                        full_accept=False,
+                        partial_accept=True,
+                        reject=False,
+                        invalidated=False,
+                        applied_full_commit=False,
+                        applied_partial_recovery=True,
+                        no_mutation_reject=False,
+                        output_tokens_committed=len(commit_tokens),
+                        invalidation_reason="",
+                    )
                 seq.pre_verify = True
                 seq.record_accepted(max(0, accept_len))
                 self._mark_eager_commit_finished_if_needed(seq, commit_tokens)
@@ -15908,6 +16360,22 @@ class ModelRunnerBase:
                         1,
                     )
                 continue
+            if unified_enabled:
+                self._upsert_unified_generic_proposal_outcome(
+                    proposal_id,
+                    verified_step=-1 if plan.step_id is None else int(plan.step_id),
+                    accepted_len=accept_len,
+                    proposal_len=token_count,
+                    full_accept=True,
+                    partial_accept=False,
+                    reject=False,
+                    invalidated=False,
+                    applied_full_commit=True,
+                    applied_partial_recovery=False,
+                    no_mutation_reject=False,
+                    output_tokens_committed=len(commit_tokens),
+                    invalidation_reason="",
+                )
             seq.pre_verify = False
             seq.record_accepted(token_count)
             self._mark_eager_commit_finished_if_needed(seq, commit_tokens)
@@ -15954,6 +16422,17 @@ class ModelRunnerBase:
                 )
 
         for depth in sorted(set(candidate_ids_by_depth) | set(committed_ids_by_depth)):
+            if unified_enabled and candidate_ids_by_depth.get(depth):
+                raw_candidate_counts = self._trace_depth_indexed_int_map(
+                    trace_record.get("unified_raw_candidate_proposal_count_by_depth")
+                )
+                raw_candidate_counts[int(depth)] = max(
+                    int(raw_candidate_counts.get(int(depth), 0)),
+                    len(set(int(item) for item in candidate_ids_by_depth.get(depth, []))),
+                )
+                trace_record["unified_raw_candidate_proposal_count_by_depth"] = self._trace_depth_map_to_json(
+                    raw_candidate_counts
+                )
             self._update_generic_depth_trace_lists(
                 trace_record,
                 depth=depth,
@@ -16063,6 +16542,7 @@ class ModelRunnerBase:
                     trace_record["unified_commit_budget_saturated_step_count"] = int(
                         output_tokens >= int(trace_record.get("unified_commit_budget_tokens_per_step", 0) or 0)
                     )
+            self._emit_unified_generic_proposal_outcome_registry_trace(trace_record)
             self._update_unified_raw_verified_to_committed_ratio(trace_record)
 
     def _run_rolling_depth4_commit_ready_only(

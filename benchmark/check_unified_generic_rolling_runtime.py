@@ -61,6 +61,18 @@ def as_bool_map(value: Any) -> dict[int, bool]:
     return result
 
 
+def as_str_map(value: Any) -> dict[int, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, str] = {}
+    for key, item in value.items():
+        try:
+            result[int(key)] = str(item)
+        except Exception:
+            continue
+    return result
+
+
 def as_int_list_map(value: Any) -> dict[int, list[int]]:
     if not isinstance(value, dict):
         return {}
@@ -127,6 +139,14 @@ def merge_bool_map(records: list[dict[str, Any]], field: str) -> dict[int, bool]
     merged: dict[int, bool] = {}
     for record in records:
         for key, value in as_bool_map(record.get(field)).items():
+            merged.setdefault(key, value)
+    return merged
+
+
+def merge_str_map(records: list[dict[str, Any]], field: str) -> dict[int, str]:
+    merged: dict[int, str] = {}
+    for record in records:
+        for key, value in as_str_map(record.get(field)).items():
             merged.setdefault(key, value)
     return merged
 
@@ -461,14 +481,20 @@ def raw_and_budget_summary(
     ]
     summary: dict[str, Any] = {}
     for field in raw_fields:
-        if has_trace_field(records, field):
+        if field == "unified_raw_candidate_proposal_count_by_depth":
+            traced_candidate = sum_depth_counts(records, field) if has_trace_field(records, field) else {}
+            derived_candidate = count_depth_lists(candidate_by_depth)
+            summary[field] = traced_candidate or derived_candidate
+            summary["unified_raw_candidate_proposal_count_available"] = bool(
+                summary[field] or traced_candidate or derived_candidate
+            )
+        elif has_trace_field(records, field):
             summary[field] = sum_depth_counts(records, field)
-        elif field == "unified_raw_candidate_proposal_count_by_depth":
-            summary[field] = count_depth_lists(candidate_by_depth)
         elif field == "unified_raw_committed_proposal_count_by_depth":
             summary[field] = count_depth_lists(committed_by_depth)
         else:
             summary[field] = fallback.get(field, {})
+    summary.setdefault("unified_raw_candidate_proposal_count_available", False)
     summary["unified_raw_accepted_len_hist_by_depth"] = (
         sum_nested_int_hist(records, "unified_raw_accepted_len_hist_by_depth")
         if has_trace_field(records, "unified_raw_accepted_len_hist_by_depth")
@@ -731,6 +757,74 @@ def single_child_ahead_summary(
         **depth_by_id,
         **merge_int_map(records, "unified_candidate_depth_by_proposal_id"),
     }
+    committed_by_depth = merge_depth_lists(records, "generic_rolling_real_committed_proposal_ids_by_depth")
+    committed_depth_by_id: dict[int, int] = {}
+    for committed_depth, committed_ids in committed_by_depth.items():
+        for committed_id in committed_ids:
+            committed_depth_by_id.setdefault(int(committed_id), int(committed_depth))
+    committed_accept_by_id = merge_int_map(records, "generic_rolling_real_committed_accept_len_by_proposal_id")
+    committed_token_by_id = merge_int_map(
+        records,
+        "generic_rolling_real_committed_token_count_by_proposal_id",
+        "generic_rolling_token_count_by_proposal_id",
+    )
+    committed_action_by_id = merge_str_map(records, "generic_rolling_real_commit_action_by_proposal_id")
+    committed_result_by_id = merge_str_map(records, "generic_rolling_real_commit_verify_result_by_proposal_id")
+    gamma = max_record_int(records, "normal_gamma")
+
+    registry_depth_by_id = merge_int_map(records, "unified_proposal_registry_depth_by_proposal_id")
+    registry_full_by_id = merge_bool_map(records, "unified_proposal_registry_full_accept_by_proposal_id")
+    registry_partial_by_id = merge_bool_map(records, "unified_proposal_registry_partial_accept_by_proposal_id")
+    registry_reject_by_id = merge_bool_map(records, "unified_proposal_registry_reject_by_proposal_id")
+    registry_invalidated_by_id = merge_bool_map(records, "unified_proposal_registry_invalidated_by_proposal_id")
+    registry_applied_full_by_id = merge_bool_map(
+        records,
+        "unified_proposal_registry_applied_full_commit_by_proposal_id",
+    )
+    registry_applied_partial_by_id = merge_bool_map(
+        records,
+        "unified_proposal_registry_applied_partial_recovery_by_proposal_id",
+    )
+    registry_no_mutation_reject_by_id = merge_bool_map(
+        records,
+        "unified_proposal_registry_no_mutation_reject_by_proposal_id",
+    )
+
+    child_parent_lookup_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_lookup_found_by_proposal_id",
+    )
+    child_parent_allowed_by_id = merge_bool_map(records, "unified_child_generation_allowed_by_proposal_id")
+    child_parent_full_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_full_accept_by_proposal_id",
+    )
+    child_parent_partial_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_partial_accept_by_proposal_id",
+    )
+    child_parent_reject_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_reject_by_proposal_id",
+    )
+    child_parent_invalidated_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_invalidated_by_proposal_id",
+    )
+    child_parent_applied_full_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_applied_full_commit_by_proposal_id",
+    )
+    child_parent_applied_partial_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_applied_partial_recovery_by_proposal_id",
+    )
+    child_parent_no_mutation_reject_by_id = merge_bool_map(
+        records,
+        "unified_child_generation_parent_no_mutation_reject_by_proposal_id",
+    )
+    child_parent_state_by_id = merge_str_map(records, "unified_child_generation_parent_state_by_proposal_id")
+    child_generation_block_by_id = merge_str_map(records, "unified_child_generation_block_reason_by_proposal_id")
 
     candidate_depth_by_id: dict[int, int] = {}
     candidate_ids: set[int] = set()
@@ -808,6 +902,15 @@ def single_child_ahead_summary(
 
     before_parent_verified_by_depth: Counter[str] = Counter()
     after_parent_verified_by_depth: Counter[str] = Counter()
+    full_parent_by_depth: Counter[str] = Counter()
+    non_full_parent_by_depth: Counter[str] = Counter()
+    unverified_parent_by_depth: Counter[str] = Counter()
+    partial_parent_by_depth: Counter[str] = Counter()
+    reject_parent_by_depth: Counter[str] = Counter()
+    invalidated_parent_by_depth: Counter[str] = Counter()
+    missing_parent_by_depth: Counter[str] = Counter()
+    guard_violation_ids: set[int] = set()
+    guard_examples: list[dict[str, Any]] = []
     for proposal_id in sorted(candidate_ids):
         parent_id = parent_by_id.get(int(proposal_id))
         if parent_id is None or int(parent_id) < 0:
@@ -822,9 +925,100 @@ def single_child_ahead_summary(
         elif parent_step >= 0 and child_step > parent_step:
             after_parent_verified_by_depth[str(depth)] += 1
 
+        if depth <= 1:
+            continue
+        parent_id = int(parent_id)
+        parent_committed = parent_id in committed_depth_by_id
+        parent_token_len = int(committed_token_by_id.get(parent_id, gamma or 0))
+        parent_accept_len = int(committed_accept_by_id.get(parent_id, parent_token_len))
+        inferred_full = bool(
+            parent_committed
+            and int(committed_depth_by_id.get(parent_id, depth - 1)) == depth - 1
+            and parent_token_len > 0
+            and parent_accept_len == parent_token_len
+            and str(committed_result_by_id.get(parent_id, "full_accept")) == "full_accept"
+            and str(committed_action_by_id.get(parent_id, "append_full_accept_real_commit"))
+            == "append_full_accept_real_commit"
+        )
+        lookup_known = (
+            child_parent_lookup_by_id.get(proposal_id)
+            if proposal_id in child_parent_lookup_by_id
+            else bool(parent_id in registry_depth_by_id or parent_committed)
+        )
+        parent_full = (
+            child_parent_full_by_id.get(proposal_id)
+            if proposal_id in child_parent_full_by_id
+            else bool(registry_full_by_id.get(parent_id, inferred_full))
+        )
+        parent_applied_full = (
+            child_parent_applied_full_by_id.get(proposal_id)
+            if proposal_id in child_parent_applied_full_by_id
+            else bool(registry_applied_full_by_id.get(parent_id, inferred_full))
+        )
+        parent_partial = (
+            child_parent_partial_by_id.get(proposal_id)
+            if proposal_id in child_parent_partial_by_id
+            else bool(registry_partial_by_id.get(parent_id, False))
+        )
+        parent_reject = (
+            child_parent_reject_by_id.get(proposal_id)
+            if proposal_id in child_parent_reject_by_id
+            else bool(registry_reject_by_id.get(parent_id, False))
+        )
+        parent_invalidated = (
+            child_parent_invalidated_by_id.get(proposal_id)
+            if proposal_id in child_parent_invalidated_by_id
+            else bool(registry_invalidated_by_id.get(parent_id, False))
+        )
+        parent_applied_partial = (
+            child_parent_applied_partial_by_id.get(proposal_id)
+            if proposal_id in child_parent_applied_partial_by_id
+            else bool(registry_applied_partial_by_id.get(parent_id, False))
+        )
+        parent_no_mutation_reject = (
+            child_parent_no_mutation_reject_by_id.get(proposal_id)
+            if proposal_id in child_parent_no_mutation_reject_by_id
+            else bool(registry_no_mutation_reject_by_id.get(parent_id, False))
+        )
+        allowed = (
+            child_parent_allowed_by_id.get(proposal_id)
+            if proposal_id in child_parent_allowed_by_id
+            else bool(lookup_known and parent_full and parent_applied_full and not parent_invalidated)
+        )
+        depth_key = str(depth)
+        if lookup_known and parent_full and parent_applied_full and not parent_invalidated:
+            full_parent_by_depth[depth_key] += 1
+        if not lookup_known:
+            missing_parent_by_depth[depth_key] += 1
+            unverified_parent_by_depth[depth_key] += 1
+        elif parent_invalidated:
+            invalidated_parent_by_depth[depth_key] += 1
+        elif parent_partial or parent_applied_partial:
+            partial_parent_by_depth[depth_key] += 1
+        elif parent_reject or parent_no_mutation_reject:
+            reject_parent_by_depth[depth_key] += 1
+        elif not (parent_full and parent_applied_full):
+            non_full_parent_by_depth[depth_key] += 1
+        if not allowed:
+            guard_violation_ids.add(int(proposal_id))
+            if len(guard_examples) < 8:
+                guard_examples.append(
+                    {
+                        "child_proposal_id": int(proposal_id),
+                        "child_depth": int(depth),
+                        "parent_proposal_id": int(parent_id),
+                        "parent_lookup_found": bool(lookup_known),
+                        "parent_state": str(child_parent_state_by_id.get(proposal_id, "")),
+                        "block_reason": str(child_generation_block_by_id.get(proposal_id, "")),
+                        "parent_full_accept": bool(parent_full),
+                        "parent_applied_full_commit": bool(parent_applied_full),
+                    }
+                )
+
     trace_violation_count = sum_record_int(records, "unified_single_child_ahead_violation_count")
     trace_grandchild_count = sum_record_int(records, "unified_generated_grandchild_before_parent_verified_count")
     derived_violation_count = len(violation_examples) if configured_limit > 0 else 0
+    parent_guard_violation_count = len(guard_violation_ids)
     return {
         "unified_single_child_ahead_enabled": bool(single_child_enabled),
         "unified_max_unverified_depth_ahead": int(configured_limit),
@@ -848,6 +1042,29 @@ def single_child_ahead_summary(
         "unified_candidate_depth_created_after_parent_verified_count_by_depth": dict(
             sorted(after_parent_verified_by_depth.items(), key=lambda item: int(item[0]))
         ),
+        "unified_child_generated_from_full_accept_parent_count_by_depth": dict(
+            sorted(full_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_generated_from_non_full_parent_count_by_depth": dict(
+            sorted(non_full_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_generated_from_unverified_parent_count_by_depth": dict(
+            sorted(unverified_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_generated_from_partial_parent_count_by_depth": dict(
+            sorted(partial_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_generated_from_reject_parent_count_by_depth": dict(
+            sorted(reject_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_generated_from_invalidated_parent_count_by_depth": dict(
+            sorted(invalidated_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_parent_outcome_missing_count_by_depth": dict(
+            sorted(missing_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_parent_full_accept_guard_violation_count": int(parent_guard_violation_count),
+        "unified_child_parent_full_accept_guard_examples": guard_examples[:8],
     }
 
 
@@ -963,6 +1180,20 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     reason_by_depth = stop_reasons_by_depth(records)
     utilization = utilization_summary(records)
     diagnostics = raw_and_budget_summary(records, candidate_by_depth, committed_by_depth)
+    child_depth_verified_by_depth = {
+        str(depth): int(count)
+        for depth, count in diagnostics.get("unified_raw_verified_proposal_count_by_depth", {}).items()
+        if int(depth) > 1
+    }
+    child_depth_invalidated_parent_not_full_by_depth = sum_depth_counts(
+        records,
+        "unified_invalidated_due_to_parent_not_full_accept_count_by_depth",
+    )
+    child_depth_invalidated_parent_not_full_by_depth = {
+        str(depth): int(count)
+        for depth, count in child_depth_invalidated_parent_not_full_by_depth.items()
+        if int(depth) > 1
+    }
     single_child_diagnostics = single_child_ahead_summary(
         records,
         result_args,
@@ -1155,6 +1386,12 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "unified_parent_not_full_accept_count_by_depth": reason_count_by_depth(
             reason_by_depth,
             "parent_not_full_accept",
+        ),
+        "unified_child_depth_verified_count_by_depth": dict(
+            sorted(child_depth_verified_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_depth_invalidated_parent_not_full_count_by_depth": dict(
+            sorted(child_depth_invalidated_parent_not_full_by_depth.items(), key=lambda item: int(item[0]))
         ),
         "unified_stop_reason_counts_by_depth": reason_by_depth,
         "unified_no_eligible_parent_count_by_depth": reason_count_by_depth(
@@ -1537,6 +1774,31 @@ def validate_records(
             errors.append(
                 "generated grandchild before parent verification examples: "
                 f"{summary.get('unified_generated_grandchild_before_parent_verified_examples')}"
+            )
+        if int_value(summary.get("unified_child_parent_full_accept_guard_violation_count"), 0) > 0:
+            errors.append(
+                "single-child parent full-accept guard violation examples: "
+                f"{summary.get('unified_child_parent_full_accept_guard_examples')}"
+            )
+        child_parent_not_full = summary.get("unified_child_depth_invalidated_parent_not_full_count_by_depth", {})
+        if any(int_value(value, 0) > 0 for value in child_parent_not_full.values()):
+            errors.append(
+                "single-child child depth invalidated as parent_not_full_accept: "
+                f"{child_parent_not_full}"
+            )
+        child_full_parent = summary.get("unified_child_generated_from_full_accept_parent_count_by_depth", {})
+        candidate_counts = summary.get("unified_raw_candidate_proposal_count_by_depth", {})
+        missing_provenance_depths = [
+            str(depth)
+            for depth, count in sorted(candidate_counts.items(), key=lambda item: int(item[0]))
+            if int(depth) > 1
+            and int_value(count, 0) > 0
+            and int_value(child_full_parent.get(str(depth)), 0) <= 0
+        ]
+        if missing_provenance_depths:
+            errors.append(
+                "single-child depth>1 candidates require full-accepted parent provenance: "
+                f"depths={missing_provenance_depths}"
             )
     if max_depth > 4 and max_real <= 4 and not target_verified_reject_only and not single_child_ahead_enabled:
         errors.append("max real committed depth must exceed 4 when configured max depth exceeds 4")
@@ -2082,8 +2344,12 @@ def synthetic_single_child_records(
     max_unverified_ahead: int = 1,
     committed_depths: set[int] | None = None,
     stop_reason: str = "target_verify_pending",
+    parent_outcomes_by_depth: dict[int, str] | None = None,
+    invalidated_parent_not_full_depths: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     committed_depths = set(committed_depths or set())
+    parent_outcomes_by_depth = dict(parent_outcomes_by_depth or {})
+    invalidated_parent_not_full_depths = set(invalidated_parent_not_full_depths or set())
     gamma = 4
     proposal_id_by_depth = {depth: 9000 + depth for depths in steps for depth in depths}
     if committed_depths:
@@ -2098,6 +2364,75 @@ def synthetic_single_child_records(
     depth_by_id = {proposal_id: depth for depth, proposal_id in proposal_id_by_depth.items()}
     total_full = int(len(committed_depths) * gamma)
     records: list[dict[str, Any]] = []
+    registry_ids = set(proposal_id_by_depth.values())
+    registry_seq_by_id = {proposal_id: 7 for proposal_id in registry_ids}
+    registry_root_by_id = {proposal_id: int(root_id) for proposal_id in registry_ids}
+    registry_depth_by_id = {proposal_id: int(depth_by_id[proposal_id]) for proposal_id in registry_ids}
+    registry_parent_by_id = {proposal_id: int(parent_by_id.get(proposal_id, -1)) for proposal_id in registry_ids}
+    registry_created_step_by_id = {
+        proposal_id: max(0, int(depth_by_id[proposal_id]) - 1) for proposal_id in registry_ids
+    }
+    registry_verified_step_by_id: dict[int, int] = {}
+    registry_accepted_by_id = {proposal_id: -1 for proposal_id in registry_ids}
+    registry_proposal_len_by_id = {proposal_id: gamma for proposal_id in registry_ids}
+    registry_base_len_by_id = {proposal_id: 100 + int(depth_by_id[proposal_id] - 1) * gamma for proposal_id in registry_ids}
+    registry_output_by_id = {proposal_id: 0 for proposal_id in registry_ids}
+    registry_full_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_partial_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_reject_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_invalidated_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_applied_full_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_applied_partial_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_no_mutation_reject_by_id = {proposal_id: False for proposal_id in registry_ids}
+    registry_invalidation_reason_by_id = {proposal_id: "" for proposal_id in registry_ids}
+    for depth, proposal_id in proposal_id_by_depth.items():
+        outcome = parent_outcomes_by_depth.get(int(depth))
+        if outcome is None and int(depth) in committed_depths:
+            outcome = "full"
+        if outcome is None:
+            continue
+        if outcome == "missing":
+            for mapping in (
+                registry_seq_by_id,
+                registry_root_by_id,
+                registry_depth_by_id,
+                registry_parent_by_id,
+                registry_created_step_by_id,
+                registry_accepted_by_id,
+                registry_proposal_len_by_id,
+                registry_base_len_by_id,
+                registry_output_by_id,
+                registry_full_by_id,
+                registry_partial_by_id,
+                registry_reject_by_id,
+                registry_invalidated_by_id,
+                registry_applied_full_by_id,
+                registry_applied_partial_by_id,
+                registry_no_mutation_reject_by_id,
+                registry_invalidation_reason_by_id,
+            ):
+                mapping.pop(proposal_id, None)
+            continue
+        registry_verified_step_by_id[proposal_id] = max(0, int(depth))
+        if outcome == "full":
+            registry_accepted_by_id[proposal_id] = gamma
+            registry_output_by_id[proposal_id] = gamma
+            registry_full_by_id[proposal_id] = True
+            registry_applied_full_by_id[proposal_id] = True
+        elif outcome in {"partial", "partial_recovery"}:
+            registry_accepted_by_id[proposal_id] = 2
+            registry_output_by_id[proposal_id] = 3 if outcome == "partial_recovery" else 0
+            registry_partial_by_id[proposal_id] = True
+            registry_applied_partial_by_id[proposal_id] = outcome == "partial_recovery"
+        elif outcome == "reject":
+            registry_accepted_by_id[proposal_id] = 0
+            registry_reject_by_id[proposal_id] = True
+            registry_no_mutation_reject_by_id[proposal_id] = True
+        elif outcome == "invalidated":
+            registry_accepted_by_id[proposal_id] = 0
+            registry_invalidated_by_id[proposal_id] = True
+            registry_invalidation_reason_by_id[proposal_id] = "invalidated_ancestor"
+
     for step_index, depths in enumerate(steps):
         candidate_by_depth = {str(depth): [proposal_id_by_depth[depth]] for depth in depths}
         ready_by_depth = {str(depth): [proposal_id_by_depth[depth]] for depth in depths}
@@ -2228,7 +2563,170 @@ def synthetic_single_child_records(
             "unified_generic_normal_lane_conflict_count": 0,
             "unified_generic_target_draft_mismatch_count": 0,
             "unified_generic_parity_ok": True,
+            "unified_single_child_parent_full_accept_guard_enabled": bool(max_unverified_ahead == 1),
+            "unified_proposal_registry_seq_id_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_seq_by_id.items()
+            },
+            "unified_proposal_registry_root_id_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_root_by_id.items()
+            },
+            "unified_proposal_registry_depth_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_depth_by_id.items()
+            },
+            "unified_proposal_registry_parent_proposal_id_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_parent_by_id.items()
+            },
+            "unified_proposal_registry_created_step_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_created_step_by_id.items()
+            },
+            "unified_proposal_registry_verified_step_by_proposal_id": {
+                str(proposal_id): registry_verified_step_by_id.get(proposal_id, -1)
+                for proposal_id in registry_seq_by_id
+            },
+            "unified_proposal_registry_accepted_len_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_accepted_by_id.items()
+            },
+            "unified_proposal_registry_proposal_len_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_proposal_len_by_id.items()
+            },
+            "unified_proposal_registry_base_len_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_base_len_by_id.items()
+            },
+            "unified_proposal_registry_output_tokens_committed_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_output_by_id.items()
+            },
+            "unified_proposal_registry_full_accept_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_full_by_id.items()
+            },
+            "unified_proposal_registry_partial_accept_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_partial_by_id.items()
+            },
+            "unified_proposal_registry_reject_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_reject_by_id.items()
+            },
+            "unified_proposal_registry_invalidated_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_invalidated_by_id.items()
+            },
+            "unified_proposal_registry_applied_full_commit_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_applied_full_by_id.items()
+            },
+            "unified_proposal_registry_applied_partial_recovery_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_applied_partial_by_id.items()
+            },
+            "unified_proposal_registry_no_mutation_reject_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_no_mutation_reject_by_id.items()
+            },
+            "unified_proposal_registry_invalidation_reason_by_proposal_id": {
+                str(proposal_id): value for proposal_id, value in registry_invalidation_reason_by_id.items()
+            },
         }
+        child_depths = [int(depth) for depth in depths if int(depth) > 1 and int(depth) in proposal_id_by_depth]
+        if child_depths:
+            child_ids = [proposal_id_by_depth[depth] for depth in child_depths]
+            parent_ids = {child_id: parent_by_id[child_id] for child_id in child_ids}
+            record["unified_child_generation_depth_by_proposal_id"] = {
+                str(child_id): depth_by_id[child_id] for child_id in child_ids
+            }
+            record["unified_child_generation_seq_id_by_proposal_id"] = {str(child_id): 7 for child_id in child_ids}
+            record["unified_child_generation_root_id_by_proposal_id"] = {
+                str(child_id): int(root_id) for child_id in child_ids
+            }
+            record["unified_child_generation_created_step_by_proposal_id"] = {
+                str(child_id): step_index for child_id in child_ids
+            }
+            record["unified_child_generation_parent_proposal_id_by_proposal_id"] = {
+                str(child_id): parent_id for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_lookup_found_by_proposal_id"] = {
+                str(child_id): parent_id in registry_depth_by_id for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_depth_by_proposal_id"] = {
+                str(child_id): registry_depth_by_id.get(parent_id, -1) for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_created_step_by_proposal_id"] = {
+                str(child_id): registry_created_step_by_id.get(parent_id, -1)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_verified_step_by_proposal_id"] = {
+                str(child_id): registry_verified_step_by_id.get(parent_id, -1)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_accepted_len_by_proposal_id"] = {
+                str(child_id): registry_accepted_by_id.get(parent_id, -1)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_proposal_len_by_proposal_id"] = {
+                str(child_id): registry_proposal_len_by_id.get(parent_id, gamma)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_full_accept_by_proposal_id"] = {
+                str(child_id): registry_full_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_partial_accept_by_proposal_id"] = {
+                str(child_id): registry_partial_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_reject_by_proposal_id"] = {
+                str(child_id): registry_reject_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_invalidated_by_proposal_id"] = {
+                str(child_id): registry_invalidated_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_applied_full_commit_by_proposal_id"] = {
+                str(child_id): registry_applied_full_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_applied_partial_recovery_by_proposal_id"] = {
+                str(child_id): registry_applied_partial_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_no_mutation_reject_by_proposal_id"] = {
+                str(child_id): registry_no_mutation_reject_by_id.get(parent_id, False)
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_allowed_by_proposal_id"] = {
+                str(child_id): bool(
+                    parent_id in registry_depth_by_id
+                    and registry_full_by_id.get(parent_id, False)
+                    and registry_applied_full_by_id.get(parent_id, False)
+                    and not registry_invalidated_by_id.get(parent_id, False)
+                )
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_parent_state_by_proposal_id"] = {
+                str(child_id): (
+                    "missing"
+                    if parent_id not in registry_depth_by_id
+                    else "full_accept_applied"
+                    if registry_full_by_id.get(parent_id, False)
+                    and registry_applied_full_by_id.get(parent_id, False)
+                    and not registry_invalidated_by_id.get(parent_id, False)
+                    else "parent_invalidated"
+                    if registry_invalidated_by_id.get(parent_id, False)
+                    else "parent_partial_accept"
+                    if registry_partial_by_id.get(parent_id, False)
+                    else "parent_reject"
+                    if registry_reject_by_id.get(parent_id, False)
+                    else "parent_not_full_accept"
+                )
+                for child_id, parent_id in parent_ids.items()
+            }
+            record["unified_child_generation_block_reason_by_proposal_id"] = {
+                str(child_id): (
+                    ""
+                    if record["unified_child_generation_allowed_by_proposal_id"][str(child_id)]
+                    else record["unified_child_generation_parent_state_by_proposal_id"][str(child_id)]
+                )
+                for child_id in child_ids
+            }
+        invalidated_depths = {
+            str(depth): 1 for depth in depths if int(depth) in invalidated_parent_not_full_depths
+        }
+        if invalidated_depths:
+            record["unified_invalidated_due_to_parent_not_full_accept_count_by_depth"] = invalidated_depths
         records.append(record)
     return records
 
@@ -2471,11 +2969,13 @@ def run_synthetic_tests() -> None:
     assert not errors, f"target_tp=3 zero proposal synthetic failed: {errors}\nsummary={zero_summary}"
     assert zero_summary["unified_generic_target_verify_owner_num_proposals"] == 0
 
-    single_child_pass = synthetic_single_child_records([[1], [2], [3]])
+    single_child_pass = synthetic_single_child_records([[1], [2], [3]], committed_depths={1, 2})
     errors, single_child_summary = validate_records(single_child_pass, synthetic_single_child_payload())
     assert not errors, f"single-child-ahead pass synthetic failed: {errors}\nsummary={single_child_summary}"
     assert single_child_summary["unified_single_child_ahead_enabled"] is True
     assert single_child_summary["unified_unverified_depth_ahead_max_observed"] <= 1
+    assert single_child_summary["unified_child_generated_from_full_accept_parent_count_by_depth"]["2"] == 1
+    assert single_child_summary["unified_raw_candidate_proposal_count_available"] is True
 
     aggressive_under_flag = synthetic_single_child_records([[1, 2, 3, 4]])
     errors, aggressive_summary = validate_records(aggressive_under_flag, synthetic_single_child_payload())
@@ -2483,14 +2983,69 @@ def run_synthetic_tests() -> None:
         f"aggressive burst under single-child flag should fail: errors={errors}\nsummary={aggressive_summary}"
     )
 
-    parent_reject_one_child = synthetic_single_child_records([[1, 2]], stop_reason="parent_not_full_accept")
-    errors, reject_one_child_summary = validate_records(parent_reject_one_child, synthetic_single_child_payload())
-    assert not errors, f"parent reject with one child should pass: {errors}\nsummary={reject_one_child_summary}"
-    assert reject_one_child_summary["unified_unverified_depth_ahead_max_observed"] == 1
-
-    parent_partial_one_child = synthetic_single_child_records([[1, 2]], stop_reason="partial_recovery_selected")
+    parent_partial_one_child = synthetic_single_child_records(
+        [[1, 2]],
+        stop_reason="partial_recovery_selected",
+        parent_outcomes_by_depth={1: "partial"},
+    )
     errors, partial_one_child_summary = validate_records(parent_partial_one_child, synthetic_single_child_payload())
-    assert not errors, f"parent partial with one child should pass: {errors}\nsummary={partial_one_child_summary}"
+    assert any("parent full-accept guard" in error for error in errors), (
+        f"child from verified partial parent should fail: errors={errors}\nsummary={partial_one_child_summary}"
+    )
+
+    parent_reject_one_child = synthetic_single_child_records(
+        [[1, 2]],
+        stop_reason="parent_not_full_accept",
+        parent_outcomes_by_depth={1: "reject"},
+    )
+    errors, reject_one_child_summary = validate_records(parent_reject_one_child, synthetic_single_child_payload())
+    assert any("parent full-accept guard" in error for error in errors), (
+        f"child from verified reject parent should fail: errors={errors}\nsummary={reject_one_child_summary}"
+    )
+
+    parent_invalidated_one_child = synthetic_single_child_records(
+        [[1, 2]],
+        stop_reason="parent_not_full_accept",
+        parent_outcomes_by_depth={1: "invalidated"},
+    )
+    errors, invalidated_one_child_summary = validate_records(
+        parent_invalidated_one_child,
+        synthetic_single_child_payload(),
+    )
+    assert any("parent full-accept guard" in error for error in errors), (
+        "child from invalidated parent should fail: "
+        f"errors={errors}\nsummary={invalidated_one_child_summary}"
+    )
+
+    parent_missing_one_child = synthetic_single_child_records(
+        [[1, 2]],
+        stop_reason="parent_not_full_accept",
+        parent_outcomes_by_depth={1: "missing"},
+    )
+    errors, missing_one_child_summary = validate_records(parent_missing_one_child, synthetic_single_child_payload())
+    assert any("parent full-accept guard" in error for error in errors), (
+        f"child from missing parent outcome should fail: errors={errors}\nsummary={missing_one_child_summary}"
+    )
+
+    full_parent_later_invalidated = synthetic_single_child_records(
+        [[1, 2]],
+        committed_depths={1},
+        stop_reason="parent_not_full_accept",
+        invalidated_parent_not_full_depths={2},
+    )
+    errors, invalidated_child_summary = validate_records(full_parent_later_invalidated, synthetic_single_child_payload())
+    assert any("invalidated as parent_not_full_accept" in error for error in errors), (
+        "child generated from full parent but invalidated as parent_not_full_accept should fail: "
+        f"errors={errors}\nsummary={invalidated_child_summary}"
+    )
+
+    partial_recovery_restart_depth1 = synthetic_single_child_records(
+        [[1], [1]],
+        parent_outcomes_by_depth={1: "partial_recovery"},
+        stop_reason="partial_recovery_selected",
+    )
+    errors, restart_summary = validate_records(partial_recovery_restart_depth1, synthetic_single_child_payload())
+    assert not errors, f"partial recovery restart depth1 synthetic should pass: {errors}\nsummary={restart_summary}"
 
     parent_full_next_child = synthetic_single_child_records([[1], [2]], committed_depths={1, 2})
     errors, full_next_summary = validate_records(parent_full_next_child, synthetic_single_child_payload())
@@ -2508,6 +3063,12 @@ def run_synthetic_tests() -> None:
     )
     assert not errors, f"default aggressive compatibility should pass: {errors}\nsummary={default_aggressive_summary}"
     assert default_aggressive_summary["unified_single_child_ahead_enabled"] is False
+
+    raw_candidate_missing = synthetic_single_child_records([[1]])
+    errors, raw_candidate_summary = validate_records(raw_candidate_missing, synthetic_single_child_payload())
+    assert not errors, f"raw candidate fallback synthetic should pass: {errors}\nsummary={raw_candidate_summary}"
+    assert raw_candidate_summary["unified_raw_candidate_proposal_count_by_depth"]["1"] == 1
+    assert raw_candidate_summary["unified_raw_candidate_proposal_count_available"] is True
 
     finished_one_child = synthetic_single_child_records([[1]], stop_reason="sequence_finished")
     errors, finished_summary = validate_records(finished_one_child, synthetic_single_child_payload())
@@ -2581,6 +3142,7 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_raw_partial_recovery_eligible_count_by_depth",
         "unified_raw_partial_recovery_ineligible_reason_counts_by_depth",
         "unified_raw_candidate_proposal_count_by_depth",
+        "unified_raw_candidate_proposal_count_available",
         "unified_raw_committed_proposal_count_by_depth",
         "unified_raw_full_commit_proposal_count_by_depth",
         "unified_raw_partial_recovery_applied_proposal_count_by_depth",
@@ -2601,6 +3163,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_generated_grandchild_before_parent_verified_examples",
         "unified_candidate_depth_created_before_parent_verified_count_by_depth",
         "unified_candidate_depth_created_after_parent_verified_count_by_depth",
+        "unified_child_generated_from_full_accept_parent_count_by_depth",
+        "unified_child_generated_from_non_full_parent_count_by_depth",
+        "unified_child_generated_from_unverified_parent_count_by_depth",
+        "unified_child_generated_from_partial_parent_count_by_depth",
+        "unified_child_generated_from_reject_parent_count_by_depth",
+        "unified_child_generated_from_invalidated_parent_count_by_depth",
+        "unified_child_parent_outcome_missing_count_by_depth",
+        "unified_child_parent_full_accept_guard_violation_count",
+        "unified_child_parent_full_accept_guard_examples",
+        "unified_child_depth_verified_count_by_depth",
+        "unified_child_depth_invalidated_parent_not_full_count_by_depth",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
         "unified_generic_target_verify_temp_append_used",
