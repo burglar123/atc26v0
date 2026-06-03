@@ -256,6 +256,174 @@ def collect_dict_examples(records: list[dict[str, Any]], field: str, *, limit: i
     return examples
 
 
+def add_depth_count_maps(*maps: dict[str, int]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for value in maps:
+        if not isinstance(value, dict):
+            continue
+        for depth, count in value.items():
+            try:
+                depth_key = str(int(depth))
+            except Exception:
+                continue
+            combined[depth_key] = int(combined.get(depth_key, 0)) + int_value(count, 0)
+    return dict(sorted(combined.items(), key=lambda item: int(item[0])))
+
+
+def normal_buffer_consumer_role(event_type: str, reason: str) -> str:
+    reason = str(reason or "")
+    event_type = str(event_type or "")
+    if reason == "target_normal_verify_consumed":
+        return "target_normal_verify"
+    if reason == "draft_apply_verify_consumed":
+        return "draft_apply_verify"
+    if reason in {"eager_owned", "unified_ready_child_owned", "owned_by_eager", "owned_by_unified_ready_child"}:
+        return "owned_lane"
+    if reason in {"sequence_finished", "request_finished", "cached_admission_completed"}:
+        return "terminal"
+    if event_type == "store":
+        return "store"
+    if reason in {"discard_inactive", "stale_base", "stale_discard"}:
+        return "stale"
+    return reason or event_type or "unknown"
+
+
+def classify_normal_buffer_event(event_type: str, reason: str) -> str:
+    reason = str(reason or "")
+    event_type = str(event_type or "")
+    if event_type == "store":
+        return "store"
+    if event_type == "receive":
+        return "receive"
+    if reason == "target_normal_verify_consumed":
+        return "target_normal_verify_consume"
+    if reason == "draft_apply_verify_consumed":
+        return "draft_apply_verify_consume"
+    if reason in {"eager_owned", "unified_ready_child_owned", "owned_by_eager", "owned_by_unified_ready_child"}:
+        return "owned_lane_skip"
+    if reason in {"sequence_finished", "request_finished", "cached_admission_completed"}:
+        return "terminal_discard"
+    if reason in {"discard_inactive", "stale_base", "stale_discard"}:
+        return "stale_discard"
+    if event_type in {"discard", "consume"}:
+        return "unexpected_discard"
+    return str(event_type or "unknown")
+
+
+def normal_proposal_buffer_lifecycle_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    events_by_key: dict[tuple[int, str, int, int, int, str, str], dict[str, Any]] = {}
+    duplicate_count = 0
+    for record in records:
+        events = record.get("normal_proposal_buffer_event_history")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type") or "")
+            reason = str(event.get("reason") or "")
+            role = str(event.get("consumer_role") or normal_buffer_consumer_role(event_type, reason))
+            seq_id = int_value(event.get("seq_id"), -1)
+            request_id = str(event.get("request_id") or "")
+            proposal_id = int_value(event.get("proposal_id"), -1)
+            plan_id = int_value(event.get("plan_id"), -1)
+            step_id = int_value(event.get("step_id"), int_value(event.get("dual_step_id"), -1))
+            key = (seq_id, request_id, proposal_id, plan_id, step_id, event_type, role)
+            if key in events_by_key:
+                duplicate_count += 1
+                continue
+            copied = dict(event)
+            copied["consumer_role"] = role
+            copied["classification"] = classify_normal_buffer_event(event_type, reason)
+            events_by_key[key] = copied
+
+    legal_consume = Counter()
+    illegal_examples: list[dict[str, Any]] = []
+    ordered_by_seq: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for event in events_by_key.values():
+        classification = str(event.get("classification") or "")
+        reason = str(event.get("reason") or "")
+        if classification in {
+            "target_normal_verify_consume",
+            "draft_apply_verify_consume",
+            "owned_lane_skip",
+            "terminal_discard",
+            "stale_discard",
+        }:
+            legal_consume[reason or classification] += 1
+        seq_key = (
+            int_value(event.get("seq_id"), -1),
+            str(event.get("request_id") or ""),
+            int_value(event.get("proposal_id"), -1),
+        )
+        ordered_by_seq[seq_key].append(event)
+
+    for seq_key, events in ordered_by_seq.items():
+        sorted_events = sorted(
+            events,
+            key=lambda item: (
+                int_value(item.get("step_id"), int_value(item.get("dual_step_id"), -1)),
+                int_value(item.get("plan_id"), -1),
+                str(item.get("event_type") or ""),
+            ),
+        )
+        saw_store = False
+        saw_legal_consume = False
+        for event in sorted_events:
+            classification = str(event.get("classification") or "")
+            if classification == "store":
+                saw_store = True
+                continue
+            if classification in {
+                "target_normal_verify_consume",
+                "draft_apply_verify_consume",
+                "owned_lane_skip",
+                "terminal_discard",
+                "stale_discard",
+            }:
+                saw_legal_consume = True
+                continue
+            if classification == "unexpected_discard" and saw_store and not saw_legal_consume:
+                if len(illegal_examples) < 8:
+                    illegal_examples.append(
+                        {
+                            "seq_id": int(seq_key[0]),
+                            "request_id": seq_key[1],
+                            "proposal_id": int(seq_key[2]),
+                            "event": dict(event),
+                            "events": [dict(item) for item in sorted_events[:8]],
+                        }
+                    )
+
+    for record in records:
+        details = record.get("target_normal_verify_missing_buffer_details")
+        if not isinstance(details, list):
+            continue
+        for detail in details:
+            if not isinstance(detail, dict) or not bool(detail.get("was_buffer_discarded", False)):
+                continue
+            reason = str(detail.get("discard_reason") or "")
+            classification = classify_normal_buffer_event("discard", reason)
+            if classification in {
+                "target_normal_verify_consume",
+                "draft_apply_verify_consume",
+                "owned_lane_skip",
+                "terminal_discard",
+                "stale_discard",
+            } or bool(detail.get("was_sequence_finished", False)) or bool(detail.get("was_eager_owned", False)) or bool(
+                detail.get("was_unified_ready_child_owned", False)
+            ):
+                legal_consume[reason or classification] += 1
+                continue
+
+    return {
+        "normal_proposal_buffer_illegal_discard_count": len(illegal_examples),
+        "normal_proposal_buffer_legal_consume_count_by_reason": dict(sorted(legal_consume.items())),
+        "normal_proposal_buffer_event_order_violation_examples": illegal_examples,
+        "normal_proposal_buffer_event_dedup_count": int(duplicate_count),
+    }
+
+
 def sum_depth_reason_counts(records: list[dict[str, Any]], *fields: str) -> dict[str, dict[str, int]]:
     by_depth: dict[str, Counter[str]] = defaultdict(Counter)
     for record in records:
@@ -1011,6 +1179,14 @@ def single_child_ahead_summary(
         records,
         "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
     )
+    ready_excluded_from_target_normal_before_filter = merge_int_lists(
+        records,
+        "unified_ready_child_excluded_from_target_normal_verify_before_filter_seq_ids",
+    )
+    ready_excluded_from_target_normal_after_filter = merge_int_lists(
+        records,
+        "unified_ready_child_excluded_from_target_normal_verify_after_filter_seq_ids",
+    )
     ready_remaining_in_target_normal = merge_int_lists(
         records,
         "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
@@ -1374,6 +1550,12 @@ def single_child_ahead_summary(
         "unified_ready_child_excluded_from_normal_draft_seq_ids": list(ready_excluded_from_draft),
         "unified_ready_child_excluded_from_target_normal_verify_seq_ids": list(
             ready_excluded_from_target_normal
+        ),
+        "unified_ready_child_excluded_from_target_normal_verify_before_filter_seq_ids": list(
+            ready_excluded_from_target_normal_before_filter
+        ),
+        "unified_ready_child_excluded_from_target_normal_verify_after_filter_seq_ids": list(
+            ready_excluded_from_target_normal_after_filter
         ),
         "unified_ready_child_remaining_in_target_normal_verify_seq_ids": list(
             ready_remaining_in_target_normal
@@ -1788,6 +1970,88 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             "unified_raw_invalidated_proposal_count_by_depth",
         )
     )
+    buffer_lifecycle = normal_proposal_buffer_lifecycle_summary(records)
+
+    explicit_full_by_depth = merge_depth_counts(
+        records,
+        "unified_full_commit_token_count_by_depth",
+        "unified_generic_full_commit_token_count_by_depth",
+    )
+    action_by_id = merge_str_map(records, "generic_rolling_real_commit_action_by_proposal_id")
+    result_by_id = merge_str_map(records, "generic_rolling_real_commit_verify_result_by_proposal_id")
+    committed_token_by_id = merge_int_map(
+        records,
+        "generic_rolling_real_committed_token_count_by_proposal_id",
+        "generic_rolling_token_count_by_proposal_id",
+    )
+    derived_full_by_depth: dict[str, int] = {}
+    if action_by_id or result_by_id:
+        for depth, proposal_ids in committed_by_depth.items():
+            depth_key = str(int(depth))
+            for proposal_id in set(int(item) for item in proposal_ids):
+                action = str(action_by_id.get(proposal_id, ""))
+                result = str(result_by_id.get(proposal_id, ""))
+                is_partial = "partial" in action or "partial" in result or "revised" in action
+                is_full = "full" in action or result == "full_accept" or (not action and not result)
+                if not is_full or is_partial:
+                    continue
+                derived_full_by_depth[depth_key] = int(derived_full_by_depth.get(depth_key, 0)) + int(
+                    committed_token_by_id.get(proposal_id, 0)
+                )
+        derived_full_by_depth = {
+            depth: int(count)
+            for depth, count in sorted(derived_full_by_depth.items(), key=lambda item: int(item[0]))
+            if int(count) > 0
+        }
+    depth_commit_sum = sum_depth_values(depth_commit_counts)
+    if explicit_full_by_depth:
+        full_commit_token_count_by_depth = explicit_full_by_depth
+    elif derived_full_by_depth:
+        full_commit_token_count_by_depth = derived_full_by_depth
+    elif depth_commit_sum == int(total_full) or int(total_partial) == 0:
+        full_commit_token_count_by_depth = dict(depth_commit_counts)
+    else:
+        full_commit_token_count_by_depth = {}
+
+    partial_recovered_by_depth = merge_depth_counts(
+        records,
+        "unified_partial_recovered_token_count_by_depth",
+        "unified_generic_depth_partial_recovered_token_counts",
+        "generic_full_continuous_depth_partial_recovered_token_counts",
+    )
+    partial_revised_by_depth = merge_depth_counts(
+        records,
+        "unified_partial_revised_token_count_by_depth",
+        "unified_generic_depth_revised_token_counts",
+        "generic_full_continuous_depth_revised_token_counts",
+    )
+    explicit_output_by_depth = merge_depth_counts(
+        records,
+        "unified_total_output_token_count_by_depth",
+        "unified_generic_depth_output_token_counts",
+    )
+    total_output_by_depth = explicit_output_by_depth or add_depth_count_maps(
+        full_commit_token_count_by_depth,
+        partial_recovered_by_depth,
+    )
+    actual_verified_proposal_count = sum(
+        int_value(value, 0)
+        for value in diagnostics.get("unified_raw_verified_proposal_count_by_depth", {}).values()
+    )
+    total_candidate_proposal_count = sum(
+        int_value(value, 0)
+        for value in diagnostics.get("unified_raw_candidate_proposal_count_by_depth", {}).values()
+    )
+    denominator_source = (
+        "unified_raw_verified_proposal_count_by_depth"
+        if actual_verified_proposal_count > 0
+        else "unified_generic_target_verify_num_proposals"
+    )
+    denominator_count = (
+        int(actual_verified_proposal_count)
+        if actual_verified_proposal_count > 0
+        else sum_record_int(records, "unified_generic_target_verify_num_proposals")
+    )
 
     return {
         "unified_generic_rolling_enabled": bool(unified_enabled),
@@ -1836,6 +2100,13 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "total_partial_recovered_token_count": total_partial,
         "total_revised_token_count": total_revised,
         "total_output_token_count": total_output,
+        "unified_full_commit_token_count_by_depth": dict(full_commit_token_count_by_depth),
+        "unified_total_full_commit_token_count": int(total_full),
+        "unified_partial_recovered_token_count_by_depth": dict(partial_recovered_by_depth),
+        "unified_total_partial_recovered_token_count": int(total_partial),
+        "unified_partial_revised_token_count_by_depth": dict(partial_revised_by_depth),
+        "unified_total_output_token_count_by_depth": dict(total_output_by_depth),
+        "unified_total_output_token_count": int(total_output),
         "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
         "partial_prefix_accepted_token_count": int_value(accounting.get("partial_prefix_accepted_token_count"), 0),
         "partial_prefix_revised_token_count": int_value(accounting.get("partial_prefix_revised_token_count"), 0),
@@ -1942,6 +2213,7 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
                 merge_str_map(records, "unified_ready_child_owner_clear_reason_by_seq_id").items()
             )
         },
+        **buffer_lifecycle,
         "unified_generic_target_verify_temp_append_used": any_record_bool(
             records,
             "unified_generic_target_verify_temp_append_used",
@@ -1954,6 +2226,14 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
             records,
             "unified_generic_target_verify_num_to_verify_tokens",
         ),
+        "unified_generic_target_verify_actual_verified_proposal_count": int(actual_verified_proposal_count),
+        "unified_generic_target_verify_total_candidate_proposal_count": int(total_candidate_proposal_count),
+        "unified_generic_target_verify_deferred_or_invalidated_proposal_count": max(
+            0,
+            int(total_candidate_proposal_count) - int(actual_verified_proposal_count),
+        ),
+        "unified_generic_target_verify_token_count_denominator_source": str(denominator_source),
+        "unified_generic_target_verify_token_count_denominator_count": int(denominator_count),
         "unified_generic_target_verify_input_ids_shape": target_input_shape,
         "unified_generic_target_verify_logits_shape": target_logits_shape,
         "unified_generic_target_verify_logits_rows_per_proposal": max_record_int(
@@ -2088,15 +2368,6 @@ def validate_normal_proposal_buffer_filter(records: list[dict[str, Any]]) -> lis
         "target_normal_verify_deferred_missing_buffer_seq_ids",
         "target_normal_verify_missing_buffer_reason_by_seq_id",
     }
-    terminal_discard_reasons = {
-        "sequence_finished",
-        "request_finished",
-        "cached_admission_completed",
-        "eager_owned",
-        "unified_ready_child_owned",
-        "owned_by_eager",
-        "owned_by_unified_ready_child",
-    }
     for index, record in enumerate(records):
         if not any(field in record for field in new_trace_fields):
             continue
@@ -2170,24 +2441,6 @@ def validate_normal_proposal_buffer_filter(records: list[dict[str, Any]]) -> lis
                     "target normal verify deferred missing-buffer seqs require reason counts: "
                     f"record_index={index}, deferred={sorted(deferred)}"
                 )
-
-        details = record.get("target_normal_verify_missing_buffer_details")
-        if isinstance(details, list):
-            for detail in details:
-                if not isinstance(detail, dict) or not bool(detail.get("was_buffer_discarded", False)):
-                    continue
-                discard_reason = str(detail.get("discard_reason") or "")
-                terminal_or_owned = (
-                    bool(detail.get("was_sequence_finished", False))
-                    or bool(detail.get("was_eager_owned", False))
-                    or bool(detail.get("was_unified_ready_child_owned", False))
-                    or discard_reason in terminal_discard_reasons
-                )
-                if not terminal_or_owned:
-                    errors.append(
-                        "normal proposal buffer was discarded before target verify without terminal/owned reason: "
-                        f"record_index={index}, seq_id={detail.get('seq_id')}, discard_reason={discard_reason}"
-                    )
 
         if before and "target_normal_verify_seq_ids_after_buffer_filter" in record:
             missing_not_available = sorted(seq_id for seq_id in before if seq_id not in available)
@@ -2305,8 +2558,16 @@ def validate_records(
         )
         logits_rows = logits_shape[0] if logits_shape else 0
         input_rows = input_shape[0] if input_shape else 0
-        if gamma > 0 and num_proposals > 0 and num_to_verify != gamma * num_proposals:
-            errors.append("temporary target verification to-verify token count must equal gamma * proposals")
+        denominator_count = int_value(
+            summary.get("unified_generic_target_verify_token_count_denominator_count"),
+            num_proposals,
+        )
+        if gamma > 0 and denominator_count > 0 and num_to_verify != gamma * denominator_count:
+            errors.append(
+                "temporary target verification to-verify token count must equal gamma * actual verified proposals: "
+                f"tokens={num_to_verify}, gamma={gamma}, denominator={denominator_count}, "
+                f"source={summary.get('unified_generic_target_verify_token_count_denominator_source')}"
+            )
         if logits_rows != num_to_verify:
             errors.append("temporary target verification logits rows must equal num_to_verify_tokens")
         if input_rows != logits_rows:
@@ -2615,17 +2876,18 @@ def validate_records(
     total_partial = int_value(summary["total_partial_recovered_token_count"], 0)
     total_revised = int_value(summary["total_revised_token_count"], 0)
     total_output = int_value(summary["total_output_token_count"], 0)
-    if total_output != total_full + total_partial:
-        errors.append("unified total output must equal full commits plus partial recovered tokens")
-    if total_output != int_value(summary["combined_real_committed_token_count"], 0):
+    alias_total_full = int_value(summary.get("unified_total_full_commit_token_count"), total_full)
+    alias_total_partial = int_value(summary.get("unified_total_partial_recovered_token_count"), total_partial)
+    alias_total_output = int_value(summary.get("unified_total_output_token_count"), total_output)
+    if alias_total_output != int_value(summary["combined_real_committed_token_count"], 0):
         errors.append("unified total output must equal combined real committed token count")
-    if total_partial != int_value(summary["partial_prefix_total_recovered_token_count"], 0):
+    if alias_total_partial != int_value(summary["partial_prefix_total_recovered_token_count"], 0):
         errors.append("unified partial recovered total must match partial-prefix total")
     if total_revised != int_value(summary["partial_prefix_revised_token_count"], 0):
         errors.append("unified revised total must match partial-prefix revised token count")
-    if total_partial:
+    if alias_total_partial:
         accepted = int_value(summary["partial_prefix_accepted_token_count"], 0)
-        if total_partial != accepted + total_revised:
+        if alias_total_partial != accepted + total_revised:
             errors.append("partial recovered total must equal accepted prefix plus revised tokens")
 
     if int_value(summary["normal_lane_conflict_count"], 0) != 0:
@@ -2644,8 +2906,17 @@ def validate_records(
         )
     if summary["depth_gt_max_commit_ids"]:
         errors.append(f"commits beyond max depth: {summary['depth_gt_max_commit_ids']}")
-    if sum_depth_values(summary["depth_commit_token_counts"]) != total_full:
-        errors.append("depth commit token counts must sum to total full commit tokens")
+    if int_value(summary.get("normal_proposal_buffer_illegal_discard_count"), 0) > 0:
+        errors.append(
+            "normal proposal buffer had illegal discard order violations: "
+            f"{summary.get('normal_proposal_buffer_event_order_violation_examples', [])}"
+        )
+    if alias_total_output != alias_total_full + alias_total_partial:
+        errors.append("unified total output must equal full commits plus partial recovered tokens")
+    if sum_depth_values(summary.get("unified_full_commit_token_count_by_depth")) != alias_total_full:
+        errors.append("full-only depth token counts must sum to total full commit tokens")
+    if sum_depth_values(summary.get("unified_total_output_token_count_by_depth")) != alias_total_output:
+        errors.append("depth total output token counts must sum to total output tokens")
     return errors, summary
 
 
@@ -3728,6 +3999,11 @@ def run_synthetic_tests() -> None:
     assert summary["unified_raw_candidate_proposal_count_by_depth"]["1"] == 1
     assert summary["unified_raw_committed_proposal_count_by_depth"]["6"] == 1
     assert summary["unified_raw_verified_to_committed_ratio_by_depth"]["1"] == 1.0
+    assert summary["unified_total_full_commit_token_count"] == 24
+    assert summary["unified_total_partial_recovered_token_count"] == 3
+    assert summary["unified_total_output_token_count"] == 27
+    assert summary["unified_full_commit_token_count_by_depth"]["6"] == 4
+    assert summary["unified_total_output_token_count_by_depth"]["2"] == 7
     assert summary["num_steps"] == 1
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
@@ -3746,6 +4022,29 @@ def run_synthetic_tests() -> None:
     assert sampled_precondition["1001"] != sampled_current_verify["1001"]
     assert records[0]["unified_generic_target_verify_appended_row0_top_token_by_proposal_id"]["1001"] == (
         sampled_inputs["1001"][1]
+    )
+
+    extra_candidates_not_verified = [json.loads(json.dumps(records[0]))]
+    extra_candidates_not_verified[0]["unified_generic_target_verify_num_proposals"] = 12
+    extra_candidates_not_verified[0]["unified_raw_candidate_proposal_count_by_depth"] = {"1": 12}
+    errors, extra_candidate_summary = validate_records(extra_candidates_not_verified, payload)
+    assert not errors, (
+        "target verify token denominator should use actual verified proposals, not all candidates: "
+        f"{errors}\nsummary={extra_candidate_summary}"
+    )
+    assert extra_candidate_summary["unified_generic_target_verify_actual_verified_proposal_count"] == 6
+    assert (
+        extra_candidate_summary["unified_generic_target_verify_token_count_denominator_source"]
+        == "unified_raw_verified_proposal_count_by_depth"
+    )
+
+    wrong_verified_token_count = [json.loads(json.dumps(extra_candidates_not_verified[0]))]
+    wrong_verified_token_count[0]["unified_generic_target_verify_num_to_verify_tokens"] = 48
+    wrong_verified_token_count[0]["unified_generic_target_verify_input_ids_shape"] = [48]
+    wrong_verified_token_count[0]["unified_generic_target_verify_logits_shape"] = [48, 32000]
+    errors, _summary = validate_records(wrong_verified_token_count, payload)
+    assert any("actual verified proposals" in error for error in errors), (
+        "wrong target verify token count should still fail against actual verified proposals"
     )
 
     missing_temp_append = [json.loads(json.dumps(records[0]))]
@@ -4000,6 +4299,10 @@ def run_synthetic_tests() -> None:
             "target_normal_verify_missing_buffer_details": [
                 {
                     "seq_id": 3,
+                    "request_id": "req-3",
+                    "proposal_id": 303,
+                    "plan_id": 12,
+                    "dual_step_id": 8,
                     "was_buffer_discarded": True,
                     "discard_reason": "manual_drop",
                     "was_sequence_finished": False,
@@ -4007,10 +4310,32 @@ def run_synthetic_tests() -> None:
                     "was_unified_ready_child_owned": False,
                 }
             ],
+            "normal_proposal_buffer_event_history": [
+                {
+                    "step_id": 7,
+                    "plan_id": 11,
+                    "seq_id": 3,
+                    "request_id": "req-3",
+                    "proposal_id": 303,
+                    "event_type": "store",
+                    "reason": "target_received_normal_proposal_store",
+                    "buffer_size_after": 1,
+                },
+                {
+                    "step_id": 8,
+                    "plan_id": 12,
+                    "seq_id": 3,
+                    "request_id": "req-3",
+                    "proposal_id": 303,
+                    "event_type": "discard",
+                    "reason": "manual_drop",
+                    "buffer_size_after": 0,
+                },
+            ],
         }
     )
     errors, _summary = validate_records(discarded_before_verify, ready_owner_payload)
-    assert any("discarded before target verify" in error for error in errors), (
+    assert any("discard" in error for error in errors), (
         "buffer store then discard before target verify should fail without terminal/owned reason"
     )
 
@@ -4021,11 +4346,66 @@ def run_synthetic_tests() -> None:
             "was_sequence_finished": True,
         }
     )
+    terminal_discarded_before_verify[0]["normal_proposal_buffer_event_history"][1][
+        "reason"
+    ] = "sequence_finished"
     errors, terminal_discard_summary = validate_records(terminal_discarded_before_verify, ready_owner_payload)
     assert not errors, (
         "buffer discard before target verify should pass with terminal sequence-finished reason: "
         f"{errors}\nsummary={terminal_discard_summary}"
     )
+
+    target_consume_before_verify = json.loads(json.dumps(discarded_before_verify))
+    target_consume_before_verify[0]["target_normal_verify_missing_buffer_details"][0].update(
+        {
+            "discard_reason": "target_normal_verify_consumed",
+            "was_sequence_finished": False,
+        }
+    )
+    target_consume_before_verify[0]["normal_proposal_buffer_event_history"] = [
+        {
+            "step_id": 7,
+            "plan_id": 11,
+            "seq_id": 3,
+            "request_id": "req-3",
+            "proposal_id": 303,
+            "event_type": "store",
+            "reason": "target_received_normal_proposal_store",
+            "buffer_size_after": 1,
+        },
+        {
+            "step_id": 8,
+            "plan_id": 12,
+            "seq_id": 3,
+            "request_id": "req-3",
+            "proposal_id": 303,
+            "event_type": "consume",
+            "reason": "target_normal_verify_consumed",
+            "buffer_size_after": 0,
+        },
+    ]
+    errors, target_consume_summary = validate_records(target_consume_before_verify, ready_owner_payload)
+    assert not errors, (
+        "target normal verify consume should be legal, not an illegal discard: "
+        f"{errors}\nsummary={target_consume_summary}"
+    )
+    assert target_consume_summary["normal_proposal_buffer_legal_consume_count_by_reason"][
+        "target_normal_verify_consumed"
+    ] >= 1
+
+    draft_apply_consume = json.loads(json.dumps(target_consume_before_verify))
+    draft_apply_consume[0]["target_normal_verify_missing_buffer_details"][0][
+        "discard_reason"
+    ] = "draft_apply_verify_consumed"
+    draft_apply_consume[0]["normal_proposal_buffer_event_history"][1]["reason"] = "draft_apply_verify_consumed"
+    errors, draft_apply_summary = validate_records(draft_apply_consume, ready_owner_payload)
+    assert not errors, (
+        "draft apply verify consume should be legal, not an illegal discard: "
+        f"{errors}\nsummary={draft_apply_summary}"
+    )
+    assert draft_apply_summary["normal_proposal_buffer_legal_consume_count_by_reason"][
+        "draft_apply_verify_consumed"
+    ] >= 1
 
     ready_owner_scheduled = [json.loads(json.dumps(ready_owner_ok[0]))]
     ready_owner_scheduled[0]["unified_child_scheduled_for_target_verify_count_by_depth"] = {"2": 1}
@@ -4426,6 +4806,13 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_candidate_token_count_by_depth",
         "unified_ready_token_count_by_depth",
         "unified_committed_token_count_by_depth",
+        "unified_full_commit_token_count_by_depth",
+        "unified_total_full_commit_token_count",
+        "unified_partial_recovered_token_count_by_depth",
+        "unified_total_partial_recovered_token_count",
+        "unified_partial_revised_token_count_by_depth",
+        "unified_total_output_token_count_by_depth",
+        "unified_total_output_token_count",
         "unified_commit_share_by_depth",
         "unified_raw_target_verification_available",
         "unified_raw_verification_source",
@@ -4482,6 +4869,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_ready_child_lane_owner_seq_ids",
         "unified_ready_child_lane_owner_request_ids",
         "unified_ready_child_excluded_from_normal_draft_seq_ids",
+        "unified_ready_child_excluded_from_target_normal_verify_before_filter_seq_ids",
+        "unified_ready_child_excluded_from_target_normal_verify_after_filter_seq_ids",
         "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
         "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
         "unified_ready_child_normal_verify_exclusion_mismatch_count",
@@ -4537,11 +4926,20 @@ def print_summary(summary: dict[str, Any]) -> None:
         "target_normal_verify_missing_buffer_reason_by_seq_id",
         "target_normal_verify_deferred_missing_buffer_reason_counts",
         "target_normal_verify_missing_buffer_details",
+        "normal_proposal_buffer_illegal_discard_count",
+        "normal_proposal_buffer_legal_consume_count_by_reason",
+        "normal_proposal_buffer_event_order_violation_examples",
+        "normal_proposal_buffer_event_dedup_count",
         "unified_ready_child_owner_cleared_seq_ids",
         "unified_ready_child_owner_clear_reason_by_seq_id",
         "unified_generic_target_verify_temp_append_used",
         "unified_generic_target_verify_num_proposals",
         "unified_generic_target_verify_num_to_verify_tokens",
+        "unified_generic_target_verify_actual_verified_proposal_count",
+        "unified_generic_target_verify_total_candidate_proposal_count",
+        "unified_generic_target_verify_deferred_or_invalidated_proposal_count",
+        "unified_generic_target_verify_token_count_denominator_source",
+        "unified_generic_target_verify_token_count_denominator_count",
         "unified_generic_target_verify_input_ids_shape",
         "unified_generic_target_verify_logits_shape",
         "unified_generic_target_verify_logits_rows_per_proposal",

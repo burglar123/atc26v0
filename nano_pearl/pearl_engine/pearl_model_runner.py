@@ -3213,6 +3213,8 @@ class ModelRunnerBase:
                         "plan_id": int(plan.plan_id),
                         "dual_step_id": int(current_step),
                         "excluded_from_normal_draft": bool(seq_id in set(draft_excluded)),
+                        "excluded_from_target_normal_verify_before_filter": bool(seq_id in set(target_excluded)),
+                        "excluded_from_target_normal_verify_after_filter": False,
                         "excluded_from_target_normal_verify": bool(seq_id in set(target_excluded)),
                     }
                 )
@@ -3224,6 +3226,7 @@ class ModelRunnerBase:
             for seq_id in owner_seq_ids
         }
         plan.unified_ready_child_excluded_from_normal_draft_seq_ids = list(draft_excluded)
+        plan.unified_ready_child_excluded_from_target_normal_verify_before_filter_seq_ids = list(target_excluded)
         plan.unified_ready_child_excluded_from_target_normal_verify_seq_ids = list(target_excluded)
 
         if draft_excluded:
@@ -3364,6 +3367,8 @@ class ModelRunnerBase:
         for field in (
             "unified_ready_child_lane_owner_seq_ids",
             "unified_ready_child_excluded_from_normal_draft_seq_ids",
+            "unified_ready_child_excluded_from_target_normal_verify_before_filter_seq_ids",
+            "unified_ready_child_excluded_from_target_normal_verify_after_filter_seq_ids",
             "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
             "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
             "unified_ready_child_missing_normal_proposal_allowed_seq_ids",
@@ -4073,6 +4078,26 @@ class ModelRunnerBase:
         )
         if not fallback_same_batch:
             plan.target_normal_verify_seq_ids = list(target_normal_verify_seq_ids_after_filter)
+        owner_seq_id_set = {
+            int(seq_id) for seq_id in getattr(plan, "unified_ready_child_lane_owner_seq_ids", [])
+        }
+        owner_before_filter = owner_seq_id_set & set(int(seq_id) for seq_id in target_normal_verify_seq_ids_before_filter)
+        owner_after_filter = owner_seq_id_set & set(int(seq_id) for seq_id in target_normal_verify_seq_ids_after_filter)
+        owner_excluded_after_filter = sorted(owner_before_filter - owner_after_filter)
+        plan.unified_ready_child_excluded_from_target_normal_verify_after_filter_seq_ids = list(
+            owner_excluded_after_filter
+        )
+        plan.unified_ready_child_remaining_in_target_normal_verify_seq_ids = sorted(owner_after_filter)
+        examples = list(getattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", []) or [])
+        for example in examples:
+            if not isinstance(example, dict):
+                continue
+            seq_id = int(example.get("seq_id", -1))
+            after_excluded = bool(seq_id in set(owner_excluded_after_filter))
+            example["excluded_from_target_normal_verify_after_filter"] = after_excluded
+            example["excluded_from_target_normal_verify"] = after_excluded
+        if examples:
+            plan.unified_child_ready_seq_normal_lane_conflict_examples = examples[:8]
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
         allowed_missing = sorted(set(buffer_inspect["miss_seq_ids"]) & eager_owned_seq_ids)
@@ -5287,10 +5312,34 @@ class ModelRunnerBase:
             trace_record["unified_generic_depth_revised_token_counts"] = dict(
                 trace_record.get("generic_full_continuous_depth_revised_token_counts") or {}
             )
+            unified_full_by_depth = dict(trace_record["unified_generic_depth_commit_token_counts"])
+            unified_partial_by_depth = dict(trace_record["unified_generic_depth_partial_recovered_token_counts"])
+            unified_output_by_depth = dict(unified_full_by_depth)
+            for depth_key, token_count in unified_partial_by_depth.items():
+                unified_output_by_depth[str(depth_key)] = int(unified_output_by_depth.get(str(depth_key), 0)) + int(
+                    token_count
+                )
+            trace_record["unified_full_commit_token_count_by_depth"] = {
+                str(depth): int(value) for depth, value in sorted(unified_full_by_depth.items(), key=lambda item: int(item[0]))
+            }
+            trace_record["unified_partial_recovered_token_count_by_depth"] = {
+                str(depth): int(value) for depth, value in sorted(unified_partial_by_depth.items(), key=lambda item: int(item[0]))
+            }
+            trace_record["unified_partial_revised_token_count_by_depth"] = {
+                str(depth): int(value)
+                for depth, value in sorted(trace_record["unified_generic_depth_revised_token_counts"].items(), key=lambda item: int(item[0]))
+            }
+            trace_record["unified_total_output_token_count_by_depth"] = {
+                str(depth): int(value) for depth, value in sorted(unified_output_by_depth.items(), key=lambda item: int(item[0]))
+            }
             trace_record["unified_generic_total_full_commit_token_count"] = int(full_continuous_total_full)
             trace_record["unified_generic_total_partial_recovered_token_count"] = int(partial_total)
             trace_record["unified_generic_total_revised_token_count"] = int(partial_revised)
             trace_record["unified_generic_total_output_token_count"] = int(full_continuous_total_full + partial_total)
+            trace_record["unified_total_full_commit_token_count"] = int(full_continuous_total_full)
+            trace_record["unified_total_partial_recovered_token_count"] = int(partial_total)
+            trace_record["unified_total_revised_token_count"] = int(partial_revised)
+            trace_record["unified_total_output_token_count"] = int(full_continuous_total_full + partial_total)
             trace_record["unified_generic_normal_lane_conflict_count"] = int(normal_lane_conflict_count)
             trace_record["unified_generic_target_draft_mismatch_count"] = int(target_draft_mismatch_count)
             trace_record["unified_generic_parity_ok"] = bool(
@@ -17030,6 +17079,12 @@ class ModelRunnerBase:
         trace_record["unified_generic_target_verify_target_master_rank"] = int(target_master_rank)
         trace_record["unified_generic_target_verify_num_proposals"] = int(len(proposals))
         trace_record["unified_generic_target_verify_num_to_verify_tokens"] = 0
+        trace_record["unified_generic_target_verify_actual_verified_proposal_count"] = 0
+        trace_record["unified_generic_target_verify_total_candidate_proposal_count"] = int(len(proposals))
+        trace_record["unified_generic_target_verify_deferred_or_invalidated_proposal_count"] = int(len(proposals))
+        trace_record["unified_generic_target_verify_token_count_denominator_source"] = (
+            "unified_generic_target_verify_actual_verified_proposal_count"
+        )
         proposal_window_verify_enabled = bool(
             getattr(self.global_config, "enable_unified_generic_proposal_window_verify", False)
         )
@@ -17830,6 +17885,17 @@ class ModelRunnerBase:
             ]
             trace_record["unified_generic_target_verify_num_proposals"] = int(target_verify_num_proposals)
             trace_record["unified_generic_target_verify_num_to_verify_tokens"] = int(target_verify_num_to_verify_tokens)
+            trace_record["unified_generic_target_verify_actual_verified_proposal_count"] = int(
+                target_verify_num_proposals
+            )
+            trace_record["unified_generic_target_verify_total_candidate_proposal_count"] = int(len(proposals))
+            trace_record["unified_generic_target_verify_deferred_or_invalidated_proposal_count"] = max(
+                0,
+                int(len(proposals)) - int(target_verify_num_proposals),
+            )
+            trace_record["unified_generic_target_verify_token_count_denominator_source"] = (
+                "unified_generic_target_verify_actual_verified_proposal_count"
+            )
             trace_record["unified_generic_target_verify_logits_rows_per_proposal"] = (
                 int(target_verify_logits_rows) // int(target_verify_num_proposals)
                 if target_verify_num_proposals > 0 and target_verify_logits_rows % target_verify_num_proposals == 0
