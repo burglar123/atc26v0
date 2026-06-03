@@ -804,6 +804,18 @@ def single_child_ahead_summary(
     for record in records:
         for reason, count in (record.get("unified_depth2_generation_block_reason_counts") or {}).items():
             depth2_block_reason_counts[str(reason)] += int_value(count, 0)
+    frontier_mismatch_by_delta: Counter[str] = Counter()
+    for record in records:
+        for delta, count in (
+            record.get("unified_full_accept_parent_frontier_mismatch_count_by_delta") or {}
+        ).items():
+            frontier_mismatch_by_delta[str(delta)] += int_value(count, 0)
+    expected_frontier_source_counts: Counter[str] = Counter()
+    for record in records:
+        for source, count in (
+            record.get("unified_full_accept_parent_expected_frontier_len_source_counts") or {}
+        ).items():
+            expected_frontier_source_counts[str(source)] += int_value(count, 0)
     child_full_accept_examples: list[dict[str, Any]] = []
     for record in records:
         for example in record.get("unified_child_generated_from_full_accept_parent_examples") or []:
@@ -811,6 +823,13 @@ def single_child_ahead_summary(
                 break
             if isinstance(example, dict):
                 child_full_accept_examples.append(example)
+    frontier_mismatch_examples: list[dict[str, Any]] = []
+    for record in records:
+        for example in record.get("unified_full_accept_parent_frontier_mismatch_examples") or []:
+            if len(frontier_mismatch_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                frontier_mismatch_examples.append(example)
 
     registered_from_registry_by_depth: Counter[str] = Counter()
     for proposal_id, depth in registry_depth_by_id.items():
@@ -1133,6 +1152,25 @@ def single_child_ahead_summary(
             str(depth): dict(sorted(reasons.items()))
             for depth, reasons in sorted(full_accept_without_child_reason_counts.items(), key=lambda item: int(item[0]))
         },
+        "unified_full_accept_parent_frontier_mismatch_count_by_delta": dict(
+            sorted(frontier_mismatch_by_delta.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_full_accept_parent_frontier_mismatch_examples": frontier_mismatch_examples[:8],
+        "unified_full_accept_parent_active_seq_missing_count": sum_record_int(
+            records,
+            "unified_full_accept_parent_active_seq_missing_count",
+        ),
+        "unified_full_accept_parent_request_id_mismatch_count": sum_record_int(
+            records,
+            "unified_full_accept_parent_request_id_mismatch_count",
+        ),
+        "unified_full_accept_parent_seq_id_mismatch_count": sum_record_int(
+            records,
+            "unified_full_accept_parent_seq_id_mismatch_count",
+        ),
+        "unified_full_accept_parent_expected_frontier_len_source_counts": dict(
+            sorted(expected_frontier_source_counts.items())
+        ),
     }
 
 
@@ -3326,6 +3364,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_generated_from_full_accept_parent_examples",
         "unified_depth2_generation_block_reason_counts",
         "unified_full_accept_without_child_reason_counts_by_depth",
+        "unified_full_accept_parent_frontier_mismatch_count_by_delta",
+        "unified_full_accept_parent_frontier_mismatch_examples",
+        "unified_full_accept_parent_active_seq_missing_count",
+        "unified_full_accept_parent_request_id_mismatch_count",
+        "unified_full_accept_parent_seq_id_mismatch_count",
+        "unified_full_accept_parent_expected_frontier_len_source_counts",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
         "unified_generic_target_verify_temp_append_used",

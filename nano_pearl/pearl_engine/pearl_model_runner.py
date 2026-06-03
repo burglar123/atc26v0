@@ -1643,6 +1643,7 @@ class ModelRunnerBase:
             "unified_proposal_registry_root_id_by_proposal_id": {},
             "unified_proposal_registry_depth_by_proposal_id": {},
             "unified_proposal_registry_parent_proposal_id_by_proposal_id": {},
+            "unified_proposal_registry_request_id_text_by_proposal_id": {},
             "unified_proposal_registry_created_step_by_proposal_id": {},
             "unified_proposal_registry_verified_step_by_proposal_id": {},
             "unified_proposal_registry_accepted_len_by_proposal_id": {},
@@ -1664,6 +1665,12 @@ class ModelRunnerBase:
             "unified_child_generated_from_full_accept_parent_examples": [],
             "unified_depth2_generation_block_reason_counts": {},
             "unified_full_accept_without_child_reason_counts_by_depth": {},
+            "unified_full_accept_parent_frontier_mismatch_count_by_delta": {},
+            "unified_full_accept_parent_frontier_mismatch_examples": [],
+            "unified_full_accept_parent_active_seq_missing_count": 0,
+            "unified_full_accept_parent_request_id_mismatch_count": 0,
+            "unified_full_accept_parent_seq_id_mismatch_count": 0,
+            "unified_full_accept_parent_expected_frontier_len_source_counts": {},
             "unified_generic_legacy_runtime_bypassed": bool(
                 getattr(self.global_config, "enable_unified_generic_rolling_runtime", False)
             ),
@@ -1805,6 +1812,8 @@ class ModelRunnerBase:
             "generic_full_continuous_total_partial_recovered_token_count": 0,
             "generic_full_continuous_total_revised_token_count": 0,
             "generic_full_continuous_total_output_token_count": 0,
+            "generic_full_continuous_full_commit_token_count_semantics": "",
+            "generic_full_continuous_full_commit_token_count_includes_partial_recovered": False,
             "generic_full_continuous_depth_gt_max_real_commit_count": 0,
             "generic_full_continuous_normal_lane_conflict_count": 0,
             "generic_full_continuous_target_draft_mismatch_count": 0,
@@ -4440,6 +4449,14 @@ class ModelRunnerBase:
             trace_record["generic_full_continuous_total_revised_token_count"] = int(partial_revised)
             trace_record["generic_full_continuous_total_output_token_count"] = int(
                 full_continuous_total_full + partial_total
+            )
+            trace_record["generic_full_continuous_full_commit_token_count_includes_partial_recovered"] = bool(
+                partial_total > 0 and full_continuous_total_full == output_token_count
+            )
+            trace_record["generic_full_continuous_full_commit_token_count_semantics"] = (
+                "all_committed_output"
+                if bool(trace_record["generic_full_continuous_full_commit_token_count_includes_partial_recovered"])
+                else "full_accept_only"
             )
             trace_record["generic_full_continuous_depth_gt_max_real_commit_count"] = 0
             trace_record["generic_full_continuous_normal_lane_conflict_count"] = int(normal_lane_conflict_count)
@@ -13369,6 +13386,11 @@ class ModelRunnerBase:
             return -1
         return self._numeric_request_id(seq.request_id)
 
+    def _unified_trace_request_key_for_seq(self, seq: Sequence | None) -> str:
+        if seq is None:
+            return ""
+        return str(seq.request_id)
+
     def _upsert_unified_generic_proposal_outcome(self, proposal_id: int, **updates) -> dict:
         proposal_id = int(proposal_id)
         if proposal_id < 0:
@@ -13382,6 +13404,7 @@ class ModelRunnerBase:
                 "depth": -1,
                 "parent_proposal_id": -1,
                 "request_id": -1,
+                "request_id_text": "",
                 "created_step": -1,
                 "verified_step": -1,
                 "committed_step": -1,
@@ -13420,7 +13443,7 @@ class ModelRunnerBase:
                 record[key] = bool(value)
             elif key == "proposal_token_ids":
                 record[key] = [int(token_id) for token_id in value]
-            elif key == "invalidation_reason":
+            elif key in {"invalidation_reason", "request_id_text"}:
                 record[key] = str(value)
             else:
                 record[key] = int(value)
@@ -13451,13 +13474,51 @@ class ModelRunnerBase:
         output_tokens = int(state.get("output_tokens_committed", 0))
         base_len = int(state.get("base_len", -1))
         output_len_after_commit = int(state.get("output_len_after_commit", -1))
-        expected_frontier_len = (
-            output_len_after_commit
-            if output_len_after_commit >= 0
-            else base_len + output_tokens
-            if base_len >= 0 and output_tokens >= 0
-            else -1
+        actual_frontier_len = -1 if seq is None else int(len(seq))
+        expected_candidates: list[tuple[str, int]] = []
+        if output_len_after_commit >= 0:
+            expected_candidates.append(("output_len_after_commit", output_len_after_commit))
+        if base_len >= 0 and output_tokens >= 0:
+            expected_candidates.append(("base_len_plus_output_tokens", base_len + output_tokens))
+        if (
+            base_len >= 0
+            and bool(state.get("full_accept", False))
+            and proposal_len > 0
+            and accepted_len == proposal_len
+        ):
+            expected_candidates.append(("base_len_plus_proposal_len", base_len + proposal_len))
+        deduped_candidates: list[tuple[str, int]] = []
+        seen_candidate_values: set[int] = set()
+        for source, value in expected_candidates:
+            value = int(value)
+            if value in seen_candidate_values:
+                continue
+            seen_candidate_values.add(value)
+            deduped_candidates.append((source, value))
+        expected_source = "unknown"
+        expected_frontier_len = -1
+        if deduped_candidates:
+            expected_source, expected_frontier_len = deduped_candidates[0]
+            if actual_frontier_len >= 0:
+                for source, value in deduped_candidates:
+                    if int(value) == int(actual_frontier_len):
+                        expected_source, expected_frontier_len = source, int(value)
+                        break
+        state["expected_frontier_len"] = int(expected_frontier_len)
+        state["expected_frontier_len_source"] = str(expected_source)
+        state["actual_frontier_len"] = int(actual_frontier_len)
+        state["frontier_delta"] = (
+            int(actual_frontier_len) - int(expected_frontier_len)
+            if actual_frontier_len >= 0 and expected_frontier_len >= 0
+            else 0
         )
+        state["active_seq_found"] = bool(seq is not None)
+        state["active_seq_id"] = -1 if seq is None else int(getattr(seq, "seq_id", -1))
+        state["active_request_id"] = "" if seq is None else str(getattr(seq, "request_id", ""))
+        state["active_seq_len"] = int(actual_frontier_len)
+        state["active_num_completion_tokens"] = -1 if seq is None else int(getattr(seq, "num_completion_tokens", -1))
+        state["active_pre_verify"] = False if seq is None else bool(getattr(seq, "pre_verify", True))
+        state["active_finished"] = False if seq is None else bool(getattr(seq, "is_finished", False))
 
         reason = None
         if child_depth is not None and int(state.get("depth", -1)) != int(child_depth) - 1:
@@ -13491,6 +13552,113 @@ class ModelRunnerBase:
             return False, str(reason), state
         state["state"] = "full_accept_applied"
         return True, "full_accept_applied", state
+
+    def _active_seq_for_unified_parent(
+        self,
+        parent_state: dict,
+        seq_by_id: dict[int, Sequence],
+    ) -> tuple[Sequence | None, bool, bool]:
+        parent_seq_id = int(parent_state.get("seq_id", -1))
+        parent_request_key = str(parent_state.get("request_id_text", "") or "")
+        seq = seq_by_id.get(parent_seq_id)
+        request_id_mismatch = False
+        seq_id_mismatch = False
+        if seq is not None and parent_request_key and str(getattr(seq, "request_id", "")) != parent_request_key:
+            request_id_mismatch = True
+            seq = None
+        if seq is None and parent_request_key:
+            for candidate in seq_by_id.values():
+                if str(getattr(candidate, "request_id", "")) == parent_request_key:
+                    seq = candidate
+                    seq_id_mismatch = parent_seq_id >= 0 and int(getattr(candidate, "seq_id", -1)) != parent_seq_id
+                    break
+        return seq, request_id_mismatch, seq_id_mismatch
+
+    def _record_unified_full_accept_parent_considered(
+        self,
+        trace_record: dict,
+        *,
+        parent_depth: int,
+        parent_state: dict,
+        seq: Sequence | None,
+        request_id_mismatch: bool,
+        seq_id_mismatch: bool,
+        block_reason: str,
+        current_step: int,
+    ) -> None:
+        if not (
+            bool(parent_state.get("full_accept", False))
+            and bool(parent_state.get("applied_full_commit", False))
+        ):
+            return
+        source = str(parent_state.get("expected_frontier_len_source", "unknown") or "unknown")
+        self._increment_trace_counter_map(
+            trace_record,
+            "unified_full_accept_parent_expected_frontier_len_source_counts",
+            source,
+            1,
+        )
+        if seq is None:
+            trace_record["unified_full_accept_parent_active_seq_missing_count"] = int(
+                trace_record.get("unified_full_accept_parent_active_seq_missing_count", 0) or 0
+            ) + 1
+        if request_id_mismatch:
+            trace_record["unified_full_accept_parent_request_id_mismatch_count"] = int(
+                trace_record.get("unified_full_accept_parent_request_id_mismatch_count", 0) or 0
+            ) + 1
+        if seq_id_mismatch:
+            trace_record["unified_full_accept_parent_seq_id_mismatch_count"] = int(
+                trace_record.get("unified_full_accept_parent_seq_id_mismatch_count", 0) or 0
+            ) + 1
+        if block_reason not in {"frontier_mismatch", "parent_frontier_mismatch"}:
+            return
+        delta = int(parent_state.get("frontier_delta", 0) or 0)
+        self._increment_trace_counter_map(
+            trace_record,
+            "unified_full_accept_parent_frontier_mismatch_count_by_delta",
+            str(delta),
+            1,
+        )
+        examples = list(trace_record.get("unified_full_accept_parent_frontier_mismatch_examples") or [])
+        if len(examples) >= 8:
+            return
+        examples.append(
+            {
+                "parent_proposal_id": int(parent_state.get("proposal_id", -1)),
+                "parent_depth": int(parent_depth),
+                "parent_seq_id": int(parent_state.get("seq_id", -1)),
+                "parent_request_id": str(
+                    parent_state.get("request_id_text", "")
+                    or parent_state.get("request_id", "")
+                ),
+                "parent_base_len": int(parent_state.get("base_len", -1)),
+                "parent_output_tokens_committed": int(parent_state.get("output_tokens_committed", 0)),
+                "parent_output_len_after_commit": int(parent_state.get("output_len_after_commit", -1)),
+                "parent_proposal_token_ids": [
+                    int(token_id) for token_id in parent_state.get("proposal_token_ids", [])
+                ],
+                "parent_accepted_len": int(parent_state.get("accepted_len", -1)),
+                "parent_full_accept": bool(parent_state.get("full_accept", False)),
+                "parent_applied_full_commit": bool(parent_state.get("applied_full_commit", False)),
+                "parent_sequence_finished": bool(parent_state.get("sequence_finished", False)),
+                "parent_committed_step": int(parent_state.get("committed_step", -1)),
+                "current_step": int(current_step),
+                "active_seq_found": bool(seq is not None),
+                "active_seq_id": -1 if seq is None else int(getattr(seq, "seq_id", -1)),
+                "active_request_id": "" if seq is None else str(getattr(seq, "request_id", "")),
+                "active_seq_len": -1 if seq is None else int(len(seq)),
+                "active_num_completion_tokens": -1
+                if seq is None
+                else int(getattr(seq, "num_completion_tokens", -1)),
+                "active_pre_verify": False if seq is None else bool(getattr(seq, "pre_verify", True)),
+                "active_finished": False if seq is None else bool(getattr(seq, "is_finished", False)),
+                "expected_frontier_len": int(parent_state.get("expected_frontier_len", -1)),
+                "actual_frontier_len": int(parent_state.get("actual_frontier_len", -1)),
+                "frontier_delta": int(delta),
+                "block_reason": str(block_reason),
+            }
+        )
+        trace_record["unified_full_accept_parent_frontier_mismatch_examples"] = examples
 
     def _record_unified_child_generation_provenance(
         self,
@@ -13632,6 +13800,12 @@ class ModelRunnerBase:
         trace_record["unified_proposal_registry_invalidation_reason_by_proposal_id"] = self._trace_sorted_str_map(
             {
                 proposal_id: str(record.get("invalidation_reason", ""))
+                for proposal_id, record in records.items()
+            }
+        )
+        trace_record["unified_proposal_registry_request_id_text_by_proposal_id"] = self._trace_sorted_str_map(
+            {
+                proposal_id: str(record.get("request_id_text", ""))
                 for proposal_id, record in records.items()
             }
         )
@@ -13836,6 +14010,11 @@ class ModelRunnerBase:
                         reason="registry_missing",
                     )
                     continue
+                seq, request_id_mismatch, seq_id_mismatch = self._active_seq_for_unified_parent(
+                    parent_state,
+                    seq_by_id,
+                )
+                active_seq_id = -1 if seq is None else int(getattr(seq, "seq_id", -1))
                 if seq_id in seen_seq_ids:
                     reject_reason_by_parent_id[parent_id] = "budget_exhausted"
                     self._record_unified_full_accept_parent_not_selected(
@@ -13845,7 +14024,15 @@ class ModelRunnerBase:
                         reason="budget_exhausted",
                     )
                     continue
-                seq = seq_by_id.get(seq_id)
+                if active_seq_id in seen_seq_ids:
+                    reject_reason_by_parent_id[parent_id] = "budget_exhausted"
+                    self._record_unified_full_accept_parent_not_selected(
+                        trace_record,
+                        parent_depth=parent_depth,
+                        child_depth=child_depth,
+                        reason="budget_exhausted",
+                    )
+                    continue
                 parent_allowed, parent_reason, parent_state = self._unified_generic_parent_outcome_state(
                     parent_id,
                     seq=seq,
@@ -13853,6 +14040,7 @@ class ModelRunnerBase:
                     child_base_len=-1 if seq is None else int(len(seq)),
                     root_id=root_id,
                 )
+                seq_id = int(active_seq_id if active_seq_id >= 0 else seq_id)
                 if strict_parent_guard:
                     self._record_unified_child_generation_provenance(
                         trace_record,
@@ -13889,6 +14077,21 @@ class ModelRunnerBase:
                     reason = "invalidated_ancestor"
                 elif child_id in self._generic_rolling_shadow_proposals_by_id:
                     reason = "already_has_unverified_child"
+                trace_reason = (
+                    "frontier_mismatch"
+                    if str(reason) == "parent_frontier_mismatch"
+                    else str(reason or parent_reason)
+                )
+                self._record_unified_full_accept_parent_considered(
+                    trace_record,
+                    parent_depth=parent_depth,
+                    parent_state=parent_state,
+                    seq=seq,
+                    request_id_mismatch=request_id_mismatch,
+                    seq_id_mismatch=seq_id_mismatch,
+                    block_reason=trace_reason,
+                    current_step=-1 if plan.step_id is None else int(plan.step_id),
+                )
                 if reason is not None:
                     reject_reason_by_parent_id[parent_id] = str(reason)
                     self._record_unified_full_accept_parent_not_selected(
@@ -14408,6 +14611,7 @@ class ModelRunnerBase:
                         depth=depth,
                         parent_proposal_id=-1 if parent_id is None else int(parent_id),
                         request_id=self._numeric_request_id(seq.request_id),
+                        request_id_text=str(seq.request_id),
                         created_step=-1 if plan.step_id is None else int(plan.step_id),
                         plan_id=int(plan.plan_id),
                         dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
@@ -16338,6 +16542,7 @@ class ModelRunnerBase:
                     depth=depth,
                     parent_proposal_id=parent_id,
                     request_id=self._unified_trace_request_id_for_seq(seq),
+                    request_id_text=self._unified_trace_request_key_for_seq(seq),
                     created_step=int(decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))),
                     plan_id=int(plan.plan_id),
                     dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
@@ -16437,6 +16642,7 @@ class ModelRunnerBase:
                         committed_step=-1,
                         plan_id=int(plan.plan_id),
                         dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
+                        request_id_text=self._unified_trace_request_key_for_seq(seq),
                         accepted_len=accept_len,
                         proposal_len=token_count,
                         full_accept=verify_result == "full_accept",
@@ -16506,6 +16712,7 @@ class ModelRunnerBase:
                         committed_step=-1 if plan.step_id is None else int(plan.step_id),
                         plan_id=int(plan.plan_id),
                         dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
+                        request_id_text=self._unified_trace_request_key_for_seq(seq),
                         accepted_len=accept_len,
                         proposal_len=token_count,
                         full_accept=False,
@@ -16561,6 +16768,7 @@ class ModelRunnerBase:
                     committed_step=-1 if plan.step_id is None else int(plan.step_id),
                     plan_id=int(plan.plan_id),
                     dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
+                    request_id_text=self._unified_trace_request_key_for_seq(seq),
                     accepted_len=accept_len,
                     proposal_len=token_count,
                     full_accept=True,

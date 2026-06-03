@@ -324,6 +324,42 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     summary["generic_full_continuous_depth_revised_token_counts"] = (
         revised_depth_counts or fallback_revised_depth_counts
     )
+    trace_semantics = next(
+        (
+            str(record.get("generic_full_continuous_full_commit_token_count_semantics"))
+            for record in records
+            if record.get("generic_full_continuous_full_commit_token_count_semantics")
+        ),
+        "",
+    )
+    total_full_for_semantics = int_value(
+        summary.get("generic_full_continuous_total_full_commit_token_count"),
+        0,
+    )
+    total_partial_for_semantics = int_value(
+        summary.get("generic_full_continuous_total_partial_recovered_token_count"),
+        0,
+    )
+    total_output_for_semantics = int_value(
+        summary.get("generic_full_continuous_total_output_token_count"),
+        0,
+    )
+    inferred_includes_partial = bool(
+        total_partial_for_semantics > 0
+        and total_output_for_semantics == total_full_for_semantics
+    )
+    summary["generic_full_continuous_full_commit_token_count_includes_partial_recovered"] = bool(
+        _bool_any(records, "generic_full_continuous_full_commit_token_count_includes_partial_recovered")
+        or inferred_includes_partial
+    )
+    summary["generic_full_continuous_full_commit_token_count_semantics"] = (
+        trace_semantics
+        or (
+            "all_committed_output"
+            if summary["generic_full_continuous_full_commit_token_count_includes_partial_recovered"]
+            else "full_accept_only"
+        )
+    )
     summary["generic_full_continuous_depth_cascade_discard_counts"] = _merge_depth_counts(
         records,
         "generic_full_continuous_depth_cascade_discard_counts",
@@ -416,7 +452,11 @@ def validate_records(
         errors.append(f"depth-indexed partial recovery sum mismatch: sum={partial_sum} total={total_partial}")
     if revised_sum != total_revised:
         errors.append(f"depth-indexed revised token sum mismatch: sum={revised_sum} total={total_revised}")
-    if total_output != total_full + total_partial:
+    full_count_includes_partial = bool(
+        summary.get("generic_full_continuous_full_commit_token_count_includes_partial_recovered", False)
+    )
+    expected_output = total_full if full_count_includes_partial else total_full + total_partial
+    if total_output != expected_output:
         errors.append("full continuous output tokens must equal full commits plus partial recovered tokens")
 
     partial_accepted = int_value(summary.get("partial_prefix_accepted_token_count"), 0)
@@ -493,6 +533,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",
         "generic_full_continuous_total_output_token_count",
+        "generic_full_continuous_full_commit_token_count_semantics",
+        "generic_full_continuous_full_commit_token_count_includes_partial_recovered",
         "generic_full_continuous_depth_gt_max_real_commit_count",
         "unified_raw_target_verification_available",
         "unified_raw_verified_proposal_count_by_depth",
@@ -728,6 +770,19 @@ def run_synthetic() -> None:
 
     bad_depth = [_base_record(max_depth=100, max_observed=101, max_real=101, depth_gt_max=1, parity_ok=False)]
     _assert_fail("depth beyond max", bad_depth, "max observed depth")
+
+    partial_included_full_total = [
+        _base_record(
+            max_depth=100,
+            depth_commit_counts={"1": 8},
+            partial_counts={"1": 4},
+            revised_counts={"1": 1},
+            one_shot=0,
+            combined=8,
+        )
+    ]
+    partial_included_full_total[0]["generic_full_continuous_total_output_token_count"] = 8
+    _assert_pass("full total includes partial output", partial_included_full_total)
 
     bad_output_total = [_base_record(max_depth=100, partial_counts={"5": 2}, revised_counts={"5": 1})]
     bad_output_total[0]["generic_full_continuous_total_output_token_count"] = 45
