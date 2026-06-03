@@ -359,6 +359,7 @@ class ModelRunnerBase:
         self._unified_pending_child_parent_id_by_child_id = {}
         self._unified_promoted_child_proposal_ids = set()
         self._unified_ready_child_proposal_ids = set()
+        self._unified_ready_child_lane_owner_by_seq_id = {}
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -1682,6 +1683,11 @@ class ModelRunnerBase:
             "unified_child_ready_for_target_verify_count_by_depth": {},
             "unified_child_ready_but_not_scheduled_count_by_depth": {},
             "unified_child_ready_not_scheduled_reason_counts_by_depth": {},
+            "unified_child_ready_seq_normal_lane_excluded_count_by_depth": {},
+            "unified_child_ready_seq_normal_lane_conflict_count_by_depth": {},
+            "unified_child_ready_seq_normal_lane_conflict_examples": [],
+            "unified_child_stale_base_count_by_depth": {},
+            "unified_child_stale_base_examples": [],
             "unified_child_scheduled_for_target_verify_count_by_depth": {},
             "unified_child_target_verified_after_promotion_count_by_depth": {},
             "unified_child_invalidated_after_parent_non_full_count_by_depth": {},
@@ -2993,6 +2999,223 @@ class ModelRunnerBase:
             global_gamma=int(self.gamma),
         )
 
+    def _unified_ready_child_records_by_seq_id(self) -> dict[int, list[tuple[int, int, EagerProposal | None, dict]]]:
+        if not (
+            self._unified_generic_rolling_runtime_enabled()
+            and self._unified_generic_max_unverified_depth_ahead() == 1
+        ):
+            return {}
+        ready_child_ids = set(int(child_id) for child_id in self._unified_ready_child_proposal_ids)
+        ready_child_ids.update(int(child_id) for child_id in self._unified_promoted_child_proposal_ids)
+        ready_by_seq: dict[int, list[tuple[int, int, EagerProposal | None, dict]]] = {}
+        for child_id in sorted(ready_child_ids):
+            proposal = self._generic_rolling_shadow_proposals_by_id.get(int(child_id))
+            record = self._generic_rolling_proposal_outcomes_by_id.get(int(child_id), {})
+            if proposal is None or not record:
+                continue
+            if not (
+                bool(record.get("child_ready_for_target_verify", False))
+                or int(child_id) in self._unified_ready_child_proposal_ids
+                or int(child_id) in self._unified_promoted_child_proposal_ids
+            ):
+                continue
+            if (
+                bool(record.get("target_verify_inflight", False))
+                or bool(record.get("invalidated", False))
+                or int(record.get("accepted_len", -1)) >= 0
+                or bool(record.get("applied_full_commit", False))
+                or bool(record.get("applied_partial_recovery", False))
+                or bool(record.get("no_mutation_reject", False))
+            ):
+                continue
+            if getattr(proposal, "state", EAGER_STATE_READY_TO_VERIFY) not in {
+                EAGER_STATE_READY_TO_VERIFY,
+                EAGER_STATE_READY_TO_VERIFY_DRY_RUN,
+            }:
+                continue
+            seq_id = int(getattr(proposal, "seq_id", record.get("seq_id", -1)))
+            depth = int(getattr(proposal, "generic_rolling_depth", record.get("depth", -1)))
+            if seq_id < 0 or depth < 1:
+                continue
+            ready_by_seq.setdefault(seq_id, []).append((depth, int(child_id), proposal, record))
+        for seq_id in list(ready_by_seq):
+            ready_by_seq[seq_id].sort(key=lambda item: (int(item[0]), int(item[1])))
+        return ready_by_seq
+
+    def _sync_unified_ready_child_lane_ownership_before_step_plan(self, plan_id: int) -> None:
+        if not (
+            self._unified_generic_rolling_runtime_enabled()
+            and self._unified_generic_max_unverified_depth_ahead() == 1
+        ):
+            self._unified_ready_child_lane_owner_by_seq_id = {}
+            return
+        owner_rank = int(self.global_config.draft_config.master_rank)
+        width = 5
+        payload_values: list[int] = []
+        if int(self.rank) == owner_rank:
+            for seq_id, records in sorted(self._unified_ready_child_records_by_seq_id().items()):
+                if not records:
+                    continue
+                depth, child_id, proposal, record = records[0]
+                payload_values.extend(
+                    [
+                        int(seq_id),
+                        int(child_id),
+                        int(depth),
+                        int(getattr(proposal, "parent_proposal_id", record.get("parent_proposal_id", -1)) or -1),
+                        int(getattr(proposal, "base_len", record.get("base_len", -1))),
+                    ]
+                )
+            meta_values = [
+                len(payload_values) // width,
+                len(payload_values),
+                int(plan_id),
+                int(self.dual_batch_manager.step_id),
+                width,
+            ]
+            meta = torch.tensor(meta_values, dtype=torch.int64, device="cuda")
+        else:
+            meta = torch.zeros(5, dtype=torch.int64, device="cuda")
+        dist.broadcast(meta, src=owner_rank, group=self.verify_group)
+        meta_values = [int(value) for value in meta.tolist()]
+        num_records, payload_len, _sync_plan_id, _sync_step_id, payload_width = meta_values
+        if int(payload_width) != width:
+            raise ValueError(
+                f"unified ready child lane ownership payload width mismatch: expected={width}, got={payload_width}"
+            )
+        if int(payload_len) != int(num_records) * width:
+            raise ValueError(
+                "unified ready child lane ownership payload length mismatch: "
+                f"num_records={num_records}, payload_len={payload_len}, width={width}"
+            )
+        if payload_len > 0:
+            if int(self.rank) == owner_rank:
+                payload = torch.tensor(payload_values, dtype=torch.int64, device="cuda")
+            else:
+                payload = torch.zeros(int(payload_len), dtype=torch.int64, device="cuda")
+            dist.broadcast(payload, src=owner_rank, group=self.verify_group)
+            payload_values = [int(value) for value in payload.tolist()]
+        else:
+            payload_values = []
+        owner_by_seq: dict[int, dict] = {}
+        for index in range(int(num_records)):
+            base = index * width
+            seq_id, child_id, depth, parent_id, base_len = payload_values[base:base + width]
+            owner_by_seq[int(seq_id)] = {
+                "seq_id": int(seq_id),
+                "proposal_id": int(child_id),
+                "depth": int(depth),
+                "parent_proposal_id": int(parent_id),
+                "base_len": int(base_len),
+            }
+        self._unified_ready_child_lane_owner_by_seq_id = owner_by_seq
+
+    def _apply_unified_ready_child_lane_ownership_to_plan(self, plan: StepPlan) -> None:
+        ready_by_seq = self._unified_ready_child_records_by_seq_id()
+        for seq_id, owner in self._unified_ready_child_lane_owner_by_seq_id.items():
+            if int(seq_id) in ready_by_seq:
+                continue
+            ready_by_seq[int(seq_id)] = [
+                (
+                    int(owner.get("depth", -1)),
+                    int(owner.get("proposal_id", -1)),
+                    None,
+                    dict(owner),
+                )
+            ]
+        if not ready_by_seq:
+            return
+        original_draft_home = [
+            int(seq_id) for seq_id in (plan.original_draft_home_set or plan.draft_home_set)
+        ]
+        raw_target_home = [
+            int(seq_id) for seq_id in (plan.raw_target_home_set_for_normal_verify or plan.target_home_set)
+        ]
+        draft_excluded = sorted(set(original_draft_home) & set(ready_by_seq))
+        target_excluded = sorted(set(raw_target_home) & set(ready_by_seq))
+        if not draft_excluded and not target_excluded:
+            return
+
+        depth_counts: dict[int, int] = {}
+        examples = list(getattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", []) or [])
+        current_step = -1 if plan.step_id is None else int(plan.step_id)
+        for seq_id in sorted(set(draft_excluded) | set(target_excluded)):
+            depth, child_id, proposal, record = ready_by_seq[int(seq_id)][0]
+            depth_counts[int(depth)] = int(depth_counts.get(int(depth), 0)) + 1
+            if len(examples) < 8:
+                examples.append(
+                    {
+                        "child_proposal_id": int(child_id),
+                        "child_depth": int(depth),
+                        "seq_id": int(seq_id),
+                        "parent_proposal_id": int(
+                            getattr(proposal, "parent_proposal_id", record.get("parent_proposal_id", -1)) or -1
+                        ),
+                        "child_base_len": int(getattr(proposal, "base_len", record.get("base_len", -1))),
+                        "plan_id": int(plan.plan_id),
+                        "dual_step_id": int(current_step),
+                        "excluded_from_normal_draft": bool(seq_id in set(draft_excluded)),
+                        "excluded_from_target_normal_verify": bool(seq_id in set(target_excluded)),
+                    }
+                )
+
+        if draft_excluded:
+            plan.original_draft_home_set = list(original_draft_home)
+            combined_draft_excluded = sorted(
+                set(int(seq_id) for seq_id in plan.lane_excluded_seq_ids)
+                | set(int(seq_id) for seq_id in draft_excluded)
+            )
+            combined_eager_excluded = sorted(
+                set(int(seq_id) for seq_id in plan.excluded_from_draft_home_for_eager_dry_run)
+                | set(int(seq_id) for seq_id in draft_excluded)
+            )
+            plan.draft_home_set = [
+                int(seq_id) for seq_id in original_draft_home if int(seq_id) not in set(combined_draft_excluded)
+            ]
+            plan.actual_draft_home_set_for_normal_draft = list(plan.draft_home_set)
+            plan.adjusted_draft_home_set_dry_run = list(plan.draft_home_set)
+            plan.excluded_from_draft_home_for_eager_dry_run = list(combined_eager_excluded)
+            plan.lane_excluded_seq_ids = list(combined_draft_excluded)
+            plan.lane_exclusion_decision_available_before_draft = True
+            plan.lane_exclusion_dry_run_done = True
+
+        if target_excluded:
+            combined_target_excluded = sorted(
+                set(int(seq_id) for seq_id in plan.excluded_from_target_normal_verify_for_eager_dry_run)
+                | set(int(seq_id) for seq_id in target_excluded)
+            )
+            plan.raw_target_home_set_for_normal_verify = list(raw_target_home)
+            plan.excluded_from_target_normal_verify_for_eager_dry_run = list(combined_target_excluded)
+            plan.target_normal_verify_seq_ids = [
+                int(seq_id) for seq_id in raw_target_home if int(seq_id) not in set(combined_target_excluded)
+            ]
+            allowed_missing = sorted(
+                set(int(seq_id) for seq_id in plan.missing_normal_proposal_allowed_seq_ids_dry_run)
+                | set(int(seq_id) for seq_id in combined_target_excluded)
+            )
+            plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(allowed_missing)
+            plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(allowed_missing)
+
+        depth_map = self._trace_depth_map_to_json(depth_counts)
+        setattr(plan, "unified_child_ready_seq_normal_lane_excluded_count_by_depth", depth_map)
+        setattr(plan, "unified_child_ready_seq_normal_lane_conflict_count_by_depth", depth_map)
+        setattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", examples[:8])
+
+    def _attach_unified_ready_child_lane_ownership_trace(self, trace_record: dict, plan: StepPlan) -> None:
+        for field in (
+            "unified_child_ready_seq_normal_lane_excluded_count_by_depth",
+            "unified_child_ready_seq_normal_lane_conflict_count_by_depth",
+        ):
+            values = getattr(plan, field, None)
+            if values:
+                trace_record[field] = {
+                    str(depth): int(count)
+                    for depth, count in sorted(values.items(), key=lambda item: int(item[0]))
+                }
+        examples = getattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", None)
+        if examples:
+            trace_record["unified_child_ready_seq_normal_lane_conflict_examples"] = list(examples[:8])
+
     def _actual_normal_draft_seq_ids(self, plan: StepPlan) -> list[int]:
         return [
             int(seq_id)
@@ -3322,6 +3545,7 @@ class ModelRunnerBase:
         iteration_id, _ = self.scheduler.next_batch_id("dual_batch")
         self._trace_plan_id += 1
         plan_id = self._trace_plan_id
+        self._sync_unified_ready_child_lane_ownership_before_step_plan(plan_id)
         lane_sync_info = self._sync_ready_eager_proposals_before_step_plan(plan_id)
         dropped_seq_ids = self._prepare_dual_batch_state()
         plan = self.dual_batch_manager.build_step_plan(
@@ -3337,6 +3561,7 @@ class ModelRunnerBase:
         )
         self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
+        self._apply_unified_ready_child_lane_ownership_to_plan(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
         raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
@@ -3346,6 +3571,13 @@ class ModelRunnerBase:
         allowed_missing = sorted(
             set(raw_buffer_inspect["miss_seq_ids"])
             & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
+        )
+        allowed_missing = sorted(
+            set(allowed_missing)
+            | (
+                set(raw_buffer_inspect["miss_seq_ids"])
+                & set(getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", []))
+            )
         )
         fallback_same_batch = (
             bool(target_normal_verify_seq_ids)
@@ -3357,9 +3589,13 @@ class ModelRunnerBase:
             if fallback_same_batch
             else []
         )
+        allowed_by_unified_ready_child = set(
+            int(seq_id) for seq_id in getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", [])
+        )
         unexpected_missing = sorted(
             set(raw_buffer_inspect["miss_seq_ids"])
             - set(allowed_missing)
+            - set(allowed_by_unified_ready_child)
             - set(fallback_pending_receive)
         )
         plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
@@ -3485,6 +3721,7 @@ class ModelRunnerBase:
             self.dual_proposal_buffer.pending_seq_ids()
         )
         record.update(self._profile_defaults(seqs, plan))
+        self._attach_unified_ready_child_lane_ownership_trace(record, plan)
         self.trace_records.append(record)
         return record
 
@@ -13445,6 +13682,9 @@ class ModelRunnerBase:
                 "created_step": -1,
                 "verified_step": -1,
                 "committed_step": -1,
+                "child_promoted_step": -1,
+                "child_ready_step": -1,
+                "child_scheduled_step": -1,
                 "plan_id": -1,
                 "dual_step_id": -1,
                 "accepted_len": -1,
@@ -13855,6 +14095,9 @@ class ModelRunnerBase:
             "unified_proposal_registry_created_step_by_proposal_id": "created_step",
             "unified_proposal_registry_verified_step_by_proposal_id": "verified_step",
             "unified_proposal_registry_committed_step_by_proposal_id": "committed_step",
+            "unified_proposal_registry_child_promoted_step_by_proposal_id": "child_promoted_step",
+            "unified_proposal_registry_child_ready_step_by_proposal_id": "child_ready_step",
+            "unified_proposal_registry_child_scheduled_step_by_proposal_id": "child_scheduled_step",
             "unified_proposal_registry_plan_id_by_proposal_id": "plan_id",
             "unified_proposal_registry_dual_step_id_by_proposal_id": "dual_step_id",
             "unified_proposal_registry_accepted_len_by_proposal_id": "accepted_len",
@@ -14188,6 +14431,8 @@ class ModelRunnerBase:
                     child_promoted_after_parent_full_accept=True,
                     child_ready_for_target_verify=True,
                     child_scheduled_for_target_verify=False,
+                    child_promoted_step=int(result_step),
+                    child_ready_step=int(result_step),
                     parent_result_step=int(result_step),
                     parent_accepted_len=int(parent_accept_len),
                     parent_full_accept=True,
@@ -14295,6 +14540,69 @@ class ModelRunnerBase:
                 invalidated=invalidating_reason,
                 invalidation_reason=reason if invalidating_reason else "",
             )
+
+    def _record_unified_child_stale_base(
+        self,
+        trace_record: dict,
+        plan: StepPlan,
+        *,
+        child_id: int,
+        child_depth: int,
+        proposal: EagerProposal,
+        child_record: dict,
+        parent_record: dict,
+        seq: Sequence,
+    ) -> None:
+        child_id = int(child_id)
+        child_depth = int(child_depth)
+        expected_len = int(getattr(proposal, "base_len", child_record.get("base_len", -1)))
+        actual_len = int(len(seq))
+        self._increment_trace_depth_counter(
+            trace_record,
+            "unified_child_stale_base_count_by_depth",
+            child_depth,
+            1,
+        )
+        examples = list(trace_record.get("unified_child_stale_base_examples") or [])
+        if len(examples) >= 8:
+            return
+        conflict_counts = self._trace_depth_indexed_int_map(
+            trace_record.get("unified_child_ready_seq_normal_lane_conflict_count_by_depth")
+        )
+        parent_id = int(getattr(proposal, "parent_proposal_id", child_record.get("parent_proposal_id", -1)) or -1)
+        examples.append(
+            {
+                "child_proposal_id": int(child_id),
+                "child_depth": int(child_depth),
+                "parent_proposal_id": int(parent_id),
+                "seq_id": int(getattr(seq, "seq_id", -1)),
+                "request_id": str(getattr(seq, "request_id", "")),
+                "child_base_len": int(expected_len),
+                "expected_active_seq_len_for_child": int(expected_len),
+                "actual_active_seq_len": int(actual_len),
+                "active_seq_last_tokens": [
+                    int(token_id) for token_id in getattr(seq, "token_ids", [])[-min(8, max(0, actual_len)):]
+                ],
+                "parent_output_len_after_commit": int(parent_record.get("output_len_after_commit", -1)),
+                "child_created_step": int(child_record.get("created_step", -1)),
+                "child_promoted_step": int(
+                    child_record.get("child_promoted_step", child_record.get("parent_result_step", -1))
+                ),
+                "child_ready_step": int(
+                    child_record.get("child_ready_step", child_record.get("parent_result_step", -1))
+                ),
+                "attempted_schedule_step": -1 if plan.step_id is None else int(plan.step_id),
+                "normal_drafted_between_child_ready_and_schedule": bool(actual_len != expected_len),
+                "normal_reseed_conflict_count": int(sum(conflict_counts.values())),
+                "seq_in_normal_draft_this_step": bool(
+                    int(getattr(seq, "seq_id", -1)) in set(self._actual_normal_draft_seq_ids(plan))
+                ),
+                "seq_in_target_normal_verify_this_step": bool(
+                    int(getattr(seq, "seq_id", -1)) in set(self._target_normal_verify_seq_ids(plan))
+                ),
+            }
+        )
+        trace_record["unified_child_stale_base_examples"] = examples
 
     def _promoted_unified_child_decisions(
         self,
@@ -14419,6 +14727,16 @@ class ModelRunnerBase:
                 )
                 continue
             if int(len(seq)) != int(getattr(proposal, "base_len", child_record.get("base_len", -1))):
+                self._record_unified_child_stale_base(
+                    trace_record,
+                    plan,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    proposal=proposal,
+                    child_record=child_record,
+                    parent_record=parent_record,
+                    seq=seq,
+                )
                 self._record_unified_child_ready_not_scheduled(
                     trace_record,
                     child_id=child_id,
@@ -14526,6 +14844,7 @@ class ModelRunnerBase:
                 child_pending_parent_result=False,
                 child_ready_for_target_verify=False,
                 child_scheduled_for_target_verify=True,
+                child_scheduled_step=-1 if plan.step_id is None else int(plan.step_id),
             )
             seen_seq_ids.add(seq_id)
             self._unified_promoted_child_proposal_ids.discard(int(child_id))

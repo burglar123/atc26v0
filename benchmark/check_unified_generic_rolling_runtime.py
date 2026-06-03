@@ -921,6 +921,31 @@ def single_child_ahead_summary(
         records,
         "unified_child_ready_not_scheduled_reason_counts_by_depth",
     )
+    ready_lane_excluded_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_ready_seq_normal_lane_excluded_count_by_depth",
+    )
+    ready_lane_conflict_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_ready_seq_normal_lane_conflict_count_by_depth",
+    )
+    stale_base_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_stale_base_count_by_depth",
+    )
+    ready_lane_conflict_examples: list[dict[str, Any]] = []
+    stale_base_examples: list[dict[str, Any]] = []
+    for record in records:
+        for example in record.get("unified_child_ready_seq_normal_lane_conflict_examples") or []:
+            if len(ready_lane_conflict_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                ready_lane_conflict_examples.append(example)
+        for example in record.get("unified_child_stale_base_examples") or []:
+            if len(stale_base_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                stale_base_examples.append(example)
     scheduled_trace_by_depth = sum_depth_counts(
         records,
         "unified_child_scheduled_for_target_verify_count_by_depth",
@@ -1239,6 +1264,17 @@ def single_child_ahead_summary(
             str(depth): dict(sorted(reasons.items()))
             for depth, reasons in sorted(ready_not_scheduled_reason_counts.items(), key=lambda item: int(item[0]))
         },
+        "unified_child_ready_seq_normal_lane_excluded_count_by_depth": dict(
+            sorted(ready_lane_excluded_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_ready_seq_normal_lane_conflict_count_by_depth": dict(
+            sorted(ready_lane_conflict_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_ready_seq_normal_lane_conflict_examples": ready_lane_conflict_examples[:8],
+        "unified_child_stale_base_count_by_depth": dict(
+            sorted(stale_base_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_stale_base_examples": stale_base_examples[:8],
         "unified_child_scheduled_for_target_verify_count_by_depth": dict(
             sorted(scheduled_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
@@ -2094,6 +2130,16 @@ def validate_records(
             "unified_child_ready_not_scheduled_reason_counts_by_depth",
             {},
         )
+        ready_for_target_by_depth = summary.get("unified_child_ready_for_target_verify_count_by_depth", {})
+        scheduled_after_promotion = summary.get("unified_child_scheduled_for_target_verify_count_by_depth", {})
+        ready_lane_excluded = summary.get(
+            "unified_child_ready_seq_normal_lane_excluded_count_by_depth",
+            {},
+        )
+        ready_lane_conflict = summary.get(
+            "unified_child_ready_seq_normal_lane_conflict_count_by_depth",
+            {},
+        )
         disappeared_promoted_depths: list[str] = []
         for depth, count in sorted(promoted_by_depth.items(), key=lambda item: int(item[0])):
             if int_value(count, 0) <= 0:
@@ -2108,6 +2154,47 @@ def validate_records(
             errors.append(
                 "single-child promoted children were not target verified and lack ready-not-scheduled reasons: "
                 f"depths={disappeared_promoted_depths}"
+            )
+        unscheduled_ready_depths: list[str] = []
+        stale_only_depths: list[str] = []
+        non_stale_block_reasons = {
+            "budget_exhausted",
+            "no_target_slot",
+            "sequence_finished",
+            "no_active_sequence",
+            "max_depth_reached",
+            "lane_conflict",
+            "not_in_target_home_set",
+        }
+        for depth, count in sorted(ready_for_target_by_depth.items(), key=lambda item: int(item[0])):
+            depth_key = str(depth)
+            if int_value(count, 0) <= 0 or int_value(scheduled_after_promotion.get(depth_key), 0) > 0:
+                continue
+            reasons = ready_not_scheduled_reasons.get(depth_key, {}) or {}
+            non_stale_count = sum(
+                int_value(reason_count, 0)
+                for reason, reason_count in reasons.items()
+                if str(reason) in non_stale_block_reasons
+            )
+            stale_count = int_value(reasons.get("stale_base"), 0)
+            if non_stale_count <= 0:
+                unscheduled_ready_depths.append(depth_key)
+            if (
+                stale_count > 0
+                and stale_count >= int_value(count, 0)
+                and int_value(scheduled_after_promotion.get(depth_key), 0) <= 0
+                and non_stale_count <= 0
+            ):
+                stale_only_depths.append(depth_key)
+        if unscheduled_ready_depths:
+            errors.append(
+                "single-child ready children were not scheduled for target verification and lack non-stale block reasons: "
+                f"depths={unscheduled_ready_depths}, reasons={ready_not_scheduled_reasons}"
+            )
+        if stale_only_depths:
+            errors.append(
+                "single-child ready children were dropped as stale_base instead of being owned/scheduled: "
+                f"depths={stale_only_depths}, lane_excluded={ready_lane_excluded}, lane_conflict={ready_lane_conflict}"
             )
         full_accept_by_depth = summary.get("unified_raw_full_accept_proposal_count_by_depth", {})
         full_child_by_depth = summary.get("unified_child_generated_from_full_accept_parent_count_by_depth", {})
@@ -3510,9 +3597,24 @@ def run_synthetic_tests() -> None:
         promoted_child_not_scheduled_reason,
         synthetic_single_child_payload(),
     )
-    assert not errors, (
-        "promoted child without verification should pass with explicit scheduling reason: "
+    assert any("dropped as stale_base" in error for error in errors), (
+        "promoted child without verification must fail when the only scheduling reason is stale_base: "
         f"errors={errors}\nsummary={promoted_reason_summary}"
+    )
+
+    promoted_child_terminal_reason = synthetic_single_child_records(
+        [[1], [2]],
+        committed_depths={1},
+        promoted_child_depths={2},
+        ready_not_scheduled_reasons_by_depth={2: "sequence_finished"},
+    )
+    errors, promoted_terminal_summary = validate_records(
+        promoted_child_terminal_reason,
+        synthetic_single_child_payload(),
+    )
+    assert not errors, (
+        "promoted child without verification should pass with a non-stale terminal scheduling reason: "
+        f"errors={errors}\nsummary={promoted_terminal_summary}"
     )
 
     premature_child_verify = synthetic_single_child_records(
@@ -3773,6 +3875,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_ready_for_target_verify_count_by_depth",
         "unified_child_ready_but_not_scheduled_count_by_depth",
         "unified_child_ready_not_scheduled_reason_counts_by_depth",
+        "unified_child_ready_seq_normal_lane_excluded_count_by_depth",
+        "unified_child_ready_seq_normal_lane_conflict_count_by_depth",
+        "unified_child_ready_seq_normal_lane_conflict_examples",
+        "unified_child_stale_base_count_by_depth",
+        "unified_child_stale_base_examples",
         "unified_child_scheduled_for_target_verify_count_by_depth",
         "unified_child_target_verified_after_promotion_count_by_depth",
         "unified_child_invalidated_after_parent_non_full_count_by_depth",
