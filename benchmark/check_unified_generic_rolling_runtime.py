@@ -911,6 +911,24 @@ def single_child_ahead_summary(
         records,
         "unified_child_promoted_after_parent_full_accept_count_by_depth",
     )
+    promoted_to_ready_trace_by_depth = sum_depth_counts(records, "unified_child_promoted_to_ready_count_by_depth")
+    ready_for_target_trace_by_depth = sum_depth_counts(records, "unified_child_ready_for_target_verify_count_by_depth")
+    ready_not_scheduled_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_ready_but_not_scheduled_count_by_depth",
+    )
+    ready_not_scheduled_reason_counts = sum_depth_reason_counts(
+        records,
+        "unified_child_ready_not_scheduled_reason_counts_by_depth",
+    )
+    scheduled_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_scheduled_for_target_verify_count_by_depth",
+    )
+    target_verified_after_promotion_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_target_verified_after_promotion_count_by_depth",
+    )
     invalidated_after_non_full_trace_by_depth = sum_depth_counts(
         records,
         "unified_child_invalidated_after_parent_non_full_count_by_depth",
@@ -1208,6 +1226,25 @@ def single_child_ahead_summary(
         "unified_child_promoted_after_parent_full_accept_count_by_depth": dict(
             sorted(promoted_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
+        "unified_child_promoted_to_ready_count_by_depth": dict(
+            sorted(promoted_to_ready_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_ready_for_target_verify_count_by_depth": dict(
+            sorted(ready_for_target_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_ready_but_not_scheduled_count_by_depth": dict(
+            sorted(ready_not_scheduled_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_ready_not_scheduled_reason_counts_by_depth": {
+            str(depth): dict(sorted(reasons.items()))
+            for depth, reasons in sorted(ready_not_scheduled_reason_counts.items(), key=lambda item: int(item[0]))
+        },
+        "unified_child_scheduled_for_target_verify_count_by_depth": dict(
+            sorted(scheduled_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_target_verified_after_promotion_count_by_depth": dict(
+            sorted(target_verified_after_promotion_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
         "unified_child_invalidated_after_parent_non_full_count_by_depth": dict(
             sorted(invalidated_after_non_full_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
@@ -1228,6 +1265,18 @@ def single_child_ahead_summary(
         "unified_depth2_generated_while_depth1_verifying_count": sum_record_int(
             records,
             "unified_depth2_generated_while_depth1_verifying_count",
+        ),
+        "unified_depth2_ready_after_depth1_full_accept_count": sum_record_int(
+            records,
+            "unified_depth2_ready_after_depth1_full_accept_count",
+        ),
+        "unified_depth2_scheduled_after_depth1_full_accept_count": sum_record_int(
+            records,
+            "unified_depth2_scheduled_after_depth1_full_accept_count",
+        ),
+        "unified_depth2_verified_after_depth1_full_accept_count": sum_record_int(
+            records,
+            "unified_depth2_verified_after_depth1_full_accept_count",
         ),
         "unified_depth3_generated_while_depth2_verifying_count": sum_record_int(
             records,
@@ -2035,6 +2084,31 @@ def validate_records(
                 "single-child depth>1 candidates require full-accepted or in-flight parent provenance: "
                 f"depths={missing_provenance_depths}"
             )
+        promoted_by_depth = summary.get("unified_child_promoted_after_parent_full_accept_count_by_depth", {})
+        verified_after_parent_full = summary.get("unified_child_verified_after_parent_full_accept_count_by_depth", {})
+        target_verified_after_promotion = summary.get(
+            "unified_child_target_verified_after_promotion_count_by_depth",
+            {},
+        )
+        ready_not_scheduled_reasons = summary.get(
+            "unified_child_ready_not_scheduled_reason_counts_by_depth",
+            {},
+        )
+        disappeared_promoted_depths: list[str] = []
+        for depth, count in sorted(promoted_by_depth.items(), key=lambda item: int(item[0])):
+            if int_value(count, 0) <= 0:
+                continue
+            if (
+                int_value(verified_after_parent_full.get(str(depth)), 0) <= 0
+                and int_value(target_verified_after_promotion.get(str(depth)), 0) <= 0
+                and not ready_not_scheduled_reasons.get(str(depth))
+            ):
+                disappeared_promoted_depths.append(str(depth))
+        if disappeared_promoted_depths:
+            errors.append(
+                "single-child promoted children were not target verified and lack ready-not-scheduled reasons: "
+                f"depths={disappeared_promoted_depths}"
+            )
         full_accept_by_depth = summary.get("unified_raw_full_accept_proposal_count_by_depth", {})
         full_child_by_depth = summary.get("unified_child_generated_from_full_accept_parent_count_by_depth", {})
         inflight_child_by_depth = summary.get("unified_child_generated_from_inflight_parent_count_by_depth", {})
@@ -2607,7 +2681,10 @@ def synthetic_single_child_records(
     full_accept_without_child_reasons_by_depth: dict[int, str] | None = None,
     inflight_child_depths: set[int] | None = None,
     promoted_child_depths: set[int] | None = None,
+    scheduled_child_depths: set[int] | None = None,
+    target_verified_after_promotion_depths: set[int] | None = None,
     invalidated_after_non_full_child_depths: set[int] | None = None,
+    ready_not_scheduled_reasons_by_depth: dict[int, str] | None = None,
     verified_before_parent_full_accept_violation: bool = False,
 ) -> list[dict[str, Any]]:
     committed_depths = set(committed_depths or set())
@@ -2616,7 +2693,10 @@ def synthetic_single_child_records(
     full_accept_without_child_reasons_by_depth = dict(full_accept_without_child_reasons_by_depth or {})
     inflight_child_depths = set(inflight_child_depths or set())
     promoted_child_depths = set(promoted_child_depths or set())
+    scheduled_child_depths = set(scheduled_child_depths or set())
+    target_verified_after_promotion_depths = set(target_verified_after_promotion_depths or set())
     invalidated_after_non_full_child_depths = set(invalidated_after_non_full_child_depths or set())
+    ready_not_scheduled_reasons_by_depth = dict(ready_not_scheduled_reasons_by_depth or {})
     target_inflight_depths = {int(depth) - 1 for depth in inflight_child_depths if int(depth) > 1}
     gamma = 4
     proposal_id_by_depth = {depth: 9000 + depth for depths in steps for depth in depths}
@@ -3064,6 +3144,41 @@ def synthetic_single_child_records(
         }
         if promoted_depths:
             record["unified_child_promoted_after_parent_full_accept_count_by_depth"] = promoted_depths
+            record["unified_child_promoted_to_ready_count_by_depth"] = promoted_depths
+            record["unified_child_ready_for_target_verify_count_by_depth"] = promoted_depths
+            if 2 in [int(depth) for depth in depths if int(depth) in promoted_child_depths]:
+                record["unified_depth2_ready_after_depth1_full_accept_count"] = 1
+        scheduled_depths = {
+            str(depth): 1 for depth in depths if int(depth) in scheduled_child_depths
+        }
+        if scheduled_depths:
+            record["unified_child_scheduled_for_target_verify_count_by_depth"] = scheduled_depths
+            if 2 in [int(depth) for depth in depths if int(depth) in scheduled_child_depths]:
+                record["unified_depth2_scheduled_after_depth1_full_accept_count"] = 1
+        target_verified_after_promotion = {
+            str(depth): 1 for depth in depths if int(depth) in target_verified_after_promotion_depths
+        }
+        if target_verified_after_promotion:
+            record["unified_child_target_verified_after_promotion_count_by_depth"] = (
+                target_verified_after_promotion
+            )
+            record["unified_child_verified_after_parent_full_accept_count_by_depth"] = (
+                target_verified_after_promotion
+            )
+            if 2 in [int(depth) for depth in depths if int(depth) in target_verified_after_promotion_depths]:
+                record["unified_depth2_verified_after_depth1_full_accept_count"] = 1
+        ready_not_scheduled_depths = {
+            str(depth): 1
+            for depth in depths
+            if int(depth) in ready_not_scheduled_reasons_by_depth
+        }
+        if ready_not_scheduled_depths:
+            record["unified_child_ready_but_not_scheduled_count_by_depth"] = ready_not_scheduled_depths
+            record["unified_child_ready_not_scheduled_reason_counts_by_depth"] = {
+                str(depth): {str(ready_not_scheduled_reasons_by_depth[int(depth)]): 1}
+                for depth in depths
+                if int(depth) in ready_not_scheduled_reasons_by_depth
+            }
         invalidated_after_non_full_depths = {
             str(depth): 1 for depth in depths if int(depth) in invalidated_after_non_full_child_depths
         }
@@ -3353,6 +3468,53 @@ def run_synthetic_tests() -> None:
     assert inflight_child_summary["unified_child_generated_from_inflight_parent_count_by_depth"]["2"] == 1
     assert inflight_child_summary["unified_depth2_generated_while_depth1_verifying_count"] == 1
 
+    promoted_child_scheduled = synthetic_single_child_records(
+        [[1], [2]],
+        committed_depths={1},
+        promoted_child_depths={2},
+        scheduled_child_depths={2},
+        target_verified_after_promotion_depths={2},
+    )
+    errors, promoted_scheduled_summary = validate_records(
+        promoted_child_scheduled,
+        synthetic_single_child_payload(),
+    )
+    assert not errors, (
+        "promoted child scheduled for target verification should pass: "
+        f"errors={errors}\nsummary={promoted_scheduled_summary}"
+    )
+    assert promoted_scheduled_summary["unified_child_scheduled_for_target_verify_count_by_depth"]["2"] == 1
+    assert promoted_scheduled_summary["unified_child_target_verified_after_promotion_count_by_depth"]["2"] == 1
+
+    promoted_child_disappeared = synthetic_single_child_records(
+        [[1], [2]],
+        committed_depths={1},
+        promoted_child_depths={2},
+    )
+    errors, promoted_disappeared_summary = validate_records(
+        promoted_child_disappeared,
+        synthetic_single_child_payload(),
+    )
+    assert any("promoted children were not target verified" in error for error in errors), (
+        "promoted child without scheduling or reason should fail: "
+        f"errors={errors}\nsummary={promoted_disappeared_summary}"
+    )
+
+    promoted_child_not_scheduled_reason = synthetic_single_child_records(
+        [[1], [2]],
+        committed_depths={1},
+        promoted_child_depths={2},
+        ready_not_scheduled_reasons_by_depth={2: "stale_base"},
+    )
+    errors, promoted_reason_summary = validate_records(
+        promoted_child_not_scheduled_reason,
+        synthetic_single_child_payload(),
+    )
+    assert not errors, (
+        "promoted child without verification should pass with explicit scheduling reason: "
+        f"errors={errors}\nsummary={promoted_reason_summary}"
+    )
+
     premature_child_verify = synthetic_single_child_records(
         [[1, 2]],
         inflight_child_depths={2},
@@ -3607,12 +3769,21 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_generated_from_inflight_parent_count_by_depth",
         "unified_child_pending_parent_result_count_by_depth",
         "unified_child_promoted_after_parent_full_accept_count_by_depth",
+        "unified_child_promoted_to_ready_count_by_depth",
+        "unified_child_ready_for_target_verify_count_by_depth",
+        "unified_child_ready_but_not_scheduled_count_by_depth",
+        "unified_child_ready_not_scheduled_reason_counts_by_depth",
+        "unified_child_scheduled_for_target_verify_count_by_depth",
+        "unified_child_target_verified_after_promotion_count_by_depth",
         "unified_child_invalidated_after_parent_non_full_count_by_depth",
         "unified_child_verified_after_parent_full_accept_count_by_depth",
         "unified_child_verified_before_parent_result_count_by_depth",
         "unified_child_verified_before_parent_full_accept_violation_count",
         "unified_child_generated_in_same_burst_as_grandchild_violation_count",
         "unified_depth2_generated_while_depth1_verifying_count",
+        "unified_depth2_ready_after_depth1_full_accept_count",
+        "unified_depth2_scheduled_after_depth1_full_accept_count",
+        "unified_depth2_verified_after_depth1_full_accept_count",
         "unified_depth3_generated_while_depth2_verifying_count",
         "unified_child_generated_from_non_full_parent_count_by_depth",
         "unified_child_generated_from_unverified_parent_count_by_depth",

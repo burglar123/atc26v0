@@ -358,6 +358,7 @@ class ModelRunnerBase:
         self._unified_pending_child_ids_by_parent_id = {}
         self._unified_pending_child_parent_id_by_child_id = {}
         self._unified_promoted_child_proposal_ids = set()
+        self._unified_ready_child_proposal_ids = set()
         self.cached_kv_store = {}
         self.cached_admission_log_interval = 32
         self.last_result_used_file_fallback = False
@@ -1677,12 +1678,21 @@ class ModelRunnerBase:
             "unified_child_generated_from_inflight_parent_count_by_depth": {},
             "unified_child_pending_parent_result_count_by_depth": {},
             "unified_child_promoted_after_parent_full_accept_count_by_depth": {},
+            "unified_child_promoted_to_ready_count_by_depth": {},
+            "unified_child_ready_for_target_verify_count_by_depth": {},
+            "unified_child_ready_but_not_scheduled_count_by_depth": {},
+            "unified_child_ready_not_scheduled_reason_counts_by_depth": {},
+            "unified_child_scheduled_for_target_verify_count_by_depth": {},
+            "unified_child_target_verified_after_promotion_count_by_depth": {},
             "unified_child_invalidated_after_parent_non_full_count_by_depth": {},
             "unified_child_verified_after_parent_full_accept_count_by_depth": {},
             "unified_child_verified_before_parent_result_count_by_depth": {},
             "unified_child_verified_before_parent_full_accept_violation_count": 0,
             "unified_child_generated_in_same_burst_as_grandchild_violation_count": 0,
             "unified_depth2_generated_while_depth1_verifying_count": 0,
+            "unified_depth2_ready_after_depth1_full_accept_count": 0,
+            "unified_depth2_scheduled_after_depth1_full_accept_count": 0,
+            "unified_depth2_verified_after_depth1_full_accept_count": 0,
             "unified_depth3_generated_while_depth2_verifying_count": 0,
             "unified_child_generation_mode_by_proposal_id": {},
             "unified_child_parent_state_at_generation_by_proposal_id": {},
@@ -13453,6 +13463,8 @@ class ModelRunnerBase:
                 "target_verify_inflight": False,
                 "child_pending_parent_result": False,
                 "child_promoted_after_parent_full_accept": False,
+                "child_ready_for_target_verify": False,
+                "child_scheduled_for_target_verify": False,
                 "child_invalidated_after_parent_non_full": False,
                 "child_generated_before_parent_result": False,
                 "child_generation_mode": "",
@@ -13482,6 +13494,8 @@ class ModelRunnerBase:
                 "target_verify_inflight",
                 "child_pending_parent_result",
                 "child_promoted_after_parent_full_accept",
+                "child_ready_for_target_verify",
+                "child_scheduled_for_target_verify",
                 "child_invalidated_after_parent_non_full",
                 "child_generated_before_parent_result",
                 "parent_full_accept",
@@ -13873,6 +13887,12 @@ class ModelRunnerBase:
             "unified_proposal_registry_child_promoted_after_parent_full_accept_by_proposal_id": (
                 "child_promoted_after_parent_full_accept"
             ),
+            "unified_proposal_registry_child_ready_for_target_verify_by_proposal_id": (
+                "child_ready_for_target_verify"
+            ),
+            "unified_proposal_registry_child_scheduled_for_target_verify_by_proposal_id": (
+                "child_scheduled_for_target_verify"
+            ),
             "unified_proposal_registry_child_invalidated_after_parent_non_full_by_proposal_id": (
                 "child_invalidated_after_parent_non_full"
             ),
@@ -14126,6 +14146,7 @@ class ModelRunnerBase:
             child_depth = int(child_record.get("depth", int(parent_depth) + 1))
             if parent_full_accept:
                 self._unified_promoted_child_proposal_ids.add(int(child_id))
+                self._unified_ready_child_proposal_ids.add(int(child_id))
                 self._unified_pending_child_parent_id_by_child_id.pop(int(child_id), None)
                 self._increment_trace_depth_counter(
                     trace_record,
@@ -14133,6 +14154,22 @@ class ModelRunnerBase:
                     child_depth,
                     1,
                 )
+                self._increment_trace_depth_counter(
+                    trace_record,
+                    "unified_child_promoted_to_ready_count_by_depth",
+                    child_depth,
+                    1,
+                )
+                self._increment_trace_depth_counter(
+                    trace_record,
+                    "unified_child_ready_for_target_verify_count_by_depth",
+                    child_depth,
+                    1,
+                )
+                if child_depth == 2 and int(parent_depth) == 1:
+                    trace_record["unified_depth2_ready_after_depth1_full_accept_count"] = int(
+                        trace_record.get("unified_depth2_ready_after_depth1_full_accept_count", 0) or 0
+                    ) + 1
                 self._set_unified_child_lifecycle_bool(
                     trace_record,
                     "unified_child_promoted_after_parent_full_accept_by_proposal_id",
@@ -14149,14 +14186,20 @@ class ModelRunnerBase:
                     child_id,
                     child_pending_parent_result=False,
                     child_promoted_after_parent_full_accept=True,
+                    child_ready_for_target_verify=True,
+                    child_scheduled_for_target_verify=False,
                     parent_result_step=int(result_step),
                     parent_accepted_len=int(parent_accept_len),
                     parent_full_accept=True,
                     parent_partial_accept=False,
                     parent_reject=False,
                 )
+                child_proposal = self._generic_rolling_shadow_proposals_by_id.get(int(child_id))
+                if child_proposal is not None:
+                    child_proposal.state = EAGER_STATE_READY_TO_VERIFY
             else:
                 self._unified_promoted_child_proposal_ids.discard(int(child_id))
+                self._unified_ready_child_proposal_ids.discard(int(child_id))
                 self._unified_pending_child_parent_id_by_child_id.pop(int(child_id), None)
                 self._increment_trace_depth_counter(
                     trace_record,
@@ -14179,6 +14222,8 @@ class ModelRunnerBase:
                 self._upsert_unified_generic_proposal_outcome(
                     child_id,
                     child_pending_parent_result=False,
+                    child_ready_for_target_verify=False,
+                    child_scheduled_for_target_verify=False,
                     child_invalidated_after_parent_non_full=True,
                     invalidated=True,
                     invalidation_reason="parent_not_full_accept",
@@ -14207,6 +14252,50 @@ class ModelRunnerBase:
             ):
                 self._set_unified_child_lifecycle_bool(trace_record, field, child_id, value)
 
+    def _record_unified_child_ready_not_scheduled(
+        self,
+        trace_record: dict,
+        *,
+        child_id: int,
+        child_depth: int,
+        reason: str,
+        drop_ready: bool = False,
+    ) -> None:
+        child_id = int(child_id)
+        child_depth = int(child_depth)
+        reason = str(reason)
+        self._increment_trace_depth_counter(
+            trace_record,
+            "unified_child_ready_but_not_scheduled_count_by_depth",
+            child_depth,
+            1,
+        )
+        self._increment_trace_depth_reason_counter(
+            trace_record,
+            "unified_child_ready_not_scheduled_reason_counts_by_depth",
+            child_depth,
+            reason,
+            1,
+        )
+        if drop_ready:
+            self._unified_ready_child_proposal_ids.discard(child_id)
+            self._unified_promoted_child_proposal_ids.discard(child_id)
+            invalidating_reason = reason in {
+                "missing_child_payload",
+                "parent_result_missing",
+                "parent_not_full_accept",
+                "stale_base",
+                "max_depth_reached",
+                "sequence_finished",
+            }
+            self._upsert_unified_generic_proposal_outcome(
+                child_id,
+                child_ready_for_target_verify=False,
+                child_scheduled_for_target_verify=False,
+                invalidated=invalidating_reason,
+                invalidation_reason=reason if invalidating_reason else "",
+            )
+
     def _promoted_unified_child_decisions(
         self,
         trace_record: dict,
@@ -14220,35 +14309,178 @@ class ModelRunnerBase:
         generation_parents: list[dict] = []
         seen_seq_ids: set[int] = set()
         selected_depth: int | None = None
-        for child_id in sorted(self._unified_promoted_child_proposal_ids):
-            if len(decisions) >= int(max_children) or len(seen_seq_ids) >= int(max_seqs):
-                break
+        ready_child_ids = set(int(child_id) for child_id in self._unified_ready_child_proposal_ids)
+        ready_child_ids.update(int(child_id) for child_id in self._unified_promoted_child_proposal_ids)
+        for child_id in sorted(ready_child_ids):
             proposal = self._generic_rolling_shadow_proposals_by_id.get(int(child_id))
             child_record = self._generic_rolling_proposal_outcomes_by_id.get(int(child_id), {})
+            child_depth = int(
+                getattr(
+                    proposal,
+                    "generic_rolling_depth",
+                    child_record.get("depth", -1) if child_record else -1,
+                )
+            )
+            if child_depth < 1:
+                child_depth = 1
+            if len(decisions) >= int(max_children):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="budget_exhausted",
+                )
+                continue
+            if len(seen_seq_ids) >= int(max_seqs):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="no_target_slot",
+                )
+                continue
             if proposal is None or not child_record:
-                self._unified_promoted_child_proposal_ids.discard(int(child_id))
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="missing_child_payload",
+                    drop_ready=True,
+                )
+                continue
+            if (
+                bool(child_record.get("target_verify_inflight", False))
+                or bool(child_record.get("invalidated", False))
+                or int(child_record.get("accepted_len", -1)) >= 0
+                or bool(child_record.get("applied_full_commit", False))
+                or bool(child_record.get("applied_partial_recovery", False))
+                or bool(child_record.get("no_mutation_reject", False))
+            ):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="already_consumed",
+                    drop_ready=True,
+                )
                 continue
             seq_id = int(getattr(proposal, "seq_id", child_record.get("seq_id", -1)))
             if seq_id in seen_seq_ids:
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="no_target_slot",
+                )
                 continue
             seq = seq_by_id.get(seq_id)
             if seq is None or getattr(seq, "status", None) != SequenceStatus.RUNNING:
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="sequence_finished" if seq is not None else "no_active_sequence",
+                    drop_ready=seq is not None,
+                )
+                continue
+            parent_id = int(getattr(proposal, "parent_proposal_id", child_record.get("parent_proposal_id", -1)) or -1)
+            parent_record = self._generic_rolling_proposal_outcomes_by_id.get(parent_id, {})
+            parent_proposal_len = int(parent_record.get("proposal_len", self.gamma)) if parent_record else int(self.gamma)
+            parent_accepted_len = int(parent_record.get("accepted_len", -1)) if parent_record else -1
+            if not parent_record or parent_accepted_len < 0:
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="parent_result_missing",
+                )
+                continue
+            if not (
+                bool(parent_record.get("full_accept", False))
+                and bool(parent_record.get("applied_full_commit", False))
+                and not bool(parent_record.get("invalidated", False))
+                and parent_proposal_len == int(self.gamma)
+                and parent_accepted_len == parent_proposal_len
+            ):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="parent_not_full_accept",
+                    drop_ready=True,
+                )
                 continue
             if bool(getattr(seq, "pre_verify", True)):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="lane_conflict",
+                )
                 continue
             if int(len(seq)) != int(getattr(proposal, "base_len", child_record.get("base_len", -1))):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="stale_base",
+                    drop_ready=True,
+                )
                 continue
-            depth = int(getattr(proposal, "generic_rolling_depth", child_record.get("depth", -1)))
-            parent_id = int(getattr(proposal, "parent_proposal_id", child_record.get("parent_proposal_id", -1)) or -1)
+            depth = int(child_depth)
+            max_depth, _max_children, _max_seqs = self._rolling_continuous_limits()
+            if depth > int(max_depth):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="max_depth_reached",
+                    drop_ready=True,
+                )
+                continue
             root_id = int(getattr(proposal, "generic_rolling_root_id", child_record.get("root_id", int(child_id))))
             tokens = [int(token_id) for token_id in getattr(proposal, "proposal_token_ids", [])]
             to_verify = [int(token_id) for token_id in getattr(proposal, "to_be_verified_token_ids", tokens)]
             if len(tokens) < int(self.gamma):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="missing_child_payload",
+                    drop_ready=True,
+                )
+                continue
+            if getattr(proposal, "state", EAGER_STATE_READY_TO_VERIFY) not in {
+                EAGER_STATE_READY_TO_VERIFY,
+                EAGER_STATE_READY_TO_VERIFY_DRY_RUN,
+            }:
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="child_state_not_ready",
+                )
                 continue
             if selected_depth is None:
                 selected_depth = int(depth)
             elif int(depth) != int(selected_depth):
+                self._record_unified_child_ready_not_scheduled(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    reason="no_target_slot",
+                )
                 continue
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_child_scheduled_for_target_verify_count_by_depth",
+                depth,
+                1,
+            )
+            if depth == 2 and int(parent_record.get("depth", -1)) == 1:
+                trace_record["unified_depth2_scheduled_after_depth1_full_accept_count"] = int(
+                    trace_record.get("unified_depth2_scheduled_after_depth1_full_accept_count", 0) or 0
+                ) + 1
             decisions.append(
                 {
                     "proposal_id": int(child_id),
@@ -14269,6 +14501,16 @@ class ModelRunnerBase:
                     "verify_result": "pending",
                 }
             )
+            self._update_generic_depth_trace_lists(
+                trace_record,
+                depth=depth,
+                candidate_ids=[],
+                candidate_seq_ids=[],
+                ready_ids=[int(child_id)],
+                ready_seq_ids=[int(seq_id)],
+                committed_ids=[],
+                committed_seq_ids=[],
+            )
             generation_parents.append(
                 {
                     "proposal_id": int(child_id),
@@ -14282,9 +14524,13 @@ class ModelRunnerBase:
                 child_id,
                 target_verify_inflight=True,
                 child_pending_parent_result=False,
+                child_ready_for_target_verify=False,
+                child_scheduled_for_target_verify=True,
             )
             seen_seq_ids.add(seq_id)
             self._unified_promoted_child_proposal_ids.discard(int(child_id))
+            self._unified_ready_child_proposal_ids.discard(int(child_id))
+            proposal.state = EAGER_STATE_VERIFYING
         return decisions, generation_parents
 
     def _select_unified_generic_depth1_seed_parents(
@@ -16005,6 +16251,26 @@ class ModelRunnerBase:
                             depth,
                             1,
                         )
+                        if bool(parent_record.get("depth", -1) == depth - 1):
+                            child_record = self._generic_rolling_proposal_outcomes_by_id.get(proposal_id, {})
+                            if (
+                                self._unified_generic_max_unverified_depth_ahead() == 1
+                                or bool(child_record.get("child_promoted_after_parent_full_accept", False))
+                            ):
+                                self._increment_trace_depth_counter(
+                                    trace_record,
+                                    "unified_child_target_verified_after_promotion_count_by_depth",
+                                    depth,
+                                    1,
+                                )
+                                if depth == 2 and int(parent_record.get("depth", -1)) == 1:
+                                    trace_record["unified_depth2_verified_after_depth1_full_accept_count"] = int(
+                                        trace_record.get(
+                                            "unified_depth2_verified_after_depth1_full_accept_count",
+                                            0,
+                                        )
+                                        or 0
+                                    ) + 1
                 if depth < 1:
                     reason = "depth_below_generic_unified"
                 elif depth > int(getattr(self.global_config, "max_rolling_continuous_depth", 0) or 0):
