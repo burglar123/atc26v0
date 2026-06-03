@@ -973,6 +973,46 @@ def single_child_ahead_summary(
                 break
             if isinstance(example, dict):
                 schedule_state_error_examples.append(example)
+    ready_owner_seq_ids = merge_int_lists(records, "unified_ready_child_lane_owner_seq_ids")
+    ready_owner_request_ids: dict[str, str] = {}
+    ready_exclusion_mismatch_examples: list[dict[str, Any]] = []
+    for record in records:
+        request_ids = record.get("unified_ready_child_lane_owner_request_ids")
+        if isinstance(request_ids, dict):
+            for seq_id, request_id in request_ids.items():
+                try:
+                    ready_owner_request_ids[str(int(seq_id))] = str(request_id)
+                except Exception:
+                    continue
+        for example in record.get("unified_ready_child_normal_verify_exclusion_mismatch_examples") or []:
+            if len(ready_exclusion_mismatch_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                ready_exclusion_mismatch_examples.append(example)
+    ready_excluded_from_draft = merge_int_lists(
+        records,
+        "unified_ready_child_excluded_from_normal_draft_seq_ids",
+    )
+    ready_excluded_from_target_normal = merge_int_lists(
+        records,
+        "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
+    )
+    ready_remaining_in_target_normal = merge_int_lists(
+        records,
+        "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
+    )
+    ready_missing_normal_allowed = merge_int_lists(
+        records,
+        "unified_ready_child_missing_normal_proposal_allowed_seq_ids",
+    )
+    missing_buffered_allowed_unified = merge_int_lists(
+        records,
+        "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids",
+    )
+    ready_exclusion_mismatch_count = sum_record_int(
+        records,
+        "unified_ready_child_normal_verify_exclusion_mismatch_count",
+    )
     target_verified_after_promotion_trace_by_depth = sum_depth_counts(
         records,
         "unified_child_target_verified_after_promotion_count_by_depth",
@@ -1315,6 +1355,27 @@ def single_child_ahead_summary(
             sorted(schedule_state_error_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
         "unified_child_schedule_state_error_examples": schedule_state_error_examples[:8],
+        "unified_ready_child_lane_owner_seq_ids": list(ready_owner_seq_ids),
+        "unified_ready_child_lane_owner_request_ids": dict(sorted(ready_owner_request_ids.items())),
+        "unified_ready_child_excluded_from_normal_draft_seq_ids": list(ready_excluded_from_draft),
+        "unified_ready_child_excluded_from_target_normal_verify_seq_ids": list(
+            ready_excluded_from_target_normal
+        ),
+        "unified_ready_child_remaining_in_target_normal_verify_seq_ids": list(
+            ready_remaining_in_target_normal
+        ),
+        "unified_ready_child_normal_verify_exclusion_mismatch_count": int(
+            ready_exclusion_mismatch_count
+        ),
+        "unified_ready_child_normal_verify_exclusion_mismatch_examples": (
+            ready_exclusion_mismatch_examples[:8]
+        ),
+        "unified_ready_child_missing_normal_proposal_allowed_seq_ids": list(
+            ready_missing_normal_allowed
+        ),
+        "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids": list(
+            missing_buffered_allowed_unified
+        ),
         "unified_child_target_verified_after_promotion_count_by_depth": dict(
             sorted(target_verified_after_promotion_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
@@ -2187,6 +2248,51 @@ def validate_records(
                 f"counts={schedule_state_errors}, examples="
                 f"{summary.get('unified_child_schedule_state_error_examples', [])}"
             )
+        owner_target_remaining = summary.get(
+            "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
+            [],
+        )
+        owner_exclusion_mismatch_count = int_value(
+            summary.get("unified_ready_child_normal_verify_exclusion_mismatch_count"),
+            0,
+        )
+        if owner_target_remaining or owner_exclusion_mismatch_count > 0:
+            errors.append(
+                "single-child ready-child owners must be excluded from target normal verify: "
+                f"remaining={owner_target_remaining}, mismatch_count={owner_exclusion_mismatch_count}, "
+                f"examples={summary.get('unified_ready_child_normal_verify_exclusion_mismatch_examples', [])}"
+            )
+        for index, record in enumerate(records):
+            owner_seq_ids = set(as_int_list(record.get("unified_ready_child_lane_owner_seq_ids")))
+            unexpected_missing = as_int_list(record.get("missing_buffered_proposal_unexpected_seq_ids"))
+            if unexpected_missing:
+                errors.append(
+                    "single-child target normal verify is missing non-owned buffered proposals: "
+                    f"record_index={index}, missing={unexpected_missing}"
+                )
+            if not owner_seq_ids:
+                continue
+            draft_overlap = sorted(
+                owner_seq_ids & set(as_int_list(record.get("actual_draft_home_set_for_normal_draft")))
+            )
+            target_overlap = sorted(
+                owner_seq_ids & set(as_int_list(record.get("target_normal_verify_seq_ids")))
+            )
+            if draft_overlap or target_overlap:
+                errors.append(
+                    "single-child ready-child owner remained in a normal lane: "
+                    f"record_index={index}, draft_overlap={draft_overlap}, target_overlap={target_overlap}, "
+                    f"owners={sorted(owner_seq_ids)}"
+                )
+            allowed_by_unified = set(
+                as_int_list(record.get("missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids"))
+            )
+            if allowed_by_unified & set(as_int_list(record.get("target_normal_verify_seq_ids"))):
+                errors.append(
+                    "single-child unified-ready missing-proposal allowance must not leave seq in target normal verify: "
+                    f"record_index={index}, overlap="
+                    f"{sorted(allowed_by_unified & set(as_int_list(record.get('target_normal_verify_seq_ids'))))}"
+                )
         disappeared_promoted_depths: list[str] = []
         for depth, count in sorted(promoted_by_depth.items(), key=lambda item: int(item[0])):
             if int_value(count, 0) <= 0:
@@ -3497,6 +3603,73 @@ def run_synthetic_tests() -> None:
     errors, _summary = validate_records(sampled_missing, payload)
     assert not errors, f"missing sampled debug fields should not fail: {errors}"
 
+    ready_owner_base = json.loads(json.dumps(synthetic_reject_partial_records()[0]))
+    ready_owner_payload = synthetic_payload(total_output_tokens=2)
+    ready_owner_ok = [json.loads(json.dumps(ready_owner_base))]
+    ready_owner_ok[0].update(
+        {
+            "target_home_set": [1, 2],
+            "target_normal_verify_seq_ids": [2],
+            "draft_home_set": [0],
+            "original_draft_home_set": [0, 1],
+            "actual_draft_home_set_for_normal_draft": [0],
+            "unified_ready_child_lane_owner_seq_ids": [1],
+            "unified_ready_child_lane_owner_request_ids": {"1": "req-1"},
+            "unified_ready_child_excluded_from_normal_draft_seq_ids": [1],
+            "unified_ready_child_excluded_from_target_normal_verify_seq_ids": [1],
+            "unified_ready_child_remaining_in_target_normal_verify_seq_ids": [],
+            "unified_ready_child_normal_verify_exclusion_mismatch_count": 0,
+            "unified_ready_child_missing_normal_proposal_allowed_seq_ids": [1],
+            "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids": [1],
+            "missing_buffered_proposal_unexpected_seq_ids": [],
+            "unified_single_child_ahead_enabled": True,
+            "unified_max_unverified_depth_ahead": 1,
+        }
+    )
+    errors, ready_owner_ok_summary = validate_records(ready_owner_ok, ready_owner_payload)
+    assert not errors, f"ready-child owner excluded from both normal lanes should pass: {errors}\nsummary={ready_owner_ok_summary}"
+
+    ready_owner_target_mismatch = [json.loads(json.dumps(ready_owner_ok[0]))]
+    ready_owner_target_mismatch[0]["target_normal_verify_seq_ids"] = [1, 2]
+    ready_owner_target_mismatch[0]["unified_ready_child_remaining_in_target_normal_verify_seq_ids"] = [1]
+    ready_owner_target_mismatch[0]["unified_ready_child_normal_verify_exclusion_mismatch_count"] = 1
+    ready_owner_target_mismatch[0]["unified_ready_child_normal_verify_exclusion_mismatch_examples"] = [
+        {"seq_id": 1, "child_proposal_id": 1002, "child_depth": 2}
+    ]
+    errors, _summary = validate_records(ready_owner_target_mismatch, ready_owner_payload)
+    assert any("target normal verify" in error or "normal lane" in error for error in errors), (
+        "ready-child owner still in target normal verify should fail"
+    )
+
+    ready_owner_missing_allowed_but_targeted = [json.loads(json.dumps(ready_owner_ok[0]))]
+    ready_owner_missing_allowed_but_targeted[0]["target_normal_verify_seq_ids"] = [1, 2]
+    ready_owner_missing_allowed_but_targeted[0]["missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids"] = [1]
+    errors, _summary = validate_records(ready_owner_missing_allowed_but_targeted, ready_owner_payload)
+    assert any("target normal verify" in error for error in errors), (
+        "ready-child owner missing a normal proposal while still targeted should fail"
+    )
+
+    non_owned_missing_buffer = [json.loads(json.dumps(ready_owner_base))]
+    non_owned_missing_buffer[0]["target_home_set"] = [9]
+    non_owned_missing_buffer[0]["target_normal_verify_seq_ids"] = [9]
+    non_owned_missing_buffer[0]["missing_buffered_proposal_unexpected_seq_ids"] = [9]
+    non_owned_missing_buffer[0]["unified_single_child_ahead_enabled"] = True
+    non_owned_missing_buffer[0]["unified_max_unverified_depth_ahead"] = 1
+    errors, _summary = validate_records(non_owned_missing_buffer, ready_owner_payload)
+    assert any("missing non-owned buffered proposals" in error for error in errors), (
+        "non-owned target-normal seq missing buffer should fail"
+    )
+
+    ready_owner_scheduled = [json.loads(json.dumps(ready_owner_ok[0]))]
+    ready_owner_scheduled[0]["unified_child_scheduled_for_target_verify_count_by_depth"] = {"2": 1}
+    ready_owner_scheduled[0]["unified_child_target_verify_inflight_count_by_depth"] = {"2": 1}
+    ready_owner_scheduled[0]["unified_child_scheduled_state_by_depth"] = {"2": {"READY_TO_VERIFY": 1}}
+    errors, ready_owner_scheduled_summary = validate_records(ready_owner_scheduled, ready_owner_payload)
+    assert not errors, (
+        "ready-child owner routed to promoted child scheduling should pass: "
+        f"{errors}\nsummary={ready_owner_scheduled_summary}"
+    )
+
     reject_partial_records = synthetic_reject_partial_records()
     errors, reject_partial_summary = validate_records(
         reject_partial_records,
@@ -3939,6 +4112,15 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_duplicate_schedule_skip_count_by_depth",
         "unified_child_schedule_state_error_count_by_depth",
         "unified_child_schedule_state_error_examples",
+        "unified_ready_child_lane_owner_seq_ids",
+        "unified_ready_child_lane_owner_request_ids",
+        "unified_ready_child_excluded_from_normal_draft_seq_ids",
+        "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
+        "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
+        "unified_ready_child_normal_verify_exclusion_mismatch_count",
+        "unified_ready_child_normal_verify_exclusion_mismatch_examples",
+        "unified_ready_child_missing_normal_proposal_allowed_seq_ids",
+        "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids",
         "unified_child_target_verified_after_promotion_count_by_depth",
         "unified_child_invalidated_after_parent_non_full_count_by_depth",
         "unified_child_verified_after_parent_full_accept_count_by_depth",

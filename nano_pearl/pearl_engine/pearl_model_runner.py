@@ -3012,20 +3012,32 @@ class ModelRunnerBase:
             return {}
         ready_child_ids = set(int(child_id) for child_id in self._unified_ready_child_proposal_ids)
         ready_child_ids.update(int(child_id) for child_id in self._unified_promoted_child_proposal_ids)
+        for child_id, record in self._generic_rolling_proposal_outcomes_by_id.items():
+            if (
+                bool(record.get("target_verify_inflight", False))
+                and bool(record.get("child_scheduled_for_target_verify", False))
+            ):
+                ready_child_ids.add(int(child_id))
         ready_by_seq: dict[int, list[tuple[int, int, EagerProposal | None, dict]]] = {}
         for child_id in sorted(ready_child_ids):
             proposal = self._generic_rolling_shadow_proposals_by_id.get(int(child_id))
             record = self._generic_rolling_proposal_outcomes_by_id.get(int(child_id), {})
             if proposal is None or not record:
                 continue
+            scheduled_inflight = (
+                bool(record.get("target_verify_inflight", False))
+                and bool(record.get("child_scheduled_for_target_verify", False))
+                and int(record.get("accepted_len", -1)) < 0
+            )
             if not (
                 bool(record.get("child_ready_for_target_verify", False))
                 or int(child_id) in self._unified_ready_child_proposal_ids
                 or int(child_id) in self._unified_promoted_child_proposal_ids
+                or scheduled_inflight
             ):
                 continue
             if (
-                bool(record.get("target_verify_inflight", False))
+                (bool(record.get("target_verify_inflight", False)) and not scheduled_inflight)
                 or bool(record.get("invalidated", False))
                 or int(record.get("accepted_len", -1)) >= 0
                 or bool(record.get("applied_full_commit", False))
@@ -3117,6 +3129,7 @@ class ModelRunnerBase:
 
     def _apply_unified_ready_child_lane_ownership_to_plan(self, plan: StepPlan) -> None:
         ready_by_seq = self._unified_ready_child_records_by_seq_id()
+        owner_seq_ids = sorted(int(seq_id) for seq_id in self._unified_ready_child_lane_owner_by_seq_id)
         for seq_id, owner in self._unified_ready_child_lane_owner_by_seq_id.items():
             if int(seq_id) in ready_by_seq:
                 continue
@@ -3128,18 +3141,24 @@ class ModelRunnerBase:
                     dict(owner),
                 )
             ]
-        if not ready_by_seq:
+        if not owner_seq_ids:
             return
-        original_draft_home = [
-            int(seq_id) for seq_id in (plan.original_draft_home_set or plan.draft_home_set)
-        ]
+        owner_seq_id_set = set(owner_seq_ids)
+        current_draft_home = self._actual_normal_draft_seq_ids(plan)
+        original_draft_home = list(
+            int(seq_id)
+            for seq_id in (
+                plan.original_draft_home_set
+                or plan.actual_draft_home_set_for_normal_draft
+                or plan.draft_home_set
+            )
+        )
         raw_target_home = [
             int(seq_id) for seq_id in (plan.raw_target_home_set_for_normal_verify or plan.target_home_set)
         ]
-        draft_excluded = sorted(set(original_draft_home) & set(ready_by_seq))
-        target_excluded = sorted(set(raw_target_home) & set(ready_by_seq))
-        if not draft_excluded and not target_excluded:
-            return
+        current_target_normal = self._target_normal_verify_seq_ids(plan)
+        draft_excluded = sorted(set(current_draft_home) & owner_seq_id_set)
+        target_excluded = sorted(set(current_target_normal) & owner_seq_id_set)
 
         depth_counts: dict[int, int] = {}
         examples = list(getattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", []) or [])
@@ -3163,6 +3182,15 @@ class ModelRunnerBase:
                         "excluded_from_target_normal_verify": bool(seq_id in set(target_excluded)),
                     }
                 )
+
+        plan.unified_ready_child_lane_owner_seq_ids = list(owner_seq_ids)
+        seq_to_request_id = self._seq_request_id_map()
+        plan.unified_ready_child_lane_owner_request_ids = {
+            int(seq_id): seq_to_request_id.get(int(seq_id), "<missing>")
+            for seq_id in owner_seq_ids
+        }
+        plan.unified_ready_child_excluded_from_normal_draft_seq_ids = list(draft_excluded)
+        plan.unified_ready_child_excluded_from_target_normal_verify_seq_ids = list(target_excluded)
 
         if draft_excluded:
             plan.original_draft_home_set = list(original_draft_home)
@@ -3201,10 +3229,89 @@ class ModelRunnerBase:
             plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(allowed_missing)
             plan.missing_normal_proposal_allowed_seq_ids_dry_run = list(allowed_missing)
 
+        remaining_target_normal = sorted(owner_seq_id_set & set(self._target_normal_verify_seq_ids(plan)))
+        plan.unified_ready_child_remaining_in_target_normal_verify_seq_ids = list(remaining_target_normal)
+        plan.unified_ready_child_missing_normal_proposal_allowed_seq_ids = list(target_excluded)
+        plan.missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids = list(target_excluded)
+        mismatch_examples = list(
+            getattr(plan, "unified_ready_child_normal_verify_exclusion_mismatch_examples", []) or []
+        )
+        if remaining_target_normal and len(mismatch_examples) < 8:
+            for seq_id in remaining_target_normal:
+                if len(mismatch_examples) >= 8:
+                    break
+                depth, child_id, proposal, record = ready_by_seq.get(
+                    int(seq_id),
+                    [(
+                        int(self._unified_ready_child_lane_owner_by_seq_id.get(int(seq_id), {}).get("depth", -1)),
+                        int(self._unified_ready_child_lane_owner_by_seq_id.get(int(seq_id), {}).get("proposal_id", -1)),
+                        None,
+                        dict(self._unified_ready_child_lane_owner_by_seq_id.get(int(seq_id), {})),
+                    )],
+                )[0]
+                mismatch_examples.append(
+                    {
+                        "plan_id": int(plan.plan_id),
+                        "dual_step_id": int(current_step),
+                        "seq_id": int(seq_id),
+                        "request_id": seq_to_request_id.get(int(seq_id), "<missing>"),
+                        "child_proposal_id": int(child_id),
+                        "child_depth": int(depth),
+                        "child_base_len": int(getattr(proposal, "base_len", record.get("base_len", -1))),
+                        "draft_home_set": list(plan.draft_home_set),
+                        "target_home_set": list(plan.target_home_set),
+                        "target_normal_verify_seq_ids": self._target_normal_verify_seq_ids(plan),
+                    }
+                )
+        plan.unified_ready_child_normal_verify_exclusion_mismatch_count = len(remaining_target_normal)
+        plan.unified_ready_child_normal_verify_exclusion_mismatch_examples = mismatch_examples[:8]
+
         depth_map = self._trace_depth_map_to_json(depth_counts)
         setattr(plan, "unified_child_ready_seq_normal_lane_excluded_count_by_depth", depth_map)
         setattr(plan, "unified_child_ready_seq_normal_lane_conflict_count_by_depth", depth_map)
         setattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", examples[:8])
+
+    def _validate_unified_ready_child_lane_ownership_plan(self, plan: StepPlan) -> None:
+        if not (
+            self._unified_generic_rolling_runtime_enabled()
+            and self._unified_generic_max_unverified_depth_ahead() == 1
+        ):
+            return
+        owner_seq_ids = {
+            int(seq_id)
+            for seq_id in getattr(plan, "unified_ready_child_lane_owner_seq_ids", [])
+        }
+        if not owner_seq_ids:
+            return
+        draft_overlap = sorted(owner_seq_ids & set(self._actual_normal_draft_seq_ids(plan)))
+        target_overlap = sorted(owner_seq_ids & set(self._target_normal_verify_seq_ids(plan)))
+        if not draft_overlap and not target_overlap:
+            return
+        seq_to_request_id = self._seq_request_id_map()
+        examples = []
+        for seq_id in sorted(set(draft_overlap) | set(target_overlap)):
+            owner = self._unified_ready_child_lane_owner_by_seq_id.get(int(seq_id), {})
+            examples.append(
+                {
+                    "plan_id": int(plan.plan_id),
+                    "dual_step_id": -1 if plan.step_id is None else int(plan.step_id),
+                    "seq_id": int(seq_id),
+                    "request_id": seq_to_request_id.get(int(seq_id), "<missing>"),
+                    "child_proposal_id": int(owner.get("proposal_id", -1)),
+                    "child_depth": int(owner.get("depth", -1)),
+                    "child_base_len": int(owner.get("base_len", -1)),
+                    "in_actual_draft_home_set_for_normal_draft": bool(seq_id in set(draft_overlap)),
+                    "in_target_normal_verify_seq_ids": bool(seq_id in set(target_overlap)),
+                    "draft_home_set": list(plan.draft_home_set),
+                    "target_home_set": list(plan.target_home_set),
+                    "target_normal_verify_seq_ids": self._target_normal_verify_seq_ids(plan),
+                }
+            )
+        raise AssertionError(
+            "unified ready-child lane ownership must exclude owned seqs from both normal lanes: "
+            f"plan_id={plan.plan_id}, dual_step_id={-1 if plan.step_id is None else int(plan.step_id)}, "
+            f"draft_overlap={draft_overlap}, target_overlap={target_overlap}, examples={examples[:8]}"
+        )
 
     def _attach_unified_ready_child_lane_ownership_trace(self, trace_record: dict, plan: StepPlan) -> None:
         for field in (
@@ -3220,6 +3327,39 @@ class ModelRunnerBase:
         examples = getattr(plan, "unified_child_ready_seq_normal_lane_conflict_examples", None)
         if examples:
             trace_record["unified_child_ready_seq_normal_lane_conflict_examples"] = list(examples[:8])
+        for field in (
+            "unified_ready_child_lane_owner_seq_ids",
+            "unified_ready_child_excluded_from_normal_draft_seq_ids",
+            "unified_ready_child_excluded_from_target_normal_verify_seq_ids",
+            "unified_ready_child_remaining_in_target_normal_verify_seq_ids",
+            "unified_ready_child_missing_normal_proposal_allowed_seq_ids",
+            "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids",
+        ):
+            values = getattr(plan, field, None)
+            if values is not None:
+                trace_record[field] = [int(seq_id) for seq_id in values]
+        request_ids = getattr(plan, "unified_ready_child_lane_owner_request_ids", None)
+        if request_ids is not None:
+            trace_record["unified_ready_child_lane_owner_request_ids"] = {
+                str(int(seq_id)): str(request_id)
+                for seq_id, request_id in request_ids.items()
+            }
+        mismatch_count = getattr(
+            plan,
+            "unified_ready_child_normal_verify_exclusion_mismatch_count",
+            None,
+        )
+        if mismatch_count is not None:
+            trace_record["unified_ready_child_normal_verify_exclusion_mismatch_count"] = int(mismatch_count)
+        mismatch_examples = getattr(
+            plan,
+            "unified_ready_child_normal_verify_exclusion_mismatch_examples",
+            None,
+        )
+        if mismatch_examples:
+            trace_record["unified_ready_child_normal_verify_exclusion_mismatch_examples"] = list(
+                mismatch_examples[:8]
+            )
 
     def _actual_normal_draft_seq_ids(self, plan: StepPlan) -> list[int]:
         return [
@@ -3567,20 +3707,21 @@ class ModelRunnerBase:
         self._attach_ready_eager_proposal_sync_info(plan, lane_sync_info)
         self._apply_eager_plan_dry_run(plan)
         self._apply_unified_ready_child_lane_ownership_to_plan(plan)
+        self._validate_unified_ready_child_lane_ownership_plan(plan)
         if bool(getattr(plan, "enable_eager_plan_dry_run", False)):
             self._validate_phase1h_plan(plan)
-        raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         target_normal_verify_seq_ids = self._target_normal_verify_seq_ids(plan)
         actual_normal_draft_seq_ids = self._actual_normal_draft_seq_ids(plan)
+        raw_buffer_inspect = self.dual_proposal_buffer.inspect(plan.target_home_set)
         buffer_inspect = self.dual_proposal_buffer.inspect(target_normal_verify_seq_ids)
         allowed_missing = sorted(
-            set(raw_buffer_inspect["miss_seq_ids"])
+            set(buffer_inspect["miss_seq_ids"])
             & set(getattr(plan, "target_eager_verify_seq_ids_dry_run", []))
         )
         allowed_missing = sorted(
             set(allowed_missing)
             | (
-                set(raw_buffer_inspect["miss_seq_ids"])
+                set(buffer_inspect["miss_seq_ids"])
                 & set(getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", []))
             )
         )
@@ -3595,17 +3736,25 @@ class ModelRunnerBase:
             else []
         )
         allowed_by_unified_ready_child = set(
-            int(seq_id) for seq_id in getattr(plan, "excluded_from_target_normal_verify_for_eager_dry_run", [])
+            int(seq_id)
+            for seq_id in getattr(plan, "unified_ready_child_missing_normal_proposal_allowed_seq_ids", [])
+        )
+        allowed_unified_missing = sorted(
+            set(raw_buffer_inspect["miss_seq_ids"]) & allowed_by_unified_ready_child
         )
         unexpected_missing = sorted(
-            set(raw_buffer_inspect["miss_seq_ids"])
+            set(buffer_inspect["miss_seq_ids"])
             - set(allowed_missing)
             - set(allowed_by_unified_ready_child)
             - set(fallback_pending_receive)
         )
-        plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
-        plan.missing_buffered_proposal_seq_ids = [int(seq_id) for seq_id in raw_buffer_inspect["miss_seq_ids"]]
+        if not plan.raw_target_home_set_for_normal_verify:
+            plan.raw_target_home_set_for_normal_verify = [int(seq_id) for seq_id in plan.target_home_set]
+        plan.missing_buffered_proposal_seq_ids = [int(seq_id) for seq_id in buffer_inspect["miss_seq_ids"]]
         plan.missing_buffered_proposal_allowed_by_eager_seq_ids = [int(seq_id) for seq_id in allowed_missing]
+        plan.missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids = [
+            int(seq_id) for seq_id in allowed_unified_missing
+        ]
         plan.missing_buffered_proposal_unexpected_seq_ids = [int(seq_id) for seq_id in unexpected_missing]
         plan.missing_normal_proposal_allowed_by_eager_dry_run = bool(allowed_missing)
         plan.missing_normal_proposal_allowed_seq_ids_dry_run = [int(seq_id) for seq_id in allowed_missing]
@@ -3745,8 +3894,18 @@ class ModelRunnerBase:
             f"{getattr(plan, 'target_eager_verify_seq_ids_dry_run', [])}, "
             f"missing_buffered_proposal_allowed_by_eager_seq_ids="
             f"{getattr(plan, 'missing_buffered_proposal_allowed_by_eager_seq_ids', [])}, "
+            f"missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids="
+            f"{getattr(plan, 'missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids', [])}, "
             f"missing_buffered_proposal_unexpected_seq_ids="
             f"{getattr(plan, 'missing_buffered_proposal_unexpected_seq_ids', [])}, "
+            f"unified_ready_child_lane_owner_seq_ids="
+            f"{getattr(plan, 'unified_ready_child_lane_owner_seq_ids', [])}, "
+            f"unified_ready_child_excluded_from_normal_draft_seq_ids="
+            f"{getattr(plan, 'unified_ready_child_excluded_from_normal_draft_seq_ids', [])}, "
+            f"unified_ready_child_excluded_from_target_normal_verify_seq_ids="
+            f"{getattr(plan, 'unified_ready_child_excluded_from_target_normal_verify_seq_ids', [])}, "
+            f"unified_ready_child_remaining_in_target_normal_verify_seq_ids="
+            f"{getattr(plan, 'unified_ready_child_remaining_in_target_normal_verify_seq_ids', [])}, "
             f"target_home_request_ids={req_ids(plan.target_home_set)}, "
             f"draft_home_request_ids={req_ids(plan.draft_home_set)}, "
             f"target_normal_verify_request_ids={req_ids(self._target_normal_verify_seq_ids(plan))}, "
@@ -3814,6 +3973,9 @@ class ModelRunnerBase:
         trace_record["missing_buffered_proposal_seq_ids"] = list(plan.missing_buffered_proposal_seq_ids)
         trace_record["missing_buffered_proposal_allowed_by_eager_seq_ids"] = list(
             plan.missing_buffered_proposal_allowed_by_eager_seq_ids
+        )
+        trace_record["missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids"] = list(
+            getattr(plan, "missing_buffered_proposal_allowed_by_unified_ready_child_seq_ids", [])
         )
         trace_record["missing_buffered_proposal_unexpected_seq_ids"] = list(
             plan.missing_buffered_proposal_unexpected_seq_ids
