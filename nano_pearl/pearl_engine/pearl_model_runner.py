@@ -13364,6 +13364,11 @@ class ModelRunnerBase:
             ratios[str(int(depth))] = (float(committed.get(depth, 0)) / float(denom)) if denom else 0.0
         trace_record["unified_raw_verified_to_committed_ratio_by_depth"] = ratios
 
+    def _unified_trace_request_id_for_seq(self, seq: Sequence | None) -> int:
+        if seq is None:
+            return -1
+        return self._numeric_request_id(seq.request_id)
+
     def _upsert_unified_generic_proposal_outcome(self, proposal_id: int, **updates) -> dict:
         proposal_id = int(proposal_id)
         if proposal_id < 0:
@@ -16324,6 +16329,7 @@ class ModelRunnerBase:
                     list(to_verify_tokens[:token_count]) == list(proposal_tokens[:token_count])
                 )
             token_count_by_id[proposal_id] = token_count
+            seq = seq_by_id.get(seq_id)
             if unified_enabled:
                 self._upsert_unified_generic_proposal_outcome(
                     proposal_id,
@@ -16331,7 +16337,7 @@ class ModelRunnerBase:
                     root_id=root_id,
                     depth=depth,
                     parent_proposal_id=parent_id,
-                    request_id=-1 if seq is None else self._numeric_request_id(seq.request_id),
+                    request_id=self._unified_trace_request_id_for_seq(seq),
                     created_step=int(decision.get("source_step_id", -1 if plan.step_id is None else int(plan.step_id))),
                     plan_id=int(plan.plan_id),
                     dual_step_id=-1 if plan.step_id is None else int(plan.step_id),
@@ -16345,7 +16351,6 @@ class ModelRunnerBase:
                 if unified_enabled and depth == 1 and parent_id < 0
                 else "parent_committed_full_accept"
             )
-            seq = seq_by_id.get(seq_id)
             reason = None
             min_depth = 1 if unified_enabled else 5
             full_commit = verify_result == "full_accept" and action == "append_full_accept_real_commit"

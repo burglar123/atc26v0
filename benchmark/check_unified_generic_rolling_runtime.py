@@ -3162,6 +3162,8 @@ def run_synthetic_tests() -> None:
     errors, full_next_summary = validate_records(parent_full_next_child, synthetic_single_child_payload())
     assert not errors, f"parent full accept next child should pass: {errors}\nsummary={full_next_summary}"
     assert full_next_summary["max_real_committed_depth"] == 2
+    assert full_next_summary["unified_full_accept_parent_registered_count_by_depth"]["1"] == 1
+    assert full_next_summary["unified_full_accept_parent_selected_for_child_count_by_depth"]["1"] == 1
 
     full_parent_no_child_no_reason = synthetic_single_child_records([[1]], committed_depths={1})
     errors, no_child_no_reason_summary = validate_records(
@@ -3186,6 +3188,14 @@ def run_synthetic_tests() -> None:
         "full-accepted parent without child should pass with explicit reason: "
         f"{errors}\nsummary={no_child_reason_summary}"
     )
+    assert no_child_reason_summary["unified_full_accept_parent_registered_count_by_depth"]["1"] == 1
+    assert (
+        no_child_reason_summary["unified_full_accept_without_child_reason_counts_by_depth"]["1"][
+            "no_active_sequence"
+        ]
+        == 1
+    )
+    assert no_child_reason_summary["unified_depth2_generation_block_reason_counts"]["no_active_sequence"] == 1
 
     default_aggressive = synthetic_single_child_records(
         [[1, 2, 3, 4, 5]],
