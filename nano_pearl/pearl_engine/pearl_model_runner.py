@@ -1689,6 +1689,11 @@ class ModelRunnerBase:
             "unified_child_stale_base_count_by_depth": {},
             "unified_child_stale_base_examples": [],
             "unified_child_scheduled_for_target_verify_count_by_depth": {},
+            "unified_child_target_verify_inflight_count_by_depth": {},
+            "unified_child_scheduled_state_by_depth": {},
+            "unified_child_duplicate_schedule_skip_count_by_depth": {},
+            "unified_child_schedule_state_error_count_by_depth": {},
+            "unified_child_schedule_state_error_examples": [],
             "unified_child_target_verified_after_promotion_count_by_depth": {},
             "unified_child_invalidated_after_parent_non_full_count_by_depth": {},
             "unified_child_verified_after_parent_full_accept_count_by_depth": {},
@@ -13685,6 +13690,7 @@ class ModelRunnerBase:
                 "child_promoted_step": -1,
                 "child_ready_step": -1,
                 "child_scheduled_step": -1,
+                "scheduled_for_target_verify_step": -1,
                 "plan_id": -1,
                 "dual_step_id": -1,
                 "accepted_len": -1,
@@ -14098,6 +14104,9 @@ class ModelRunnerBase:
             "unified_proposal_registry_child_promoted_step_by_proposal_id": "child_promoted_step",
             "unified_proposal_registry_child_ready_step_by_proposal_id": "child_ready_step",
             "unified_proposal_registry_child_scheduled_step_by_proposal_id": "child_scheduled_step",
+            "unified_proposal_registry_scheduled_for_target_verify_step_by_proposal_id": (
+                "scheduled_for_target_verify_step"
+            ),
             "unified_proposal_registry_plan_id_by_proposal_id": "plan_id",
             "unified_proposal_registry_dual_step_id_by_proposal_id": "dual_step_id",
             "unified_proposal_registry_accepted_len_by_proposal_id": "accepted_len",
@@ -14604,6 +14613,53 @@ class ModelRunnerBase:
         )
         trace_record["unified_child_stale_base_examples"] = examples
 
+    def _record_unified_child_duplicate_schedule_skip(
+        self,
+        trace_record: dict,
+        *,
+        child_id: int,
+        child_depth: int,
+    ) -> None:
+        self._increment_trace_depth_counter(
+            trace_record,
+            "unified_child_duplicate_schedule_skip_count_by_depth",
+            int(child_depth),
+            1,
+        )
+
+    def _record_unified_child_schedule_state_error(
+        self,
+        trace_record: dict,
+        plan: StepPlan,
+        *,
+        child_id: int,
+        child_depth: int,
+        proposal_state: str,
+        reason: str,
+    ) -> None:
+        child_id = int(child_id)
+        child_depth = int(child_depth)
+        self._increment_trace_depth_counter(
+            trace_record,
+            "unified_child_schedule_state_error_count_by_depth",
+            child_depth,
+            1,
+        )
+        examples = list(trace_record.get("unified_child_schedule_state_error_examples") or [])
+        if len(examples) >= 8:
+            return
+        examples.append(
+            {
+                "child_proposal_id": child_id,
+                "child_depth": child_depth,
+                "proposal_state": str(proposal_state),
+                "reason": str(reason),
+                "plan_id": int(plan.plan_id),
+                "dual_step_id": -1 if plan.step_id is None else int(plan.step_id),
+            }
+        )
+        trace_record["unified_child_schedule_state_error_examples"] = examples
+
     def _promoted_unified_child_decisions(
         self,
         trace_record: dict,
@@ -14656,8 +14712,15 @@ class ModelRunnerBase:
                     drop_ready=True,
                 )
                 continue
+            already_inflight = bool(child_record.get("target_verify_inflight", False))
+            if already_inflight:
+                self._record_unified_child_duplicate_schedule_skip(
+                    trace_record,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                )
             if (
-                bool(child_record.get("target_verify_inflight", False))
+                already_inflight
                 or bool(child_record.get("invalidated", False))
                 or int(child_record.get("accepted_len", -1)) >= 0
                 or bool(child_record.get("applied_full_commit", False))
@@ -14768,10 +14831,19 @@ class ModelRunnerBase:
                     drop_ready=True,
                 )
                 continue
-            if getattr(proposal, "state", EAGER_STATE_READY_TO_VERIFY) not in {
+            proposal_state = str(getattr(proposal, "state", EAGER_STATE_READY_TO_VERIFY))
+            if proposal_state not in {
                 EAGER_STATE_READY_TO_VERIFY,
                 EAGER_STATE_READY_TO_VERIFY_DRY_RUN,
             }:
+                self._record_unified_child_schedule_state_error(
+                    trace_record,
+                    plan,
+                    child_id=child_id,
+                    child_depth=child_depth,
+                    proposal_state=proposal_state,
+                    reason="child_state_not_ready",
+                )
                 self._record_unified_child_ready_not_scheduled(
                     trace_record,
                     child_id=child_id,
@@ -14793,6 +14865,19 @@ class ModelRunnerBase:
                 trace_record,
                 "unified_child_scheduled_for_target_verify_count_by_depth",
                 depth,
+                1,
+            )
+            self._increment_trace_depth_counter(
+                trace_record,
+                "unified_child_target_verify_inflight_count_by_depth",
+                depth,
+                1,
+            )
+            self._increment_trace_depth_reason_counter(
+                trace_record,
+                "unified_child_scheduled_state_by_depth",
+                depth,
+                proposal_state,
                 1,
             )
             if depth == 2 and int(parent_record.get("depth", -1)) == 1:
@@ -14845,11 +14930,12 @@ class ModelRunnerBase:
                 child_ready_for_target_verify=False,
                 child_scheduled_for_target_verify=True,
                 child_scheduled_step=-1 if plan.step_id is None else int(plan.step_id),
+                scheduled_for_target_verify_step=-1 if plan.step_id is None else int(plan.step_id),
             )
             seen_seq_ids.add(seq_id)
             self._unified_promoted_child_proposal_ids.discard(int(child_id))
             self._unified_ready_child_proposal_ids.discard(int(child_id))
-            proposal.state = EAGER_STATE_VERIFYING
+            proposal.state = EAGER_STATE_READY_TO_VERIFY
         return decisions, generation_parents
 
     def _select_unified_generic_depth1_seed_parents(

@@ -950,6 +950,29 @@ def single_child_ahead_summary(
         records,
         "unified_child_scheduled_for_target_verify_count_by_depth",
     )
+    target_verify_inflight_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_target_verify_inflight_count_by_depth",
+    )
+    scheduled_state_by_depth = sum_depth_reason_counts(
+        records,
+        "unified_child_scheduled_state_by_depth",
+    )
+    duplicate_schedule_skip_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_duplicate_schedule_skip_count_by_depth",
+    )
+    schedule_state_error_trace_by_depth = sum_depth_counts(
+        records,
+        "unified_child_schedule_state_error_count_by_depth",
+    )
+    schedule_state_error_examples: list[dict[str, Any]] = []
+    for record in records:
+        for example in record.get("unified_child_schedule_state_error_examples") or []:
+            if len(schedule_state_error_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                schedule_state_error_examples.append(example)
     target_verified_after_promotion_trace_by_depth = sum_depth_counts(
         records,
         "unified_child_target_verified_after_promotion_count_by_depth",
@@ -1278,6 +1301,20 @@ def single_child_ahead_summary(
         "unified_child_scheduled_for_target_verify_count_by_depth": dict(
             sorted(scheduled_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
+        "unified_child_target_verify_inflight_count_by_depth": dict(
+            sorted(target_verify_inflight_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_scheduled_state_by_depth": {
+            str(depth): dict(sorted(states.items()))
+            for depth, states in sorted(scheduled_state_by_depth.items(), key=lambda item: int(item[0]))
+        },
+        "unified_child_duplicate_schedule_skip_count_by_depth": dict(
+            sorted(duplicate_schedule_skip_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_schedule_state_error_count_by_depth": dict(
+            sorted(schedule_state_error_trace_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_child_schedule_state_error_examples": schedule_state_error_examples[:8],
         "unified_child_target_verified_after_promotion_count_by_depth": dict(
             sorted(target_verified_after_promotion_trace_by_depth.items(), key=lambda item: int(item[0]))
         ),
@@ -2140,6 +2177,16 @@ def validate_records(
             "unified_child_ready_seq_normal_lane_conflict_count_by_depth",
             {},
         )
+        schedule_state_errors = summary.get(
+            "unified_child_schedule_state_error_count_by_depth",
+            {},
+        )
+        if any(int_value(count, 0) > 0 for count in schedule_state_errors.values()):
+            errors.append(
+                "single-child promoted-child scheduling saw invalid proposal state: "
+                f"counts={schedule_state_errors}, examples="
+                f"{summary.get('unified_child_schedule_state_error_examples', [])}"
+            )
         disappeared_promoted_depths: list[str] = []
         for depth, count in sorted(promoted_by_depth.items(), key=lambda item: int(item[0])):
             if int_value(count, 0) <= 0:
@@ -3240,6 +3287,12 @@ def synthetic_single_child_records(
         }
         if scheduled_depths:
             record["unified_child_scheduled_for_target_verify_count_by_depth"] = scheduled_depths
+            record["unified_child_target_verify_inflight_count_by_depth"] = scheduled_depths
+            record["unified_child_scheduled_state_by_depth"] = {
+                str(depth): {"READY_TO_VERIFY": 1}
+                for depth in depths
+                if int(depth) in scheduled_child_depths
+            }
             if 2 in [int(depth) for depth in depths if int(depth) in scheduled_child_depths]:
                 record["unified_depth2_scheduled_after_depth1_full_accept_count"] = 1
         target_verified_after_promotion = {
@@ -3881,6 +3934,11 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_stale_base_count_by_depth",
         "unified_child_stale_base_examples",
         "unified_child_scheduled_for_target_verify_count_by_depth",
+        "unified_child_target_verify_inflight_count_by_depth",
+        "unified_child_scheduled_state_by_depth",
+        "unified_child_duplicate_schedule_skip_count_by_depth",
+        "unified_child_schedule_state_error_count_by_depth",
+        "unified_child_schedule_state_error_examples",
         "unified_child_target_verified_after_promotion_count_by_depth",
         "unified_child_invalidated_after_parent_non_full_count_by_depth",
         "unified_child_verified_after_parent_full_accept_count_by_depth",
