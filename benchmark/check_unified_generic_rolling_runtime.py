@@ -789,6 +789,38 @@ def single_child_ahead_summary(
         records,
         "unified_proposal_registry_no_mutation_reject_by_proposal_id",
     )
+    registered_trace_by_depth = sum_depth_counts(records, "unified_full_accept_parent_registered_count_by_depth")
+    registry_size_trace_by_depth = merge_depth_counts(records, "unified_full_accept_parent_registry_size_by_depth")
+    selected_trace_by_depth = sum_depth_counts(records, "unified_full_accept_parent_selected_for_child_count_by_depth")
+    parent_not_selected_reason_counts = sum_depth_reason_counts(
+        records,
+        "unified_full_accept_parent_not_selected_reason_counts_by_depth",
+    )
+    full_accept_without_child_reason_counts = sum_depth_reason_counts(
+        records,
+        "unified_full_accept_without_child_reason_counts_by_depth",
+    )
+    depth2_block_reason_counts: Counter[str] = Counter()
+    for record in records:
+        for reason, count in (record.get("unified_depth2_generation_block_reason_counts") or {}).items():
+            depth2_block_reason_counts[str(reason)] += int_value(count, 0)
+    child_full_accept_examples: list[dict[str, Any]] = []
+    for record in records:
+        for example in record.get("unified_child_generated_from_full_accept_parent_examples") or []:
+            if len(child_full_accept_examples) >= 8:
+                break
+            if isinstance(example, dict):
+                child_full_accept_examples.append(example)
+
+    registered_from_registry_by_depth: Counter[str] = Counter()
+    for proposal_id, depth in registry_depth_by_id.items():
+        if (
+            int(depth) >= 1
+            and registry_full_by_id.get(proposal_id, False)
+            and registry_applied_full_by_id.get(proposal_id, False)
+            and not registry_invalidated_by_id.get(proposal_id, False)
+        ):
+            registered_from_registry_by_depth[str(int(depth))] += 1
 
     child_parent_lookup_by_id = merge_bool_map(
         records,
@@ -1019,6 +1051,23 @@ def single_child_ahead_summary(
     trace_grandchild_count = sum_record_int(records, "unified_generated_grandchild_before_parent_verified_count")
     derived_violation_count = len(violation_examples) if configured_limit > 0 else 0
     parent_guard_violation_count = len(guard_violation_ids)
+    selected_from_children_by_parent_depth: Counter[str] = Counter()
+    for depth_key, count in full_parent_by_depth.items():
+        parent_depth = int(depth_key) - 1
+        if parent_depth >= 1:
+            selected_from_children_by_parent_depth[str(parent_depth)] += int(count)
+    registered_by_depth = {
+        str(depth): int(count)
+        for depth, count in (registered_trace_by_depth or registered_from_registry_by_depth).items()
+    }
+    registry_size_by_depth = {
+        str(depth): int(count)
+        for depth, count in (registry_size_trace_by_depth or registered_from_registry_by_depth).items()
+    }
+    selected_parent_by_depth = {
+        str(depth): int(count)
+        for depth, count in (selected_trace_by_depth or selected_from_children_by_parent_depth).items()
+    }
     return {
         "unified_single_child_ahead_enabled": bool(single_child_enabled),
         "unified_max_unverified_depth_ahead": int(configured_limit),
@@ -1065,6 +1114,25 @@ def single_child_ahead_summary(
         ),
         "unified_child_parent_full_accept_guard_violation_count": int(parent_guard_violation_count),
         "unified_child_parent_full_accept_guard_examples": guard_examples[:8],
+        "unified_full_accept_parent_registered_count_by_depth": dict(
+            sorted(registered_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_full_accept_parent_registry_size_by_depth": dict(
+            sorted(registry_size_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_full_accept_parent_selected_for_child_count_by_depth": dict(
+            sorted(selected_parent_by_depth.items(), key=lambda item: int(item[0]))
+        ),
+        "unified_full_accept_parent_not_selected_reason_counts_by_depth": {
+            str(depth): dict(sorted(reasons.items()))
+            for depth, reasons in sorted(parent_not_selected_reason_counts.items(), key=lambda item: int(item[0]))
+        },
+        "unified_child_generated_from_full_accept_parent_examples": child_full_accept_examples[:8],
+        "unified_depth2_generation_block_reason_counts": dict(sorted(depth2_block_reason_counts.items())),
+        "unified_full_accept_without_child_reason_counts_by_depth": {
+            str(depth): dict(sorted(reasons.items()))
+            for depth, reasons in sorted(full_accept_without_child_reason_counts.items(), key=lambda item: int(item[0]))
+        },
     }
 
 
@@ -1800,6 +1868,27 @@ def validate_records(
                 "single-child depth>1 candidates require full-accepted parent provenance: "
                 f"depths={missing_provenance_depths}"
             )
+        full_accept_by_depth = summary.get("unified_raw_full_accept_proposal_count_by_depth", {})
+        full_child_by_depth = summary.get("unified_child_generated_from_full_accept_parent_count_by_depth", {})
+        selected_parent_by_depth = summary.get("unified_full_accept_parent_selected_for_child_count_by_depth", {})
+        not_selected_reasons = summary.get("unified_full_accept_without_child_reason_counts_by_depth", {})
+        unexplained_full_depths: list[str] = []
+        for depth, count in sorted(full_accept_by_depth.items(), key=lambda item: int(item[0])):
+            depth_int = int(depth)
+            if depth_int >= max_depth or int_value(count, 0) <= 0:
+                continue
+            child_depth = str(depth_int + 1)
+            if (
+                int_value(full_child_by_depth.get(child_depth), 0) <= 0
+                and int_value(selected_parent_by_depth.get(str(depth_int)), 0) <= 0
+                and not not_selected_reasons.get(str(depth_int))
+            ):
+                unexplained_full_depths.append(str(depth_int))
+        if unexplained_full_depths:
+            errors.append(
+                "single-child full-accepted parents did not produce continuation children or block reasons: "
+                f"depths={unexplained_full_depths}"
+            )
     if max_depth > 4 and max_real <= 4 and not target_verified_reject_only and not single_child_ahead_enabled:
         errors.append("max real committed depth must exceed 4 when configured max depth exceeds 4")
 
@@ -2346,10 +2435,12 @@ def synthetic_single_child_records(
     stop_reason: str = "target_verify_pending",
     parent_outcomes_by_depth: dict[int, str] | None = None,
     invalidated_parent_not_full_depths: set[int] | None = None,
+    full_accept_without_child_reasons_by_depth: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     committed_depths = set(committed_depths or set())
     parent_outcomes_by_depth = dict(parent_outcomes_by_depth or {})
     invalidated_parent_not_full_depths = set(invalidated_parent_not_full_depths or set())
+    full_accept_without_child_reasons_by_depth = dict(full_accept_without_child_reasons_by_depth or {})
     gamma = 4
     proposal_id_by_depth = {depth: 9000 + depth for depths in steps for depth in depths}
     if committed_depths:
@@ -2727,6 +2818,22 @@ def synthetic_single_child_records(
         }
         if invalidated_depths:
             record["unified_invalidated_due_to_parent_not_full_accept_count_by_depth"] = invalidated_depths
+        full_accept_without_child_reasons = {
+            str(depth): {str(reason): 1}
+            for depth, reason in full_accept_without_child_reasons_by_depth.items()
+            if int(depth) in depths and str(reason)
+        }
+        if full_accept_without_child_reasons:
+            record["unified_full_accept_without_child_reason_counts_by_depth"] = (
+                full_accept_without_child_reasons
+            )
+            record["unified_full_accept_parent_not_selected_reason_counts_by_depth"] = (
+                full_accept_without_child_reasons
+            )
+            if "1" in full_accept_without_child_reasons:
+                record["unified_depth2_generation_block_reason_counts"] = dict(
+                    full_accept_without_child_reasons["1"]
+                )
         records.append(record)
     return records
 
@@ -3047,10 +3154,38 @@ def run_synthetic_tests() -> None:
     errors, restart_summary = validate_records(partial_recovery_restart_depth1, synthetic_single_child_payload())
     assert not errors, f"partial recovery restart depth1 synthetic should pass: {errors}\nsummary={restart_summary}"
 
-    parent_full_next_child = synthetic_single_child_records([[1], [2]], committed_depths={1, 2})
+    parent_full_next_child = synthetic_single_child_records(
+        [[1], [2]],
+        committed_depths={1, 2},
+        full_accept_without_child_reasons_by_depth={2: "no_active_sequence"},
+    )
     errors, full_next_summary = validate_records(parent_full_next_child, synthetic_single_child_payload())
     assert not errors, f"parent full accept next child should pass: {errors}\nsummary={full_next_summary}"
     assert full_next_summary["max_real_committed_depth"] == 2
+
+    full_parent_no_child_no_reason = synthetic_single_child_records([[1]], committed_depths={1})
+    errors, no_child_no_reason_summary = validate_records(
+        full_parent_no_child_no_reason,
+        synthetic_single_child_payload(),
+    )
+    assert any("did not produce continuation children or block reasons" in error for error in errors), (
+        "full-accepted parent without child or reason should fail: "
+        f"errors={errors}\nsummary={no_child_no_reason_summary}"
+    )
+
+    full_parent_no_child_with_reason = synthetic_single_child_records(
+        [[1]],
+        committed_depths={1},
+        full_accept_without_child_reasons_by_depth={1: "no_active_sequence"},
+    )
+    errors, no_child_reason_summary = validate_records(
+        full_parent_no_child_with_reason,
+        synthetic_single_child_payload(),
+    )
+    assert not errors, (
+        "full-accepted parent without child should pass with explicit reason: "
+        f"{errors}\nsummary={no_child_reason_summary}"
+    )
 
     default_aggressive = synthetic_single_child_records(
         [[1, 2, 3, 4, 5]],
@@ -3174,6 +3309,13 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_child_parent_full_accept_guard_examples",
         "unified_child_depth_verified_count_by_depth",
         "unified_child_depth_invalidated_parent_not_full_count_by_depth",
+        "unified_full_accept_parent_registered_count_by_depth",
+        "unified_full_accept_parent_registry_size_by_depth",
+        "unified_full_accept_parent_selected_for_child_count_by_depth",
+        "unified_full_accept_parent_not_selected_reason_counts_by_depth",
+        "unified_child_generated_from_full_accept_parent_examples",
+        "unified_depth2_generation_block_reason_counts",
+        "unified_full_accept_without_child_reason_counts_by_depth",
         "generic_rolling_to_verify_equals_proposal_all",
         "generic_rolling_to_verify_mismatch_proposal_ids",
         "unified_generic_target_verify_temp_append_used",
