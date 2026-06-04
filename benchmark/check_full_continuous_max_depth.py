@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Historical full-continuous diagnostic checker.
+
+Phase 1H-9C uses benchmark/check_phase1h9c_acceptance.py as its hard gate.
+This checker remains useful for legacy/full-continuous diagnostics, but it is
+not the authoritative 9C acceptance check.
+"""
+
 from __future__ import annotations
 
 import argparse
