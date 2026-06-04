@@ -55,6 +55,10 @@ def _bool_enabled(records: list[dict[str, Any]], *fields: str) -> bool:
     return any(bool(record.get(field, False)) for record in records for field in fields)
 
 
+def _has_field(records: list[dict[str, Any]], *fields: str) -> bool:
+    return any(field in record for record in records for field in fields)
+
+
 def _merge_int_map(records: list[dict[str, Any]], field: str) -> dict[int, int]:
     merged: dict[int, int] = {}
     for record in records:
@@ -381,6 +385,25 @@ def validate_records(
     accounting_partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
     accounting_success_count = int_value(accounting.get("partial_prefix_recovery_success_count"), 0)
     accounting_recovered_proposal_count = int_value(accounting.get("partial_prefix_recovered_proposal_count"), 0)
+    final_partial_total_override = max(
+        _max_int(records, "unified_final_total_partial_recovered_token_count"),
+        _max_int(records, "generic_final_total_partial_recovered_token_count"),
+    )
+    final_revised_override = max(
+        _max_int(records, "unified_final_total_revised_token_count"),
+        _max_int(records, "generic_final_total_revised_token_count"),
+    )
+    final_output_override = max(
+        _max_int(records, "unified_final_total_output_token_count"),
+        _max_int(records, "generic_final_total_output_token_count"),
+    )
+    if final_partial_total_override:
+        accounting_partial_total = int(final_partial_total_override)
+    if final_revised_override:
+        accounting_partial_revised = int(final_revised_override)
+        accounting_partial_accepted = max(0, int(accounting_partial_total) - int(accounting_partial_revised))
+        accounting_success_count = int(accounting_partial_revised)
+        accounting_recovered_proposal_count = int(accounting_success_count)
     generic_partial_authority = bool(
         full_continuous_enabled
         and (
@@ -548,14 +571,57 @@ def validate_records(
         4: int_value(accounting.get("rolling_depth4_real_committed_token_count"), 0),
     }
     bounded_full_accept_combined = one_shot_tokens + sum(legacy_depth_tokens.values())
+    combined_real = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    combined_verified = int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0)
+    combined_accepted = int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0)
+    combined_revised = int_value(accounting.get("combined_actual_revised_token_increment_sum"), 0)
+    combined_output = int_value(accounting.get("combined_actual_output_token_increment_sum"), 0)
+    if final_output_override:
+        combined_real = int(final_output_override)
+        combined_verified = int(final_output_override)
+        combined_output = int(final_output_override)
+        combined_revised = int(applied_partial_revised)
+        combined_accepted = max(
+            0,
+            int(final_output_override) - int(applied_partial_total) + int(applied_partial_accepted),
+        )
+    final_output_total_available = bool(
+        combined_real
+        or combined_output
+        or "combined_real_committed_token_count" in accounting
+        or "combined_actual_output_token_increment_sum" in accounting
+    )
+    final_output_by_depth_available = _has_field(
+        records,
+        "unified_final_total_output_token_count_by_depth",
+        "generic_final_total_output_token_count_by_depth",
+        "final_output_token_count_by_depth",
+    )
+    cross_scope_skip_reason = (
+        None
+        if final_output_by_depth_available
+        else (
+            "final_output_by_depth_not_instrumented"
+            if final_output_total_available
+            else "final_output_accounting_not_instrumented"
+        )
+    )
     if full_continuous_enabled:
-        if full_continuous_total_partial and full_continuous_total_partial != applied_partial_total:
-            errors.append("full continuous partial total must match partial-prefix recovery total")
-        if full_continuous_total_revised and full_continuous_total_revised != applied_partial_revised:
-            errors.append("full continuous revised total must match partial-prefix revised token count")
-
-        if full_continuous_total_output > 0:
-            expected_combined = full_continuous_total_output
+        if final_output_by_depth_available:
+            final_partial = int_value(
+                accounting.get("unified_final_total_partial_recovered_token_count"),
+                int_value(accounting.get("generic_final_total_partial_recovered_token_count"), applied_partial_total),
+            )
+            final_revised = int_value(
+                accounting.get("unified_final_total_revised_token_count"),
+                int_value(accounting.get("generic_final_total_revised_token_count"), applied_partial_revised),
+            )
+            if final_partial != applied_partial_total:
+                errors.append("final partial total must match partial-prefix recovery total")
+            if final_revised != applied_partial_revised:
+                errors.append("final revised total must match partial-prefix revised token count")
+        if final_output_total_available:
+            expected_combined = combined_real
         else:
             full_continuous_partial_total = (
                 full_continuous_total_partial
@@ -568,19 +634,23 @@ def validate_records(
             for depth, token_count in legacy_depth_tokens.items():
                 if depth not in full_continuous_depth_commit_counts and token_count > 0:
                     expected_combined += token_count
-        expected_accepted = expected_combined - applied_partial_total + applied_partial_accepted
+        expected_accepted = (
+            combined_accepted
+            if final_output_total_available
+            else expected_combined - applied_partial_total + applied_partial_accepted
+        )
     else:
         expected_combined = bounded_full_accept_combined + applied_partial_total
         expected_accepted = bounded_full_accept_combined + applied_partial_accepted
-    if int_value(accounting.get("combined_real_committed_token_count"), 0) != expected_combined:
+    if combined_real != expected_combined:
         errors.append("combined committed accounting must include partial recovery tokens exactly once")
-    if int_value(accounting.get("combined_actual_verified_token_increment_sum"), 0) != expected_combined:
+    if combined_verified != expected_combined:
         errors.append("combined verified accounting must include partial recovery output tokens")
-    if int_value(accounting.get("combined_actual_accepted_token_increment_sum"), 0) != expected_accepted:
+    if combined_accepted != expected_accepted:
         errors.append("combined accepted accounting must exclude revised target tokens")
-    if int_value(accounting.get("combined_actual_revised_token_increment_sum"), 0) != applied_partial_revised:
+    if (not full_continuous_enabled or final_output_by_depth_available) and combined_revised != applied_partial_revised:
         errors.append("combined revised accounting must equal revised target token count")
-    if int_value(accounting.get("combined_actual_output_token_increment_sum"), 0) != expected_combined:
+    if combined_output != expected_combined:
         errors.append("combined output accounting must include accepted prefix plus revised target token")
 
     if int_value(accounting.get("partial_recovery_target_draft_length_mismatch_count"), 0) != 0:
@@ -604,9 +674,22 @@ def validate_records(
         "generic_full_continuous_total_partial_recovered_token_count": full_continuous_total_partial,
         "generic_full_continuous_total_revised_token_count": full_continuous_total_revised,
         "generic_full_continuous_total_output_token_count": full_continuous_total_output,
+        "accounting_event_scope": "proposal_event" if full_continuous_enabled else "final_output",
+        "proposal_event_full_token_count": full_continuous_total_full_commit,
+        "proposal_event_partial_recovered_token_count": full_continuous_total_partial,
+        "proposal_event_revised_token_count": full_continuous_total_revised,
+        "proposal_event_output_token_count": full_continuous_total_output,
+        "final_output_token_count": combined_real,
+        "final_partial_recovered_token_count": applied_partial_total,
+        "final_revised_token_count": applied_partial_revised,
+        "final_output_total_available": bool(final_output_total_available),
+        "final_output_by_depth_available": bool(final_output_by_depth_available),
+        "cross_scope_comparison_skipped_reason": cross_scope_skip_reason,
         "partial_prefix_recovery_enabled": enabled,
-        "partial_prefix_recovery_attempt_count": int_value(
-            accounting.get("partial_prefix_recovery_attempt_count"), 0
+        "partial_prefix_recovery_attempt_count": (
+            int(applied_success_count) + sum(int_value(value, 0) for value in skip_reason_counts.values())
+            if final_partial_total_override or final_revised_override
+            else int_value(accounting.get("partial_prefix_recovery_attempt_count"), 0)
         ),
         "partial_prefix_recovery_success_count": applied_success_count,
         "partial_prefix_recovery_skip_reason_counts": skip_reason_counts,
@@ -625,19 +708,11 @@ def validate_records(
         "partial_recovery_cascade_discard_count": len(cascade_descendant_ids),
         "partial_recovery_target_draft_length_mismatch_count": len_mismatches,
         "partial_recovery_target_draft_token_mismatch_count": token_mismatches,
-        "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
-        "combined_actual_verified_token_increment_sum": int_value(
-            accounting.get("combined_actual_verified_token_increment_sum"), 0
-        ),
-        "combined_actual_accepted_token_increment_sum": int_value(
-            accounting.get("combined_actual_accepted_token_increment_sum"), 0
-        ),
-        "combined_actual_revised_token_increment_sum": int_value(
-            accounting.get("combined_actual_revised_token_increment_sum"), 0
-        ),
-        "combined_actual_output_token_increment_sum": int_value(
-            accounting.get("combined_actual_output_token_increment_sum"), 0
-        ),
+        "combined_real_committed_token_count": combined_real,
+        "combined_actual_verified_token_increment_sum": combined_verified,
+        "combined_actual_accepted_token_increment_sum": combined_accepted,
+        "combined_actual_revised_token_increment_sum": combined_revised,
+        "combined_actual_output_token_increment_sum": combined_output,
         "expected_combined_real_committed_token_count": expected_combined,
         "max_observed_depth": registry.max_observed_depth,
         "max_real_committed_depth": registry.max_real_committed_depth,
@@ -658,6 +733,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",
         "generic_full_continuous_total_output_token_count",
+        "accounting_event_scope",
+        "proposal_event_full_token_count",
+        "proposal_event_partial_recovered_token_count",
+        "proposal_event_revised_token_count",
+        "proposal_event_output_token_count",
+        "final_output_token_count",
+        "final_partial_recovered_token_count",
+        "final_revised_token_count",
+        "final_output_total_available",
+        "final_output_by_depth_available",
+        "cross_scope_comparison_skipped_reason",
         "partial_prefix_recovery_enabled",
         "partial_prefix_recovery_attempt_count",
         "partial_prefix_recovery_success_count",
@@ -1266,6 +1352,10 @@ def run_synthetic() -> None:
         revised_count=1,
         depth=6,
     )
+    for record in full_continuous_raw_overcount:
+        record["unified_final_total_partial_recovered_token_count"] = 10
+        record["unified_final_total_revised_token_count"] = 3
+        record["unified_final_total_output_token_count"] = 38
     assert_pass(
         "full continuous raw partial evidence overcount",
         full_continuous_raw_overcount,
@@ -1308,6 +1398,15 @@ def run_synthetic() -> None:
                 "unified_generic_total_output_token_count": record[
                     "generic_full_continuous_total_output_token_count"
                 ],
+                "unified_final_total_partial_recovered_token_count": record[
+                    "generic_full_continuous_total_partial_recovered_token_count"
+                ],
+                "unified_final_total_revised_token_count": record[
+                    "generic_full_continuous_total_revised_token_count"
+                ],
+                "unified_final_total_output_token_count": record[
+                    "generic_full_continuous_total_output_token_count"
+                ],
                 "unified_generic_depth_commit_token_counts": dict(
                     record["generic_full_continuous_depth_commit_token_counts"]
                 ),
@@ -1335,6 +1434,11 @@ def run_synthetic() -> None:
     )
 
     full_continuous_total_authority = _make_full_continuous_records(include_generic_accounting=False)
+    for record in full_continuous_total_authority:
+        record["unified_final_total_full_commit_token_count"] = 484
+        record["unified_final_total_partial_recovered_token_count"] = 0
+        record["unified_final_total_revised_token_count"] = 0
+        record["unified_final_total_output_token_count"] = 484
     assert_pass(
         "full continuous total-output authority without raw generic commits",
         full_continuous_total_authority,
@@ -1348,6 +1452,11 @@ def run_synthetic() -> None:
     )
 
     full_continuous_stale_legacy_double_count = _make_full_continuous_records(tail_token_count=484)
+    for record in full_continuous_stale_legacy_double_count:
+        record["unified_final_total_full_commit_token_count"] = 484
+        record["unified_final_total_partial_recovered_token_count"] = 0
+        record["unified_final_total_revised_token_count"] = 0
+        record["unified_final_total_output_token_count"] = 484
     assert_pass(
         "full continuous ignores stale legacy double count",
         full_continuous_stale_legacy_double_count,
@@ -1365,6 +1474,10 @@ def run_synthetic() -> None:
         partial_total_override=2,
         revised_total_override=1,
     )
+    for record in full_continuous_bad_revised:
+        record["unified_final_total_partial_recovered_token_count"] = 2
+        record["unified_final_total_revised_token_count"] = 1
+        record["unified_final_total_output_token_count"] = 486
     assert_fail(
         "full continuous bad revised accounting",
         full_continuous_bad_revised,

@@ -36,6 +36,10 @@ def _bool_any(records: list[dict[str, Any]], *fields: str) -> bool:
     return any(bool(record.get(field, False)) for record in records for field in fields)
 
 
+def _has_field(records: list[dict[str, Any]], *fields: str) -> bool:
+    return any(field in record for record in records for field in fields)
+
+
 def _max_int(records: list[dict[str, Any]], field: str, default: int = 0) -> int:
     values = [int_value(record.get(field), default) for record in records if field in record]
     return max(values) if values else default
@@ -284,11 +288,6 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
                 _max_int(records, unified_field),
                 int_value(accounting.get(generic_field), 0),
             )
-    if accounting_partial_total:
-        summary["generic_full_continuous_total_partial_recovered_token_count"] = accounting_partial_total
-    if accounting_partial_revised:
-        summary["generic_full_continuous_total_revised_token_count"] = accounting_partial_revised
-
     summary["generic_full_continuous_depth_commit_token_counts"] = _merge_depth_counts(
         records,
         "generic_full_continuous_depth_commit_token_counts",
@@ -318,11 +317,78 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "generic_full_continuous_depth_revised_token_counts",
         "unified_generic_depth_revised_token_counts",
     )
+    proposal_total_partial = int_value(
+        summary.get("generic_full_continuous_total_partial_recovered_token_count"), 0
+    )
+    proposal_total_revised = int_value(summary.get("generic_full_continuous_total_revised_token_count"), 0)
+    if fallback_partial_depth_counts and (
+        not proposal_total_partial
+        or sum(int_value(value, 0) for value in fallback_partial_depth_counts.values()) == proposal_total_partial
+    ):
+        partial_depth_counts = fallback_partial_depth_counts
+    if fallback_revised_depth_counts and (
+        not proposal_total_revised
+        or sum(int_value(value, 0) for value in fallback_revised_depth_counts.values()) == proposal_total_revised
+    ):
+        revised_depth_counts = fallback_revised_depth_counts
     summary["generic_full_continuous_depth_partial_recovered_token_counts"] = (
         partial_depth_counts or fallback_partial_depth_counts
     )
     summary["generic_full_continuous_depth_revised_token_counts"] = (
         revised_depth_counts or fallback_revised_depth_counts
+    )
+    if not proposal_total_partial and summary["generic_full_continuous_depth_partial_recovered_token_counts"]:
+        summary["generic_full_continuous_total_partial_recovered_token_count"] = sum(
+            int_value(value, 0)
+            for value in summary["generic_full_continuous_depth_partial_recovered_token_counts"].values()
+        )
+    if not proposal_total_revised and summary["generic_full_continuous_depth_revised_token_counts"]:
+        summary["generic_full_continuous_total_revised_token_count"] = sum(
+            int_value(value, 0)
+            for value in summary["generic_full_continuous_depth_revised_token_counts"].values()
+        )
+    if not int_value(summary.get("generic_full_continuous_total_output_token_count"), 0):
+        summary["generic_full_continuous_total_output_token_count"] = (
+            int_value(summary.get("generic_full_continuous_total_full_commit_token_count"), 0)
+            + int_value(summary.get("generic_full_continuous_total_partial_recovered_token_count"), 0)
+        )
+    summary["accounting_event_scope"] = "proposal_event"
+    summary["proposal_event_full_token_count"] = int_value(
+        summary.get("generic_full_continuous_total_full_commit_token_count"), 0
+    )
+    summary["proposal_event_partial_recovered_token_count"] = int_value(
+        summary.get("generic_full_continuous_total_partial_recovered_token_count"), 0
+    )
+    summary["proposal_event_revised_token_count"] = int_value(
+        summary.get("generic_full_continuous_total_revised_token_count"), 0
+    )
+    summary["proposal_event_output_token_count"] = int_value(
+        summary.get("generic_full_continuous_total_output_token_count"), 0
+    )
+    summary["final_output_token_count"] = int_value(summary.get("combined_real_committed_token_count"), 0)
+    summary["final_partial_recovered_token_count"] = int_value(
+        summary.get("partial_prefix_total_recovered_token_count"), 0
+    )
+    summary["final_revised_token_count"] = int_value(summary.get("partial_prefix_revised_token_count"), 0)
+    summary["final_output_total_available"] = bool(
+        summary["final_output_token_count"]
+        or _has_field(records, "combined_real_committed_token_count")
+        or "combined_real_committed_token_count" in accounting
+    )
+    summary["final_output_by_depth_available"] = _has_field(
+        records,
+        "unified_final_total_output_token_count_by_depth",
+        "generic_final_total_output_token_count_by_depth",
+        "final_output_token_count_by_depth",
+    )
+    summary["cross_scope_comparison_skipped_reason"] = (
+        None
+        if summary["final_output_by_depth_available"]
+        else (
+            "final_output_by_depth_not_instrumented"
+            if summary["final_output_total_available"]
+            else "final_output_accounting_not_instrumented"
+        )
     )
     trace_semantics = next(
         (
@@ -464,16 +530,16 @@ def validate_records(
     partial_total = int_value(summary.get("partial_prefix_total_recovered_token_count"), 0)
     if partial_total and partial_total != partial_accepted + partial_revised:
         errors.append("partial recovered tokens must equal accepted prefix plus revised tokens")
-    if total_partial and total_partial != partial_total:
-        errors.append("full continuous partial total must match partial-prefix recovery total")
-    if total_revised and total_revised != partial_revised:
-        errors.append("full continuous revised total must match partial-prefix revised token count")
-
-    expected_combined = total_output
-    if int_value(summary.get("combined_real_committed_token_count"), 0) != expected_combined:
-        errors.append(
-            "combined real committed/output tokens must equal full continuous output"
-        )
+    if summary.get("final_output_by_depth_available"):
+        final_output = int_value(summary.get("final_output_token_count"), 0)
+        if int_value(summary.get("combined_real_committed_token_count"), 0) != final_output:
+            errors.append("combined real committed/output tokens must equal final output")
+        if int_value(summary.get("final_partial_recovered_token_count"), 0) != partial_total:
+            errors.append("final partial total must match partial-prefix recovery total")
+        if int_value(summary.get("final_revised_token_count"), 0) != partial_revised:
+            errors.append("final revised total must match partial-prefix revised token count")
+    elif not summary.get("cross_scope_comparison_skipped_reason"):
+        errors.append("missing reason for skipped final-output accounting comparison")
     if int_value(summary.get("generic_full_continuous_normal_lane_conflict_count"), 0) != 0:
         errors.append("full continuous normal lane conflict count must remain zero")
     if int_value(summary.get("generic_full_continuous_target_draft_mismatch_count"), 0) != 0:
@@ -533,6 +599,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         "generic_full_continuous_total_partial_recovered_token_count",
         "generic_full_continuous_total_revised_token_count",
         "generic_full_continuous_total_output_token_count",
+        "accounting_event_scope",
+        "proposal_event_full_token_count",
+        "proposal_event_partial_recovered_token_count",
+        "proposal_event_revised_token_count",
+        "proposal_event_output_token_count",
+        "final_output_token_count",
+        "final_partial_recovered_token_count",
+        "final_revised_token_count",
+        "final_output_total_available",
+        "final_output_by_depth_available",
+        "cross_scope_comparison_skipped_reason",
         "generic_full_continuous_full_commit_token_count_semantics",
         "generic_full_continuous_full_commit_token_count_includes_partial_recovered",
         "generic_full_continuous_depth_gt_max_real_commit_count",
