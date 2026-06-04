@@ -417,6 +417,16 @@ def applied_token_accounting_summary(
         source = "fallback_trace_totals"
 
     return {
+        "unified_accounting_event_scope": "proposal_event",
+        "unified_applied_event_full_token_count_by_depth": full_by_depth,
+        "unified_applied_event_total_full_token_count": int(total_full),
+        "unified_applied_event_partial_recovered_token_count_by_depth": partial_by_depth,
+        "unified_applied_event_total_partial_recovered_token_count": int(total_partial),
+        "unified_applied_event_partial_revised_token_count_by_depth": revised_by_depth,
+        "unified_applied_event_total_revised_token_count": int(total_revised),
+        "unified_applied_event_total_output_token_count_by_depth": output_by_depth,
+        "unified_applied_event_total_output_token_count": int(total_output),
+        "unified_proposal_event_output_token_count": int(total_output),
         "unified_full_commit_token_count_by_depth": full_by_depth,
         "unified_total_full_commit_token_count": int(total_full),
         "unified_partial_recovered_token_count_by_depth": partial_by_depth,
@@ -428,6 +438,86 @@ def applied_token_accounting_summary(
         "unified_accounting_aggregation_source": source,
         "unified_accounting_full_event_dedup_count": int(len(seen_full_events)),
         "unified_accounting_partial_event_dedup_count": int(len(seen_partial_events)),
+    }
+
+
+def final_output_accounting_summary(records: list[dict[str, Any]], accounting: dict[str, Any]) -> dict[str, Any]:
+    final_field_names = (
+        "unified_final_full_commit_token_count_by_depth",
+        "unified_final_partial_recovered_token_count_by_depth",
+        "unified_final_partial_revised_token_count_by_depth",
+        "unified_final_total_output_token_count_by_depth",
+        "unified_final_total_full_commit_token_count",
+        "unified_final_total_partial_recovered_token_count",
+        "unified_final_total_revised_token_count",
+        "unified_final_total_output_token_count",
+        "unified_final_output_token_count",
+    )
+    final_field_present = any(has_trace_field(records, field) for field in final_field_names)
+    combined_output = int_value(accounting.get("combined_real_committed_token_count"), 0)
+    partial_total = int_value(accounting.get("partial_prefix_total_recovered_token_count"), 0)
+    revised_total = int_value(accounting.get("partial_prefix_revised_token_count"), 0)
+
+    if not final_field_present:
+        output_total = int(combined_output)
+        return {
+            "unified_final_full_commit_token_count_by_depth": {},
+            "unified_final_total_full_commit_token_count": max(0, int(output_total) - int(partial_total)),
+            "unified_final_partial_recovered_token_count_by_depth": {},
+            "unified_final_total_partial_recovered_token_count": int(partial_total),
+            "unified_final_partial_revised_token_count_by_depth": {},
+            "unified_final_total_revised_token_count": int(revised_total),
+            "unified_final_total_output_token_count_by_depth": {},
+            "unified_final_total_output_token_count": int(output_total),
+            "unified_final_output_token_count": int(output_total),
+            "unified_final_output_accounting_available": False,
+            "unified_accounting_cross_scope_comparison_skipped_reason": (
+                "final_output_accounting_not_instrumented"
+            ),
+        }
+
+    full_by_depth = merge_depth_counts(records, "unified_final_full_commit_token_count_by_depth")
+    partial_by_depth = merge_depth_counts(records, "unified_final_partial_recovered_token_count_by_depth")
+    revised_by_depth = merge_depth_counts(records, "unified_final_partial_revised_token_count_by_depth")
+    output_by_depth = merge_depth_counts(records, "unified_final_total_output_token_count_by_depth")
+
+    full_total = max_record_int(records, "unified_final_total_full_commit_token_count")
+    partial_total = max_record_int(records, "unified_final_total_partial_recovered_token_count") or int(partial_total)
+    revised_total = max_record_int(records, "unified_final_total_revised_token_count") or int(revised_total)
+    output_total = max_record_int(
+        records,
+        "unified_final_total_output_token_count",
+        "unified_final_output_token_count",
+    )
+
+    if full_total == 0 and full_by_depth:
+        full_total = sum_depth_values(full_by_depth)
+    if partial_total == 0 and partial_by_depth:
+        partial_total = sum_depth_values(partial_by_depth)
+    if revised_total == 0 and revised_by_depth:
+        revised_total = sum_depth_values(revised_by_depth)
+    if not output_by_depth and (full_by_depth or partial_by_depth):
+        output_by_depth = add_depth_count_maps(full_by_depth, partial_by_depth)
+    if output_total == 0:
+        if output_by_depth:
+            output_total = sum_depth_values(output_by_depth)
+        elif full_total or partial_total:
+            output_total = int(full_total) + int(partial_total)
+        else:
+            output_total = int(combined_output)
+
+    return {
+        "unified_final_full_commit_token_count_by_depth": full_by_depth,
+        "unified_final_total_full_commit_token_count": int(full_total),
+        "unified_final_partial_recovered_token_count_by_depth": partial_by_depth,
+        "unified_final_total_partial_recovered_token_count": int(partial_total),
+        "unified_final_partial_revised_token_count_by_depth": revised_by_depth,
+        "unified_final_total_revised_token_count": int(revised_total),
+        "unified_final_total_output_token_count_by_depth": output_by_depth,
+        "unified_final_total_output_token_count": int(output_total),
+        "unified_final_output_token_count": int(output_total),
+        "unified_final_output_accounting_available": True,
+        "unified_accounting_cross_scope_comparison_skipped_reason": None,
     }
 
 
@@ -2174,6 +2264,7 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     total_partial = int(applied_accounting["unified_total_partial_recovered_token_count"])
     total_revised = int(applied_accounting["unified_total_revised_token_count"])
     total_output = int(applied_accounting["unified_total_output_token_count"])
+    final_accounting = final_output_accounting_summary(records, accounting)
     actual_verified_proposal_count = sum(
         int_value(value, 0)
         for value in diagnostics.get("unified_raw_verified_proposal_count_by_depth", {}).values()
@@ -2241,6 +2332,7 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "total_revised_token_count": total_revised,
         "total_output_token_count": total_output,
         **applied_accounting,
+        **final_accounting,
         "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
         "partial_prefix_accepted_token_count": int_value(accounting.get("partial_prefix_accepted_token_count"), 0),
         "partial_prefix_revised_token_count": int_value(accounting.get("partial_prefix_revised_token_count"), 0),
@@ -3006,23 +3098,54 @@ def validate_records(
     if reject_total and no_mutation_reject_total + reject_correction_total > reject_total:
         errors.append("reject apply counters must not exceed raw reject outcomes")
 
-    total_full = int_value(summary["total_full_commit_token_count"], 0)
-    total_partial = int_value(summary["total_partial_recovered_token_count"], 0)
-    total_revised = int_value(summary["total_revised_token_count"], 0)
-    total_output = int_value(summary["total_output_token_count"], 0)
-    alias_total_full = int_value(summary.get("unified_total_full_commit_token_count"), total_full)
-    alias_total_partial = int_value(summary.get("unified_total_partial_recovered_token_count"), total_partial)
-    alias_total_output = int_value(summary.get("unified_total_output_token_count"), total_output)
-    if alias_total_output != int_value(summary["combined_real_committed_token_count"], 0):
-        errors.append("unified total output must equal combined real committed token count")
-    if alias_total_partial != int_value(summary["partial_prefix_total_recovered_token_count"], 0):
-        errors.append("unified partial recovered total must match partial-prefix total")
-    if total_revised != int_value(summary["partial_prefix_revised_token_count"], 0):
-        errors.append("unified revised total must match partial-prefix revised token count")
-    if alias_total_partial:
-        accepted = int_value(summary["partial_prefix_accepted_token_count"], 0)
-        if alias_total_partial != accepted + total_revised:
-            errors.append("partial recovered total must equal accepted prefix plus revised tokens")
+    event_total_full = int_value(
+        summary.get("unified_applied_event_total_full_token_count"),
+        int_value(summary.get("unified_total_full_commit_token_count"), 0),
+    )
+    event_total_partial = int_value(
+        summary.get("unified_applied_event_total_partial_recovered_token_count"),
+        int_value(summary.get("unified_total_partial_recovered_token_count"), 0),
+    )
+    event_total_revised = int_value(
+        summary.get("unified_applied_event_total_revised_token_count"),
+        int_value(summary.get("unified_total_revised_token_count"), 0),
+    )
+    event_total_output = int_value(
+        summary.get("unified_applied_event_total_output_token_count"),
+        int_value(summary.get("unified_total_output_token_count"), 0),
+    )
+    final_available = bool(summary.get("unified_final_output_accounting_available", False))
+    if final_available:
+        final_total_output = int_value(summary.get("unified_final_total_output_token_count"), 0)
+        final_total_partial = int_value(summary.get("unified_final_total_partial_recovered_token_count"), 0)
+        final_total_revised = int_value(summary.get("unified_final_total_revised_token_count"), 0)
+        if final_total_output != int_value(summary["combined_real_committed_token_count"], 0):
+            errors.append("unified final output must equal combined real committed token count")
+        if final_total_partial != int_value(summary["partial_prefix_total_recovered_token_count"], 0):
+            errors.append("unified final partial recovered total must match partial-prefix total")
+        if final_total_revised != int_value(summary["partial_prefix_revised_token_count"], 0):
+            errors.append("unified final revised total must match partial-prefix revised token count")
+        if final_total_partial:
+            accepted = int_value(summary["partial_prefix_accepted_token_count"], 0)
+            if final_total_partial != accepted + final_total_revised:
+                errors.append("unified final partial recovered total must equal accepted prefix plus revised tokens")
+        if summary.get("unified_final_full_commit_token_count_by_depth") and (
+            sum_depth_values(summary.get("unified_final_full_commit_token_count_by_depth"))
+            != int_value(summary.get("unified_final_total_full_commit_token_count"), 0)
+        ):
+            errors.append("final full-only depth token counts must sum to final full commit tokens")
+        if summary.get("unified_final_partial_recovered_token_count_by_depth") and (
+            sum_depth_values(summary.get("unified_final_partial_recovered_token_count_by_depth"))
+            != final_total_partial
+        ):
+            errors.append("final partial depth token counts must sum to final partial recovered tokens")
+        if summary.get("unified_final_total_output_token_count_by_depth") and (
+            sum_depth_values(summary.get("unified_final_total_output_token_count_by_depth"))
+            != final_total_output
+        ):
+            errors.append("final depth output token counts must sum to final output tokens")
+    elif not summary.get("unified_accounting_cross_scope_comparison_skipped_reason"):
+        errors.append("missing reason for skipped final-output accounting comparison")
 
     if int_value(summary["normal_lane_conflict_count"], 0) != 0:
         errors.append("normal lane conflict count must be zero")
@@ -3045,16 +3168,19 @@ def validate_records(
             "normal proposal buffer had illegal discard order violations: "
             f"{summary.get('normal_proposal_buffer_event_order_violation_examples', [])}"
         )
-    if alias_total_output != alias_total_full + alias_total_partial:
-        errors.append("unified total output must equal full commits plus partial recovered tokens")
-    if sum_depth_values(summary.get("unified_full_commit_token_count_by_depth")) != alias_total_full:
-        errors.append("full-only depth token counts must sum to total full commit tokens")
-    if sum_depth_values(summary.get("unified_partial_recovered_token_count_by_depth")) != alias_total_partial:
-        errors.append("partial recovered depth token counts must sum to total partial recovered tokens")
-    if sum_depth_values(summary.get("unified_partial_revised_token_count_by_depth")) != total_revised:
-        errors.append("partial revised depth token counts must sum to total revised tokens")
-    if sum_depth_values(summary.get("unified_total_output_token_count_by_depth")) != alias_total_output:
-        errors.append("depth total output token counts must sum to total output tokens")
+    if event_total_output != event_total_full + event_total_partial:
+        errors.append("proposal-event total output must equal full events plus partial recovered events")
+    if sum_depth_values(summary.get("unified_applied_event_full_token_count_by_depth")) != event_total_full:
+        errors.append("proposal-event full depth token counts must sum to proposal-event full tokens")
+    if (
+        sum_depth_values(summary.get("unified_applied_event_partial_recovered_token_count_by_depth"))
+        != event_total_partial
+    ):
+        errors.append("proposal-event partial depth token counts must sum to proposal-event partial tokens")
+    if sum_depth_values(summary.get("unified_applied_event_partial_revised_token_count_by_depth")) != event_total_revised:
+        errors.append("proposal-event revised depth token counts must sum to proposal-event revised tokens")
+    if sum_depth_values(summary.get("unified_applied_event_total_output_token_count_by_depth")) != event_total_output:
+        errors.append("proposal-event depth output token counts must sum to proposal-event output tokens")
     return errors, summary
 
 
@@ -4143,6 +4269,17 @@ def run_synthetic_tests() -> None:
     assert summary["unified_total_output_token_count"] == 27
     assert summary["unified_full_commit_token_count_by_depth"]["6"] == 4
     assert summary["unified_total_output_token_count_by_depth"]["2"] == 7
+    assert summary["unified_accounting_event_scope"] == "proposal_event"
+    assert summary["unified_applied_event_total_full_token_count"] == 24
+    assert summary["unified_applied_event_total_partial_recovered_token_count"] == 3
+    assert summary["unified_applied_event_total_revised_token_count"] == 1
+    assert summary["unified_applied_event_total_output_token_count"] == 27
+    assert summary["unified_proposal_event_output_token_count"] == 27
+    assert summary["unified_final_output_accounting_available"] is False
+    assert summary["unified_final_output_token_count"] == 27
+    assert summary["unified_accounting_cross_scope_comparison_skipped_reason"] == (
+        "final_output_accounting_not_instrumented"
+    )
     assert summary["unified_accounting_aggregation_source"] == "stable_applied_event_dedup"
     assert summary["unified_accounting_full_event_dedup_count"] == 6
     assert summary["unified_accounting_partial_event_dedup_count"] == 1
@@ -4187,6 +4324,7 @@ def run_synthetic_tests() -> None:
     assert bad_fallback_summary["unified_total_partial_recovered_token_count"] == 3
     assert bad_fallback_summary["unified_total_revised_token_count"] == 1
     assert bad_fallback_summary["unified_total_output_token_count"] == 27
+    assert bad_fallback_summary["unified_applied_event_total_output_token_count"] == 27
     assert bad_fallback_summary["unified_full_commit_token_count_by_depth"]["1"] == 4
     assert bad_fallback_summary["unified_partial_recovered_token_count_by_depth"]["2"] == 3
     assert bad_fallback_summary["unified_total_output_token_count_by_depth"]["2"] == 7
@@ -4950,11 +5088,12 @@ def run_synthetic_tests() -> None:
     errors, _summary = validate_records(bad_parent, payload)
     assert errors, "synthetic missing parent should fail"
 
-    bad_output = [dict(records[0])]
-    bad_output[0]["unified_generic_total_output_token_count"] = 26
-    bad_output[0]["generic_full_continuous_total_output_token_count"] = 26
-    errors, _summary = validate_records(bad_output, payload)
-    assert errors, "synthetic output mismatch should fail"
+    bad_final_output = [dict(records[0])]
+    bad_final_output[0]["unified_final_total_output_token_count"] = 26
+    bad_final_output[0]["unified_final_total_partial_recovered_token_count"] = 3
+    bad_final_output[0]["unified_final_total_revised_token_count"] = 1
+    errors, _summary = validate_records(bad_final_output, payload)
+    assert errors, "synthetic final-output mismatch should fail"
     print("synthetic unified generic rolling runtime checks passed")
 
 
@@ -4981,6 +5120,27 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_total_revised_token_count",
         "unified_total_output_token_count_by_depth",
         "unified_total_output_token_count",
+        "unified_accounting_event_scope",
+        "unified_applied_event_full_token_count_by_depth",
+        "unified_applied_event_total_full_token_count",
+        "unified_applied_event_partial_recovered_token_count_by_depth",
+        "unified_applied_event_total_partial_recovered_token_count",
+        "unified_applied_event_partial_revised_token_count_by_depth",
+        "unified_applied_event_total_revised_token_count",
+        "unified_applied_event_total_output_token_count_by_depth",
+        "unified_applied_event_total_output_token_count",
+        "unified_proposal_event_output_token_count",
+        "unified_final_full_commit_token_count_by_depth",
+        "unified_final_total_full_commit_token_count",
+        "unified_final_partial_recovered_token_count_by_depth",
+        "unified_final_total_partial_recovered_token_count",
+        "unified_final_partial_revised_token_count_by_depth",
+        "unified_final_total_revised_token_count",
+        "unified_final_total_output_token_count_by_depth",
+        "unified_final_total_output_token_count",
+        "unified_final_output_token_count",
+        "unified_final_output_accounting_available",
+        "unified_accounting_cross_scope_comparison_skipped_reason",
         "unified_accounting_aggregation_source",
         "unified_accounting_full_event_dedup_count",
         "unified_accounting_partial_event_dedup_count",
