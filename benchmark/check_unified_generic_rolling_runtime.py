@@ -270,6 +270,167 @@ def add_depth_count_maps(*maps: dict[str, int]) -> dict[str, int]:
     return dict(sorted(combined.items(), key=lambda item: int(item[0])))
 
 
+def committed_seq_by_proposal_id(records: list[dict[str, Any]]) -> dict[int, int]:
+    seq_by_id = merge_int_map(
+        records,
+        "generic_rolling_real_commit_seq_id_by_proposal_id",
+        "unified_proposal_registry_seq_id_by_proposal_id",
+        "unified_child_generation_seq_id_by_proposal_id",
+        "partial_prefix_recovered_seq_id_by_proposal_id",
+    )
+    for record in records:
+        ids_by_depth = as_depth_int_lists(record.get("generic_rolling_real_committed_proposal_ids_by_depth"))
+        seqs_by_depth = as_depth_int_lists(record.get("generic_rolling_real_committed_seq_ids_by_depth"))
+        for depth, proposal_ids in ids_by_depth.items():
+            seq_ids = seqs_by_depth.get(int(depth), [])
+            if len(proposal_ids) != len(seq_ids):
+                continue
+            for proposal_id, seq_id in zip(proposal_ids, seq_ids):
+                seq_by_id.setdefault(int(proposal_id), int(seq_id))
+    return seq_by_id
+
+
+def applied_token_accounting_summary(
+    records: list[dict[str, Any]],
+    committed_by_depth: dict[int, list[int]],
+    fallback_full_by_depth: dict[str, int],
+    fallback_total_full: int,
+    fallback_partial_by_depth: dict[str, int],
+    fallback_total_partial: int,
+    fallback_revised_by_depth: dict[str, int],
+    fallback_total_revised: int,
+    fallback_output_by_depth: dict[str, int],
+    fallback_total_output: int,
+) -> dict[str, Any]:
+    seq_by_id = committed_seq_by_proposal_id(records)
+    depth_by_id = merge_int_map(
+        records,
+        "generic_rolling_real_commit_depth_by_proposal_id",
+        "generic_rolling_depth_by_proposal_id",
+        "unified_proposal_registry_depth_by_proposal_id",
+    )
+    for depth, proposal_ids in committed_by_depth.items():
+        for proposal_id in proposal_ids:
+            depth_by_id.setdefault(int(proposal_id), int(depth))
+    action_by_id = merge_str_map(records, "generic_rolling_real_commit_action_by_proposal_id")
+    result_by_id = merge_str_map(records, "generic_rolling_real_commit_verify_result_by_proposal_id")
+    token_by_id = merge_int_map(
+        records,
+        "generic_rolling_real_committed_token_count_by_proposal_id",
+        "generic_rolling_token_count_by_proposal_id",
+    )
+    committed_step_by_id = merge_int_map(
+        records,
+        "unified_proposal_registry_committed_step_by_proposal_id",
+        "generic_rolling_real_commit_step_by_proposal_id",
+        "generic_rolling_source_dual_step_id_by_proposal_id",
+    )
+    partial_ids: set[int] = set()
+    for record in records:
+        partial_ids.update(as_int_list(record.get("partial_prefix_recovered_proposal_ids")))
+    partial_depth_by_id = merge_int_map(
+        records,
+        "partial_prefix_recovered_depth_by_proposal_id",
+        "unified_proposal_registry_depth_by_proposal_id",
+    )
+    partial_seq_by_id = merge_int_map(
+        records,
+        "partial_prefix_recovered_seq_id_by_proposal_id",
+        "unified_proposal_registry_seq_id_by_proposal_id",
+    )
+    partial_token_by_id = merge_int_map(records, "partial_prefix_committed_token_count_by_proposal_id")
+    partial_revised_by_id = merge_int_map(records, "partial_prefix_revised_token_count_by_proposal_id")
+
+    full_by_depth: dict[str, int] = {}
+    partial_by_depth: dict[str, int] = {}
+    revised_by_depth: dict[str, int] = {}
+    seen_full_events: set[tuple[int, int, int, str, int]] = set()
+    seen_partial_events: set[tuple[int, int, int, str, int]] = set()
+
+    for depth, proposal_ids in sorted(committed_by_depth.items()):
+        for proposal_id in sorted(set(int(item) for item in proposal_ids)):
+            action = str(action_by_id.get(proposal_id, ""))
+            result = str(result_by_id.get(proposal_id, ""))
+            if proposal_id in partial_ids or "partial" in action or "partial" in result or "revised" in action:
+                continue
+            if action and "full" not in action and result != "full_accept":
+                continue
+            if result and result != "full_accept" and "full" not in action:
+                continue
+            token_count = int(token_by_id.get(proposal_id, 0))
+            if token_count <= 0:
+                continue
+            event_depth = int(depth_by_id.get(proposal_id, depth))
+            seq_id = int(seq_by_id.get(proposal_id, -1))
+            applied_step = int(committed_step_by_id.get(proposal_id, -1))
+            apply_event_type = action or "append_full_accept_real_commit"
+            key = (int(proposal_id), seq_id, event_depth, str(apply_event_type), applied_step)
+            if key in seen_full_events:
+                continue
+            seen_full_events.add(key)
+            depth_key = str(event_depth)
+            full_by_depth[depth_key] = int(full_by_depth.get(depth_key, 0)) + token_count
+
+    for proposal_id in sorted(partial_ids):
+        token_count = int(partial_token_by_id.get(proposal_id, 0))
+        revised_count = int(partial_revised_by_id.get(proposal_id, 0))
+        if token_count <= 0 and revised_count <= 0:
+            continue
+        event_depth = int(partial_depth_by_id.get(proposal_id, depth_by_id.get(proposal_id, -1)))
+        if event_depth < 1:
+            continue
+        seq_id = int(partial_seq_by_id.get(proposal_id, seq_by_id.get(proposal_id, -1)))
+        applied_step = int(committed_step_by_id.get(proposal_id, -1))
+        key = (int(proposal_id), seq_id, event_depth, "partial_prefix_recovery", applied_step)
+        if key in seen_partial_events:
+            continue
+        seen_partial_events.add(key)
+        depth_key = str(event_depth)
+        partial_by_depth[depth_key] = int(partial_by_depth.get(depth_key, 0)) + token_count
+        if revised_count > 0:
+            revised_by_depth[depth_key] = int(revised_by_depth.get(depth_key, 0)) + revised_count
+
+    used_full_applied_events = bool(seen_full_events)
+    used_partial_applied_events = bool(seen_partial_events)
+    if used_full_applied_events:
+        full_by_depth = dict(sorted(full_by_depth.items(), key=lambda item: int(item[0])))
+    else:
+        full_by_depth = dict(fallback_full_by_depth)
+
+    if used_partial_applied_events:
+        partial_by_depth = dict(sorted(partial_by_depth.items(), key=lambda item: int(item[0])))
+        revised_by_depth = dict(sorted(revised_by_depth.items(), key=lambda item: int(item[0])))
+    else:
+        partial_by_depth = dict(fallback_partial_by_depth)
+        revised_by_depth = dict(fallback_revised_by_depth)
+
+    output_by_depth = add_depth_count_maps(full_by_depth, partial_by_depth)
+    total_full = sum_depth_values(full_by_depth)
+    total_partial = sum_depth_values(partial_by_depth)
+    total_revised = sum_depth_values(revised_by_depth)
+    total_output = total_full + total_partial
+    if used_full_applied_events and used_partial_applied_events:
+        source = "stable_applied_event_dedup"
+    elif used_full_applied_events or used_partial_applied_events:
+        source = "mixed_stable_applied_event_dedup_with_fallback"
+    else:
+        source = "fallback_trace_totals"
+
+    return {
+        "unified_full_commit_token_count_by_depth": full_by_depth,
+        "unified_total_full_commit_token_count": int(total_full),
+        "unified_partial_recovered_token_count_by_depth": partial_by_depth,
+        "unified_total_partial_recovered_token_count": int(total_partial),
+        "unified_partial_revised_token_count_by_depth": revised_by_depth,
+        "unified_total_revised_token_count": int(total_revised),
+        "unified_total_output_token_count_by_depth": output_by_depth,
+        "unified_total_output_token_count": int(total_output),
+        "unified_accounting_aggregation_source": source,
+        "unified_accounting_full_event_dedup_count": int(len(seen_full_events)),
+        "unified_accounting_partial_event_dedup_count": int(len(seen_partial_events)),
+    }
+
+
 def normal_buffer_consumer_role(event_type: str, reason: str) -> str:
     reason = str(reason or "")
     event_type = str(event_type or "")
@@ -1972,68 +2133,47 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
     )
     buffer_lifecycle = normal_proposal_buffer_lifecycle_summary(records)
 
-    explicit_full_by_depth = merge_depth_counts(
+    fallback_full_by_depth = merge_depth_counts(
         records,
         "unified_full_commit_token_count_by_depth",
         "unified_generic_full_commit_token_count_by_depth",
-    )
-    action_by_id = merge_str_map(records, "generic_rolling_real_commit_action_by_proposal_id")
-    result_by_id = merge_str_map(records, "generic_rolling_real_commit_verify_result_by_proposal_id")
-    committed_token_by_id = merge_int_map(
-        records,
-        "generic_rolling_real_committed_token_count_by_proposal_id",
-        "generic_rolling_token_count_by_proposal_id",
-    )
-    derived_full_by_depth: dict[str, int] = {}
-    if action_by_id or result_by_id:
-        for depth, proposal_ids in committed_by_depth.items():
-            depth_key = str(int(depth))
-            for proposal_id in set(int(item) for item in proposal_ids):
-                action = str(action_by_id.get(proposal_id, ""))
-                result = str(result_by_id.get(proposal_id, ""))
-                is_partial = "partial" in action or "partial" in result or "revised" in action
-                is_full = "full" in action or result == "full_accept" or (not action and not result)
-                if not is_full or is_partial:
-                    continue
-                derived_full_by_depth[depth_key] = int(derived_full_by_depth.get(depth_key, 0)) + int(
-                    committed_token_by_id.get(proposal_id, 0)
-                )
-        derived_full_by_depth = {
-            depth: int(count)
-            for depth, count in sorted(derived_full_by_depth.items(), key=lambda item: int(item[0]))
-            if int(count) > 0
-        }
-    depth_commit_sum = sum_depth_values(depth_commit_counts)
-    if explicit_full_by_depth:
-        full_commit_token_count_by_depth = explicit_full_by_depth
-    elif derived_full_by_depth:
-        full_commit_token_count_by_depth = derived_full_by_depth
-    elif depth_commit_sum == int(total_full) or int(total_partial) == 0:
-        full_commit_token_count_by_depth = dict(depth_commit_counts)
-    else:
-        full_commit_token_count_by_depth = {}
-
-    partial_recovered_by_depth = merge_depth_counts(
+    ) or (dict(depth_commit_counts) if sum_depth_values(depth_commit_counts) == int(total_full) else {})
+    fallback_partial_by_depth = merge_depth_counts(
         records,
         "unified_partial_recovered_token_count_by_depth",
         "unified_generic_depth_partial_recovered_token_counts",
         "generic_full_continuous_depth_partial_recovered_token_counts",
     )
-    partial_revised_by_depth = merge_depth_counts(
+    fallback_revised_by_depth = merge_depth_counts(
         records,
         "unified_partial_revised_token_count_by_depth",
         "unified_generic_depth_revised_token_counts",
         "generic_full_continuous_depth_revised_token_counts",
     )
-    explicit_output_by_depth = merge_depth_counts(
+    fallback_output_by_depth = merge_depth_counts(
         records,
         "unified_total_output_token_count_by_depth",
         "unified_generic_depth_output_token_counts",
+    ) or add_depth_count_maps(
+        fallback_full_by_depth,
+        fallback_partial_by_depth,
     )
-    total_output_by_depth = explicit_output_by_depth or add_depth_count_maps(
-        full_commit_token_count_by_depth,
-        partial_recovered_by_depth,
+    applied_accounting = applied_token_accounting_summary(
+        records,
+        committed_by_depth,
+        fallback_full_by_depth,
+        int(total_full),
+        fallback_partial_by_depth,
+        int(total_partial),
+        fallback_revised_by_depth,
+        int(total_revised),
+        fallback_output_by_depth,
+        int(total_output),
     )
+    total_full = int(applied_accounting["unified_total_full_commit_token_count"])
+    total_partial = int(applied_accounting["unified_total_partial_recovered_token_count"])
+    total_revised = int(applied_accounting["unified_total_revised_token_count"])
+    total_output = int(applied_accounting["unified_total_output_token_count"])
     actual_verified_proposal_count = sum(
         int_value(value, 0)
         for value in diagnostics.get("unified_raw_verified_proposal_count_by_depth", {}).values()
@@ -2100,13 +2240,7 @@ def build_summary(records: list[dict[str, Any]], result_payload: dict[str, Any] 
         "total_partial_recovered_token_count": total_partial,
         "total_revised_token_count": total_revised,
         "total_output_token_count": total_output,
-        "unified_full_commit_token_count_by_depth": dict(full_commit_token_count_by_depth),
-        "unified_total_full_commit_token_count": int(total_full),
-        "unified_partial_recovered_token_count_by_depth": dict(partial_recovered_by_depth),
-        "unified_total_partial_recovered_token_count": int(total_partial),
-        "unified_partial_revised_token_count_by_depth": dict(partial_revised_by_depth),
-        "unified_total_output_token_count_by_depth": dict(total_output_by_depth),
-        "unified_total_output_token_count": int(total_output),
+        **applied_accounting,
         "combined_real_committed_token_count": int_value(accounting.get("combined_real_committed_token_count"), 0),
         "partial_prefix_accepted_token_count": int_value(accounting.get("partial_prefix_accepted_token_count"), 0),
         "partial_prefix_revised_token_count": int_value(accounting.get("partial_prefix_revised_token_count"), 0),
@@ -2915,6 +3049,10 @@ def validate_records(
         errors.append("unified total output must equal full commits plus partial recovered tokens")
     if sum_depth_values(summary.get("unified_full_commit_token_count_by_depth")) != alias_total_full:
         errors.append("full-only depth token counts must sum to total full commit tokens")
+    if sum_depth_values(summary.get("unified_partial_recovered_token_count_by_depth")) != alias_total_partial:
+        errors.append("partial recovered depth token counts must sum to total partial recovered tokens")
+    if sum_depth_values(summary.get("unified_partial_revised_token_count_by_depth")) != total_revised:
+        errors.append("partial revised depth token counts must sum to total revised tokens")
     if sum_depth_values(summary.get("unified_total_output_token_count_by_depth")) != alias_total_output:
         errors.append("depth total output token counts must sum to total output tokens")
     return errors, summary
@@ -4001,9 +4139,13 @@ def run_synthetic_tests() -> None:
     assert summary["unified_raw_verified_to_committed_ratio_by_depth"]["1"] == 1.0
     assert summary["unified_total_full_commit_token_count"] == 24
     assert summary["unified_total_partial_recovered_token_count"] == 3
+    assert summary["unified_total_revised_token_count"] == 1
     assert summary["unified_total_output_token_count"] == 27
     assert summary["unified_full_commit_token_count_by_depth"]["6"] == 4
     assert summary["unified_total_output_token_count_by_depth"]["2"] == 7
+    assert summary["unified_accounting_aggregation_source"] == "stable_applied_event_dedup"
+    assert summary["unified_accounting_full_event_dedup_count"] == 6
+    assert summary["unified_accounting_partial_event_dedup_count"] == 1
     assert summary["num_steps"] == 1
     assert summary["steps_with_any_unified_candidate"] == 1
     assert summary["steps_with_any_unified_commit"] == 1
@@ -4023,6 +4165,31 @@ def run_synthetic_tests() -> None:
     assert records[0]["unified_generic_target_verify_appended_row0_top_token_by_proposal_id"]["1001"] == (
         sampled_inputs["1001"][1]
     )
+
+    bad_fallback_accounting = [json.loads(json.dumps(records[0]))]
+    bad_fallback_accounting[0].update(
+        {
+            "unified_full_commit_token_count_by_depth": {"1": 999},
+            "unified_partial_recovered_token_count_by_depth": {"2": 999},
+            "unified_partial_revised_token_count_by_depth": {"2": 333},
+            "unified_total_output_token_count_by_depth": {"1": 999, "2": 999},
+            "unified_generic_depth_partial_recovered_token_counts": {"2": 999},
+            "generic_full_continuous_depth_partial_recovered_token_counts": {"2": 999},
+            "generic_full_continuous_depth_revised_token_counts": {"2": 333},
+        }
+    )
+    errors, bad_fallback_summary = validate_records(bad_fallback_accounting, payload)
+    assert not errors, (
+        "applied-event accounting should ignore stale fallback aggregate counters: "
+        f"{errors}\nsummary={bad_fallback_summary}"
+    )
+    assert bad_fallback_summary["unified_total_full_commit_token_count"] == 24
+    assert bad_fallback_summary["unified_total_partial_recovered_token_count"] == 3
+    assert bad_fallback_summary["unified_total_revised_token_count"] == 1
+    assert bad_fallback_summary["unified_total_output_token_count"] == 27
+    assert bad_fallback_summary["unified_full_commit_token_count_by_depth"]["1"] == 4
+    assert bad_fallback_summary["unified_partial_recovered_token_count_by_depth"]["2"] == 3
+    assert bad_fallback_summary["unified_total_output_token_count_by_depth"]["2"] == 7
 
     extra_candidates_not_verified = [json.loads(json.dumps(records[0]))]
     extra_candidates_not_verified[0]["unified_generic_target_verify_num_proposals"] = 12
@@ -4811,8 +4978,12 @@ def print_summary(summary: dict[str, Any]) -> None:
         "unified_partial_recovered_token_count_by_depth",
         "unified_total_partial_recovered_token_count",
         "unified_partial_revised_token_count_by_depth",
+        "unified_total_revised_token_count",
         "unified_total_output_token_count_by_depth",
         "unified_total_output_token_count",
+        "unified_accounting_aggregation_source",
+        "unified_accounting_full_event_dedup_count",
+        "unified_accounting_partial_event_dedup_count",
         "unified_commit_share_by_depth",
         "unified_raw_target_verification_available",
         "unified_raw_verification_source",
