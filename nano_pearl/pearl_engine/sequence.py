@@ -51,6 +51,8 @@ class Sequence:
         self.slo_tpot_ms = slo_tpot_ms
         self.slo_class = slo_class
         self.per_request_gamma = per_request_gamma
+        self.prompt_format_used = None
+        self.tokenized_prompt_len = len(token_ids)
         self.home_batch_id = None
         self.trace_stats = {
             "scheduled_iterations": [],
@@ -217,6 +219,8 @@ class Sequence:
             "slo_tpot_ms": self.slo_tpot_ms,
             "slo_class": self.slo_class,
             "per_request_gamma": self.per_request_gamma,
+            "prompt_format_used": self.prompt_format_used,
+            "tokenized_prompt_len": self.tokenized_prompt_len,
             "home_batch_id": self.home_batch_id,
             "trace_stats": self.trace_stats,
         }
@@ -247,6 +251,7 @@ class Sequence:
                 self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
                 self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
                 self.cached_kv_materialized,
+                self.prompt_format_used, self.tokenized_prompt_len,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
@@ -258,6 +263,8 @@ class Sequence:
         self.cached_prefill_skipped = False
         self.cached_admission_status = None
         self.cached_kv_materialized = False
+        self.prompt_format_used = None
+        self.tokenized_prompt_len = None
         if len(fields) == 25:
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              self.temperature, self.ignore_eos, self.max_tokens, self.seq_id, self.pre_verify,
@@ -283,15 +290,20 @@ class Sequence:
              self.first_token_ts, self.admit_ts, self.finish_ts, self.decode_ready_ts, self.decode_start_ts,
              self.decode_ready_mode, self.num_decode_ready_prefill_tokens,
              self.slo_tpot_ms, self.slo_class, self.per_request_gamma, self.home_batch_id, self.trace_stats,
-             self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
-             self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
+            self.cached_admission_enabled, self.cached_kv_ready, self.cached_prefill_mode,
+            self.cache_key, self.cached_prefill_skipped, self.cached_admission_status,
              *rest_cached_fields) = fields
             if rest_cached_fields:
                 self.cached_kv_materialized = bool(rest_cached_fields[0])
+            if len(rest_cached_fields) >= 3:
+                self.prompt_format_used = rest_cached_fields[1]
+                self.tokenized_prompt_len = rest_cached_fields[2]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:
             self.last_token = state[-1]
+        if self.tokenized_prompt_len is None:
+            self.tokenized_prompt_len = self.num_prompt_tokens
 
 
 def _sequence_status_name(seq: Sequence) -> str:

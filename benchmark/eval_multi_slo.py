@@ -43,6 +43,7 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
 from nano_pearl import PEARLConfig, PEARLEngine  # noqa: E402
+from nano_pearl.pearl_engine.tokenizer_utils import prompt_to_token_ids  # noqa: E402
 from nano_pearl.pearl_engine.sequence import Sequence  # noqa: E402
 
 try:
@@ -86,9 +87,10 @@ def validate_request(req: Dict[str, Any], line_no: int) -> None:
         if key not in req:
             raise ValueError(f"Missing key '{key}' in workload line {line_no}")
 
-    if "prompt" not in req and "input_ids" not in req:
+    if not any(key in req for key in ("prompt", "input_ids", "messages", "input", "text")):
         raise ValueError(
-            f"Workload line {line_no} must contain either 'prompt' or 'input_ids'"
+            f"Workload line {line_no} must contain one of "
+            "'prompt', 'input_ids', 'messages', 'input', or 'text'"
         )
 
     if "arrival_offset_sec" not in req and "arrival_ts" not in req:
@@ -367,7 +369,13 @@ def make_sampling_params(req: Dict[str, Any], args: argparse.Namespace) -> Sampl
 def get_request_prompt(req: Dict[str, Any]) -> Any:
     if "input_ids" in req:
         return req["input_ids"]
-    return req["prompt"]
+    if "messages" in req:
+        return req["messages"]
+    if "prompt" in req:
+        return req["prompt"]
+    if "input" in req:
+        return req["input"]
+    return req["text"]
 
 
 def materialize_arrival_ts(
@@ -1889,15 +1897,7 @@ def make_cached_sequence(
     args: argparse.Namespace,
 ) -> Sequence:
     prompt = get_request_prompt(req)
-    if isinstance(prompt, str):
-        prompt = engine.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        token_ids = engine.tokenizer.encode(prompt)
-    else:
-        token_ids = list(prompt)
+    token_ids, prompt_format_used = prompt_to_token_ids(engine.tokenizer, prompt)
 
     seq = Sequence(
         token_ids,
@@ -1908,6 +1908,8 @@ def make_cached_sequence(
         slo_class=req["slo_class"],
         per_request_gamma=int(req.get("per_request_gamma", 0)),
     )
+    seq.prompt_format_used = prompt_format_used
+    seq.tokenized_prompt_len = len(token_ids)
     seq.arrival_offset_sec = to_float(req.get("arrival_offset_sec"))
     seq.mark_cached_prefill_metadata(mode="in_memory_kv", cache_key=req["request_id"])
     return seq
@@ -2255,6 +2257,8 @@ def trace_export_record(row: Dict[str, Any], execution_mode: str, decode_ready: 
         "slo_class": row.get("slo_class"),
         "slo_tpot_ms": row.get("slo_tpot_ms"),
         "per_request_gamma": row.get("per_request_gamma"),
+        "prompt_format_used": row.get("prompt_format_used"),
+        "tokenized_prompt_len": row.get("tokenized_prompt_len"),
         "execution_mode": row.get("execution_mode", execution_mode),
         "decode_ready_mode": row.get("decode_ready_mode", decode_ready),
         "arrival_offset_sec": row.get("arrival_offset_sec"),
@@ -2740,6 +2744,15 @@ def main() -> None:
         metrics["execution_mode"] = args.execution_mode
         metrics["decode_ready_mode"] = bool(args.decode_ready)
         metrics["eval_batch_size"] = args.eval_batch_size
+        metrics["model_tokenizer_diagnostics"] = getattr(
+            config,
+            "model_tokenizer_diagnostics",
+            {},
+        )
+        metrics["tokenizer_compatibility_check_passed"] = bool(
+            getattr(config, "tokenizer_compatibility_check_passed", False)
+        )
+        metrics["global_stop_token_ids"] = list(getattr(config, "stop_token_ids", []) or [])
         cached_admission_trace = list(getattr(args, "_cached_admission_trace", []))
         cached_admission_summary = build_cached_admission_summary(
             evaluated_rows,
@@ -2774,6 +2787,7 @@ def main() -> None:
             "args": result_args,
             "workload_meta": workload_meta,
             "metrics": metrics,
+            "model_tokenizer_diagnostics": getattr(config, "model_tokenizer_diagnostics", {}),
             "cached_admission": cached_admission_summary,
             "cached_admission_trace": cached_admission_trace,
             "eager_performance_accounting": eager_performance_accounting,

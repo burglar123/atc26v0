@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import ClassVar
 from transformers import AutoConfig
 import torch.distributed as dist
+from nano_pearl.pearl_engine.tokenizer_utils import (
+    check_tokenizer_compatibility,
+    collect_stop_token_ids,
+    compact_stop_token_ids,
+    load_tokenizer,
+    resolve_model_path,
+    tokenizer_diagnostics,
+)
 
 
 PHASE_1H0_EAGER_NOT_IMPLEMENTED = (
@@ -66,12 +74,28 @@ class TPParams:
 
 class BaseConfig:
     def __init__(self, model: str, tensor_parallel_size: int, devices: list[int], group_name: str):
-        self.model = model
+        self.model = resolve_model_path(model)
         self.tensor_parallel_size = tensor_parallel_size
         self.devices = devices
         self.group_name = group_name
-        self.hf_config = AutoConfig.from_pretrained(self.model)
-        self.eos = self.hf_config.eos_token_id
+        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        if not getattr(self.hf_config, "architectures", None):
+            model_type = str(getattr(self.hf_config, "model_type", ""))
+            if model_type == "llama":
+                self.hf_config.architectures = ["LlamaForCausalLM"]
+            elif model_type == "qwen2":
+                self.hf_config.architectures = ["Qwen2ForCausalLM"]
+            elif model_type == "qwen3":
+                self.hf_config.architectures = ["Qwen3ForCausalLM"]
+        if not hasattr(self.hf_config, "num_key_value_heads"):
+            self.hf_config.num_key_value_heads = self.hf_config.num_attention_heads
+        self.tokenizer = load_tokenizer(self.model, use_fast=True)
+        stop_token_ids = collect_stop_token_ids(self.hf_config, self.tokenizer)
+        self.eos = compact_stop_token_ids(stop_token_ids)
+        self.stop_token_ids = stop_token_ids
+        if getattr(self.hf_config, "pad_token_id", None) is None:
+            self.hf_config.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        self.tokenizer_diagnostics = tokenizer_diagnostics(self.model, self.hf_config, self.tokenizer)
         self.master_rank = self.devices[0]
         logger.info(f"Model={get_model_name(self.model)}")
         logger.info(f"TP={self.tensor_parallel_size}")
@@ -80,6 +104,10 @@ class BaseConfig:
         logger.info(f"Architectures={self.hf_config.architectures[0]}")
         logger.info(f"Vocab_Size={self.hf_config.vocab_size}")
         logger.info(f"Eos={self.eos}")
+        logger.info(f"Pad={self.tokenizer_diagnostics.get('pad_token_id')}")
+        logger.info(f"Bos={self.tokenizer_diagnostics.get('bos_token_id')}")
+        logger.info(f"Eot={self.tokenizer_diagnostics.get('eot_token_id')}")
+        logger.info(f"Tokenizer_Len={self.tokenizer_diagnostics.get('len_tokenizer')}")
 
         # Dynamic TP: Padding Parameters
         if self.tensor_parallel_size not in [1, 2, 4, 8]:
@@ -548,7 +576,35 @@ class PEARLConfig:
         logger.info(f"Cached_Admission_Policy={self.cached_admission_policy}")
         logger.info(f"Cached_Admission_Max_Active={self.cached_admission_max_active}")
         logger.info(f"Cached_Admission_Arrival_Field={self.cached_admission_arrival_field}")
-        assert self.draft_config.eos == self.target_config.eos
+        self.tokenizer_compatibility = check_tokenizer_compatibility(
+            self.draft_config.tokenizer,
+            self.target_config.tokenizer,
+        )
+        self.tokenizer_compatibility_check_passed = bool(
+            self.tokenizer_compatibility.get("tokenizer_compatibility_check_passed")
+        )
+        if self.execution_mode != "ar" and not self.tokenizer_compatibility_check_passed:
+            raise ValueError(
+                "Draft/target tokenizer compatibility check failed for speculative execution: "
+                f"{self.tokenizer_compatibility}"
+            )
+        combined_stop_ids = []
+        for token_id in self.draft_config.stop_token_ids + self.target_config.stop_token_ids:
+            if token_id not in combined_stop_ids:
+                combined_stop_ids.append(token_id)
+        self.eos = compact_stop_token_ids(combined_stop_ids)
+        self.stop_token_ids = combined_stop_ids
+        self.model_tokenizer_diagnostics = {
+            "draft": self.draft_config.tokenizer_diagnostics,
+            "target": self.target_config.tokenizer_diagnostics,
+            "tokenizer_compatibility": self.tokenizer_compatibility,
+            "tokenizer_compatibility_check_passed": self.tokenizer_compatibility_check_passed,
+            "global_stop_token_ids": self.stop_token_ids,
+        }
+        self.draft_config.tokenizer = None
+        self.target_config.tokenizer = None
+        logger.info(f"Tokenizer_Compatibility={self.tokenizer_compatibility_check_passed}")
+        logger.info(f"Global_Stop_Token_Ids={self.stop_token_ids}")
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len
         self.world_size = self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size

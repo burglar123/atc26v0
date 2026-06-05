@@ -25,6 +25,7 @@ from nano_pearl.pearl_engine.sequence import (
     make_sequence_checkpoint,
 )
 from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
+from nano_pearl.pearl_engine.tokenizer_utils import load_tokenizer
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from nano_pearl.pearl_engine.step_plan import RequestBudget, StepPlan
 from nano_pearl.pearl_engine.dual_batch import (
@@ -51,7 +52,6 @@ from nano_pearl.pearl_engine.dual_batch import (
     serialize_eager_transfer_payload,
     serialize_ready_eager_proposals,
 )
-from transformers import AutoTokenizer
 from tqdm import trange
 
 
@@ -324,12 +324,18 @@ class ModelRunnerBase:
         torch.cuda.set_device(self.rank)
         torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = model_dict[self.hf_config.architectures[0]](self.hf_config, self.tp_params)
+        architecture = self.hf_config.architectures[0]
+        if architecture not in model_dict:
+            raise ValueError(
+                f"Architecture not supported: {architecture}. "
+                f"Supported architectures={sorted(model_dict)}"
+            )
+        self.model = model_dict[architecture](self.hf_config, self.tp_params)
         load_model(self.model, self.group_config.model)
         dist.barrier()
         self.sampler = Sampler()
         self.warmup_model()
-        self.tokenizer = AutoTokenizer.from_pretrained(self.group_config.model)
+        self.tokenizer = load_tokenizer(self.group_config.model)
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         self.trace_records = []
@@ -627,6 +633,8 @@ class ModelRunnerBase:
             "slo_tpot_ms": seq.slo_tpot_ms,
             "slo_class": seq.slo_class,
             "per_request_gamma": seq.per_request_gamma,
+            "prompt_format_used": getattr(seq, "prompt_format_used", None),
+            "tokenized_prompt_len": getattr(seq, "tokenized_prompt_len", seq.num_prompt_tokens),
             "home_batch_id": seq.home_batch_id,
             "num_decode_ready_prefill_tokens": int(seq.num_decode_ready_prefill_tokens),
             "decode_ready_mode": bool(seq.decode_ready_mode),
@@ -663,6 +671,8 @@ class ModelRunnerBase:
         seq.decode_ready_mode = bool(snapshot.get("decode_ready_mode", False))
         seq.num_decode_ready_prefill_tokens = int(snapshot.get("num_decode_ready_prefill_tokens", 0))
         seq.home_batch_id = snapshot.get("home_batch_id")
+        seq.prompt_format_used = snapshot.get("prompt_format_used")
+        seq.tokenized_prompt_len = int(snapshot.get("tokenized_prompt_len", seq.num_prompt_tokens))
         seq.trace_stats = snapshot.get("trace_stats", seq.trace_stats)
         seq.arrival_offset_sec = snapshot.get("arrival_offset_sec")
         if snapshot.get("cached_admission_enabled"):

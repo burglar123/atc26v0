@@ -2,7 +2,6 @@ import atexit
 import json
 from dataclasses import fields
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
 import pickle
@@ -13,6 +12,7 @@ from nano_pearl.pearl_engine.pearl_model_runner import DraftModelRunner, TargetM
 from nano_pearl.utils.pearl_logger import logger
 from multiprocessing.synchronize import Event
 from nano_pearl.pearl_engine.sequence import Sequence
+from nano_pearl.pearl_engine.tokenizer_utils import load_tokenizer, prompt_to_token_ids
 from nano_pearl.layers.sampler import SamplingParams
 
 
@@ -109,8 +109,8 @@ class PEARLEngine:
         self.controller = Controller(config, self.control_event)
         self.last_traces = []
         self.last_request_metadata = []
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.draft_config.model, use_fast=True)
-        config.eos = self.config.draft_config.eos
+        self.tokenizer = load_tokenizer(self.config.draft_config.model, use_fast=True)
+        config.eos = getattr(self.config, "eos", self.config.draft_config.eos)
         logger.info(f"[Main Process] EOS token id: {config.eos}, EOS tokens: {self.tokenizer.decode(config.eos)}")   
 
         for i in range(config.world_size):
@@ -175,13 +175,13 @@ class PEARLEngine:
         slo_class: str | None = None,
         per_request_gamma: int | None = None,
     ):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            prompt = self.tokenizer.encode(prompt)
+        prompt_format_used = "pretokenized"
+        if isinstance(prompt, str) or (
+            isinstance(prompt, (list, tuple)) and not all(isinstance(item, int) for item in prompt)
+        ):
+            prompt, prompt_format_used = prompt_to_token_ids(self.tokenizer, prompt)
+        else:
+            prompt = list(prompt)
         seq = Sequence(
             prompt,
             sampling_params,
@@ -191,6 +191,8 @@ class PEARLEngine:
             slo_class=slo_class,
             per_request_gamma=per_request_gamma,
         )
+        seq.prompt_format_used = prompt_format_used
+        seq.tokenized_prompt_len = len(prompt)
         seq.arrival_offset_sec = arrival_offset_sec
         if getattr(self.config, "enable_cached_admission", False):
             seq.mark_cached_prefill_metadata(
@@ -504,6 +506,7 @@ class PEARLEngine:
         return {
             "traces": self.last_traces,
             "requests": self.last_request_metadata,
+            "model_tokenizer_diagnostics": getattr(self.config, "model_tokenizer_diagnostics", {}),
         }
 
     def dump_traces_json(self, path: str | os.PathLike | None = None, indent: int = 2):
